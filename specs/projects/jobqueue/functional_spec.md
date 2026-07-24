@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: jobqueue
@@ -26,6 +26,7 @@ The first stable milestone includes:
 - dead-letter handling and redrive;
 - a capacity-aware worker runtime with automatic lease renewal;
 - a higher-level `JobQueue` with job and attempt history;
+- atomic batch job enqueue;
 - scheduling, retries, cancellation, expiration, results, and administrative retry;
 - typed Go helpers over JSON job arguments;
 - atomic job completion and deterministic child-job creation;
@@ -79,6 +80,7 @@ They are not requirements for the initial milestones.
 - **Acknowledge:** Confirm successful processing and remove the active low-level message.
 - **Release:** Make a leased delivery eligible again, immediately or after a delay.
 - **Job:** Durable executable work with arguments, lifecycle state, attempts, and an optional result.
+- **Dispatch record:** Internal, reconstructable wake-up state connecting a non-terminal job to an eligible worker lane. It is not a raw application message.
 - **Attempt:** One leased execution of a job.
 - **Handler:** Application code registered for a job kind.
 - **Event:** An immutable fact that has already happened.
@@ -171,6 +173,7 @@ Raw messages, job dispatch records, and event-subscription deliveries occupy sep
 - The same human-readable name can exist in different namespaces without collision.
 - Raw receive, purge, delete, or redrive operations cannot address managed job or subscription deliveries.
 - Job and subscription administration is performed through their corresponding higher-level APIs.
+- Internal job dispatch records are governed by job lifecycle policy, not by raw-message retention or maximum-delivery policy.
 
 The PostgreSQL implementation may store these delivery forms in one physical table or several tables. That is an architecture decision; the functional requirement is that one public capability cannot accidentally steal or corrupt another capability's managed deliveries.
 
@@ -185,7 +188,8 @@ Required behavior:
 - publishing to a missing queue returns `ErrQueueNotFound`;
 - explicit creation is the production default;
 - optional automatic creation may be enabled for development and tests;
-- creating an existing queue with materially different configuration returns a conflict;
+- creating an existing queue is idempotent when every explicitly supplied persisted setting equals the normalized stored value;
+- any explicitly supplied persisted setting that differs from the stored value returns `ErrConflict`;
 - purging is a distinct destructive operation;
 - ordinary deletion rejects a non-empty or in-use queue unless a separately explicit force operation is added later;
 - queue configuration changes do not retroactively rewrite messages already published with snapshotted limits;
@@ -302,6 +306,8 @@ Retention expiration is cleanup behavior, not a retry strategy.
 
 When an eligible message has reached its configured maximum-delivery count without acknowledgement, it is atomically removed from active delivery and placed in dead-letter storage or its configured dead-letter queue.
 
+This low-level policy applies to raw messages and to higher-level delivery types only where their owning API explicitly adopts it. It never independently dead-letters an internal job dispatch record or makes a job terminal.
+
 Dead-letter records retain enough information for diagnosis:
 
 - original message ID and queue;
@@ -335,7 +341,20 @@ These inspection calls do not lease work.
 
 Applications register one handler per job kind. Registering the same kind twice is an error unless an explicit replacement API is used before the pool starts.
 
-Starting a pool with no handlers or no queue bindings is rejected. A delivery referring to an unknown job kind is failed with a structured permanent configuration error rather than acknowledged as successful.
+Starting a pool with no handlers or no queue bindings is rejected.
+
+Worker pools advertise or pass the set of job kinds registered in that process when claiming work. The runtime must prefer claiming only jobs it can handle. This allows old and new worker versions with different handler sets to share a lane safely during rolling deployment.
+
+If a process nevertheless receives an unknown kind:
+
+- the handler is not invoked;
+- no application attempt or retry-budget unit is consumed;
+- the dispatch is released with bounded backoff and jitter;
+- the job remains non-terminal;
+- a structured `ErrHandlerNotRegistered` observation is emitted;
+- newer workers remain able to claim it.
+
+Permanently failing unknown kinds is available only through explicit opt-in policy, optionally after a configured grace period. It is never the default.
 
 ### 7.2 Capacity-aware dispatch
 
@@ -353,6 +372,8 @@ Configuration supports:
 
 Weights and priorities are best-effort scheduling controls and must not be documented as strict fairness guarantees.
 
+If no running process currently advertises a queued kind, inspection and observability must expose the resulting unhandled backlog rather than silently failing it.
+
 ### 7.3 Notifications and polling
 
 The PostgreSQL runtime may use a dedicated `LISTEN` connection per process as a wake-up optimization. It always retains polling fallback.
@@ -362,6 +383,8 @@ Users can disable notifications for PgBouncer transaction-pooling environments. 
 ### 7.4 Automatic lease renewal
 
 The runtime automatically renews active leases before expiration, preferably in batches. Handlers do not implement their own heartbeat loops for ordinary use.
+
+When no handler timeout is configured, renewal can continue for as long as the handler remains active. The runtime always exposes running duration and last successful renewal, and it can emit a one-time long-running-attempt observation after a configurable threshold.
 
 When renewal shows that ownership was lost:
 
@@ -412,7 +435,7 @@ A job contains:
 - lifecycle state;
 - priority;
 - scheduling and expiration timestamps;
-- attempt count and maximum attempts;
+- execution and retry-budget counts plus maximum application attempts;
 - optional uniqueness key;
 - optional result and structured error;
 - metadata and correlation identifiers;
@@ -424,7 +447,7 @@ Job arguments and results are JSON. Typed generic helpers marshal and validate G
 
 ### 8.2 Enqueue
 
-Enqueue durably creates the job and its low-level reference message in one transaction.
+Enqueue durably creates the job and its managed dispatch record in one transaction.
 
 The request can specify:
 
@@ -440,13 +463,25 @@ The request can specify:
 
 Behavior:
 
-- an empty or unregistered kind may be enqueued, but the worker later treats an unknown handler as a permanent configuration failure;
+- an empty kind is invalid;
+- an unregistered kind may be enqueued because producers are not required to share a worker's local handler registry;
 - an omitted queue uses an explicitly configured default job lane;
 - delay and absolute availability are mutually exclusive;
 - `ExpiresAt` must be later than the effective availability time;
 - duplicate stable IDs are idempotent only when immutable creation fields match;
 - conflicting reuse returns `ErrConflict`;
-- the low-level message contains a versioned job reference rather than a duplicate copy of all job state.
+- the managed dispatch record contains a versioned job reference rather than a duplicate copy of all job state.
+
+#### Batch enqueue
+
+Milestone 1 provides bounded `EnqueueBatch` behavior for creating many independent jobs in one call and PostgreSQL transaction.
+
+- Results correspond to request order.
+- Matching idempotent duplicates return their existing jobs.
+- Every request is validated before commit.
+- A conflicting identity, conflicting uniqueness key, or invalid request rolls back the whole batch.
+- Partial or best-effort batch creation is deferred until a concrete need justifies its more complicated error contract.
+- The maximum batch size is configurable and documented by the backend.
 
 ### 8.3 Uniqueness
 
@@ -480,9 +515,18 @@ The public lifecycle includes:
 
 Ordinary state transitions are monotonic toward a terminal state. Only an explicit administrative retry can move an eligible terminal job back to `retrying`.
 
+There is no separate persisted `scheduled` state in the initial model:
+
+- `available` with `AvailableAt` later than database time is scheduled but not yet eligible;
+- `available` with `AvailableAt` at or before database time is eligible now;
+- `retrying` retains its distinct state while waiting for its persisted retry time;
+- inspection filters and metrics expose scheduled jobs as a derived classification.
+
+This avoids a correctness-dependent scheduler transition whose only purpose would be changing `scheduled` to `available`.
+
 ### 8.5 Attempt start
 
-Receiving a job atomically leases its reference message, creates an attempt, and transitions an eligible job to `running` under a fence.
+Claiming a job for a handler registered in the current process atomically claims its managed dispatch record, creates an attempt, and transitions an eligible job to `running` under a fence.
 
 Each attempt records:
 
@@ -494,7 +538,22 @@ Each attempt records:
 - bounded structured error information;
 - handler/build version when configured.
 
-A stale message for an already terminal or otherwise ineligible job is reconciled without rerunning the job.
+A stale dispatch record for an already terminal or otherwise ineligible job is reconciled without rerunning the job.
+
+An application attempt begins only when the runtime is ready to invoke a registered handler. Dispatches deferred because of an unknown handler, shutdown before invocation, or other infrastructure conditions do not create application attempts.
+
+Attempt history may record an execution interrupted after invocation by shutdown or lease loss, but such an interruption is explicitly marked as not consuming the application retry budget.
+
+#### Managed dispatch invariant
+
+The job row is authoritative. Internal dispatch records exist only to wake workers and must not independently decide job terminality.
+
+- Raw-message maximum-delivery and retention policies do not apply to job dispatch records.
+- A non-terminal job cannot be stranded because an internal dispatch record expired, was deleted, or exhausted raw delivery attempts.
+- Reconciliation recreates missing dispatch state for non-terminal jobs that should be or become eligible.
+- Reconciliation removes dispatch state for terminal or otherwise ineligible jobs.
+- Recreated dispatch is idempotently keyed to the logical job so reconciliation cannot create duplicate logical work.
+- Only job expiration, cancellation, discard, successful completion, permanent application failure, or exhausted application retry policy makes the job terminal.
 
 ### 8.6 Expiration and execution timeout
 
@@ -545,11 +604,13 @@ Default behavior:
 - permanent errors transition directly to `failed`;
 - discard transitions to `discarded`;
 - panic follows the normal retry policy;
-- exhausted attempts transition to `failed` and preserve dead-letter diagnostics;
+- exhausted attempts transition to `failed` and preserve terminal failure diagnostics;
 - shutdown interruption releases the job without counting an application failure;
 - lease loss permits no stale finalization.
 
-The initial default is five maximum application attempts with configurable per-job or per-handler override. The chosen retry timestamp is persisted so a replay does not regenerate different jitter.
+The initial default is five retry-budget-consuming application attempts with configurable per-job or per-handler override. Ordinary handler failures and panics consume that budget. Unknown-handler deferral, shutdown interruption, and lease loss do not. All invoked executions can still appear in attempt history.
+
+The chosen retry timestamp is persisted so a replay does not regenerate different jitter.
 
 ### 8.10 Failure transaction
 
@@ -558,7 +619,7 @@ Failure handling atomically:
 - verifies attempt ownership;
 - records the attempt error and completion;
 - transitions the job to `retrying`, `failed`, or `discarded`;
-- reschedules or dead-letters the reference message;
+- reschedules managed dispatch or makes the job terminal according to job policy;
 - records workflow history when applicable.
 
 If failure recording cannot commit, lease expiry permits another delivery. This can repeat handler execution and is part of the at-least-once contract.
@@ -568,7 +629,7 @@ If failure recording cannot commit, lease expiry permits another delivery. This 
 Cancellation is durable and cooperative.
 
 - `CancelJob` accepts a job ID and optional bounded reason and actor metadata.
-- An available, delayed, retrying, or blocked job atomically becomes terminal `cancelled`, and its pending delivery can no longer start.
+- An available job, including one with a future `AvailableAt`, or a retrying or blocked job atomically becomes terminal `cancelled`, and its pending dispatch can no longer start.
 - A running job atomically becomes terminal `cancelled`, its current completion fence is invalidated, and its handler context receives cancellation.
 - If success commits before cancellation, success wins.
 - If cancellation commits first, stale success finalization is rejected.
@@ -584,7 +645,7 @@ An authorized caller can retry `failed`, `cancelled`, `expired`, or `discarded` 
 Administrative retry:
 
 - preserves the logical job ID, original inputs, and history;
-- creates a new low-level message and eventually a new attempt and lease;
+- creates new managed dispatch state and eventually a new attempt and lease;
 - can override availability, expiration, queue, and maximum remaining attempts;
 - records actor, reason, timestamp, and overrides;
 - rejects a job already active unless a separate force operation is introduced later.
@@ -756,6 +817,17 @@ Dead subscription deliveries can be inspected and redriven independently. Redriv
 
 Redriving event delivery does not append a duplicate domain event to its source stream.
 
+### 10.5 Event retention
+
+EventBus events use configurable retention with an initial default of 30 days. The event payload cannot be removed while any active or retained dead-letter subscription delivery still references it.
+
+An event becomes eligible for cleanup only when:
+
+- its configured minimum retention window has elapsed; and
+- every subscription delivery is acknowledged, discarded, expired, or removed under its own retained dead-letter policy.
+
+Applications requiring an authoritative indefinite history append events to `EventStore`. EventBus retention is a delivery and operational-history policy, not event sourcing.
+
 ## 11. EventStore
 
 ### 11.1 Streams and append
@@ -800,7 +872,7 @@ Any conflict or failure rolls back the entire composed operation.
 
 ### 11.4 Snapshots and retention
 
-Event streams are append-only and are not deleted by ordinary queue retention. Snapshotting, archival, and stream deletion policies are deferred until demonstrated workloads require them.
+Event streams are append-only, retained indefinitely by default, and unaffected by queue or EventBus retention. Snapshotting, archival, and stream deletion policies are deferred until demonstrated workloads require them.
 
 Administrative erasure required by an application remains the application's responsibility until an explicit policy is designed; the library must not silently claim immutable storage satisfies every regulatory regime.
 
@@ -816,6 +888,7 @@ Public sentinel or typed errors allow callers to recognize at least:
 - invalid state transition;
 - terminal-state conflict;
 - invalid request or payload limit;
+- handler not registered in the current worker process;
 - unavailable/closed runtime;
 - migration or compatibility failure.
 
@@ -831,14 +904,16 @@ Initial defaults:
 
 - visibility timeout: 30 seconds;
 - low-level message retention: 4 days;
-- maximum message deliveries: 5;
+- maximum raw-message deliveries: 5;
 - maximum job application attempts: 5;
 - maximum message or JSON result body: 1 MiB;
 - maximum encoded headers: 64 KiB;
 - idle correctness poll: 1 second, configurable;
 - notifications: enabled when a dedicated session connection is configured;
 - handler timeout: none unless configured;
+- long-running observation threshold: configurable without imposing a second hard timeout;
 - job/attempt terminal history: 30 days;
+- EventBus event retention: 30 days minimum and never shorter than outstanding delivery references;
 - strict FIFO: disabled and unsupported initially;
 - automatic queue creation: disabled except when explicitly enabled.
 
@@ -854,6 +929,8 @@ The core library exposes optional no-op-by-default observation hooks for:
 - retries, cancellation, expiration, and dead-letter transitions;
 - lease extension and loss;
 - listener reconnect and polling fallback;
+- unknown-handler deferral and unhandled job backlog;
+- long-running attempts and last successful lease renewal;
 - workflow and event transitions.
 
 Observations include relevant queue, message, lease, job, attempt, workflow, node, correlation, worker, and process identity.
@@ -861,6 +938,8 @@ Observations include relevant queue, message, lease, job, attempt, workflow, nod
 The library does not force a logging, metrics, or tracing vendor. Adapter packages can integrate OpenTelemetry or application-specific systems later.
 
 Inspection queries expose queue depth, oldest eligible age, retry schedule, running and terminal jobs, dead work, workflow graph/timeline, and per-kind outcome data needed by operators.
+
+Job inspection additionally exposes derived scheduled counts, unhandled counts by kind and lane, current running duration, and last successful lease-renewal time. A configured long-running threshold emits an observation without changing job state or stopping lease renewal.
 
 ## 15. Security and Resource Safety
 
@@ -930,6 +1009,8 @@ The PostgreSQL implementation uses real PostgreSQL integration tests for concurr
 
 Fault-injection tests cover crashes or uncertainty before and after completion commit. Workflow tests verify deterministic child and node identity. Event-store tests verify optimistic concurrency and gapless committed stream versions.
 
+Rolling-deployment tests run old and new worker versions with different registered kind sets and verify that an old worker cannot permanently fail new-kind work. Reconciliation tests remove internal dispatch records and verify that non-terminal jobs become executable again without duplicating logical jobs.
+
 ## 19. Initial Non-Goals
 
 The initial milestones do not promise:
@@ -959,6 +1040,11 @@ Milestone 1 is complete when:
 - workers do not hold queue connections during handler execution;
 - notification loss recovers through polling;
 - job retries, cancellation, expiration, results, and history behave as specified;
+- workers with different registered kind sets can share a lane during rolling deployment without permanently failing unknown work;
+- missing managed dispatch state is reconciled without stranding or duplicating a non-terminal job;
+- raw message retention and delivery limits cannot independently terminate a managed job;
+- scheduled-job inspection derives eligibility consistently from `AvailableAt` and database time;
+- atomic batch enqueue either commits every valid/idempotent request or none;
 - concurrent duplicate job requests resolve to one logical job under stable IDs or uniqueness keys;
 - cancellation that wins the state race prevents a running attempt from committing stale outcomes;
 - parent success and deterministic child creation commit atomically;
@@ -983,6 +1069,7 @@ Milestone 2 is complete when:
 Milestone 3 is complete when:
 
 - one event publication creates independent durable subscription deliveries;
+- EventBus cleanup cannot remove an event still referenced by an active or retained dead-letter delivery;
 - concurrent publication of one stable event ID does not duplicate the event or its subscription fan-out;
 - subscription retries and acknowledgements do not affect one another;
 - stream append enforces expected versions;
