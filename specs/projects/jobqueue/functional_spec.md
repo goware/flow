@@ -78,7 +78,7 @@ They are not requirements for the initial milestones.
 - **Receipt:** The current message and lease identity required to settle or extend a delivery.
 - **Lease:** A period during which a received message is normally hidden from competing consumers.
 - **Acknowledge:** Confirm successful processing and remove the active low-level message.
-- **Release:** Make a leased delivery eligible again, immediately or after a delay.
+- **Release (API verb: `Nack`):** Make a leased delivery eligible again, immediately or after a delay.
 - **Job:** Durable executable work with arguments, lifecycle state, attempts, and an optional result.
 - **Dispatch record:** Internal, reconstructable wake-up state connecting a non-terminal job to an eligible worker lane. It is not a raw application message.
 - **Attempt:** One leased execution of a job.
@@ -185,7 +185,7 @@ Applications can explicitly create, inspect, update, purge, and delete raw messa
 
 Required behavior:
 
-- publishing to a missing queue returns `ErrQueueNotFound`;
+- publishing to a missing queue returns `ErrNotFound` with resource `queue`;
 - explicit creation is the production default;
 - optional automatic creation may be enabled for development and tests;
 - creating an existing queue is idempotent when every explicitly supplied persisted setting equals the normalized stored value;
@@ -351,7 +351,7 @@ If a process nevertheless receives an unknown kind:
 - no application attempt or retry-budget unit is consumed;
 - the dispatch is released with bounded backoff and jitter;
 - the job remains non-terminal;
-- a structured `ErrHandlerNotRegistered` observation is emitted;
+- a structured `ErrUnavailable` observation with resource `handler` is emitted;
 - newer workers remain able to claim it.
 
 Permanently failing unknown kinds is available only through explicit opt-in policy, optionally after a configured grace period. It is never the default.
@@ -457,6 +457,7 @@ The request can specify:
 - priority;
 - initial delay or availability time;
 - optional `ExpiresAt` start deadline;
+- optional per-job execution-timeout override, distinct from the start deadline;
 - maximum attempts;
 - uniqueness key;
 - metadata and correlation fields.
@@ -762,6 +763,8 @@ Applications can query:
 
 The operational event log supports audit and debugging but is distinct from the general domain `EventStore`.
 
+Workflow runs, nodes, dependencies, operational history, and their referenced node jobs are retained indefinitely in the initial milestones. A future explicit workflow-retention policy must remove the graph and job history as one referentially safe unit.
+
 ### 9.9 Versioning and replay boundary
 
 Each workflow run records its definition version, and attempts can record handler/build versions.
@@ -902,7 +905,8 @@ Configuration is provided through typed constructors and options, queue configur
 
 Initial defaults:
 
-- visibility timeout: 30 seconds;
+- raw-message and EventBus-delivery visibility timeout: 30 seconds;
+- job-lane visibility timeout: 60 seconds;
 - low-level message retention: 4 days;
 - maximum raw-message deliveries: 5;
 - maximum job application attempts: 5;
@@ -912,7 +916,7 @@ Initial defaults:
 - notifications: enabled when a dedicated session connection is configured;
 - handler timeout: none unless configured;
 - long-running observation threshold: configurable without imposing a second hard timeout;
-- job/attempt terminal history: 30 days;
+- standalone job/attempt terminal history: 30 days; workflow-node jobs follow the indefinite initial workflow-retention policy;
 - EventBus event retention: 30 days minimum and never shorter than outstanding delivery references;
 - strict FIFO: disabled and unsupported initially;
 - automatic queue creation: disabled except when explicitly enabled.
