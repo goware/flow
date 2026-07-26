@@ -4,6 +4,8 @@ status: complete
 
 # jobqueue
 
+> **Superseded.** This is an earlier design for the same problem, structured as five layers — `MessageQueue`, `JobQueue`, Workflow DAG, `EventBus`, and `EventStore`. The active design lives in `specs/projects/flow` and uses a command / worker / event model with declarative plans instead. These documents are retained for their reasoning and their PostgreSQL mechanics, much of which carried forward; the APIs they describe are not current.
+
 `jobqueue` is a reusable Go library for building durable asynchronous jobs and event-driven workflows on PostgreSQL. It is intended for Go applications that already rely on PostgreSQL and need reliable background execution, retries, and multi-step state transitions without operating a separate message broker or workflow platform.
 
 PostgreSQL is the source of truth. A low-level, SQS-inspired `MessageQueue` provides durable, at-least-once delivery using expiring leases and fencing tokens. A higher-level `JobQueue` manages job lifecycle, attempts, retries, scheduling, cancellation, outcomes, expiration, and worker execution. A later workflow milestone will compose jobs into deterministic directed acyclic graphs (DAGs), including chains, fan-out, fan-in and joins, conditional branches, dependencies, and dynamically created work.

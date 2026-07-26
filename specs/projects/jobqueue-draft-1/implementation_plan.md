@@ -4,6 +4,8 @@ status: complete
 
 # Implementation Plan: jobqueue
 
+> **Superseded.** This is an earlier design for the same problem, structured as five layers — `MessageQueue`, `JobQueue`, Workflow DAG, `EventBus`, and `EventStore`. The active design lives in `specs/projects/flow` and uses a command / worker / event model with declarative plans instead. These documents are retained for their reasoning and their PostgreSQL mechanics, much of which carried forward; the APIs they describe are not current.
+
 ## Phases
 
 - [ ] Phase 1: Establish root contracts, validation, errors, observations, PostgreSQL backend foundations, migration engine, and real-PostgreSQL test harness.

@@ -4,6 +4,8 @@ status: complete
 
 # Component: PostgreSQL Backend and Operations
 
+> **Superseded.** This is an earlier design for the same problem, structured as five layers — `MessageQueue`, `JobQueue`, Workflow DAG, `EventBus`, and `EventStore`. The active design lives in `specs/projects/flow` and uses a command / worker / event model with declarative plans instead. These documents are retained for their reasoning and their PostgreSQL mechanics, much of which carried forward; the APIs they describe are not current.
+
 ## 1. Purpose and Scope
 
 This component assembles the PostgreSQL implementation and owns behavior shared by MessageQueue, JobQueue, workflows, EventBus, and EventStore.
