@@ -29,6 +29,8 @@ Every execution also has one immutable, ordered **journal**. The journal is broa
 
 Plans are optional. The simplest use starts one command directly as durable background work; its worker may spawn bounded child commands, and the execution finishes after the root and all required descendants finish. When progression needs dependencies, joins, waits, or branches across commands, the application adds a **plan**: a small pure function that declares commands by durable key. The plan does not receive one event callback. It is re-evaluated over all relevant events and command results recorded so far; it never sleeps in memory. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
 
+This also makes `flow` suitable for long-running durable agents without adding an agent-specific framework. One agent run or bounded episode is an execution; its coordinator is the durable control loop; model calls, tools, and bounded sub-agent tasks are commands; and their results and external observations are events. A long-lived execution is composed of bounded worker invocations rather than one worker retaining an agent loop in memory. A coordinator may schedule its next command for later without occupying a worker, and the journal preserves every accepted turn, tool call, failure, retry, and causal decision across replica failure and takeover.
+
 The intended experience is closer to using an in-process Go library than operating Kafka or a separate workflow platform: a small type-safe API, ordinary Go handlers, PostgreSQL transactions, and one operational backend.
 
 `flow` is distributed by design. Calling `.Execute` durably queues work in PostgreSQL rather than assigning it to the calling process. Any compatible application replica running `Runtime.Run` may claim that command, record its event, and enqueue the next commands; successive parts of one execution may therefore run on different replicas. Leases, retries, and fencing provide automatic takeover when a process disappears, while PostgreSQL remains the durable authority for the complete execution.
@@ -233,6 +235,10 @@ An execution uses exactly one driver mode: a direct root command, a plan, or a h
 
 A coordinator subscribes to application facts with `On` and to every terminal result of a typed command with `OnOutcome`. The latter receives the existing command event as `CommandOutcome[R]`: success includes `R`, while failure, cancellation, expiry, and skipping include their structured terminal reason. It creates no additional event. Commands whose failures the coordinator intends to interpret are normally spawned `Optional()`, leaving the coordinator to decide the aggregate result instead of triggering automatic fail-fast first.
 
+Coordinator and worker spawns may attach `StartAfter`, a one-shot durable delay measured from PostgreSQL time in the transaction that accepts the child. The child exists immediately for tracing but holds no worker, connection, goroutine, or lease before its claim-eligible time. This is enough for an agent to pause between turns, respect a provider delay, or revisit work later; recurring calendar schedules remain a separate future capability.
+
+For an adaptive agent, the model worker should normally return proposed actions and let the coordinator validate and spawn the corresponding tool or subtask commands. The coordinator stores only orchestration state and durable references; transcripts, documents, embeddings, and other application data remain in application tables or object storage. Bounded sub-agents are ordinary commands in the same execution. A sub-agent that needs its own durable adaptive loop will eventually use a child execution with its own driver and journal rather than expanding the parent coordinator into a second framework.
+
 ### Execution identity and causation
 
 An `ExecutionID` groups all commands, attempts, events, decisions, and outcomes for one run. Every derived record identifies its direct cause.
@@ -267,12 +273,13 @@ Handlers are ordinary Go and may call normal application services. Business data
 - **Local reasoning:** a worker understands one command, its explicit dependencies, and its direct children; a plan reads high-level progression and joins top to bottom.
 - **Type safety:** command payloads, command results, event payloads, and handler signatures checked by Go.
 - **Dynamic composition:** runtime branching, worker-spawned child commands, fan-out, fan-in, waits, and long-running executions without a fully predeclared graph.
+- **Durable adaptive execution:** long-running agents and other open-ended loops progress as bounded commands around durable coordinator decisions, with no process-local loop required for correctness.
 - **Durability:** commands, attempts, events, decisions, and causal relationships survive process and machine failure.
 - **Failure correctness:** bounded retries, backoff, leases, timeouts, cancellation, terminal failure, and explicit operator-visible outcomes.
 - **Atomic progression:** a command result, its declared short application write, emitted events, spawned commands, plan reconciliation, coordinator state, and inbox progress commit under one settlement discipline.
 - **Traceability:** explain what is running, what is waiting, what failed, what was retried, and why every command exists.
 - **Horizontal operation:** many API processes and workers cooperating on one PostgreSQL database.
-- **Testability:** workers and optional plans unit-testable without starting a distributed system.
+- **Testability:** workers, optional plans, and coordinator-driven agent loops unit-testable without starting a distributed system.
 
 ## Technical requirements
 
@@ -295,6 +302,8 @@ Handlers are ordinary Go and may call normal application services. Business data
 - External monitors and webhooks may publish idempotent execution facts atomically with application-table writes; commands awaiting those facts consume no runtime worker capacity while pending.
 - `Within` bounds only an awaited-fact stage and starts after the command's non-event prerequisites resolve.
 - Coordinators can consume typed success and unsuccessful command outcomes through one subscription over the command's existing terminal event.
+- Workers and coordinators can durably delay a spawned command from PostgreSQL time without occupying runtime capacity or consuming its retry budget before eligibility.
+- Every execution mode has a configurable total-command safety ceiling, snapshotted when the execution starts so all replicas enforce the same value; it limits one execution's topology, not database backlog or concurrency.
 - Transactions that compose Flow operations with application writes acquire Flow-owned state first and application rows second.
 
 ## Non-goals
@@ -309,13 +318,14 @@ Handlers are ordinary Go and may call normal application services. Business data
 - Multi-region active-active execution in the initial milestones.
 - Hard replica pinning or correctness that depends on instance-local memory.
 - A visual workflow designer in the core library.
+- Agent-specific `Agent`, `Subagent`, `Tool`, `Memory`, or conversation abstractions; applications model those concepts with commands, events, coordinators, and application-owned data.
 
 ## Future direction
 
+- child executions for independently durable sub-agents and other nested work, with an explicit parent link, separate execution-scoped journal, terminal outcome boundary, and cancellation policy rather than merged ordering;
 - an operational UI with execution timelines, causal graph views, pending waits, retries, and failures;
 - OpenTelemetry, metrics, and structured-logging adapters;
 - administrative retry, fork, explicit policy amendment, repair, and compensation tools;
-- child coordinators for decomposing very large executions;
 - optional local affinity that makes a bounded best effort to keep causally related work on the replica that started it, while always allowing another replica to take over;
 - archival and configurable journal retention, including the option to discard bulky command payloads before retaining their causal skeletons for longer;
 - optional event export and cross-execution subscriptions through explicit idempotent boundaries that preserve each source execution's identity and order without promising order across executions;
