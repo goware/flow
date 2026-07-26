@@ -70,14 +70,16 @@ This is a product feature: application writes, command completion, plan reconcil
 - arbitrary subtree cancellation;
 - recurring schedules;
 - archival and configurable terminal-history retention;
-- cross-execution subscriptions and event export to Kafka or analytics systems;
+- cross-execution subscriptions and event export to Kafka or analytics systems through an explicit idempotent boundary that preserves the source `(ExecutionID, position)` and neither merges execution logs nor promises cross-execution order (§9.4);
+- plan simulation and dry-run tooling that uses the exact plan version and a retained execution snapshot to preview declarations and reads after historical or candidate transitions, without executing workers or external effects (§9.6);
 - optional soft local affinity with bounded preference for the replica that starts an execution and automatic takeover by another replica;
 - backend implementations other than PostgreSQL;
 - multi-region execution.
 
 ### 2.5 Explicit non-goals
 
-- a general-purpose message broker, cross-execution pub/sub, or event-streaming platform;
+- a general-purpose message broker or event-streaming platform, or implicit cross-execution pub/sub inside the core event log;
+- a database-wide event log, global event position, or total ordering guarantee across executions;
 - framework-owned copies of application/domain state;
 - deterministic replay of arbitrary Go code;
 - exactly-once external side effects;
@@ -644,6 +646,8 @@ A worker may additionally call `Emit` to record application events. Those are re
 
 Failure, cancellation, expiry, or skipping records exactly one `CommandFailed`, `CommandCancelled`, `CommandExpired`, or `CommandSkipped` event instead. All are ordinary events in the same log. A database constraint prevents more than one event recording the final state of a command. Retryable attempt failures are history, not events, because the command has not ended.
 
+This invariant makes every terminal command transition plan-observable and auditable, and lets plan simulation follow terminal progress when combined with retained command, dependency, and child-membership records. It does **not** make the event log alone a complete source for command or execution state: the immutable command row remains the issuance record (§9.6).
+
 ### 7.4 Bounded child spawning
 
 `Spawn` stages a command for asynchronous delivery. It does not invoke a handler, block for a result, or open a nested transaction.
@@ -745,6 +749,8 @@ There is one event model and one typed abstraction: `Event[T]`. Events enter the
 
 These are different event names and payloads, not different event systems or developer-facing categories. Attempt failures, lease renewals, and lease loss remain operational history rather than events, so transient mechanics never masquerade as permanent facts.
 
+The runtime deliberately does not append a `CommandStarted` event. `Trace` derives whether a command is currently running from command state and its active lease, and reads when and where attempts ran from attempt records and operational history. An attempt start is durable operational history, while the command's single terminal event is the permanent plan-visible fact. This avoids duplicate representations of running state and prevents plans from reacting to retry mechanics.
+
 ### 9.3 Idempotency
 
 `Publish` requires a non-empty event key. Identity is `(ExecutionID, event_name, EventKey)`, scoped across versions so a publisher retrying the same natural fact after a deployment cannot create duplicate progression under a newer schema.
@@ -764,6 +770,8 @@ Plans and coordinators observe matching events in increasing position order. A f
 
 Checkpointing must never permanently skip an event whose creating transaction becomes visible later; architecture must either make per-execution positions gap-free at commit or use a cursor that revisits unresolved gaps. Because positions are scoped to one execution — which is already the serialization point for its own commits — this is materially simpler than database-wide ordering.
 
+There is no position or ordering relationship across executions. A future export, subscription, or execution-start bridge may interleave events from several executions in any order, but it must retain each event's source `(ExecutionID, position)`, cross an explicit idempotent boundary, and make no claim that the resulting stream is one merged `flow` log.
+
 ### 9.5 Payloads and result references
 
 Small durable results may be carried in payloads. Large or sensitive outputs belong in application-owned tables or object storage, referenced by a stable identifier. Changing data behind a reference does not change the historical event; use immutable, versioned, or content-addressed references where historical reproducibility matters.
@@ -772,7 +780,7 @@ Small durable results may be carried in payloads. Large or sensitive outputs bel
 
 `flow` preserves replayable orchestration history without being a strict event-sourced runtime. Immutable command rows record requested work and parentage; events record how commands ended and any additional application facts; attempts record transient execution mechanics; materialized command and execution states make claiming and inspection efficient.
 
-Plans may be re-evaluated from the retained arguments, command states, results, and events, and inspection projections may be rebuilt from commands, dependencies, attempts, events, and causation. Recovery never replays arbitrary Go handlers or repeats their historical external side effects. A command row is itself the durable record that the command was issued, so Milestone 1 does not add a redundant `CommandIssued` event.
+Plans may be re-evaluated from the retained arguments, command states, results, closed child memberships, and events, and inspection projections may be rebuilt from commands, dependencies, attempts, events, and causation. Accurate historical plan simulation additionally requires the exact plan version and the retained plan-visible snapshot as it existed at each simulated transition; an event prefix alone is insufficient because command issuance, dependencies, and closed child membership are not all events. Recovery and simulation never replay arbitrary Go handlers or repeat their historical external side effects. A command row is itself the durable record that the command was issued, so Milestone 1 does not add a redundant `CommandIssued` event.
 
 ## 10. Plans
 
@@ -806,6 +814,23 @@ The public boolean remains deliberately small: `Children` and `Result` return fa
 Reading a command's children, result, or outcome does not by itself create a dependency edge. A command that consumes those keys or values must also name the source commands with `After` or `AfterSettled`, so scheduling and traceability do not depend on an implicit data read. A joined worker may then read the successful immutable results of its explicitly named dependencies through `ResultOf`.
 
 Plans are ordinary Go functions, so statements reached before an early return are the declarations produced by that evaluation; the runtime does not pretend source order is irrelevant. Applications should declare structural work as soon as its keys are known and reserve value reads for topology decisions. `Children`, explicit dependencies, and worker-side `ResultOf` remove the common need to loop over unfinished results merely to construct the next payload.
+
+Plan fragments compose as ordinary Go functions taking `*Plan`; the library needs no separate composition primitive:
+
+```go
+func planPayout(p *flow.Plan, prefix string, args PayoutArgs) {
+    flow.Do(p, prefix+"/send", SendTxn, args.Send)
+    flow.Do(p, prefix+"/confirm", ConfirmTxn, args.Confirm).
+        After(prefix + "/send")
+}
+
+func planIntent(p *flow.Plan, args IntentArgs) {
+    planPayout(p, "origin", args.Origin)
+    planPayout(p, "destination", args.Destination)
+}
+```
+
+A fragment intended for repeated use accepts a caller-chosen key prefix, and each logical instance uses a distinct prefix. A conflicting collision is a plan defect. Equivalent duplicate declarations intentionally coalesce, so `flowtest` should assert the complete expected key set rather than assuming every accidental reuse fails loudly.
 
 #### Temporarily unavailable reads block successful completion
 
@@ -849,14 +874,16 @@ The consulted-input set and each read's availability classification from the lat
 A plan's declared output is a pure function of its root arguments and the durable events and final command states it consulted. Evaluation is therefore required only when one of those can have changed:
 
 - at execution start;
-- when an event arrives whose name the latest evaluation consulted, or which the plan has never had the chance to consult;
+- when an event arrives whose name the latest evaluation consulted;
 - when a final event is appended for a command read by the plan or named by one of its dependencies.
 
 Claim, lease renewal, `running`, and `retry_wait` transitions do not trigger plan evaluation because no plan API can observe them. The event recorded when the command ends does.
 
-Events of names no evaluation has ever consulted cannot change the plan's output and do not trigger evaluation. Because plans are pure, skipping is sound rather than an optimization that risks divergence.
+Events of names the latest evaluation did not consult cannot change that evaluation's control path by themselves and do not trigger evaluation. Skipping is sound because plans are pure and facts are immutable, append-only, and durably re-readable; terminal command outcomes and closed child memberships are likewise immutable. If another consulted input later opens a branch that reads an older, previously ignored fact, that consulted input triggers evaluation and the older fact is still present for the newly reached branch.
 
 Evaluation is idempotent, so an implementation may always evaluate more often than required — including on every event — without changing behavior.
+
+A debug or test verification mode may deliberately evaluate on a durable transition that normal routing would skip and assert that canonical declarations, dependencies, consulted reads, and read-availability classifications remain unchanged. A difference is an invariant failure and none of the verification evaluation's output is committed.
 
 ### 10.4 Dependencies
 
@@ -1110,7 +1137,9 @@ The library ships a test package so direct command trees, workers, plans, and co
 
 - a worker is an ordinary function — given a payload and an immutable set of explicitly declared dependency results, assert `ResultOf` reads, its returned result or error, its staged events and spawned children, direct-child keys, optional classification, and registered application writes;
 - a direct-execution harness begins with one root worker decision and settles staged descendants, allowing completion and failure policy to be asserted without defining a plan;
-- a plan is a pure function — given root arguments, facts, command states, and closed child memberships, assert its declarations, dependencies, read availability, outcomes, and waits; a determinism assertion evaluates the identical snapshot repeatedly and compares canonical output;
+- a plan is a pure function — given root arguments, facts, command states, and closed child memberships, assert its declarations, dependencies, read availability, outcomes, waits, and complete expected key set; a determinism assertion evaluates the identical snapshot repeatedly and compares canonical output;
+- a plan harness may advance through an ordered sequence of synthetic durable snapshots — including facts, terminal command outcomes, and closed child memberships — and return or assert the canonical declarations, dependencies, consulted inputs, and read-availability classifications after each transition, without running workers or external effects;
+- a plan-routing assertion mode evaluates selected transitions that normal consulted-input routing would skip and verifies that the canonical output and reads remain unchanged;
 - a coordinator harness delivers the durable start activation and events in order, allowing `OnStart`, state changes, outputs, retry, and completion decisions to be asserted.
 
 Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, publish-before-declare and declare-before-publish ordering, all-or-nothing worker fan-out, authoritative child reads, batched worker dependency results, repeated plan evaluation creating no duplicate commands, unknown dependency rejection, terminally unavailable results not blocking failure, failure branches surviving fail-fast, `Await` expiry, and rolling deployments with divergent registered versions.
@@ -1152,13 +1181,15 @@ Milestone 1 is complete when:
 - plan reads distinguish available, temporarily unavailable, and permanently unavailable inputs internally: `Result` becomes available only on success, `Outcome` on any terminal state, and an unsuccessful terminal `Result` cannot block completion as though it might later succeed;
 - after each evaluation, dependency keys are validated against durable commands plus every declaration in that evaluation, so forward references work and a nonexistent key fails immediately as a plan defect;
 - a plan panic, conflicting declaration, or invalid read records `PlanFailed` and fails the execution without consuming worker retry budget or rerunning accepted work;
-- the plan determinism harness detects different declarations or consulted reads from an identical snapshot;
-- plan evaluation at the documented command ceiling stays within its benchmarked budget, and events of never-consulted names trigger no evaluation;
+- the plan determinism harness detects different declarations or consulted reads from an identical snapshot, and fragment tests can assert the complete intended key set;
+- the database-free plan harness can advance synthetic facts, terminal outcomes, and closed child memberships and expose canonical declarations, dependencies, consulted inputs, and read availability after each transition without executing workers;
+- plan evaluation at the documented command ceiling stays within its benchmarked budget; events whose names the latest evaluation did not consult trigger no normal evaluation, a later consulted transition still exposes any stored fact to a newly reached branch, and routing assertion mode detects if a skipped evaluation would differ;
 - a command result, emitted events, spawned children, plan-created commands, dependency resolution, and application writes commit atomically or not at all;
 - a stalled worker cannot commit after losing its lease;
 - an event published before its plan-declared command or coordinator existed is still observed by it;
+- event positions are total only within one execution, and no API or projection implies a total order across executions;
 - an idempotent republish of a stored event succeeds after the execution becomes terminal, while a genuinely new event is rejected;
 - crash at any commit boundary leaves the execution recoverable and internally consistent;
 - workers registering different `(name, version)` sets share a database without failing each other's work;
-- `Trace` returns both what happened and what the execution is waiting for, including parent-child edges and every final command state, in one call;
+- `Trace` returns both what happened and what the execution is waiting for, including parent-child edges, every final command state, current running state, and attempt start history in one call, without a `CommandStarted` event;
 - worker and plan unit tests run without a database.

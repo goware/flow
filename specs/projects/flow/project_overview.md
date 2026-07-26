@@ -23,7 +23,7 @@ The developer model is:
 - **Plans**, when used, react to recorded events and coordinate the overall execution.
 - **Workers** may spawn child commands when their work reveals more work.
 
-There is one event concept. When a worker returns successfully, `flow` automatically records an event carrying its typed result. When a command instead ends in failure, cancellation, expiry, or skipping, `flow` records an event describing that fact. A worker may explicitly emit additional application facts. All are ordinary events in the same execution log.
+When a worker returns successfully, `flow` automatically records an event carrying its typed result. When a command instead ends in failure, cancellation, expiry, or skipping, `flow` records an event describing that fact. A worker may explicitly emit additional application facts. All are ordinary events in the same execution log.
 
 Plans are optional. The simplest use starts one command directly as durable background work; its worker may spawn bounded child commands, and the execution finishes after the root and all required descendants finish. When progression needs dependencies, joins, waits, or branches across commands, the application adds a **plan**: a small pure function that declares commands by durable key. The plan does not receive one event callback. It is re-evaluated over all relevant events and command results recorded so far; it never sleeps in memory. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
 
@@ -200,6 +200,8 @@ The plan is re-evaluated whenever a relevant event is recorded or an observed co
 
 Purity is a contract rather than a Go sandbox: the plan receives no context, database, client, clock, or transaction capability, but Go cannot prevent a function from calling a package global. Reconciliation rejects conflicting declarations, plan panics and conflicts fail the execution as plan defects rather than retrying completed work, and `flowtest` evaluates plans repeatedly against identical snapshots to detect nondeterminism.
 
+Plans compose through ordinary Go functions rather than another orchestration abstraction. A reusable plan fragment accepts `*flow.Plan` plus a caller-chosen key prefix, and its caller invokes it like any other function. Each logical fragment instance should use a distinct prefix: conflicting reuse fails as a plan defect, while equivalent duplicate declarations intentionally coalesce, so tests should assert the complete intended key set.
+
 ### Coordinators
 
 A coordinator is durable memory that reacts to events. It is not needed for a direct command tree or a bounded fan-out returned by one worker; the authoritative direct-child records already preserve that membership. It exists for open-ended processes — work discovered over time, cycles, or several event streams — where no single command completion can close the decision.
@@ -266,7 +268,7 @@ Handlers are ordinary Go and may call normal application services. Business data
 
 - Reimplementing Kafka or providing a general-purpose high-throughput streaming platform.
 - Requiring Kafka, Redis, a separate control plane, or a hosted service.
-- Cross-execution or cross-service event fan-out in the initial milestones; the event log is scoped to one execution.
+- A database-wide event log or cross-execution ordering guarantee. The core event log and its total ordering are permanently execution-scoped. Future cross-execution delivery must cross an explicit idempotent export, subscription, or execution-start boundary that retains the source execution and position; it must not merge execution logs or imply a global order.
 - Treating application/domain state as framework-owned flow state.
 - Transparent replay of arbitrary Go code or deterministic-workflow sandboxing.
 - Exactly-once external side effects.
@@ -283,4 +285,5 @@ Handlers are ordinary Go and may call normal application services. Business data
 - child coordinators for decomposing very large executions;
 - optional local affinity that makes a bounded best effort to keep causally related work on the replica that started it, while always allowing another replica to take over;
 - archival and configurable history retention;
-- optional event export to Kafka or other analytics systems, without making them runtime dependencies.
+- optional event export and cross-execution subscriptions through explicit idempotent boundaries that preserve each source execution's identity and order without promising order across executions;
+- plan simulation and dry-run tooling that, when the exact plan version and retained execution snapshot are available, shows declarations and consulted inputs after historical or candidate transitions without executing workers or external effects.
