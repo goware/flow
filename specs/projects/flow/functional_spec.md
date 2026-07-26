@@ -12,14 +12,16 @@ Its core loop is:
 
 ```text
 command  →  worker  →  event
-                     └→ optional direct child commands
+                     └→ optional child commands
 ```
 
-A command is a durable instruction to perform work. A worker handles the command and performs that work. Events record facts about what happened. Plans react to recorded events and coordinate the overall execution. Workers may spawn child commands when their work reveals more work.
+A command is a durable instruction to perform work. A worker handles the command and performs that work. Events record facts about what happened. Plans, when used, react to recorded events and coordinate the overall execution. Workers may spawn child commands when their work reveals more work.
 
 There is one event concept. Conceptually, workers emit events. In the API, returning `(result, nil)` automatically records an immutable event carrying the command's typed result; workers call `flow.Emit` only for additional application facts. Failure, cancellation, expiry, and skipping are also recorded as ordinary events. Every command that ends therefore produces exactly one final fact, so progress is observable and "wait for this work" and "wait for this fact" use the same durable mechanism. A retryable error records attempt history but no final event because the command has not finished.
 
-Commands and events belong to an **execution**. What high-level work an execution needs is normally declared by a **plan** — a pure function re-evaluated over all relevant events and command results recorded so far. "React" does not mean that the plan receives one event callback. A worker may atomically **spawn** a bounded set of direct child commands when performing one command reveals more work. Where membership is open-ended or a plan cannot express the logic, a hand-written **coordinator** reacts to events directly.
+Commands and events belong to an **execution**. A plan is optional. The simplest execution starts one root command directly; its workers may form a bounded command tree with `Spawn`, and the execution finishes when that tree settles. When progression requires dependencies, joins, waits, or branches across commands, a **plan** declares that orchestration as a pure function re-evaluated over all relevant events and command results recorded so far. "React" does not mean that the plan receives one event callback. Where membership is open-ended or a plan cannot express the logic, a hand-written **coordinator** reacts to events directly.
+
+Application code begins any mode by binding its command, plan, or coordinator definition with `With(runtime)` and calling `.Execute` on the returned immutable copy. The call durably schedules the execution and returns an `ExecutionHandle`; it never runs a worker or coordinator handler inline.
 
 Commands are the executable vertices of the runtime graph, events explain progression, and causation supplies the edges. The graph is a projection of durable history, extended by the plan's record of work that is declared but not yet runnable.
 
@@ -34,6 +36,8 @@ This is a product feature: application writes, command completion, plan reconcil
 ### 2.2 Milestone 1
 
 - durable executions with idempotent start, deadlines, and explicit final states;
+- direct root-command execution requiring no plan or coordinator;
+- one `.Execute` verb on command, plan, and coordinator definitions, using immutable runtime binding through `With`;
 - typed, versioned commands carrying both a payload type and a **result** type;
 - exactly one event recording how each command ends, with successful worker results recorded automatically as typed events;
 - worker registration, command scheduling, leases, attempts, retries, timeouts, and fencing;
@@ -86,9 +90,9 @@ This is a product feature: application writes, command completion, plan reconcil
 | **Attempt** | One invocation of a command handler, identified separately from the command. |
 | **Worker** | A registered typed handler for one command name and version. |
 | **Event** | An immutable fact in an execution's ordered log, never destructively consumed. A successful worker return records one automatically; the runtime records one when a command ends another way; workers and applications may record additional facts. |
-| **Plan** | A pure function declaring the commands an execution needs and what each one waits for. |
+| **Plan** | An optional pure function declaring the commands an execution needs and what each one waits for. Used for dependencies, joins, waits, and branching across commands. |
 | **Spawn** | A worker or coordinator staging an asynchronous command; a worker-spawned command is a direct child of the current command. |
-| **Coordinator** | Durable typed state reacting to events. A plan is the built-in coordinator. |
+| **Coordinator** | Durable typed state reacting to events for orchestration that is open-ended or unsuitable for a plan. |
 | **Causation** | The direct durable record or decision responsible for creating another record. |
 
 ## 4. Public developer surface
@@ -99,7 +103,7 @@ This section defines the intended developer experience. Architecture may refine 
 
 ```go
 type Runtime struct{}
-type Client  struct{}
+type Client interface{ /* sealed capability */ }
 
 func New(db *pgkit.DB, opts ...Option) (*Runtime, error)
 func Migrate(ctx context.Context, db *pgkit.DB, opts ...MigrateOption) error
@@ -107,13 +111,14 @@ func Migrate(ctx context.Context, db *pgkit.DB, opts ...MigrateOption) error
 func (r *Runtime) Register(defs ...Registration) error
 func (r *Runtime) Run(ctx context.Context) error
 func (r *Runtime) Stop(ctx context.Context) error
-func (r *Runtime) Client() Client
 func (r *Runtime) InTx(tx pgx.Tx) Client
+
+func WithMaxPlanCommands(int) Option // default 1,000; 0 disables
 ```
 
-`New` validates configuration and schema compatibility, starts no goroutines, and never migrates implicitly. Registrations are accepted only before `Run`, which may be called once.
+`New` validates configuration and schema compatibility, starts no goroutines, and never migrates implicitly. `*Runtime` implements `Client`, so it can be passed directly to every operation whether or not `Run` is called. Registrations are accepted only before `Run`, which may be called once.
 
-A process may hold a `Client` without running workers. API processes, mixed processes, and specialized worker pools may all share one database.
+`Client` is a small sealed capability implemented by `*Runtime` and the transaction-scoped value returned by `InTx`. Application code does not construct one. API processes create a runtime and simply do not call `Run`; mixed processes and specialized worker pools may use the same type against one database.
 
 ### 4.2 Typed definitions
 
@@ -131,6 +136,7 @@ func DefineEvent[T any](name string, version int) Event[T]
 func (c Command[A, R]) Done() Event[R]        // event recorded when this command succeeds
 func (c Command[A, R]) Name() string
 func (c Command[A, R]) Version() int
+func (c Command[A, R]) With(client Client) Command[A, R]
 
 func Handle[A, R any](
     cmd Command[A, R],
@@ -139,8 +145,11 @@ func Handle[A, R any](
 ) Registration
 
 func DefinePlan[A any](name string, version int, plan func(*Plan, A)) PlanDef[A]
+func (p PlanDef[A]) With(client Client) PlanDef[A]
 
 func DefineCoordinator[S any](name string, version int, handlers ...Handler[S]) Coordinator[S]
+func (c Coordinator[S]) With(client Client) Coordinator[S]
+func OnStart[S any](h func(context.Context, *Coordination[S]) error) Handler[S]
 func On[S, T any](event Event[T], h func(context.Context, *Coordination[S], Received[T]) error) Handler[S]
 
 func WithMaxAttempts(int) CommandOption
@@ -153,7 +162,9 @@ A command declares both what it takes and what it returns. `Command.Done()` is t
 
 Names are stable durable identifiers. Every definition carries an explicit positive integer version; `0` is invalid. A `(name, version)` pair has immutable payload and result meaning once used, while its handler implementation may change and redeploy freely. A runtime claims only work for pairs it has registered; unknown pairs stay pending for a compatible process and consume no retry budget.
 
-Registration is explicit and runtime-local; definitions mutate no package-global state. A runtime rejects duplicate workers for one command pair and duplicate handlers for one event pair within a coordinator.
+Registration is explicit and runtime-local; definitions mutate no package-global state. A runtime rejects duplicate workers for one command pair, more than one `OnStart` handler for a coordinator, and duplicate handlers for one event pair within a coordinator.
+
+`With` returns a new immutable, concurrency-safe value of the **same definition type**, carrying the client capability in private non-durable state. It never mutates or registers the original definition, performs no I/O, and creates no execution. Definition identity, serialization, event references, and registration ignore the binding.
 
 ### 4.3 Plans
 
@@ -213,22 +224,26 @@ type ExecutionID string
 type CommandID   string
 
 type ExecutionHandle struct {
-    ID      ExecutionID
-    Type    string
-    Key     string
-    Created bool
+    ID            ExecutionID
+    Type          string
+    Key           string
+    RootCommandID CommandID // set only by Command.Execute
+    Created       bool
 }
 
-func Start[A any](
-    ctx context.Context, c Client,
-    plan PlanDef[A], key string, args A,
-    opts ...StartOption,
+func (cmd Command[A, R]) Execute(
+    ctx context.Context, key string, args A,
+    opts ...ExecutionOption,
 ) (ExecutionHandle, error)
 
-func StartWith[S any](
-    ctx context.Context, c Client,
-    coordinator Coordinator[S], key string, initial S,
-    opts ...StartOption,
+func (plan PlanDef[A]) Execute(
+    ctx context.Context, key string, args A,
+    opts ...ExecutionOption,
+) (ExecutionHandle, error)
+
+func (coordinator Coordinator[S]) Execute(
+    ctx context.Context, key string, initial S,
+    opts ...ExecutionOption,
 ) (ExecutionHandle, error)
 
 func Issue[A, R any](ctx context.Context, c Client, id ExecutionID, key string, cmd Command[A, R], args A) (CommandID, error)
@@ -237,13 +252,21 @@ func Publish[T any](ctx context.Context, c Client, id ExecutionID, event Event[T
 func CancelExecution(ctx context.Context, c Client, id ExecutionID, reason string) error
 func CancelCommand(ctx context.Context, c Client, id CommandID, reason string) error
 
-func WithExecutionDeadline(time.Duration) StartOption
-func WithoutExecutionDeadline() StartOption
-func WithMetadata(map[string]string) StartOption
-func WithFailFast(bool) StartOption
+func WithExecutionDeadline(time.Duration) ExecutionOption
+func WithoutExecutionDeadline() ExecutionOption
+func WithMetadata(map[string]string) ExecutionOption
+func WithFailFast(bool) ExecutionOption
 ```
 
-`Start` is the common path; the execution's type is the plan's name. `StartWith` drives an execution with a hand-written coordinator instead. `Issue` and `Publish` are available to any process holding a client and may participate in a caller-owned transaction through `InTx`.
+Every executable definition uses the same verb and returns the same handle:
+
+- `Command.Execute` creates an execution and enqueues its root command atomically. Its root command key is the reserved key `root`, exposed through `RootCommandID`.
+- `PlanDef.Execute` creates a plan-driven execution, evaluates the initial pure plan declaration, and enqueues every initially ready command in the same transaction.
+- `Coordinator.Execute` creates a coordinator-driven execution and enqueues a durable initial activation. The runtime later invokes its optional `OnStart` handler.
+
+All three calls require the receiver to carry a client from `With`; calling `.Execute` on an unbound definition returns `ErrInvalid` without writing. A successful call returns after durable scheduling and never invokes a worker or coordinator handler inline. The caller-supplied `key` is the execution idempotency key. The methods select mutually exclusive execution modes. `Issue` and `Publish` remain available to any process holding a client and may participate in a caller-owned transaction through `InTx`.
+
+Calling `With(client)` on any definition returns the same static type with that capability attached. Calling `With` again replaces the capability only in the new copy, so `SendTxn.With(runtimeOverride).Execute(...)` is the explicit per-call override. Long-lived runtime-bound values are safe for concurrent use. A value bound to `runtime.InTx(tx)` is valid only for that transaction's lifetime and returns `ErrClosed` after the transaction ends.
 
 ### 4.5 Handler scope and outputs
 
@@ -284,7 +307,7 @@ Requirements:
 - output payloads are type-checked through their definitions;
 - `Emit` and `Spawn` are available to both worker and coordinator scopes; a plan uses `Do`, never `Spawn`;
 - duplicate equivalent `Spawn` calls for one key within one handler decision coalesce, while different content for one key returns `ErrConflict` and commits nothing;
-- execution completion functions are available only to coordinator scopes; plan-driven executions complete automatically (§6.4);
+- execution completion functions are available only to coordinator scopes; direct and plan-driven executions complete automatically (§6.4);
 - `OnCommit` is for application-table writes. Nested `flow` operations use staged outputs or a caller-owned transaction, never a recursive call from inside a callback.
 
 ### 4.6 Inspection
@@ -313,17 +336,83 @@ func RetryAfter(d time.Duration, err error) error
 
 | Category | Exported |
 |---|---|
-| Runtime | `New`, `Migrate`, `Register`, `Run`, `Stop`, `Client`, `InTx` |
-| Definitions | `DefineCommand`, `DefineEvent`, `DefinePlan`, `DefineCoordinator`, `Handle`, `On`, `Done`, `Name`, `Version` |
+| Runtime | `New`, `Migrate`, `Register`, `Run`, `Stop`, `InTx` |
+| Definitions | `DefineCommand`, `DefineEvent`, `DefinePlan`, `DefineCoordinator`, `Handle`, `OnStart`, `On`, `Done`, `Name`, `Version`, `With` |
 | Plans | `Do`, `Fact`, `Facts`, `Result`, `Outcome`, plus 10 command builder methods |
-| Execution | `Start`, `StartWith`, `Issue`, `Publish`, `CancelExecution`, `CancelCommand` |
+| Execution | `Execute` on `Command`, `PlanDef`, and `Coordinator`; `Issue`, `Publish`, `CancelExecution`, `CancelCommand` |
 | Handler output | `Emit`, `Spawn`, `Optional`, `OnCommit`, `Info`, `SucceedExecution`, `FailExecution` |
 | Inspection | `GetExecution`, `LookupExecution`, `Trace`, `History`, `ListExecutions`, `AwaitExecution`, `ResultOf` |
 | Errors | `Permanent`, `RetryAfter` |
 
-The common path is `DefineCommand`, `DefineEvent`, `DefinePlan`, `Handle`, `Do`, `Spawn`, `Start`, `Publish`, and `Run`. `Do` declares high-level work from a plan; `Spawn` is learned only by a worker that discovers direct children. Coordinators, cancellation, transaction composition, and policy customization form the operational surface.
+The smallest path is `DefineCommand`, `Handle`, `With(runtime)`, `Command.Execute`, and `Run`. Store the returned same-type copy when a definition is executed repeatedly. Add `Spawn` when a worker discovers bounded children. Add `DefinePlan`, `Do`, `PlanDef.Execute`, and event reads only when the execution needs cross-command dependencies, joins, waits, or branching. Coordinators, cancellation, transaction composition, and policy customization form the advanced operational surface.
 
-## 5. Worked example
+## 5. Worked examples
+
+### 5.1 Direct background command
+
+A plan is not required for ordinary durable background work:
+
+```go
+type ReceiptArgs struct {
+    OrderID string
+    Email   string
+}
+
+var SendReceipt = flow.DefineCommand[ReceiptArgs, flow.None]("send_receipt", 1)
+
+func sendReceipt(ctx context.Context, w *flow.Work[ReceiptArgs]) (flow.None, error) {
+    if err := mailer.SendReceipt(ctx, w.Payload.OrderID, w.Payload.Email); err != nil {
+        return flow.None{}, err
+    }
+    return flow.None{}, nil
+}
+
+rt, err := flow.New(db)
+if err != nil {
+    return err
+}
+if err := rt.Register(flow.Handle(SendReceipt, sendReceipt)); err != nil {
+    return err
+}
+
+// With returns a copy; Execute persists and queues without calling sendReceipt inline.
+h, err := SendReceipt.With(rt).Execute(
+    ctx,
+    "receipt/"+orderID,
+    ReceiptArgs{OrderID: orderID, Email: email},
+)
+```
+
+`Runtime.Run` claims the queued command and invokes the registered `sendReceipt` worker. `Command.Execute` returns an `ExecutionHandle` immediately. When the command succeeds, its result event and the execution's `ExecutionSucceeded` event are recorded. If the worker spawns required children, the execution remains running until those descendants also settle.
+
+An application may bind its frequently used definitions once:
+
+```go
+type AppFlows struct {
+    SendReceipt flow.Command[ReceiptArgs, flow.None]
+    Report      flow.PlanDef[ReportArgs]
+    Intent      flow.Coordinator[IntentState]
+}
+
+func NewAppFlows(rt *flow.Runtime) AppFlows {
+    return AppFlows{
+        SendReceipt: SendReceipt.With(rt),
+        Report:      ReportExecution.With(rt),
+        Intent:      IntentCoordinator.With(rt),
+    }
+}
+
+appFlows := NewAppFlows(rt)
+h, err := appFlows.SendReceipt.Execute(
+    ctx,
+    "receipt/"+orderID,
+    ReceiptArgs{OrderID: orderID, Email: email},
+)
+```
+
+Definitions remain available separately for worker registration, typed result access, event references, other runtimes, and tests. `DefineCommand`, `DefinePlan`, and `DefineCoordinator` do not accept or retain a runtime. Binding is deliberately separate from definition: references used only for registration or inspection need no client, while calling `.Execute` requires a copy produced by `With(client)`.
+
+### 5.2 Planned fan-out and join
 
 ```go
 // ---- definitions ----
@@ -431,9 +520,13 @@ return rt.Run(ctx)
 Starting from an RPC process that runs no workers:
 
 ```go
-h, err := flow.Start(
-    ctx, c,
-    ReportExecution,
+flowDB, err := flow.New(db)
+if err != nil {
+    return err
+}
+
+h, err := ReportExecution.With(flowDB).Execute(
+    ctx,
     reportID,
     ReportArgs{CompanyID: companyID},
     flow.WithFailFast(false), // let independent analyses settle before final failure
@@ -448,9 +541,9 @@ If the preparation handler fails partway through staging, no child is committed.
 
 ### 6.1 Identity and idempotent start
 
-An execution has a generated `ExecutionID`, an execution type, and a caller-supplied key. The type is the plan name, or the coordinator name for `StartWith`. `(execution_type, execution_key)` is unique for as long as the execution is retained; an empty key enforces no uniqueness.
+An execution has a generated `ExecutionID`, a driver mode, an execution type, and a caller-supplied key. The driver mode is `direct`, `plan`, or `coordinator`. The type is the receiver definition's name: command, plan, or coordinator respectively. `(driver_mode, execution_type, execution_key)` is unique for as long as the execution is retained; an empty key enforces no uniqueness.
 
-Repeating `Start` with the same type, key, definition version, canonical arguments, and materially relevant options returns the existing execution with `Created == false`. Reusing the key with materially different content returns `ErrConflict` and changes nothing.
+Repeating `.Execute` on the same definition with the same key, definition version, canonical arguments or initial state, and materially relevant options returns the existing execution with `Created == false`. Reusing that identity with materially different content returns `ErrConflict` and changes nothing.
 
 The idempotency check happens before terminal-state rejection, so a caller retrying after a lost response receives the existing terminal execution rather than an error.
 
@@ -469,7 +562,7 @@ An execution is `running` from creation, becomes `failing` while selected failur
 
 ### 6.3 Outcome and fail-fast
 
-An execution succeeds when every command is terminal, nothing remains pending or awaited, and no required command ended `failed`, `expired`, or `cancelled`. `skipped` resolves graph structure but never fails an execution by itself. Commands made optional through the plan builder or spawned with `flow.Optional()` never determine the outcome. Plan-declared, worker-spawned, coordinator-spawned, and externally issued commands otherwise participate in the same outcome rules.
+An execution succeeds when every command is terminal, nothing remains pending or awaited, and no required command ended `failed`, `expired`, or `cancelled`. `skipped` resolves graph structure but never fails an execution by itself. Commands made optional through the plan builder or spawned with `flow.Optional()` never determine the outcome. Direct roots, plan-declared, worker-spawned, coordinator-spawned, and externally issued commands otherwise participate in the same outcome rules.
 
 **Fail-fast is the default and does not suppress failure handling.** When a required command becomes `failed`, `expired`, or `cancelled`, one transaction, in this order:
 
@@ -484,11 +577,13 @@ This is what makes refunds, compensation, reconciliation, and cleanup expressibl
 
 ### 6.4 Completion
 
+For a direct execution, completion is derived from its closed command tree: the root and every spawned descendant are terminal, no required command failed, and no successful command can add another child because each command's child membership closed atomically with its successful return. Children staged by the same commit are counted before completion is evaluated, so temporary quiescence cannot report false success. Direct mode has no joins across sibling results, event waits, or later conditional branches; those require a plan or coordinator.
+
 For a plan-driven execution, completion is derived: every command is terminal, no plan-declared command is pending or awaiting an unarrived fact, the latest evaluation consulted no input that did not exist (§10.1), and re-evaluating the plan declares nothing new. Because spawned children increment the same open-command count and the plan records what is still expected, neither unfinished fan-out nor temporary quiescence can report false completion.
 
 For a coordinator-driven execution, completion is an explicit `SucceedExecution` or `FailExecution` decision, and temporary quiescence never completes it.
 
-Success may commit only when no command is non-terminal and nothing staged by the same decision would make that false. On completion the coordinator is closed and pending work cancelled atomically, and one immutable `ExecutionSucceeded` or `ExecutionFailed` event is recorded.
+Success may commit only when no command is non-terminal and nothing staged by the same decision would make that false. On completion any coordinator is closed and pending work is cancelled atomically, and one immutable `ExecutionSucceeded` or `ExecutionFailed` event is recorded.
 
 ### 6.5 Deadlines
 
@@ -496,7 +591,9 @@ An execution carries a deadline, defaulting to 30 days, overridable with `WithEx
 
 ### 6.6 External additions
 
-`Issue` and `Publish` may add a command or a fact to a running execution. They are rejected for a terminal execution unless the operation is an idempotent retry of an already-stored key with equivalent content.
+`Issue` may add a command to a running plan- or coordinator-driven execution. `Publish` may add a fact to any running execution. Both are rejected for a terminal execution unless the operation is an idempotent retry of an already-stored key with equivalent content.
+
+`Issue` is rejected for direct executions. Every command in direct mode must descend from the root through an atomic `Spawn`, which is what makes its topology closed and automatic completion sound. Independently submitted background work starts its own direct execution with `Command.Execute`. `Publish` is accepted for a running direct execution as immutable history but cannot alter progression because no plan or coordinator observes it.
 
 A command added by `Issue` is required for outcome purposes in Milestone 1. Detached work belongs in a separate execution.
 
@@ -667,11 +764,15 @@ Plans may be re-evaluated from the retained arguments, command states, results, 
 
 ### 10.1 The plan function
 
-A plan is a pure function of the execution's root arguments and the events, command states, and results recorded so far. It declares commands; it never performs work. It must not do I/O, read clocks, use randomness, start goroutines, or depend on mutable globals, and must be deterministic given identical inputs. Although a plan reacts to events, it does not receive one event callback; each evaluation sees the relevant durable snapshot accumulated so far.
+A plan is optional. Applications use one only when a direct root command and its spawned descendants cannot express the required dependencies, joins, waits, or branching.
+
+The public name is intentionally `Plan`, not `Workflow`: the execution is the whole durable workflow, while a plan is only the optional pure declaration function that coordinates some executions.
+
+When present, a plan is a pure function of the execution's root arguments and the events, command states, and results recorded so far. It declares commands; it never performs work. It must not do I/O, read clocks, use randomness, start goroutines, or depend on mutable globals, and must be deterministic given identical inputs. Although a plan reacts to events, it does not receive one event callback; each evaluation sees the relevant durable snapshot accumulated so far.
 
 Ordinary Go cannot be sandboxed completely. `flow` therefore enforces purity by capability and verification: a plan receives no context, client, database, transaction, clock, or worker scope; declarations are reconciled by canonical identity; panics and conflicts are plan defects; and `flowtest` can evaluate the same snapshot repeatedly and compare declarations and reads. A debug runtime option may perform the same double evaluation. A plan defect records `PlanFailed`, fails the execution, and cancels outstanding work; it never consumes a worker's retry budget or reruns a worker whose result was already accepted.
 
-The terminal plan-defect rule also applies to the initial evaluation in `Start` and evaluations caused by ingress. The execution and accepted triggering command or fact remain durable for inspection; the operation returns a typed error carrying the `ExecutionID`, and an idempotent retry finds the same terminal execution.
+The terminal plan-defect rule also applies to the initial evaluation in `PlanDef.Execute` and evaluations caused by ingress. The execution and accepted triggering command or fact remain durable for inspection; the operation returns a typed error carrying the `ExecutionID`, and an idempotent retry finds the same terminal execution.
 
 `Fact` and `Facts` read events already recorded in this execution. `Result` reads a successful command's typed result. `Outcome` reads any terminal result or structured failure, including for worker-spawned commands. A branch that depends on runtime information is an ordinary Go conditional over those reads.
 
@@ -758,7 +859,9 @@ Each evaluation costs:
 
 Writes are proportional to the delta, but the read and the Go evaluation are proportional to the whole command set, and an execution produces at least one terminal event per command. Total plan work over an execution's life is therefore approximately **O(commands²)**, which is what bounds plan-driven execution size.
 
-The limit is **1,000 total commands per plan-driven execution**, including commands created by `Do`, `Spawn`, and `Issue`, with 100 dependencies per plan-declared command. The limit is validated against the complete staged batch before any child or plan command is inserted, so a fan-out cannot commit partially at the ceiling. At that ceiling an execution performs on the order of a million narrow row reads across its lifetime, which is acceptable; an order of magnitude higher is not. This is well above the intended workload — executions of tens of commands — and larger fan-outs belong in separate executions, one per unit of work, with a parent execution coordinating them.
+The default safety limit is **1,000 total commands within one plan-driven execution**, including commands created by `Do`, `Spawn`, and `Issue`, with 100 dependencies per plan-declared command. It is configurable, and `0` explicitly disables it. The limit is validated against the complete staged batch before any child or plan command is inserted, so a fan-out cannot commit partially at the configured ceiling. At the default ceiling an execution performs on the order of a million narrow row reads across its lifetime; operators raising or disabling the limit accept the plan's approximately O(commands²) cost.
+
+This is not a queue-capacity, backlog, or concurrency limit. The database may hold any number of executions and queued commands, subject only to operational capacity. Direct and coordinator-driven executions do not use the plan graph-size limit.
 
 Coordinator-driven executions are not re-evaluated and are not bound by this limit; they are bounded only by inbox delivery cost.
 
@@ -766,13 +869,15 @@ Architecture must make the per-evaluation state load a single narrow indexed que
 
 ## 11. Coordinators
 
-A coordinator is durable typed state that reacts to events. Plans and direct-child records already handle bounded joins; a coordinator exists for open-ended membership, cycles, and multi-event decisions that need durable mutable orchestration memory.
+A coordinator is durable typed state that reacts to events. Direct-child records handle bounded command trees, and plans handle bounded joins; a coordinator exists for open-ended membership, cycles, and multi-event decisions that need durable mutable orchestration memory.
 
-**One coordinator drives an execution**: either the plan, or an application-defined coordinator started with `StartWith`. Child coordinators are a later capability.
+**Every execution selects exactly one driver mode.** `Command.Execute` uses a direct root command and no coordinator. `PlanDef.Execute` uses a plan as its built-in orchestration authority. `Coordinator.Execute` uses one application-defined coordinator. The modes cannot be combined within one execution, and child coordinators are a later capability.
 
-### 11.1 Definition and instance
+### 11.1 Definition, start activation, and instance
 
-A definition has a stable name, positive version, typed state schema, and exact typed event subscriptions declared with `On`. Its instance holds typed canonical state, a durable inbox position, and a lifecycle of `active → completed | failed | cancelled`.
+A definition has a stable name, positive version, typed state schema, an optional start handler declared with `OnStart`, and exact typed event subscriptions declared with `On`. Its instance holds typed canonical state, a durable inbox position, and a lifecycle of `active → completed | failed | cancelled`.
+
+`Coordinator.Execute` durably creates the instance and enqueues one initial activation in the same transaction. It never invokes coordinator code inline. A runtime registering the exact coordinator name and version later claims the activation and invokes `OnStart`, when present; without `OnStart`, the activation is acknowledged as a no-op and the coordinator waits for events. Events, commands, state changes, and `OnCommit` writes staged by `OnStart` follow the same atomic processing and retry rules as an event handler.
 
 ### 11.2 Historical matching-event delivery
 
@@ -794,7 +899,7 @@ Coordinator handlers are for short decisions. External work belongs in commands.
 
 ### 11.6 Rolling deployments
 
-A coordinator delivery is claimed only by a runtime registering the instance's exact coordinator name and version and the matching event name and version. A process understanding neither side leaves the delivery pending without consuming retry budget, and unclaimable coordinator backlog is visible through inspection and observability.
+A coordinator delivery is claimed only by a runtime registering the instance's exact coordinator name and version and, for an event delivery, the matching event name and version. A process understanding neither side leaves the delivery pending without consuming retry budget, and unclaimable coordinator backlog is visible through inspection and observability.
 
 ## 12. Transactional guarantees
 
@@ -832,17 +937,17 @@ Serialization applies to **commits, not work**. Commands of one execution run co
 
 ### 12.6 Bounded completion
 
-Every non-terminal command has a bounded path to terminal: dependencies that will resolve, an awaited fact with a deadline, a retry schedule, a `Within` bound, or the execution deadline. A background reconciler repairs dispatch state after crashes without duplicating work.
+Every non-terminal command has a bounded path to terminal: direct eligibility, dependencies that will resolve, an awaited fact with a deadline, a retry schedule, a `Within` bound, or the execution deadline. Direct executions additionally have bounded topology because every worker publishes its complete direct-child set and closes membership in one successful return. A background reconciler repairs dispatch state after crashes without duplicating work.
 
 Two situations lie outside this and are reported rather than absorbed: an execution started with `WithoutExecutionDeadline` whose commands declare no bounds, and a command whose `(name, version)` no live worker registers.
 
 ### 12.7 Caller-owned transactions
 
-`Runtime.InTx(tx)` allows `Start`, `Issue`, `Publish`, and cancellation to commit atomically with caller-owned application writes. The library defines and enforces one transaction ordering discipline across execution, command, event, plan, coordinator, and application operations; its exact lock order belongs in the architecture.
+`Runtime.InTx(tx)` returns a transaction-scoped `Client` and allows every definition's `.Execute`, plus `Issue`, `Publish`, and cancellation, to commit atomically with caller-owned application writes. Definitions may bind that capability with `With`, but the resulting value must not outlive the transaction. The library defines and enforces one transaction ordering discipline across execution, command, event, plan, coordinator, and application operations; its exact lock order belongs in the architecture.
 
 ### 12.8 Causation
 
-Outputs created inside handlers automatically inherit execution identity and causation: worker events and spawned direct children are caused by the current command; plan outputs are caused by the durable transition that triggered evaluation; coordinator outputs are caused by the event being processed; an event recording a command's final state identifies that command and transition. Callers cannot forge an origin that contradicts the active handler scope.
+Outputs created inside handlers automatically inherit execution identity and causation: worker events and spawned direct children are caused by the current command; plan outputs are caused by the durable transition that triggered evaluation; coordinator outputs are caused by the start activation or event being processed; an event recording a command's final state identifies that command and transition. Callers cannot forge an origin that contradicts the active handler scope.
 
 ## 13. Cancellation, deadlines, and terminal races
 
@@ -858,7 +963,7 @@ Cancelling an already-cancelled target is idempotent; cancelling a differently-t
 
 Command payloads, command results, event payloads, coordinator state, and all identity comparisons use deterministic canonical JSON. Idempotency compares canonical stored bytes, not caller memory layout or database formatting. The architecture defines the encoder and its treatment of custom marshalers; the functional requirement is that the same logical value always produces the same identity bytes.
 
-Payload, state, total-command-count, and dependency-count limits are enforced against the complete staged transaction before any durable write. Violations return `ErrPayloadTooLarge` or `ErrInvalid` with no partial effect.
+Payload, state, configured plan-command-count, and dependency-count limits are enforced against the complete staged transaction before any durable write. Violations return `ErrPayloadTooLarge` or `ErrInvalid` with no partial effect.
 
 ## 15. Inspection and graph projection
 
@@ -866,7 +971,7 @@ Payload, state, total-command-count, and dependency-count limits are enforced ag
 
 `Trace` returns, in one call:
 
-- the execution: type, key, status, deadline, timings, outcome, and failure;
+- the execution: driver mode, type, key, status, deadline, timings, outcome, and failure;
 - every command: key, name, version, state, payload, result, last error, retry schedule, deadlines, and current running duration;
 - every command not yet runnable, with its creation source, parent where applicable, dependencies, and awaited facts;
 - every event: name, version, key, position, payload, arrival time, originating command and final-state metadata where applicable, and causation;
@@ -905,7 +1010,7 @@ Every running attempt holds a lease its worker renews. A replica that crashes, i
 
 ### 16.3 Roles
 
-`Client` and `Runtime` are separate. A process may start executions, issue commands, publish events, cancel, and inspect without running workers. Deployments may mix one binary doing both, split request-serving from worker replicas, or run several pools registering different command names and versions, which scale independently against one database.
+`Runtime` is the ordinary configured application handle and also implements the lightweight `Client` capability used by execution operations. Calling `Run` adds worker and coordinator processing; omitting it leaves an API-only handle. Deployments may mix one binary doing both, split request-serving from worker replicas, or run several pools registering different command names and versions, which scale independently against one database. `InTx` supplies the same operations through a transaction-scoped capability.
 
 ### 16.4 Concurrency and wake-up
 
@@ -948,7 +1053,7 @@ Claiming a command is a write: it updates lease and update times and never eligi
 | command payload / result size | 256 KiB |
 | event payload size | 64 KiB |
 | coordinator state size | 256 KiB |
-| total commands per plan-driven execution | 1,000 |
+| commands per plan-driven execution | 1,000; configurable, `0` disables |
 | dependencies per plan-declared command | 100 |
 | idle poll interval | 1 second |
 | terminal execution retention | indefinite in v1 |
@@ -974,10 +1079,12 @@ The durable model is deliberately sufficient for an operational UI without a UI 
 
 ## 21. Testing support
 
-The library ships a test package so workers and plans are testable without a database:
+The library ships a test package so direct command trees, workers, plans, and coordinators are testable without a database:
 
 - a worker is an ordinary function — given a payload, assert its returned result or error, its staged events and spawned children, direct-child keys, optional classification, and registered application writes;
+- a direct-execution harness begins with one root worker decision and settles staged descendants, allowing completion and failure policy to be asserted without defining a plan;
 - a plan is a pure function — given root arguments, facts, and command states, assert its declarations, dependencies, reads, outcomes, and waits; a determinism assertion evaluates the identical snapshot repeatedly and compares canonical output.
+- a coordinator harness delivers the durable start activation and events in order, allowing `OnStart`, state changes, outputs, retry, and completion decisions to be asserted.
 
 Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, publish-before-declare and declare-before-publish ordering, all-or-nothing worker fan-out, repeated plan evaluation creating no duplicate commands, failure branches surviving fail-fast, `Await` expiry, and rolling deployments with divergent registered versions.
 
@@ -986,11 +1093,21 @@ Integration behavior is verified against real PostgreSQL: concurrent claims, lea
 Milestone 1 is complete when:
 
 - an execution can be started, traced, published to, and cancelled through the documented API;
+- `*Runtime` can be passed directly wherever `Client` is accepted, without calling `rt.Client()`;
+- binding a definition with `With(runtime)` returns the same static definition type, produces a concurrency-safe executable copy, and does not mutate or register the original;
+- calling `With` on an already bound definition replaces the client only in the returned copy, enabling an explicit per-call runtime override without mutating a shared definition;
+- calling `.Execute` on an unbound definition returns `ErrInvalid` without writing;
+- the same definition may be bound independently to multiple runtimes, while a transaction-bound value cannot execute after its transaction closes;
+- `Command.Execute` durably queues one typed root command and returns immediately without requiring a plan or coordinator;
+- `PlanDef.Execute` durably creates the execution and atomically enqueues every command made ready by its initial pure evaluation;
+- `Coordinator.Execute` durably creates the instance and queues its start activation without invoking `OnStart` inline;
+- a direct execution remains running through every required spawned descendant, then completes without relying on temporary quiescence;
+- a direct required-command failure produces the configured fail-fast or settle-all result without plan evaluation;
 - the worked example in §5 compiles and runs against PostgreSQL;
 - a mistyped command or event reference, or a wrong payload, result, or event payload type, fails to compile;
 - every command that ends records exactly one event describing how it ended, with success carrying its typed result and transient attempt failures excluded;
 - a worker that successfully spawns several children commits the complete direct-child set, the event recording parent success, additionally emitted events, and `OnCommit` writes atomically;
-- a worker that errors, panics, loses its lease, or exceeds the total-command limit after staging children commits none of them;
+- a worker that errors, panics, loses its lease, or exceeds the configured plan-command limit after staging children commits none of them;
 - equivalent repeated child keys within one handler decision coalesce, conflicting content fails atomically, and no parent retry can duplicate a committed child;
 - spawned children are required by default, `flow.Optional()` removes them from execution outcome, and both classifications remain visible in `Trace`;
 - re-evaluating a plan many times creates each declared command exactly once;

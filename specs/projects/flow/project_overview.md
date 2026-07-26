@@ -20,12 +20,12 @@ The developer model is:
 - **Commands** are durable instructions to perform work.
 - **Workers** handle commands and perform that work.
 - **Events** record facts about what happened.
-- **Plans** react to recorded events and coordinate the overall execution.
+- **Plans**, when used, react to recorded events and coordinate the overall execution.
 - **Workers** may spawn child commands when their work reveals more work.
 
 There is one event concept. When a worker returns successfully, `flow` automatically records an event carrying its typed result. When a command instead ends in failure, cancellation, expiry, or skipping, `flow` records an event describing that fact. A worker may explicitly emit additional application facts. All are ordinary events in the same execution log.
 
-Most executions have a high-level shape the application knows how to describe, so the primary way to compose work is a **plan**: a small pure function that declares commands and joins by durable key. The plan does not receive one event callback. It is re-evaluated over all relevant events and command results recorded so far; it never sleeps in memory. A worker may also **spawn** a bounded set of direct child commands when performing one command reveals more work. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
+Plans are optional. The simplest use starts one command directly as durable background work; its worker may spawn bounded child commands, and the execution finishes after the root and all required descendants finish. When progression needs dependencies, joins, waits, or branches across commands, the application adds a **plan**: a small pure function that declares commands by durable key. The plan does not receive one event callback. It is re-evaluated over all relevant events and command results recorded so far; it never sleeps in memory. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
 
 The intended experience is closer to using an in-process Go library than operating Kafka or a separate workflow platform: a small type-safe API, ordinary Go handlers, PostgreSQL transactions, and one operational backend.
 
@@ -40,7 +40,7 @@ Hand-rolling this produces a status column per table, a poll loop per status, a 
 - A **command** is a durable instruction to perform work.
 - A **worker** handles one command kind, may atomically spawn direct child commands, and returns its typed result.
 - An **event** records a fact about what happened and may be observed by anything interested.
-- A **plan** purely declares high-level commands and joins over recorded events and command states.
+- An optional **plan** purely declares high-level commands and joins over recorded events and command states.
 - A **coordinator** is the escape hatch: durable memory that reacts to events when a plan is not enough.
 
 ## Product model
@@ -50,6 +50,58 @@ Hand-rolling this produces a status column per table, a poll loop per status, a 
 A command is a durable, immutable request for work. It has a typed name, version, payload type, and **result type**. It belongs to an execution and is delivered to a compatible worker with lease, attempt, and retry semantics. One logical command keeps the same `CommandID` across its separately recorded attempts.
 
 A command is the executable vertex of the projected graph; `flow` needs no second node abstraction. A deterministic `CommandKey` gives it a stable, human-readable identity within its execution and an idempotency boundary for repeated decisions. Plan-declared, worker-spawned, coordinator-spawned, and externally issued commands share one key namespace and one lifecycle.
+
+For ordinary background work, calling `.Execute` on a runtime-bound copy of a command definition creates an execution and enqueues its root command together. No plan or coordinator is involved. The root worker may spawn direct children, those children may spawn their own children, and each successful worker return permanently closes that command's child membership. This lets the runtime know when the whole command tree is finished without guessing from temporary quiescence.
+
+```go
+h, err := SendReceipt.With(rt).Execute(ctx, "receipt/"+orderID, args)
+```
+
+The same verb starts every execution mode:
+
+```go
+receipt, err := SendReceipt.With(rt).Execute(ctx, receiptID, receiptArgs)
+report,  err := ReportPlan.With(rt).Execute(ctx, reportID, reportArgs)
+intent,  err := IntentCoordinator.With(rt).Execute(ctx, intentID, initialState)
+```
+
+Each call returns after durable scheduling. A command enqueues its root command. A plan evaluates its initial pure declaration and enqueues every command that is ready. A coordinator enqueues its initial activation. No worker or coordinator handler runs inline in the caller.
+
+Frequently used definitions may be bound once to a runtime:
+
+```go
+sendReceipt := SendReceipt.With(rt)
+h, err := sendReceipt.Execute(ctx, receiptID, receiptArgs)
+```
+
+`With` returns an immutable copy of the same definition type carrying the runtime capability; it never mutates the global definition or introduces a wrapper type. Calling `With` again replaces the capability only in the new copy, so an explicit one-call override remains concise:
+
+```go
+h, err := SendReceipt.With(runtimeOverride).Execute(ctx, receiptID, receiptArgs)
+```
+
+Applications can collect runtime-bound commands, plans, and coordinators in one dependency struct:
+
+```go
+type AppFlows struct {
+    SendReceipt flow.Command[ReceiptArgs, flow.None]
+    Report      flow.PlanDef[ReportArgs]
+    Intent      flow.Coordinator[IntentState]
+}
+
+func NewAppFlows(rt *flow.Runtime) AppFlows {
+    return AppFlows{
+        SendReceipt: SendReceipt.With(rt),
+        Report:      ReportPlan.With(rt),
+        Intent:      IntentCoordinator.With(rt),
+    }
+}
+
+appFlows := NewAppFlows(rt)
+h, err := appFlows.SendReceipt.Execute(ctx, receiptID, receiptArgs)
+```
+
+`Runtime` itself satisfies the lightweight client capability, whether or not `Run` is called. `InTx` returns a transaction-scoped capability for the same APIs. The separate capability matters for atomic composition, but ordinary application code passes or binds the runtime directly and never needs an `rt.Client()` step.
 
 ### Workers
 
@@ -115,7 +167,7 @@ Retryable attempt errors remain attempt history rather than events because the c
 
 ### Plans
 
-A plan is a pure function that declares the commands an execution needs:
+A plan is an optional pure function that declares the commands an execution needs when progression spans more than one independently completing branch:
 
 ```go
 func planIntent(p *flow.Plan, args ExecuteArgs) {
@@ -133,6 +185,8 @@ func planIntent(p *flow.Plan, args ExecuteArgs) {
 }
 ```
 
+The name is deliberate: the whole durable run is the workflow in ordinary language, represented by an `Execution`. `Plan` names only the optional pure function that plans cross-command progression; calling that function `Workflow` would blur it with the execution it helps coordinate.
+
 The plan is re-evaluated whenever a relevant event is recorded or an observed command reaches a final state, and reconciled by command key: declaring a command that already exists does nothing, and declaring a new one whose prerequisites are met issues it. "React" does not mean that the plan receives a single event callback. Each evaluation is a pure function over the execution arguments and all relevant events and command results recorded so far. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. `Result` and `Outcome` can read a command declared earlier in that evaluation or any existing command key, including a direct child spawned by a worker. A plan only ever grows; it never withdraws work it already asked for.
 
 `After` waits for the event recording another command's success. `AfterSettled` waits for the command to reach any final state, and `Outcome` exposes the typed result or structured reason. `Await` waits for any event, including one published from outside the execution. `Result` and `Outcome` are plan-reading operations over command state and its recorded event; they are not additional event categories.
@@ -141,9 +195,9 @@ Purity is a contract rather than a Go sandbox: the plan receives no context, dat
 
 ### Coordinators
 
-A coordinator is durable memory that reacts to events. It is not needed for a bounded fan-out returned by one worker; the parent result and direct-child records already preserve that membership. It exists for open-ended processes — work discovered over time, cycles, or several event streams — where no single command completion can close the decision.
+A coordinator is durable memory that reacts to events. It is not needed for a direct command tree or a bounded fan-out returned by one worker; the parent result and direct-child records already preserve that membership. It exists for open-ended processes — work discovered over time, cycles, or several event streams — where no single command completion can close the decision.
 
-One coordinator runs per execution. A plan is the coordinator most applications will use; writing one by hand is the escape hatch for logic a declarative plan cannot express. Its state is typed, its event inbox is durable, and recording an event as processed, updating state, and spawning commands and emitting events all commit atomically. Coordinator state holds orchestration facts only — never a second copy of application data.
+An execution uses exactly one driver mode: a direct root command, a plan, or a hand-written coordinator. A runtime-bound copy of each definition exposes the same `.Execute` method and returns an `ExecutionHandle`. Direct executions need no coordinator. A plan is the built-in orchestration authority for most multi-command graphs; writing a coordinator by hand is the escape hatch for logic a declarative plan cannot express. Its state is typed, its event inbox is durable, and recording an event as processed, updating state, and spawning commands and emitting events all commit atomically. Coordinator state holds orchestration facts only — never a second copy of application data.
 
 ### Execution identity and causation
 
@@ -168,15 +222,14 @@ This is deliberately not strict event sourcing. Immutable command records, attem
 
 1. Define typed commands (payload and result) and typed events.
 2. Register a worker for each command kind; a worker may spawn bounded direct children.
-3. Write a plan for high-level progression and joins, or a coordinator where the process is open-ended.
-4. Start an execution.
-5. Inspect any `ExecutionID` for its graph, pending work, attempts, events, waits, and outcome.
+3. Bind a command, plan, or coordinator with `With(runtime)`, then call `.Execute`; the requested work is durably enqueued.
+4. Inspect any `ExecutionID` for its graph, pending work, attempts, events, waits, and outcome.
 
 Handlers are ordinary Go and may call normal application services. Business data stays in application-owned tables; `flow` owns execution, delivery, coordination, and history data. Sharing one PostgreSQL database lets application writes and `flow` outputs commit atomically.
 
 ## Goals
 
-- **Small and intuitive:** few core concepts and a low public method count.
+- **Small and intuitive:** one command can run durably without defining orchestration; advanced concepts are introduced only when needed.
 - **Local reasoning:** a worker understands one command and its direct children; a plan reads high-level progression and joins top to bottom.
 - **Type safety:** command payloads, command results, event payloads, and handler signatures checked by Go.
 - **Dynamic composition:** runtime branching, worker-spawned child commands, fan-out, fan-in, waits, and long-running executions without a fully predeclared graph.
@@ -185,7 +238,7 @@ Handlers are ordinary Go and may call normal application services. Business data
 - **Atomic progression:** handler state, application writes, inbox progress, emitted events, and spawned commands commit together.
 - **Traceability:** explain what is running, what is waiting, what failed, what was retried, and why every command exists.
 - **Horizontal operation:** many API processes and workers cooperating on one PostgreSQL database.
-- **Testability:** workers and plans unit-testable without starting a distributed system.
+- **Testability:** workers and optional plans unit-testable without starting a distributed system.
 
 ## Technical requirements
 
@@ -197,6 +250,8 @@ Handlers are ordinary Go and may call normal application services. Business data
 - Commands and events are versioned durable data whose schemas may outlive the code version that created them.
 - Rolling deployments where processes temporarily recognize different command or event versions.
 - Runtime correctness must never depend on a process retaining in-memory state.
+- `Runtime` directly satisfies the lightweight client capability, and definitions bind to that capability immutably for concise execution and application wiring.
+- A direct command execution requires neither a plan nor a coordinator and completes from its closed command tree.
 - Every command that ends has exactly one persisted event recording how it ended; transient attempt failures remain separately inspectable history.
 - Durable commands, events, attempts, dependencies, child relationships, and causation must be sufficient to rebuild inspection, telemetry, and a graph view without a UI in the core runtime.
 
