@@ -44,6 +44,7 @@ This is a product feature: application writes, command completion, plan reconcil
 - exactly one event recording how each command ends, with successful worker results recorded automatically as typed events;
 - worker registration, command scheduling, leases, attempts, retries, timeouts, and fencing;
 - bounded worker-spawned child commands committed atomically with the event recording the parent's success;
+- authoritative plan reads of closed direct-child membership, without duplicating membership into application result payloads;
 - typed, versioned events, including facts published from outside the execution;
 - **plans**: declarative command graphs reconciled by key, with dependencies, waits, fan-out, joins, and failure branches;
 - hand-written coordinators with durable typed state and ordered event inboxes;
@@ -200,6 +201,7 @@ func Do[A, R any](p *Plan, key string, cmd Command[A, R], args A) *Node
 
 func Fact[T any](p *Plan, event Event[T]) (T, bool)
 func Facts[T any](p *Plan, event Event[T]) []T
+func Children(p *Plan, parentKey string) ([]string, bool)
 func Result[A, R any](p *Plan, key string, cmd Command[A, R]) (R, bool)
 func Outcome[A, R any](p *Plan, key string, cmd Command[A, R]) (CommandOutcome[R], bool)
 
@@ -215,7 +217,9 @@ func (n *Node) MaxAttempts(int) *Node
 func (n *Node) RetryPolicy(RetryPolicy) *Node
 ```
 
-`Result` and `Outcome` address a command declared earlier with `Do` in the current evaluation or already present in the execution from `Do`, `Spawn`, or `Issue`. The supplied command definition must match the key's stored name and version or evaluation fails as a plan defect. `Result` returns true only for success; `Outcome` returns true for any final state. They are typed views over command state and its recorded event, not event abstractions of their own. A key that is neither currently declared nor durably present is also a plan defect rather than an absent read. Dependency builders likewise name command keys in the execution-wide key namespace, not only commands created by the current plan evaluation.
+`Children`, `Result`, and `Outcome` address a command declared earlier with `Do` in the current evaluation or already present in the execution from `Do`, `Spawn`, or `Issue`. `Children` returns the authoritative direct-child keys in deterministic key order once the parent succeeds and its membership is closed; it returns false while the parent is non-terminal or if the parent ends unsuccessfully. `Result` returns true only for success; `Outcome` returns true for any final state. The supplied command definition for `Result` or `Outcome` must match the key's stored name and version or evaluation fails as a plan defect. These are typed views over command state and its recorded event, not event abstractions of their own.
+
+A read key that is neither currently declared nor durably present is a plan defect rather than an absent read. Dependency builders likewise name command keys in the execution-wide key namespace, not only commands created by the current plan evaluation. Forward references within one evaluation are valid, because dependency-key validation occurs after the plan function returns (§10.2).
 
 `EventName` is satisfied by both `Event[T]` and `Command[A, R].Done()`, so `After("origin")` and `Await(DepositConfirmed)` are the same mechanism expressed two ways: waiting for a fact to exist.
 
@@ -279,6 +283,8 @@ type Work[A any] struct {
     Payload A
 }
 
+type ResultSource interface{ /* sealed by flow */ }
+
 type Coordination[S any] struct {
     State S
 }
@@ -303,7 +309,9 @@ A worker returns `(R, error)`. Conceptually, the worker emits an event when its 
 
 From a worker, every spawned command is a direct child of the current command and automatically inherits execution identity and causation. The successful parent return closes that parent's direct-child membership: all children staged by that logical command become visible with the event recording its success, and that parent can never add another child later. Closure describes membership only; it does not mean that the children have finished or succeeded. Each child may subsequently succeed, retry, fail, expire, or be cancelled independently. From a coordinator, spawned commands are caused by the currently handled event.
 
-Spawned commands are required by default and therefore determine execution outcome. `flow.Optional()` makes one spawned command optional. A worker may return the stable child keys in its typed result when the plan needs to join or collect their results; the runtime's authoritative parent-child relationship is derived from the staged `Spawn` calls, not from an application payload.
+Spawned commands are required by default and therefore determine execution outcome. `flow.Optional()` makes one spawned command optional. The runtime's authoritative parent-child relationship is derived from staged `Spawn` calls, never from an application payload. Plans read that relationship with `Children`; an application result carries child keys only when they are domain data or identify a semantic subset distinct from all direct children.
+
+Every `*Work[A]` implements the sealed `ResultSource` capability used by `ResultOf` (§4.6). Inside a worker, `ResultOf(work, key, cmd)` may read only a command explicitly named as a dependency of the current command, and the supplied definition must match that dependency's durable name and version. The dependency key remains explicit in the current command's payload when application logic needs to select it. A successful dependency returns its immutable typed result; a non-dependency, mismatched definition, or dependency without a successful result returns a structured permanently classified error. Workers cannot inspect arbitrary commands or the wider execution graph.
 
 Requirements:
 
@@ -327,7 +335,7 @@ func AwaitExecution(ctx context.Context, c Client, id ExecutionID) (Execution, e
 func ResultOf[A, R any](src ResultSource, key string, cmd Command[A, R]) (R, error)
 ```
 
-Inspection never mutates execution state.
+`ResultSource` is sealed and implemented by every `*Work[A]` and by `ExecutionTrace`, the immutable inspection snapshot containing command results. For a worker source, dependency results are immutable before the handler becomes runnable; the runtime may batch or preload them so repeated typed `ResultOf` calls do not imply one database query each. Inspection never mutates execution state.
 
 ### 4.7 Error classification
 
@@ -342,7 +350,7 @@ func RetryAfter(d time.Duration, err error) error
 |---|---|
 | Runtime | `New`, `Migrate`, `Register`, `Run`, `Stop`, `InTx` |
 | Definitions | `DefineCommand`, `DefineEvent`, `DefinePlan`, `DefineCoordinator`, `Handle`, `OnStart`, `On`, `Done`, `Name`, `Version`, `With` |
-| Plans | `Do`, `Fact`, `Facts`, `Result`, `Outcome`, plus 10 command builder methods |
+| Plans | `Do`, `Fact`, `Facts`, `Children`, `Result`, `Outcome`, plus 10 command builder methods |
 | Execution | `Execute` on `Command`, `PlanDef`, and `Coordinator`; `Issue`, `Publish`, `CancelExecution`, `CancelCommand` |
 | Handler output | `Emit`, `Spawn`, `Optional`, `OnCommit`, `Info`, `SucceedExecution`, `FailExecution` |
 | Inspection | `GetExecution`, `LookupExecution`, `Trace`, `History`, `ListExecutions`, `AwaitExecution`, `ResultOf` |
@@ -422,7 +430,7 @@ Definitions remain available separately for worker registration, typed result ac
 // ---- definitions ----
 
 var (
-    PrepareReport = flow.DefineCommand[PrepareArgs, PrepareResult]("prepare_report", 1)
+    PrepareReport = flow.DefineCommand[PrepareArgs, flow.None]("prepare_report", 1)
     AnalyzePart   = flow.DefineCommand[AnalysisArgs, AnalysisResult](
         "analyze_report_part", 1,
         flow.WithMaxAttempts(5),
@@ -432,7 +440,8 @@ var (
     RecordAnalysisFailure = flow.DefineCommand[FailureArgs, flow.None]("record_analysis_failure", 1)
 )
 
-type PrepareResult struct {
+type GenerateArgs struct {
+    CompanyID    string
     AnalysisKeys []string
 }
 
@@ -443,13 +452,12 @@ var ReportExecution = flow.DefinePlan[ReportArgs]("report_execution", 1, planRep
 func planReport(p *flow.Plan, args ReportArgs) {
     flow.Do(p, "prepare", PrepareReport, PrepareArgs{CompanyID: args.CompanyID})
 
-    prepared, ok := flow.Result(p, "prepare", PrepareReport)
+    analysisKeys, ok := flow.Children(p, "prepare")
     if !ok {
         return
     }
 
-    for _, key := range prepared.AnalysisKeys {
-        // Declare every failure branch before waiting on any one result.
+    for _, key := range analysisKeys {
         flow.Do(
             p, "record-failure/"+key,
             RecordAnalysisFailure,
@@ -457,48 +465,48 @@ func planReport(p *flow.Plan, args ReportArgs) {
         ).AfterFailed(key)
     }
 
-    results := make([]AnalysisResult, 0, len(prepared.AnalysisKeys))
-    for _, key := range prepared.AnalysisKeys {
-        // This command was spawned by prepareReport. Its key shares the
-        // execution-wide namespace used by commands declared with Do.
-        result, succeeded := flow.Result(p, key, AnalyzePart)
-        if !succeeded {
-            return
-        }
-        results = append(results, result)
-    }
-
+    dependencies := append([]string{"prepare"}, analysisKeys...)
     flow.Do(p, "generate", GenerateReport, GenerateArgs{
-        CompanyID: args.CompanyID,
-        Analyses:  results,
-    }).After(prepared.AnalysisKeys...)
+        CompanyID:   args.CompanyID,
+        AnalysisKeys: analysisKeys,
+    }).After(dependencies...)
 }
 
 // ---- a worker may expand one command into bounded direct children ----
 
-func prepareReport(ctx context.Context, w *flow.Work[PrepareArgs]) (PrepareResult, error) {
+func prepareReport(ctx context.Context, w *flow.Work[PrepareArgs]) (flow.None, error) {
     analyses, err := determineAnalyses(ctx, w.Payload.CompanyID)
     if err != nil {
-        return PrepareResult{}, err
+        return flow.None{}, err
     }
 
-    keys := make([]string, 0, len(analyses))
     for _, analysis := range analyses {
         key := "analysis/" + analysis.ID
         if err := flow.Spawn(w, key, AnalyzePart, analysis.Args); err != nil {
-            return PrepareResult{}, err
+            return flow.None{}, err
         }
-        keys = append(keys, key)
     }
 
     w.OnCommit(func(ctx context.Context, tx pgx.Tx) error {
-        return reports.MarkPrepared(ctx, tx, w.Payload.CompanyID, len(keys))
+        return reports.MarkPrepared(ctx, tx, w.Payload.CompanyID, len(analyses))
     })
-    return PrepareResult{AnalysisKeys: keys}, nil
+    return flow.None{}, nil
 }
 
 func analyzePart(ctx context.Context, w *flow.Work[AnalysisArgs]) (AnalysisResult, error) {
     return analyzers.For(w.Payload.Kind).Analyze(ctx, w.Payload)
+}
+
+func generateReport(ctx context.Context, w *flow.Work[GenerateArgs]) (ReportResult, error) {
+    results := make([]AnalysisResult, 0, len(w.Payload.AnalysisKeys))
+    for _, key := range w.Payload.AnalysisKeys {
+        result, err := flow.ResultOf(w, key, AnalyzePart)
+        if err != nil {
+            return ReportResult{}, err
+        }
+        results = append(results, result)
+    }
+    return reports.Generate(ctx, w.Payload.CompanyID, results)
 }
 ```
 
@@ -537,9 +545,9 @@ h, err := ReportExecution.With(flowDB).Execute(
 )
 ```
 
-The first plan evaluation declares only `prepare`. Its worker discovers the complete analysis membership and stages every child with `Spawn`; the children and the event returned by `PrepareReport.Done()` become visible atomically. Analysis workers run in parallel. Each successful result records the event returned by `AnalyzePart.Done()`, which wakes plan reconciliation. Only after every child result exists does the plan declare `generate`.
+The first plan evaluation declares only `prepare`. Its worker discovers the complete analysis membership and stages every child with `Spawn`; the children and the event returned by `PrepareReport.Done()` become visible atomically. `Children` then exposes that authoritative closed membership, and the next evaluation declares every failure branch and the pending `generate` command together. Analysis workers run in parallel. Once every `After` dependency succeeds, `generate` becomes runnable and its worker reads the immutable typed dependency results through `ResultOf`.
 
-If the preparation handler fails partway through staging, no child is committed. If one analysis exhausts retries, it records `CommandFailed`, the corresponding `AfterFailed` branch runs, `generate` is never declared, and the execution ultimately fails after the remaining analyses settle. The plan needs no coordinator because this fan-out membership closes with one successful parent return.
+If the preparation handler fails partway through staging, no child is committed. If one analysis exhausts retries, it records `CommandFailed`, the already-declared corresponding `AfterFailed` branch runs, `generate` becomes `skipped`, and the execution ultimately fails after the remaining analyses settle. Child membership is never duplicated in `PrepareReport`'s result, and routine value plumbing introduces no result-loop early-return trap. The plan needs no coordinator because this fan-out membership closes with one successful parent return.
 
 ## 6. Executions
 
@@ -579,11 +587,13 @@ This is what makes refunds, compensation, reconciliation, and cleanup expressibl
 
 `WithFailFast(false)` lets unrelated branches finish, and the outcome is computed once every command is terminal.
 
+The plan-read gate is a condition of **successful** completion, not terminal failure. Once a required command has ended unsuccessfully, temporarily unavailable plan reads do not keep a doomed execution alive. Failure waits only for the explicitly declared failure-handling subgraph described above, or for all existing commands to settle when fail-fast is disabled. If failure handling must wait for an external fact, the plan declares that work with `AfterFailed` together with `Await` and, when appropriate, `Within`; a bare conditional read is not an implicit failure-handling command.
+
 ### 6.4 Completion
 
 For a direct execution, completion is derived from its closed command tree: the root and every spawned descendant are terminal, no required command failed, and no successful command can add another child because each command's child membership closed atomically with its successful return. Children staged by the same commit are counted before completion is evaluated, so temporary quiescence cannot report false success. Direct mode has no joins across sibling results, event waits, or later conditional branches; those require a plan or coordinator.
 
-For a plan-driven execution, completion is derived: every command is terminal, no plan-declared command is pending or awaiting an unarrived fact, the latest evaluation consulted no input that did not exist (§10.1), and re-evaluating the plan declares nothing new. Because spawned children increment the same open-command count and the plan records what is still expected, neither unfinished fan-out nor temporary quiescence can report false completion.
+For a plan-driven execution, **successful** completion is derived: every command is terminal, no plan-declared command is pending or awaiting an unarrived fact, the latest evaluation has no temporarily unavailable read (§10.1), and re-evaluating the plan declares nothing new. Terminal failure follows §6.3 and is not blocked by temporarily unavailable reads after its explicit failure-handling work has resolved. Because spawned children increment the same open-command count and the plan records what is still expected, neither unfinished fan-out nor temporary quiescence can report false success.
 
 For a coordinator-driven execution, completion is an explicit `SucceedExecution` or `FailExecution` decision, and temporary quiescence never completes it.
 
@@ -647,7 +657,7 @@ For a worker handler:
 - after the parent succeeds, its direct-child membership is closed permanently, although the children remain independently active;
 - spawned children are required unless created with `flow.Optional()`.
 
-The runtime derives authoritative child membership from command causation. A typed parent result may carry child keys so the plan can collect results or declare joins, but correctness and tracing never infer membership from arbitrary result payload fields.
+The runtime derives authoritative child membership from command causation, and a plan joining all direct children reads it with `Children`. A typed parent result carries child keys only when those keys are themselves domain data or identify a semantic subset of a heterogeneous child set; correctness and tracing never infer membership from arbitrary result payload fields.
 
 Before accepting the worker result, settlement validates the entire staged set against the execution-wide key namespace and applicable command limit. A key already owned by another creation decision, different content for one buffered key, or a deterministic limit violation is a permanent structured output failure: no staged output or success event commits, the parent records `CommandFailed`, and rerunning the same worker is not attempted because it cannot repair that decision.
 
@@ -697,7 +707,7 @@ Attempt failures are not application results. A negative application result is a
 
 The application chooses failure behavior with existing command policies rather than a separate fan-out state machine:
 
-- **all must succeed** — spawn required children (the default) and collect them with `Result`; a terminal child failure prevents the success join and fails the execution;
+- **all must succeed** — spawn required children (the default), declare the join with `After`, and let the joined worker read successful dependency results through `ResultOf`; a terminal child failure skips the success join and fails the execution;
 - **wait for all before failing** — start with `WithFailFast(false)` so independent required siblings settle before outcome calculation;
 - **partial result** — spawn children with `flow.Optional()`, read each with `Outcome`, and declare the final command only after all are terminal;
 - **compensation** — declare keyed commands with `AfterFailed(childKey)`; fail-fast preserves that failure-handling closure.
@@ -778,19 +788,28 @@ Ordinary Go cannot be sandboxed completely. `flow` therefore enforces purity by 
 
 The terminal plan-defect rule also applies to the initial evaluation in `PlanDef.Execute` and evaluations caused by ingress. The execution and accepted triggering command or fact remain durable for inspection; the operation returns a typed error carrying the `ExecutionID`, and an idempotent retry finds the same terminal execution.
 
-`Fact` and `Facts` read events already recorded in this execution. `Result` reads a successful command's typed result. `Outcome` reads any terminal result or structured failure, including for worker-spawned commands. A branch that depends on runtime information is an ordinary Go conditional over those reads.
+`Fact` and `Facts` read events already recorded in this execution. `Children` reads a command's authoritative direct-child membership after that membership closes successfully. `Result` reads a successful command's typed result. `Outcome` reads any terminal result or structured failure, including for worker-spawned commands. A branch that genuinely changes topology according to runtime information is an ordinary Go conditional over those reads. Routine value plumbing belongs in a dependent worker through `ResultOf`, as shown in §5.2.
 
-**Reads are recorded.** Every `Fact`, `Facts`, `Result`, and `Outcome` call during an evaluation is registered as an input that evaluation consulted. Because the plan is pure, its declared output is a function of exactly those reads plus the root arguments — which makes the consulted set both a correctness signal (§10.2) and the basis for skipping needless evaluations (§10.3).
+**Reads are recorded.** Every `Fact`, `Facts`, `Children`, `Result`, and `Outcome` call during an evaluation is registered as an input that evaluation consulted. The library records more than the public value and boolean: it classifies each read as available, temporarily unavailable, or permanently unavailable.
 
-**`Result` and `Outcome` may only read a key declared earlier with `Do` in the current evaluation or an existing command key.** A durable command may have been created by `Do`, `Spawn`, or `Issue`. Reading any other key, or supplying a command definition whose name and version do not match the key, returns `ErrInvalid`; it is a plan defect, not a runtime condition. A newly declared or existing non-succeeded command makes `Result` return `(zero, false)`. A newly declared or existing non-terminal command makes `Outcome` return `(zero, false)`.
+| Read | Available | Temporarily unavailable | Permanently unavailable |
+|---|---|---|---|
+| `Fact` / `Facts` | matching facts exist | no matching fact has arrived | — |
+| `Children` | parent succeeded and membership is closed, including an empty set | parent is non-terminal | parent ended unsuccessfully |
+| `Result` | command succeeded | command is non-terminal | command ended unsuccessfully |
+| `Outcome` | command is terminal | command is non-terminal | — |
 
-`Result` remains absent after an unsuccessful final state because no value of `R` exists. If failure is an accepted branch — especially for an optional child — the plan must use `Outcome` or a keyed command selected with `AfterFailed` / `AfterSettled` rather than wait forever for `Result`.
+The public boolean remains deliberately small: `Children` and `Result` return false for either unavailable state, while `Outcome` is the operation for code that must distinguish success from terminal failure. The internal distinction prevents a result that can never exist from being mistaken for one that may arrive later.
 
-Reading a command's result or outcome does not by itself create a dependency edge. A command whose arguments derive from another command should also name it with `After` or `AfterSettled`, so the trace can explain the ordering. Correctness does not depend on this — a command consulted before it completed keeps the execution incomplete — but inspection quality does.
+**`Children`, `Result`, and `Outcome` may only read a key declared earlier with `Do` in the current evaluation or an existing command key.** A durable command may have been created by `Do`, `Spawn`, or `Issue`. Reading any other key, or supplying a command definition whose name and version do not match the key, returns `ErrInvalid`; it is a plan defect, not a runtime condition.
 
-#### Consulted-but-absent reads block completion
+Reading a command's children, result, or outcome does not by itself create a dependency edge. A command that consumes those keys or values must also name the source commands with `After` or `AfterSettled`, so scheduling and traceability do not depend on an implicit data read. A joined worker may then read the successful immutable results of its explicitly named dependencies through `ResultOf`.
 
-A read that finds nothing — a fact not yet published, a command not yet succeeded for `Result`, or a command not yet terminal for `Outcome` — means the plan's output may differ once that input exists. An execution therefore **cannot complete while its most recent evaluation consulted an input that did not exist.**
+Plans are ordinary Go functions, so statements reached before an early return are the declarations produced by that evaluation; the runtime does not pretend source order is irrelevant. Applications should declare structural work as soon as its keys are known and reserve value reads for topology decisions. `Children`, explicit dependencies, and worker-side `ResultOf` remove the common need to loop over unfinished results merely to construct the next payload.
+
+#### Temporarily unavailable reads block successful completion
+
+A temporarily unavailable read means the plan's output may differ once that input arrives. An execution therefore **cannot succeed while its most recent evaluation contains a temporarily unavailable read.** Permanently unavailable reads do not block completion: a required unsuccessful command drives the failure rules in §6.3, while plans handling an optional or otherwise accepted failure use `Outcome`, `AfterFailed`, or `AfterSettled` to make that branch explicit.
 
 This closes an otherwise silent hole. Given:
 
@@ -800,9 +819,9 @@ if route, ok := flow.Fact(p, RouteSelected); ok {
 }
 ```
 
-if `RouteSelected` never arrives, no `dest` command is ever declared. Without this rule, an execution whose declared commands had all succeeded would report success while the destination transaction was never sent. With it, the consulted-but-absent `RouteSelected` keeps the execution running until the fact arrives or the execution deadline expires.
+if `RouteSelected` never arrives, no `dest` command is ever declared. Without this rule, an execution whose declared commands had all succeeded would report success while the destination transaction was never sent. With it, the temporarily unavailable `RouteSelected` read keeps the execution running until the fact arrives or the execution deadline expires.
 
-The rule is automatic and cannot be forgotten, because it derives from the read itself rather than from a separate declaration. Absent reads are bounded by the execution deadline; a plan wanting a tighter bound declares a command with `Await(...).Within(...)` instead of branching on a bare `Fact`.
+The success gate is automatic and cannot be forgotten, because it derives from the read itself rather than from a separate declaration. Temporarily unavailable reads are bounded by the execution deadline; a plan wanting a tighter bound declares a command with `Await(...).Within(...)` instead of branching on a bare `Fact`. Once the execution is failing, unresolved reads do not postpone terminal failure; work that must run or wait during failure is represented by the explicit failure-handling subgraph from §6.3.
 
 ### 10.2 Evaluation and reconciliation
 
@@ -821,7 +840,9 @@ The plan is evaluated at execution start and again whenever a relevant event is 
 
 Every command made runnable by one evaluation is created in that single transaction, so a crash exposes either all of them or none.
 
-The consulted-input set from the latest evaluation is persisted alongside the declared set. It determines both whether the execution may complete (§10.1) and when the plan must next be evaluated (§10.3).
+After the plan function returns, every command key named by a dependency builder is validated against the union of commands already durable and commands declared anywhere in that evaluation. This permits forward references within the function but rejects a typo or a reference to work that does not exist as a plan defect; such a dependency can never sit pending until the execution deadline. Future externally supplied facts use `Await`, and future externally issued commands cannot be anticipated by an undeclared dependency key.
+
+The consulted-input set and each read's availability classification from the latest evaluation are persisted alongside the declared set. They determine both whether the execution may succeed (§10.1) and when the plan must next be evaluated (§10.3).
 
 ### 10.3 When the plan is evaluated
 
@@ -1087,12 +1108,12 @@ The durable model is deliberately sufficient for an operational UI without a UI 
 
 The library ships a test package so direct command trees, workers, plans, and coordinators are testable without a database:
 
-- a worker is an ordinary function — given a payload, assert its returned result or error, its staged events and spawned children, direct-child keys, optional classification, and registered application writes;
+- a worker is an ordinary function — given a payload and an immutable set of explicitly declared dependency results, assert `ResultOf` reads, its returned result or error, its staged events and spawned children, direct-child keys, optional classification, and registered application writes;
 - a direct-execution harness begins with one root worker decision and settles staged descendants, allowing completion and failure policy to be asserted without defining a plan;
-- a plan is a pure function — given root arguments, facts, and command states, assert its declarations, dependencies, reads, outcomes, and waits; a determinism assertion evaluates the identical snapshot repeatedly and compares canonical output.
+- a plan is a pure function — given root arguments, facts, command states, and closed child memberships, assert its declarations, dependencies, read availability, outcomes, and waits; a determinism assertion evaluates the identical snapshot repeatedly and compares canonical output;
 - a coordinator harness delivers the durable start activation and events in order, allowing `OnStart`, state changes, outputs, retry, and completion decisions to be asserted.
 
-Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, publish-before-declare and declare-before-publish ordering, all-or-nothing worker fan-out, repeated plan evaluation creating no duplicate commands, failure branches surviving fail-fast, `Await` expiry, and rolling deployments with divergent registered versions.
+Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, publish-before-declare and declare-before-publish ordering, all-or-nothing worker fan-out, authoritative child reads, batched worker dependency results, repeated plan evaluation creating no duplicate commands, unknown dependency rejection, terminally unavailable results not blocking failure, failure branches surviving fail-fast, `Await` expiry, and rolling deployments with divergent registered versions.
 
 ## 22. Acceptance criteria
 
@@ -1116,16 +1137,20 @@ Milestone 1 is complete when:
 - a worker that errors, panics, loses its lease, or exceeds the configured plan-command limit after staging children commits none of them;
 - equivalent repeated child keys within one handler decision coalesce, conflicting content fails atomically, and no parent retry can duplicate a committed child;
 - spawned children are required by default, `flow.Optional()` removes them from execution outcome, and both classifications remain visible in `Trace`;
+- `Children` returns the authoritative deterministically ordered direct-child keys after successful membership closure, including a successful empty fan-out, without relying on an application result payload;
+- `ResultOf` in a worker returns typed immutable results only for commands explicitly named as that command's dependencies, rejects arbitrary graph reads, and can serve repeated reads without one database query per call;
 - re-evaluating a plan many times creates each declared command exactly once;
 - a plan branch appears only once the fact deciding it exists, and never withdraws work already declared;
 - every command made runnable by one plan evaluation is created in a single transaction;
 - a command with `Await` becomes runnable when its fact arrives, whether that fact was published before or after the command was declared;
 - an awaited fact that never arrives expires its command within the declared bound, and dependents resolve through the failure branch;
 - a failure branch declared with `AfterFailed` runs to completion under fail-fast, and the execution becomes terminal only after it resolves;
-- a plan-driven execution completes exactly when nothing is declared, pending, awaited, or consulted-but-absent, and never on temporary quiescence;
+- a plan-driven execution succeeds exactly when every declared command is terminal, nothing remains pending or awaited, no read is temporarily unavailable, and re-evaluation declares nothing new; it never succeeds on temporary quiescence;
+- a required terminal command failure reaches terminal execution failure after its explicit failure-handling subgraph resolves, even when the latest plan evaluation contains temporarily unavailable reads;
 - a plan that branches on a fact which never arrives keeps its execution running until its deadline rather than reporting success;
-- `Result` and `Outcome` read commands declared earlier in the evaluation or durably created by `Do`, `Spawn`, or `Issue`, while any other key is rejected as a plan defect;
-- `Result` becomes available only on success, while `Outcome` becomes available for success, failure, expiry, cancellation, or skip;
+- `Children`, `Result`, and `Outcome` read commands declared earlier in the evaluation or durably created by `Do`, `Spawn`, or `Issue`, while any other read key is rejected as a plan defect;
+- plan reads distinguish available, temporarily unavailable, and permanently unavailable inputs internally: `Result` becomes available only on success, `Outcome` on any terminal state, and an unsuccessful terminal `Result` cannot block completion as though it might later succeed;
+- after each evaluation, dependency keys are validated against durable commands plus every declaration in that evaluation, so forward references work and a nonexistent key fails immediately as a plan defect;
 - a plan panic, conflicting declaration, or invalid read records `PlanFailed` and fails the execution without consuming worker retry budget or rerunning accepted work;
 - the plan determinism harness detects different declarations or consulted reads from an identical snapshot;
 - plan evaluation at the documented command ceiling stays within its benchmarked budget, and events of never-consulted names trigger no evaluation;

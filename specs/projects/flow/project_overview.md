@@ -132,28 +132,28 @@ Conceptually, workers emit events. In the API, returning `(result, nil)` automat
 
 The result event is recorded atomically with any application writes the handler registered and any additional events or child commands it staged. If the transaction does not commit, none of it becomes visible.
 
-When work discovers a complete bounded fan-out, the worker may spawn those children directly:
+When work discovers a complete bounded fan-out, the worker may spawn those children directly. The worker does not need to duplicate their keys in its result merely so orchestration can find them:
 
 ```go
-func prepareReport(ctx context.Context, work *flow.Work[PrepareArgs]) (PrepareResult, error) {
+func prepareReport(ctx context.Context, work *flow.Work[PrepareArgs]) (flow.None, error) {
     analyses, err := determineAnalyses(ctx, work.Payload.CompanyID)
     if err != nil {
-        return PrepareResult{}, err
+        return flow.None{}, err
     }
 
-    keys := make([]string, 0, len(analyses))
     for _, analysis := range analyses {
         key := "analysis/" + analysis.ID
         if err := flow.Spawn(work, key, AnalyzeReportPart, analysis.Args); err != nil {
-            return PrepareResult{}, err
+            return flow.None{}, err
         }
-        keys = append(keys, key)
     }
-    return PrepareResult{AnalysisKeys: keys}, nil
+    return flow.None{}, nil
 }
 ```
 
-`Spawn` is asynchronous: it stages a direct child rather than calling its handler. On success all children, the parent's result event, extra events, and `OnCommit` writes become visible together. On error none do. The successful return closes that parent's direct-child membership — it says no more children will be added by that command, not that the children have finished.
+`Spawn` is asynchronous: it stages a direct child rather than calling its handler. On success all children, the parent's result event, extra events, and `OnCommit` writes become visible together. On error none do. The successful return closes that parent's direct-child membership — it says no more children will be added by that command, not that the children have finished. A plan reads that authoritative membership with `Children`; it never reconstructs membership from an application result payload.
+
+Plans normally pass the resulting child keys to a dependent command and declare the dependency with `After`. That command's worker may use the existing typed `ResultOf` operation to read only those commands named as its dependencies. This keeps routine result plumbing out of the plan while keeping every input and graph edge explicit; arbitrary execution-wide reads from workers are not allowed.
 
 Because every command that finishes produces exactly one event recording how it ended, the rest of the system never has to guess whether work finished. Waiting on successful work and waiting on an external fact use the same event mechanism; all-terminal joins additionally recognize failure, cancellation, expiry, and skipping.
 
@@ -176,10 +176,15 @@ func planIntent(p *flow.Plan, args ExecuteArgs) {
     flow.Do(p, "deposit", AwaitDeposit, depositArgs(args)).Await(DepositConfirmed).Within(15 * time.Minute)
     flow.Do(p, "origin",  SendTxn, originTxn(args)).After("deposit")
 
-    if route, ok := flow.Fact(p, RouteSelected); ok && route.Provider == "cctp" {
+    route, ok := flow.Fact(p, RouteSelected)
+    if !ok {
+        return
+    }
+
+    if route.Provider == "cctp" {
         flow.Do(p, "attest", AwaitCCTP, cctpArgs(args)).After("origin")
         flow.Do(p, "dest",   SendTxn, destTxn(args)).After("attest")
-    } else if ok {
+    } else {
         flow.Do(p, "dest",   SendTxn, destTxn(args)).After("origin")
     }
 
@@ -189,15 +194,15 @@ func planIntent(p *flow.Plan, args ExecuteArgs) {
 
 The name is deliberate: the whole durable run is the workflow in ordinary language, represented by an `Execution`. `Plan` names only the optional pure function that plans cross-command progression; calling that function `Workflow` would blur it with the execution it helps coordinate.
 
-The plan is re-evaluated whenever a relevant event is recorded or an observed command reaches a final state, and reconciled by command key: declaring a command that already exists does nothing, and declaring a new one whose prerequisites are met issues it. "React" does not mean that the plan receives a single event callback. Each evaluation is a pure function over the execution arguments and all relevant events and command results recorded so far. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. `Result` and `Outcome` can read a command declared earlier in that evaluation or any existing command key, including a direct child spawned by a worker. A plan only ever grows; it never withdraws work it already asked for.
+The plan is re-evaluated whenever a relevant event is recorded or an observed command reaches a final state, and reconciled by command key: declaring a command that already exists does nothing, and declaring a new one whose prerequisites are met issues it. "React" does not mean that the plan receives a single event callback. Each evaluation is a pure function over the execution arguments and all relevant events and command results recorded so far. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. `Children` reads a worker's authoritative closed child membership; `Result` and `Outcome` remain available for genuine value-dependent branching. A plan only ever grows; it never withdraws work it already asked for.
 
-`After` waits for the event recording another command's success. `AfterSettled` waits for the command to reach any final state, and `Outcome` exposes the typed result or structured reason. `Await` waits for any event, including one published from outside the execution. `Result` and `Outcome` are plan-reading operations over command state and its recorded event; they are not additional event categories.
+`After` waits for the event recording another command's success. `AfterSettled` waits for the command to reach any final state, and `Outcome` exposes the typed result or structured reason. `Await` waits for any event, including one published from outside the execution. Plan reads internally distinguish an input that may still arrive from one that resolved without a value, so an unsuccessful command can never leave an execution waiting forever for an impossible result. These are plan-reading operations over durable state and events, not additional event categories.
 
 Purity is a contract rather than a Go sandbox: the plan receives no context, database, client, clock, or transaction capability, but Go cannot prevent a function from calling a package global. Reconciliation rejects conflicting declarations, plan panics and conflicts fail the execution as plan defects rather than retrying completed work, and `flowtest` evaluates plans repeatedly against identical snapshots to detect nondeterminism.
 
 ### Coordinators
 
-A coordinator is durable memory that reacts to events. It is not needed for a direct command tree or a bounded fan-out returned by one worker; the parent result and direct-child records already preserve that membership. It exists for open-ended processes — work discovered over time, cycles, or several event streams — where no single command completion can close the decision.
+A coordinator is durable memory that reacts to events. It is not needed for a direct command tree or a bounded fan-out returned by one worker; the authoritative direct-child records already preserve that membership. It exists for open-ended processes — work discovered over time, cycles, or several event streams — where no single command completion can close the decision.
 
 An execution uses exactly one driver mode: a direct root command, a plan, or a hand-written coordinator. A runtime-bound copy of each definition exposes the same `.Execute` method and returns an `ExecutionHandle`. Direct executions need no coordinator. A plan is the built-in orchestration authority for most multi-command graphs; writing a coordinator by hand is the escape hatch for logic a declarative plan cannot express. Its state is typed, its event inbox is durable, and recording an event as processed, updating state, and spawning commands and emitting events all commit atomically. Coordinator state holds orchestration facts only — never a second copy of application data.
 
@@ -231,8 +236,8 @@ Handlers are ordinary Go and may call normal application services. Business data
 
 ## Goals
 
-- **Small and intuitive:** one command can run durably without defining orchestration; advanced concepts are introduced only when needed.
-- **Local reasoning:** a worker understands one command and its direct children; a plan reads high-level progression and joins top to bottom.
+- **Small and intuitive:** one command can run durably without defining orchestration; advanced concepts are introduced only when needed, and bookkeeping such as child membership, result loading, and failure-safe completion stays inside the library.
+- **Local reasoning:** a worker understands one command, its explicit dependencies, and its direct children; a plan reads high-level progression and joins top to bottom.
 - **Type safety:** command payloads, command results, event payloads, and handler signatures checked by Go.
 - **Dynamic composition:** runtime branching, worker-spawned child commands, fan-out, fan-in, waits, and long-running executions without a fully predeclared graph.
 - **Durability:** commands, attempts, events, decisions, and causal relationships survive process and machine failure.
