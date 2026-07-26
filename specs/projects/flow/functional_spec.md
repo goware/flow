@@ -14,7 +14,7 @@ The library provides three concepts at the top level:
 
 | Concept | Meaning |
 |---|---|
-| **Flow** | One durable execution of a state machine. Has identity, optional typed state, a graph of steps, and immutable history. Its steps execute in parallel but commit one at a time. |
+| **Flow** | One durable execution of a state machine. Has identity, a graph of steps, an outcome, and immutable history. Its steps execute in parallel but commit one at a time. |
 | **Step** | One unit of work in a flow. Durable, retriable, fenced, individually traceable. Handlers are ordinary Go functions with typed arguments and typed results. |
 | **Signal** | An immutable external fact delivered to a flow, which can release steps waiting on it. |
 
@@ -28,7 +28,7 @@ This is a deliberate simplification. Portability is not a goal; a small, concret
 
 ### 2.2 Milestone 1
 
-- flow start, identity, and optional typed state;
+- flow start, identity, outcome, and deadlines;
 - versioned step definitions, typed handlers, typed results, and dispositions;
 - graph construction, dependencies, fan-out, joins, and failure-handling branches;
 - immutable keyed signals and durable waiting with mandatory deadlines;
@@ -39,11 +39,15 @@ This is a deliberate simplification. Portability is not a goal; a small, concret
 - inspection: flow lookup, full trace, history, listing, and await;
 - embedded migrations.
 
-### 2.3 Later capabilities
+### 2.3 Near-term follow-ons
 
-Not required for the initial release: recurring/scheduled flows, per-key rate limits, tenant quotas, an HTTP admin API or UI, history archival/export, OpenTelemetry adapters, cross-flow subscriptions, durable pub/sub fan-out, and mutable last-write-wins state cells as a primitive distinct from signals.
+The initial release stores everything needed by an operational UI and emits vendor-neutral runtime observations. A first-party web UI for live graph inspection and OpenTelemetry, metrics, and structured-logging adapters are planned follow-ons. They are not required to execute flows correctly and do not change the core persistence model.
 
-### 2.4 Explicit non-goals
+### 2.4 Later capabilities
+
+Other later capabilities include recurring or scheduled flows, administrative recovery and flow forking, per-key rate limits, tenant quotas, history archival/export, cross-flow subscriptions, durable pub/sub fan-out, and mutable last-write-wins state cells.
+
+### 2.5 Explicit non-goals
 
 - transparent replay or determinism requirements on handler code;
 - pinning in-flight work to a build of the executable;
@@ -81,15 +85,15 @@ type Handler[A, R any] func(context.Context, *Step[A, R]) error
 
 type StepRef[A, R any]   struct{ /* ... */ }
 type SignalRef[T any]    struct{ /* ... */ }
-type StateRef[T any]     struct{ /* ... */ }
 
 func Define[A, R any](kind string, version int, h Handler[A, R], opts ...StepOption) StepRef[A, R]
 func DefineSignal[T any](name string, version int) SignalRef[T]
-func DefineState[T any](name string) StateRef[T]
 
 func (r StepRef[A, R]) Register(rt *Runtime) error
 func (r StepRef[A, R]) Kind() string
 func (r StepRef[A, R]) Version() int
+func (r SignalRef[T]) Name() string
+func (r SignalRef[T]) Version() int
 
 type Registrable interface{ Register(*Runtime) error }
 func RegisterAll(rt *Runtime, defs ...Registrable) error
@@ -98,10 +102,9 @@ func WithMaxAttempts(int) StepOption
 func WithRetryPolicy(RetryPolicy) StepOption
 func WithTimeout(time.Duration) StepOption        // per-execution wall clock
 func WithQueue(string) StepOption                 // worker lane
-func WithState[T any](StateRef[T]) StepOption     // root steps: declares the flow's state type
 ```
 
-`A` is the step's argument type and `R` its result type; use `flow.None` for either when unused. A step definition is **not bound to a flow state type**, so the same definition may be used by different flow types.
+`A` is the step's argument type and `R` its result type; use `flow.None` for either when unused. Step definitions are independent of flow types and may be reused wherever their arguments and results fit.
 
 `Define` is normally called at package level and produces a **typed step reference**. Everywhere a step is named — starting a flow, declaring a graph node — the reference is used rather than a string. This makes three classes of mistake fail to compile: a mistyped or renamed step kind, arguments of the wrong type for the target step, and a result decoded at the wrong type.
 
@@ -120,7 +123,7 @@ var (
 )
 ```
 
-This is **durable-schema versioning, not executable pinning**. It exists so that argument, result, and state schemas may evolve while in-flight work created under an older schema is still decodable by a handler that understands it. A new binary registers both versions until old work drains, then drops the old definition in a later release. Handler code for a given version may still be changed and redeployed freely.
+This is **durable-schema versioning, not executable pinning**. It exists so argument and result schemas may evolve while in-flight work created under an older schema is still decodable by a handler that understands it. The persisted schemas and meaning of one `(kind, version)` are immutable, while its implementation may be changed compatibly and redeployed freely. A new binary registers both versions until old work drains, then drops the old definition in a later release.
 
 Version `0` is reserved and rejected; the first version is `1`.
 
@@ -140,15 +143,12 @@ func Start[A, R any](ctx context.Context, c Client, root StepRef[A, R], key stri
 func Signal[T any](ctx context.Context, c Client, id FlowID, ref SignalRef[T], payload T, opts ...SignalOption) error
 func Cancel(ctx context.Context, c Client, id FlowID, reason string) error
 func CancelStep(ctx context.Context, c Client, id FlowID, stepKey string, reason string) error
-func Retry(ctx context.Context, c Client, id FlowID, stepKey string, opts ...RetryOption) error
 
 func WithFlowDeadline(time.Duration) StartOption
 func WithoutFlowDeadline() StartOption
 func WithFlowMetadata(map[string]string) StartOption
 func WithFailFast(bool) StartOption
 func WithSignalID(string) SignalOption
-func RetryWithArgs[A any](A) RetryOption
-func RetryWithMaxAttempts(int) RetryOption
 ```
 
 `Start` creates a flow from a root step reference. The flow's type is that reference's kind. Starting the same `(type, key)` again returns the existing flow with `Handle.Created == false`.
@@ -164,11 +164,10 @@ func List(ctx context.Context, c Client, f Filter) (Page, error)
 func Await(ctx context.Context, c Client, id FlowID, opts ...AwaitOption) (Flow, error)
 
 func ResultOf[R any](src ResultSource, node NodeRef[R]) (R, error)
-func ResultByKey[R any](src ResultSource, key string) (R, error)
-func Read[T any](src StateSource, ref StateRef[T]) (T, error)
+func ResultByKey[A, R any](src ResultSource, key string, ref StepRef[A, R]) (R, error)
 ```
 
-`ResultSource` and `StateSource` are satisfied by both `FlowTrace` and `*Step[A, R]`, so typed reads work identically from an inspection call and from inside a handler. `ResultOf` takes a node reference and needs no explicit type argument; `ResultByKey` is the escape hatch for a step declared in an earlier, out-of-scope declaration.
+`ResultSource` is satisfied by both `FlowTrace` and `*Step[A, R]`, so typed reads work identically from an inspection call and from inside a handler. `ResultOf` takes a node reference and needs no explicit type argument. `ResultByKey` is the escape hatch for a step declared in an earlier declaration; its step reference supplies the expected kind, version, and result type.
 
 ### 3.6 Step context
 
@@ -183,9 +182,11 @@ func (s *Step[A, R]) Graph() *Graph
 func (s *Step[A, R]) OnCommit(func(context.Context, pgx.Tx) error)
 func (s *Step[A, R]) Info() StepInfo
 
-type SignalName interface{ Name() string }   // satisfied by SignalRef[T]
+type SignalName interface {                  // satisfied by SignalRef[T]
+    Name() string
+    Version() int
+}
 
-func Update[T any](s StepScope, ref StateRef[T], fn func(*T) error) error
 func Received[T any](s StepScope, ref SignalRef[T]) (T, bool)
 func ReceivedAll[T any](s StepScope, ref SignalRef[T]) ([]T, error)
 ```
@@ -199,10 +200,9 @@ type Dep     interface{ /* ... */ }
 
 func Add[A, R any](g *Graph, key string, ref StepRef[A, R], args A) NodeRef[R]
 func Key(stepKey string) Dep                  // depend on a node from an earlier declaration
-func (g *Graph) Commit() error
 
 func (n NodeRef[R]) After(deps ...Dep) NodeRef[R]
-func (n NodeRef[R]) AfterFailed(deps ...Dep) NodeRef[R]
+func (n NodeRef[R]) AfterUnsuccessful(deps ...Dep) NodeRef[R]
 func (n NodeRef[R]) AfterSettled(deps ...Dep) NodeRef[R]
 func (n NodeRef[R]) Optional() NodeRef[R]
 func (n NodeRef[R]) StartWithin(time.Duration) NodeRef[R]
@@ -226,14 +226,14 @@ func Skip(reason string) error                   // step ends skipped, not faile
 | Category | Exported |
 |---|---|
 | Runtime and migration | `New`, `Run`, `Stop`, `Client`, `InTx`, `Migrate` |
-| Definitions | `Define`, `DefineSignal`, `DefineState`, `Register`, `RegisterAll`, `Kind`, `Version` |
-| Flow operations | `Start`, `Signal`, `Cancel`, `CancelStep`, `Retry` |
-| Inspection | `Get`, `Lookup`, `Trace`, `History`, `List`, `Await`, `ResultOf`, `ResultByKey`, `Read` |
-| Step context | `Done`, `Wait`, `Graph`, `OnCommit`, `Info`, `Update`, `Received`, `ReceivedAll` |
-| Graph | `Add`, `Key`, `Commit`, and 8 node builder methods |
+| Definitions | `Define`, `DefineSignal`, `Register`, `RegisterAll`, `Kind`, `Name`, `Version` |
+| Flow operations | `Start`, `Signal`, `Cancel`, `CancelStep` |
+| Inspection | `Get`, `Lookup`, `Trace`, `History`, `List`, `Await`, `ResultOf`, `ResultByKey` |
+| Step context | `Done`, `Wait`, `Graph`, `OnCommit`, `Info`, `Received`, `ReceivedAll` |
+| Graph | `Add`, `Key`, and 8 node builder methods |
 | Errors | `Permanent`, `RetryAfter`, `Skip` |
 
-Roughly 45 exported functions and methods. Supporting data types — `Flow`, `FlowTrace`, `Event`, `StepInfo`, `Filter`, `Page`, `RetryPolicy`, `SignalValue`, option types, and error values — are additional but carry no behavior a caller must learn. A service that defines steps, starts flows, and writes handlers touches roughly ten of the above.
+The common path is `Define`, `DefineSignal`, `RegisterAll`, `Start`, `Signal`, `Add`, `Done`, `Wait`, `Received`, `OnCommit`, and `Run`. Inspection, cancellation, transaction composition, and policy customization form the operational surface and need not be learned to write a basic flow.
 
 ## 4. Worked example
 
@@ -241,14 +241,11 @@ Roughly 45 exported functions and methods. Supporting data types — `Flow`, `Fl
 // ---- definitions, declared once at package level ----
 
 type ExecuteArgs struct{ IntentID string; Route Route }
-type IntentStateData struct{ DepositHash string; Legs map[string]string }
-
-var IntentState = flow.DefineState[IntentStateData]("intent_state")
 
 var DepositConfirmed = flow.DefineSignal[Deposit]("deposit_confirmed", 1)
 
 var (
-    ExecuteIntent = flow.Define("execute_intent", 1, executeIntent, flow.WithState(IntentState))
+    ExecuteIntent = flow.Define("execute_intent", 1, executeIntent)
     AwaitDeposit  = flow.Define("await_deposit", 1, awaitDeposit, flow.WithQueue("monitors"))
     AwaitCCTP     = flow.Define("await_cctp", 1, awaitCCTP, flow.WithQueue("monitors"))
     SendTxn       = flow.Define("send_txn", 1, sendTxn, flow.WithMaxAttempts(8))
@@ -278,9 +275,9 @@ func executeIntent(ctx context.Context, s *flow.Step[ExecuteArgs, flow.None]) er
 
     // Failure handling: runs only if the destination leg fails, and is not
     // cancelled by fail-fast (§5.3).
-    flow.Add(g, "refund", RefundIntent, refundArgs(s.Args)).AfterFailed(dest)
+    flow.Add(g, "refund", RefundIntent, refundArgs(s.Args)).AfterUnsuccessful(dest)
 
-    return g.Commit()
+    return s.Done(flow.None{})
 }
 
 // ---- a step that waits on an external fact ----
@@ -289,12 +286,6 @@ func awaitDeposit(ctx context.Context, s *flow.Step[DepositArgs, Deposit]) error
     d, ok := flow.Received(s, DepositConfirmed)
     if !ok {
         return s.Wait(DepositConfirmed, 15*time.Minute)
-    }
-    if err := flow.Update(s, IntentState, func(st *IntentStateData) error {
-        st.DepositHash = d.Hash
-        return nil
-    }); err != nil {
-        return err
     }
     return s.Done(d)
 }
@@ -305,12 +296,6 @@ func sendTxn(ctx context.Context, s *flow.Step[SendArgs, SendResult]) error {
     hash, err := relayer.Send(ctx, s.Args.Txn)   // slow work, no transaction held
     if err != nil {
         return err                               // retried per policy
-    }
-    if err := flow.Update(s, IntentState, func(st *IntentStateData) error {
-        st.Legs[s.Args.Leg] = hash
-        return nil
-    }); err != nil {
-        return err
     }
     s.OnCommit(func(ctx context.Context, tx pgx.Tx) error {
         return db.MarkSent(ctx, tx, s.Args.TxnID, hash)
@@ -354,10 +339,11 @@ Starting an existing `(type, key)` returns the existing flow rather than creatin
 ### 5.2 States
 
 ```
-running → succeeded | failed | cancelled | expired
+running → succeeded | failing → failed
+running | failing → cancelled | expired
 ```
 
-A flow is `running` from creation and becomes terminal when its graph resolves, when it is cancelled, or when its deadline passes.
+A flow is `running` from creation. It becomes `failing` while selected failure-handling work is still active, and becomes terminal when its graph resolves, when it is cancelled, or when its deadline passes.
 
 ### 5.3 Outcome and fail-fast
 
@@ -365,41 +351,24 @@ A flow succeeds when every step is terminal and no required step ended in a fail
 
 Steps marked `Optional()` never determine the flow outcome.
 
-**Fail-fast is the default and does not suppress failure handling.** When a required step fails, the following happens in one transaction, in this order:
+**Fail-fast is the default and does not suppress failure handling.** When a required step fails, expires, or is cancelled individually, the following happens in one transaction, in this order:
 
 1. the failing step becomes terminal;
-2. **all of its outgoing edges resolve first**, so successors selected by `AfterFailed` or `AfterSettled` become runnable and successors that required success become `skipped`;
-3. the flow is marked failing, and remaining work is cancelled **except** the failure-handling subgraph — the transitive closure of steps reachable through edges that the failure itself satisfied, together with any step already running;
+2. **all of its outgoing edges resolve first**, so successors selected by `AfterUnsuccessful` or `AfterSettled` become runnable and successors that required success become `skipped`;
+3. the flow becomes `failing`, and remaining work is cancelled except the failure-handling subgraph — the selected successors, their descendants, and any non-terminal prerequisites they still require;
 4. the flow becomes terminal only once that failure-handling subgraph has resolved.
 
-This is what makes refunds, compensations, reconciliation, and cleanup expressible. A `AfterFailed` node is guaranteed the chance to run.
+This is what makes refunds, compensations, reconciliation, and cleanup expressible. An `AfterUnsuccessful` node is guaranteed the chance to run. Flow-level cancellation is different: it cancels the graph as a whole and does not select failure-handling branches.
 
 Fail-fast may be disabled with `WithFailFast(false)`, in which case unrelated branches also run to completion and the outcome is computed once every step is terminal.
 
 A flow that was already `cancelled` or `expired` never transitions to another terminal state.
 
-### 5.4 State
+### 5.4 Application state
 
-A flow may carry one typed state document, declared by the root step definition via `WithState`. Flows whose root declares no state have none, and steps that never touch state need no knowledge of it.
+`flow` does not maintain a second mutable application-state document. Durable domain state belongs in the service's own PostgreSQL tables; orchestration data belongs in typed step arguments and results, signals, the graph, and history.
 
-Two access modes are offered, with different concurrency behavior:
-
-**`Update` — merge, no conflicts.** `flow.Update(s, ref, fn)` records a mutation. The callback runs inside the completion transaction, after the flow row is locked, against the latest committed state. It therefore cannot conflict and never causes re-execution. The callback must be short, deterministic, and perform no I/O or external calls; it may be invoked in a transaction that later rolls back for an unrelated reason. **This is the recommended default.**
-
-**`Read` + version-checked write.** `flow.Read(s, ref)` returns the current state and records the version observed. If the handler subsequently calls `Update`, that update is applied against fresh state; if the handler's decision *depends* on the value it read, it may request that the version be enforced, in which case completion requires the version to be unchanged. A conflict rolls the completion back and the handler runs again against fresh state.
-
-A state-version conflict is an **infrastructure interruption, not an application failure**:
-
-- it consumes no retry budget;
-- it can never make a step terminal;
-- re-execution is scheduled with bounded jitter, and repeated contention backs off;
-- it is recorded in history and metrics as a distinct outcome, separate from handler failures.
-
-Because a conflicting completion re-invokes the handler, external effects performed before the conflict may repeat. This is within the at-least-once contract, but it makes contention a routine source of re-execution rather than a rare one. Prefer `Update` for aggregation, keep per-branch data in the step's own **result** (private to that step, never contended), and reserve version-checked reads for decisions that genuinely depend on a prior snapshot.
-
-State is size-limited (default 256 KiB) and stored as JSON.
-
-A `StateRef` is matched against the flow's declared state at runtime; using a reference the flow was not started with returns `ErrInvalid`. This is the one type relationship the compiler cannot check, and it is the cost of step definitions being reusable across flow types.
+A handler that must update application state registers the write with `OnCommit`. Those writes commit atomically with the step result and graph mutation (§11.4). This keeps one source of truth and lets the same step definition be reused by different flow types without binding it to a shared state schema.
 
 ### 5.5 Deadlines
 
@@ -430,7 +399,7 @@ Stable keys are what make retried graph construction safe. The library never gen
 | `cancelled` | cancelled explicitly, or by flow cancellation | terminal |
 | `expired` | a deadline passed before the step could start or finish waiting | terminal |
 
-Ordinary transitions are monotonic toward a terminal state. Only an explicit administrative retry moves a terminal step back to `ready`.
+Transitions are monotonic toward a terminal state. Administrative recovery and flow forking are later capabilities; M1 never reopens a terminal step.
 
 There is no persisted `scheduled` state: a `ready` step with a future run time is scheduled, and inspection derives that classification.
 
@@ -446,15 +415,15 @@ There is no persisted `scheduled` state: a `ready` step with a future run time i
 | `s.Wait(signal, within)` | park until the signal arrives | not consumed |
 | panic | recovered, treated as a retryable failure | consumed |
 
-Infrastructure outcomes — shutdown interruption, lease loss, state-version conflict, and unregistered-version deferral — never consume retry budget and never make a step terminal.
+Infrastructure outcomes — shutdown interruption, lease loss, and unregistered-version deferral — never consume retry budget and never make a step terminal.
 
-`s.Done` may be called once, and not in combination with `s.Wait`.
+`s.Done` may be called once, and not in combination with `s.Wait`. Results, graph declarations, and `OnCommit` callbacks are buffered and become durable only with `Done`; returning another disposition discards those buffers. Returning `nil` without first choosing a disposition is an invalid handler outcome.
 
 ### 6.4 Execution model
 
 Handlers are **re-invoked, never replayed**. A parked or retried step runs its handler again from the top. There is no step memoization, no call-ordering requirement, and no constraint that handler code be deterministic. Handlers may be freely changed and redeployed while flows are in flight.
 
-A handler is therefore written as a function of durable inputs: its arguments, its flow's state, the signals it has received, and the results of steps it depends on. Handlers are not pure — they perform I/O, which is their purpose — but they are **re-invocable and independently testable**: given the same durable inputs, a handler can be exercised in isolation and asserted on its disposition, its state mutation, and the graph it declares.
+A handler is therefore written as a function of durable inputs: its arguments, the signals it has received, the results of steps it depends on, and application state it reads explicitly. Handlers are not pure — they perform I/O, which is their purpose — but they are **re-invocable and independently testable**: given the same durable inputs, a handler can be exercised in isolation and asserted on its disposition, result, callbacks, and declared graph.
 
 ### 6.5 Timeouts
 
@@ -467,9 +436,9 @@ Two independent bounds apply:
 
 ### 7.1 Construction
 
-A graph is declared by a handler via `s.Graph()` and materializes atomically with that handler's success. A flow's initial graph is therefore always produced by its root step.
+A graph is declared by a handler via `s.Graph()` and materializes atomically when that handler calls `Done`. A flow's initial graph is therefore always produced by its root step.
 
-Declared work becomes durable only if the declaring step commits. A failed handler leaves no partial graph.
+Graph declarations are buffered; no separate graph commit operation exists. Declared work becomes durable only if the declaring step commits successfully. A waiting, skipped, or failed handler leaves no partial graph.
 
 ### 7.2 Dependencies
 
@@ -478,7 +447,7 @@ An edge carries a condition:
 | Builder | Satisfied when the predecessor is |
 |---|---|
 | `After(d)` | `succeeded` |
-| `AfterFailed(d)` | `failed` or `expired` |
+| `AfterUnsuccessful(d)` | `failed`, `expired`, or individually `cancelled` |
 | `AfterSettled(d)` | any terminal state |
 
 When a step becomes terminal, **every one of its outgoing edges resolves**, and each edge's condition is evaluated. A successor becomes runnable exactly once, when all of its incoming edges have resolved and all their conditions are satisfied. If any condition is unsatisfied, the successor becomes `skipped` — never blocked forever — and its own outgoing edges resolve so downstream branches continue.
@@ -505,7 +474,7 @@ Large fan-out is bounded by configured per-declaration and per-flow limits.
 
 ### 8.1 Model
 
-A signal is an **immutable fact** delivered to a flow, identified by `(flow_id, signal_name, signal_id)`. It carries a typed JSON payload, a version, and an arrival time. Signals are never overwritten and never silently replaced.
+A signal is an **immutable fact** delivered to a flow, identified by `(flow_id, signal_name, signal_version, signal_id)`. It carries a typed JSON payload, a durable per-flow position, and an arrival time. Signals are never overwritten and never silently replaced.
 
 | Delivery | Outcome |
 |---|---|
@@ -516,23 +485,27 @@ A signal is an **immutable fact** delivered to a flow, identified by `(flow_id, 
 
 Multiple facts may therefore exist under one signal name — several deposits, several attestations — and none can destroy another. Where a caller has a natural identifier, such as a transaction hash or a message ID, supplying it via `WithSignalID` makes delivery idempotent across retries.
 
-A mutable last-write-wins cell is a genuinely different primitive and is deliberately not offered under this name (§2.3).
+A mutable last-write-wins cell is a genuinely different primitive and is deliberately not offered under this name (§2.4).
 
 ### 8.2 Delivery
 
-`flow.Signal(ctx, c, id, ref, payload)` stores the fact and releases every step in that flow waiting on that signal name. Both effects commit together.
+`flow.Signal(ctx, c, id, ref, payload)` stores the fact and releases every step in that flow waiting on that signal name and version. Both effects commit together.
 
-Signals may be delivered before any step waits on them. `flow.Received(s, ref)` observes facts that have already arrived, returning the earliest; `flow.ReceivedAll(s, ref)` returns all of them in arrival order. It is therefore never possible for a signal to arrive "too early", which removes the lost-release race entirely.
+Signals may be delivered before any step waits on them. `flow.Received(s, ref)` observes the earliest fact after that step's durable signal cursor; `flow.ReceivedAll(s, ref)` returns all such facts in position order. It is therefore never possible for a signal to arrive "too early", which removes the lost-release race entirely.
 
-Delivering a signal to a terminal flow returns `ErrTerminal` and stores nothing.
+Signal idempotency is checked before terminal-flow rejection. Retrying an already-stored signal ID with the same canonical payload succeeds even if the flow has since become terminal; the same ID with a different payload returns `ErrConflict`. A genuinely new signal delivered to a terminal flow returns `ErrTerminal` and stores nothing.
 
 ### 8.3 Waiting
 
-`s.Wait(ref, within)` parks the step in `waiting`, releases the worker slot, and records a wait deadline.
+`s.Wait(ref, within)` releases the worker slot, records a wait deadline, and advances that step's cursor to the greatest matching signal position observed by the current execution. The cursor advances only if the wait disposition commits. In the same transaction, the runtime checks for an unobserved matching fact: if one already exists, the step remains `ready`; otherwise it becomes `waiting`. This closes the signal-before-wait race even if a handler did not call `Received` immediately before waiting. A later fact wakes the step; an already-observed fact does not create an immediate wake loop. If the handler fails before waiting or completing, the cursor does not advance and the same facts are visible on retry.
 
 **Every wait has a deadline.** `within` is mandatory and must be positive; there is no unbounded wait. On expiry the step becomes `expired`, and its dependents resolve through the failure branch. A parked step holds no worker, no connection, and no lease.
 
-When a matching fact arrives, the step returns to `ready` and its handler is invoked again, this time observing it.
+When a newer matching fact arrives, the step returns to `ready` and its handler is invoked again, this time observing it.
+
+### 8.4 Canonical equality
+
+Arguments, step definitions, and signal payloads use a deterministic canonical JSON encoding for identity comparisons. Idempotency compares the canonical stored bytes, not caller memory layout or database JSON formatting. The architecture defines the encoder and the treatment of custom marshalers; the functional requirement is that the same logical value always produces the same identity bytes.
 
 ## 9. Retries and failure
 
@@ -550,11 +523,11 @@ A step that exhausts its attempts becomes `failed`, with its full attempt histor
 
 Cancelling a flow marks it `cancelled`, marks non-terminal steps `cancelled`, removes pending work, and delivers context cancellation to running handlers. Cancelling a single required step causes the flow to fail under the rules in §5.3, including its failure-handling branches.
 
-Cancellation and completion race on the flow. Whichever commits first wins. A handler whose step was cancelled cannot commit its result, its state mutation, its graph declarations, or its `OnCommit` callbacks — completion is rejected with a lease-lost or terminal-state error.
+Cancellation and completion race on the flow. Whichever commits first wins. A handler whose step was cancelled cannot commit its result, graph declarations, or `OnCommit` callbacks — completion is rejected with a lease-lost or terminal-state error.
 
-Cancellation cannot undo external side effects already performed, and cannot forcibly stop a non-cooperative goroutine. Fencing guarantees only that such a goroutine cannot commit **flow-managed state or its `OnCommit` writes**; writes it makes directly to external systems, or to the database outside `OnCommit`, are beyond the library's control.
+Cancellation cannot undo external side effects already performed, and cannot forcibly stop a non-cooperative goroutine. Fencing guarantees only that such a goroutine cannot commit **its flow result, graph changes, or `OnCommit` writes**; writes it makes directly to external systems, or to the database outside `OnCommit`, are beyond the library's control.
 
-Cancelling an already-cancelled flow is idempotent; cancelling a differently-terminal flow returns `ErrTerminal`.
+Cancelling an already-cancelled flow or step is idempotent. Cancelling a differently-terminal target returns `ErrTerminal`.
 
 ## 11. Guarantees
 
@@ -566,11 +539,11 @@ All durable state is recoverable by querying PostgreSQL. Notifications reduce la
 
 A step handler may run more than once, including after an apparently successful run. Handlers must tolerate re-execution. Effects against external systems require idempotency keys or reconciliation; the library never claims globally exactly-once behavior.
 
-Sources of re-execution are: retry after failure, lease loss, shutdown interruption, state-version conflict, and administrative retry.
+Sources of re-execution are retry after failure, lease loss, and shutdown interruption.
 
 ### 11.3 Fencing
 
-Each execution holds a lease. Completion, failure recording, state mutation, graph declaration, and `OnCommit` callbacks all require the current lease. A stalled or superseded worker receives a lease-lost error and commits nothing.
+Each execution holds a lease. Completion, failure recording, graph declaration, and `OnCommit` callbacks all require the current lease. A stalled or superseded worker receives a lease-lost error and commits nothing.
 
 Leases renew automatically while a handler runs. Handlers never implement heartbeats.
 
@@ -579,7 +552,6 @@ Leases renew automatically while a handler runs. Handlers never implement heartb
 When a step succeeds, one short transaction commits all of:
 
 - the step's result and terminal state;
-- the flow state mutation;
 - newly declared steps and edges;
 - edge resolution and any releases it triggers;
 - the flow's own outcome transition if this was the last step;
@@ -594,7 +566,7 @@ Commits within one flow are serialized: two steps of the same flow never commit 
 
 Serialization applies to **commits, not execution**. Steps of one flow may run concurrently on any number of workers — parallel fan-out is a first-class case — and they queue only at the moment they commit.
 
-Together with the state rules in §5.4, every durable transition of a flow is applied against a consistent view of that flow, so application code needs no locking of its own and no documented lock order to write flow state safely.
+Every durable graph and outcome transition is therefore applied against a consistent view of the flow. Application writes registered through `OnCommit` participate in the same transaction but remain subject to the ordered transaction discipline defined by the architecture.
 
 ### 11.6 Bounded completion
 
@@ -617,10 +589,10 @@ Tracing is a first-class requirement.
 
 `Trace(ctx, c, id)` returns, in one call:
 
-- the flow: type, root version, key, state document, status, deadline, timings, outcome, and failure;
+- the flow: type, root version, key, status, deadline, timings, outcome, and failure;
 - every step: key, kind, version, state, arguments, result, last error, retry schedule, deadlines, and current running duration;
 - every edge: predecessor, successor, condition, and whether it is resolved and satisfied;
-- every signal received, with name, version, identifier, and arrival time;
+- every signal received, with name, version, identifier, durable position, and arrival time;
 - attempt summaries per step, including infrastructure interruptions distinguished from application failures.
 
 `History(ctx, c, id)` returns the flow's immutable, ordered event log — every meaningful transition with timestamp, actor, and cause. Supplying an after-sequence returns only newer entries, so a UI or CLI can poll a live flow incrementally.
@@ -642,7 +614,7 @@ A single `Runtime` per process owns registration, workers, lease renewal, and ba
 
 ## 14. Distribution and replicas
 
-`flow` is distributed by default. Running more replicas increases capacity with no configuration, no coordination protocol, and no changes to handler code.
+`flow` is distributed by default. Given sufficient eligible work and database headroom, running more replicas increases capacity with no configuration, no coordination protocol, and no changes to handler code.
 
 ### 14.1 Replica model
 
@@ -691,7 +663,7 @@ Timestamps follow a strict taxonomy; each answers exactly one question, and no t
 | creation time | when was this row created? | insert only, immutable |
 | update time | when did anything last write it? | every write, including claim; used only for crash recovery |
 | status time | when did the state last change? | state transitions only |
-| eligibility time | when was this permitted to run? | grants only — creation, release, retry scheduling, administrative retry |
+| eligibility time | when was this permitted to run? | grants only — creation, release, and retry scheduling |
 
 Claiming a step is a write. It updates lease and update times, and never eligibility or deadline anchors. This is what prevents work that retries forever without ever timing out.
 
@@ -704,7 +676,6 @@ Claiming a step is a write. It updates lease and update times, and never eligibi
 | retry delays | 1s, 5s, 30s, 2m, jittered |
 | execution timeout | none unless configured |
 | flow deadline | 30 days; removable per flow |
-| flow state size | 256 KiB |
 | step arguments / result size | 256 KiB |
 | signal payload size | 64 KiB |
 | nodes per declaration / per flow | 100 / 10,000 |
@@ -719,23 +690,21 @@ Configuration is supplied through typed options. Environment parsing is the appl
 
 Public sentinel categories support `errors.Is`, and a typed error carries safe structured context (operation, resource, identifier, reason). Recognizable categories:
 
-`ErrNotFound`, `ErrConflict`, `ErrInvalid`, `ErrInvalidState`, `ErrTerminal`, `ErrLeaseLost`, `ErrStateConflict`, `ErrPayloadTooLarge`, `ErrClosed`, `ErrSchema`.
+`ErrNotFound`, `ErrConflict`, `ErrInvalid`, `ErrInvalidState`, `ErrTerminal`, `ErrLeaseLost`, `ErrPayloadTooLarge`, `ErrClosed`, `ErrSchema`.
 
 Error messages carry identifiers, never payloads, arguments, secrets, or connection strings.
 
 ## 18. Observability
 
-The runtime emits optional, no-op-by-default observations for flow start and outcome, step transitions, handler duration, retries, waits and wait expiry, signals delivered, state-version conflicts, lease renewal and loss, claim activity, unclaimable backlog, reconciliation repairs, and long-running executions.
-
-State-version conflicts are reported as a distinct outcome, never aggregated with handler failures, so contention is visible as its own signal.
+The runtime emits optional, no-op-by-default observations for flow start and outcome, step transitions, handler duration, retries, waits and wait expiry, signals delivered, lease renewal and loss, claim activity, unclaimable backlog, reconciliation repairs, and long-running executions. The observation contract is part of M1; first-party OpenTelemetry, metrics, and structured-logging adapters are near-term follow-ons (§2.3).
 
 Observations carry flow type, flow ID, step key, step kind, step version, worker identity, correlation and causation IDs, and outcome category — never payload data. No logging, metrics, or tracing vendor is imposed.
 
 ## 19. Testing
 
-The library ships a test package providing an in-process harness so handlers can be exercised without a database: given arguments, flow state, and received signals, assert the returned disposition, the state mutation, the result, and the graph declared.
+The library ships a test package providing an in-process harness so handlers can be exercised without a database: given arguments, step results, and received signals, assert the returned disposition, result, callbacks, and graph declarations.
 
-Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, signal-before-wait and wait-before-signal ordering, distinct signals under one name, deterministic re-declaration under retry, failure-handling branches surviving fail-fast, state contention and conflict retries, deadline expiry, and rolling deployments with divergent registered versions.
+Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, signal-before-wait and wait-before-signal ordering, distinct signals under one name, signal cursor advancement, deterministic re-declaration under retry, failure-handling branches surviving fail-fast, deadline expiry, and rolling deployments with divergent registered versions.
 
 ## 20. Acceptance criteria
 
@@ -745,12 +714,11 @@ Milestone 1 is complete when:
 - the worked example in §4 compiles and runs against PostgreSQL;
 - referring to a step that does not exist, or passing arguments, results, or signal payloads of the wrong type, fails to compile;
 - commits within a flow are observably serialized while its parallel steps still execute concurrently;
-- `Update` mutations from parallel steps all apply, in commit order, with no conflicts and no re-execution;
-- a version-checked state conflict re-invokes the handler, consumes no retry budget, cannot make a step terminal, and appears in tracing as its own outcome;
-- a step's result, flow state mutation, declared graph, edge resolution, and application writes commit atomically or not at all;
+- a step's result, declared graph, edge resolution, and application writes commit atomically or not at all;
 - a stalled worker cannot commit after losing its lease;
-- a signal delivered before a wait is observed by that wait, and two signals with different identifiers both survive;
-- a failure-handling branch selected by `AfterFailed` runs to completion under fail-fast, and the flow becomes terminal only after it resolves;
+- a signal delivered before a wait is observed by that wait, two signals with different identifiers both survive, and waiting again advances past already-observed facts without a wake loop;
+- an idempotent retry of an already-stored signal succeeds after the flow becomes terminal, while a new signal is rejected;
+- a failure-handling branch selected by `AfterUnsuccessful` runs to completion under fail-fast, and the flow becomes terminal only after it resolves;
 - every wait, step, and deadline-bearing flow reaches a terminal state without operator intervention;
 - re-declaring an identical graph fragment after a retry creates no duplicate steps;
 - workers registering different `(kind, version)` sets share a database without failing each other's work;
