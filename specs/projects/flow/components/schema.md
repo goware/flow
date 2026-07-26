@@ -2,388 +2,674 @@
 status: draft
 ---
 
-# Component: PostgreSQL Schema and Statements
+# Component: PostgreSQL storage and journal
 
 ## 1. Purpose and scope
 
-This component owns every table, constraint, index, and SQL statement in `flow`. It is the authority on physical layout; `engine.md` and `runtime.md` consume the statements defined here and never write SQL of their own.
+This component owns the physical PostgreSQL contract for `flow`: tables, constraints, indexes, migrations, statement boundaries, durable time, and SQL error classification. `internal/store` is generated or handwritten against this document; no other package issues Flow SQL.
 
-Responsibilities: DDL, constraints, indexes, autovacuum settings, every runtime statement, and the benchmark evidence behind index choices.
+It does not decide plan semantics, retry outcomes, or process scheduling. Those decisions arrive as validated engine changes and runtime claim/renew requests.
 
-Non-responsibilities: algorithms above single statements (`engine.md`), process lifecycle (`runtime.md`), and public Go types (functional spec §4).
+All examples use schema `flow`. Migration rendering substitutes a separately validated and quoted schema identifier, and every runtime statement remains schema-qualified.
 
-All DDL below uses the default schema `flow`. Migration rendering substitutes a validated, quoted schema identifier; runtime SQL is fully qualified and never depends on `search_path`.
+## 2. Storage rules
 
-## 2. Design rules
+1. The journal and materializations commit in one transaction.
+2. No journal insert occurs without first locking its execution row.
+3. All durable timestamps in one transition come from one captured `clock_timestamp()` value.
+4. Canonical payloads are `bytea`; SQL never interprets application JSON.
+5. Digests accelerate comparison, but a conflict path compares canonical bytes too.
+6. Pending commands have no dispatch row. Ready, retry-wait, and running commands have exactly one dispatch row. Terminal commands have none.
+7. Lease renewal touches only hot delivery rows and is intentionally absent from the journal.
+8. Every statement is bounded by an execution, a claim batch, a maintenance batch, or a page limit.
+9. Constraint and index names are stable because error mapping and migrations refer to them.
+10. No correctness query depends on `LISTEN`, notification delivery, application time, or process-local state.
 
-1. **One row per logical thing.** A declared-but-unrunnable plan node is a `commands` row in state `pending`, not a parallel entity.
-2. **Counters on `executions` make hot decisions O(1).** Completion, position allocation, and outcome checks read the row the transaction already locked.
-3. **Whole-execution loads, in-memory computation, delta writes.** The engine loads an execution's commands and clauses once per settle transaction — it needs them for plan evaluation anyway — computes dependency resolution in Go, and writes only what changed. No recursive SQL, no reverse-edge index.
-4. **Four timestamp classes, never conflated** (FS §17): `created_at` immutable, `updated_at` any write including claim, `status_at` state transitions only, `eligible_at` grants only.
-5. **Partial indexes on hot states.** The claim index contains only `ready` rows; pending, running, and terminal rows never enter it.
+## 3. Schema
 
-## 3. Tables
+The DDL is the target shape for the initial migration. Small column-type changes discovered during implementation require an architecture amendment; semantic changes require the functional spec to reopen.
 
 ### 3.1 Executions
 
 ```sql
 CREATE TABLE flow.executions (
-    execution_id        uuid PRIMARY KEY,
-    execution_type      text NOT NULL,
-    execution_key       text NOT NULL DEFAULT '',
+    execution_id          uuid PRIMARY KEY,
+    driver_mode           text NOT NULL,
+    definition_name       text NOT NULL,
+    definition_version    integer NOT NULL CHECK (definition_version > 0),
+    execution_key         text NOT NULL DEFAULT '',
 
-    status              text NOT NULL,
-    failing             boolean NOT NULL DEFAULT false,
-    fail_fast           boolean NOT NULL DEFAULT true,
+    status                text NOT NULL DEFAULT 'running',
+    fail_fast             boolean NOT NULL DEFAULT true,
 
-    -- exactly one driver
-    plan_name           text,
-    plan_version        integer,
-    root_args           jsonb,
-    coordinator_name    text,
-    coordinator_version integer,
+    start_fingerprint     bytea NOT NULL CHECK (octet_length(start_fingerprint) = 32),
+    input                 bytea NOT NULL,
+    input_hash            bytea NOT NULL CHECK (octet_length(input_hash) = 32),
+    metadata              jsonb NOT NULL DEFAULT '{}'::jsonb,
+    metadata_canonical    bytea NOT NULL,
+    metadata_hash         bytea NOT NULL CHECK (octet_length(metadata_hash) = 32),
 
-    request_fingerprint bytea NOT NULL CHECK (octet_length(request_fingerprint) = 32),
-    metadata            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    deadline_at           timestamptz,
+    max_commands          integer NOT NULL CHECK (max_commands >= 0),
+    command_count         integer NOT NULL DEFAULT 0 CHECK (command_count >= 0),
+    open_commands         integer NOT NULL DEFAULT 0 CHECK (open_commands >= 0),
 
-    next_event_position bigint  NOT NULL DEFAULT 1,
-    open_commands       integer NOT NULL DEFAULT 0,
-    absent_reads        integer NOT NULL DEFAULT 0,
+    temporary_plan_reads  integer NOT NULL DEFAULT 0 CHECK (temporary_plan_reads >= 0),
+    plan_quiescent        boolean NOT NULL DEFAULT false,
+    plan_revision         bigint NOT NULL DEFAULT 0 CHECK (plan_revision >= 0),
 
-    deadline_at         timestamptz,
-    outcome_ref         text,
-    failure             jsonb,
+    next_journal_position bigint NOT NULL DEFAULT 1 CHECK (next_journal_position >= 1),
+    root_command_id       uuid,
+    outcome_ref           text,
+    failure               jsonb,
 
-    created_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
-    updated_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
-    status_at           timestamptz NOT NULL DEFAULT clock_timestamp(),
-    finished_at         timestamptz,
+    created_at            timestamptz NOT NULL,
+    updated_at            timestamptz NOT NULL,
+    status_at             timestamptz NOT NULL,
+    finished_at           timestamptz,
 
-    CONSTRAINT executions_status_valid CHECK (status IN
-        ('running','succeeded','failed','cancelled','expired')),
-    CONSTRAINT executions_driver_exclusive CHECK (
-        (plan_name IS NOT NULL AND plan_version IS NOT NULL AND root_args IS NOT NULL
-         AND coordinator_name IS NULL AND coordinator_version IS NULL)
+    CONSTRAINT executions_driver_mode_ck CHECK
+        (driver_mode IN ('direct', 'plan', 'coordinator')),
+    CONSTRAINT executions_status_ck CHECK
+        (status IN ('running', 'failing', 'succeeded', 'failed', 'cancelled', 'expired')),
+    CONSTRAINT executions_terminal_shape_ck CHECK (
+        (status IN ('running', 'failing') AND finished_at IS NULL)
         OR
-        (coordinator_name IS NOT NULL AND coordinator_version IS NOT NULL
-         AND plan_name IS NULL AND plan_version IS NULL)
+        (status IN ('succeeded', 'failed', 'cancelled', 'expired') AND finished_at IS NOT NULL)
     ),
-    CONSTRAINT executions_position_positive  CHECK (next_event_position >= 1),
-    CONSTRAINT executions_open_nonnegative   CHECK (open_commands >= 0),
-    CONSTRAINT executions_absent_nonnegative CHECK (absent_reads >= 0),
-    CONSTRAINT executions_failing_only_running CHECK (NOT failing OR status = 'running'),
-    CONSTRAINT executions_finished_shape CHECK (
-        (status = 'running') = (finished_at IS NULL)
+    CONSTRAINT executions_command_limit_ck CHECK
+        (max_commands = 0 OR command_count <= max_commands),
+    CONSTRAINT executions_plan_fields_ck CHECK (
+        (driver_mode = 'plan') OR
+        (temporary_plan_reads = 0 AND plan_revision = 0 AND plan_quiescent = false)
     )
 );
 
-CREATE UNIQUE INDEX executions_natural_key_idx
-    ON flow.executions (execution_type, execution_key)
+CREATE UNIQUE INDEX executions_idempotency_uq
+    ON flow.executions (driver_mode, definition_name, execution_key)
     WHERE execution_key <> '';
 
 CREATE INDEX executions_list_idx
-    ON flow.executions (execution_type, created_at DESC, execution_id DESC);
+    ON flow.executions (definition_name, created_at DESC, execution_id DESC);
 
-CREATE INDEX executions_status_list_idx
+CREATE INDEX executions_key_prefix_idx
+    ON flow.executions
+       (definition_name, execution_key text_pattern_ops, created_at DESC, execution_id DESC);
+
+CREATE INDEX executions_status_idx
     ON flow.executions (status, created_at DESC, execution_id DESC);
+
+CREATE INDEX executions_metadata_idx
+    ON flow.executions USING gin (metadata jsonb_path_ops);
 
 CREATE INDEX executions_deadline_idx
     ON flow.executions (deadline_at, execution_id)
-    WHERE status = 'running' AND deadline_at IS NOT NULL;
+    WHERE status IN ('running', 'failing') AND deadline_at IS NOT NULL;
 ```
 
-`next_event_position` is the allocator proved gap-free in architecture §7. `open_commands` and `absent_reads` are the two counters completion reads (§14 there).
+`start_fingerprint` covers definition version, canonical input, explicit deadline/fail-fast/metadata options, and driver mode. It deliberately excludes the runtime's accepted `max_commands` default and a direct root command's definition-level retry/timeout/queue defaults: an idempotent repeat returns the already accepted execution under changed deployment defaults. Metadata is duplicated as canonical bytes for identity and `jsonb` for the bounded `ListExecutions` containment filter; keys, values, and total size are validated before insertion.
+
+`status = 'failing'` is the durable form of failure handling in progress. `plan_quiescent` means the latest required evaluation introduced no new command. It is ignored outside plan mode.
 
 ### 3.2 Commands
 
 ```sql
 CREATE TABLE flow.commands (
-    command_id          uuid PRIMARY KEY,
-    execution_id        uuid NOT NULL
+    command_id              uuid PRIMARY KEY,
+    execution_id            uuid NOT NULL
         REFERENCES flow.executions(execution_id) ON DELETE RESTRICT,
-    command_key         text NOT NULL,
+    command_key             text NOT NULL,
 
-    name                text NOT NULL,
-    version             integer NOT NULL CHECK (version > 0),
-    lane                text NOT NULL DEFAULT 'default',
+    name                    text NOT NULL,
+    version                 integer NOT NULL CHECK (version > 0),
+    origin                  text NOT NULL,
+    parent_command_id       uuid REFERENCES flow.commands(command_id) ON DELETE RESTRICT,
+    required                boolean NOT NULL DEFAULT true,
 
-    payload             jsonb NOT NULL,
-    payload_hash        bytea NOT NULL CHECK (octet_length(payload_hash) = 32),
+    args                    bytea NOT NULL,
+    args_hash               bytea NOT NULL CHECK (octet_length(args_hash) = 32),
+    declaration_fingerprint bytea NOT NULL CHECK (octet_length(declaration_fingerprint) = 32),
 
-    state               text NOT NULL,
-    optional            boolean NOT NULL DEFAULT false,
-    unsatisfied_clauses integer NOT NULL DEFAULT 0,
+    state                   text NOT NULL,
+    unsatisfied_groups      integer NOT NULL DEFAULT 0 CHECK (unsatisfied_groups >= 0),
+    unsatisfied_waits       integer NOT NULL DEFAULT 0 CHECK (unsatisfied_waits >= 0),
+    child_membership_closed boolean NOT NULL DEFAULT false,
+    failure_scope           boolean NOT NULL DEFAULT false,
 
-    eligible_at         timestamptz NOT NULL,
-    start_deadline_at   timestamptz,
-    attempt_timeout_ms  bigint,
+    queue                   text NOT NULL,
+    attempt_timeout_ms      bigint CHECK (attempt_timeout_ms IS NULL OR attempt_timeout_ms > 0),
+    retry_policy            jsonb NOT NULL,
+    retry_policy_hash       bytea NOT NULL CHECK (octet_length(retry_policy_hash) = 32),
 
-    lease_id            uuid,
-    leased_at           timestamptz,
-    lease_expires_at    timestamptz,
+    schedule_kind           text NOT NULL DEFAULT 'none',
+    initial_delay_ms        bigint CHECK (initial_delay_ms IS NULL OR initial_delay_ms > 0),
+    budget_started_at       timestamptz,
+    next_attempt_at         timestamptz,
+    wait_started_at         timestamptz,
+    wait_deadline_at        timestamptz,
 
-    attempt_count       integer NOT NULL DEFAULT 0,
-    consumed_attempts   integer NOT NULL DEFAULT 0,
-    max_attempts        integer NOT NULL CHECK (max_attempts > 0),
-    retry_policy        jsonb,
+    attempt_ordinal         integer NOT NULL DEFAULT 0 CHECK (attempt_ordinal >= 0),
+    consumed_attempts       integer NOT NULL DEFAULT 0 CHECK (consumed_attempts >= 0),
 
-    result              jsonb,
-    last_error          jsonb,
+    result                  bytea,
+    result_hash             bytea CHECK (result_hash IS NULL OR octet_length(result_hash) = 32),
+    last_error              jsonb,
+    terminal_failure       jsonb,
+    terminal_position       bigint,
 
-    origin              text NOT NULL,
-    causation_event_id  uuid,
+    created_position        bigint NOT NULL CHECK (created_position >= 1),
+    created_at              timestamptz NOT NULL,
+    updated_at              timestamptz NOT NULL,
+    status_at               timestamptz NOT NULL,
+    finished_at             timestamptz,
 
-    created_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
-    updated_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
-    status_at           timestamptz NOT NULL DEFAULT clock_timestamp(),
-    started_at          timestamptz,
-    finished_at         timestamptz,
-
-    CONSTRAINT commands_state_valid CHECK (state IN
-        ('pending','ready','running','retry_wait',
-         'succeeded','failed','skipped','cancelled','expired')),
-    CONSTRAINT commands_origin_valid CHECK (origin IN ('plan','coordinator','worker','client')),
-    CONSTRAINT commands_clauses_nonnegative CHECK (unsatisfied_clauses >= 0),
-    CONSTRAINT commands_pending_has_clauses CHECK (state <> 'pending' OR unsatisfied_clauses > 0),
-    CONSTRAINT commands_consumed_le_attempts CHECK (consumed_attempts <= attempt_count),
-    CONSTRAINT commands_lease_shape CHECK (
-        (lease_id IS NULL AND leased_at IS NULL AND lease_expires_at IS NULL)
+    CONSTRAINT commands_execution_key_uq UNIQUE (execution_id, command_key),
+    CONSTRAINT commands_origin_ck CHECK
+        (origin IN ('direct_root', 'plan', 'worker_spawn', 'coordinator_spawn', 'external_issue')),
+    CONSTRAINT commands_state_ck CHECK
+        (state IN ('pending', 'ready', 'running', 'retry_wait',
+                   'succeeded', 'failed', 'cancelled', 'expired', 'skipped')),
+    CONSTRAINT commands_schedule_kind_ck CHECK
+        (schedule_kind IN ('none', 'plan_delay', 'spawn_start_after')),
+    CONSTRAINT commands_schedule_shape_ck CHECK (
+        (schedule_kind = 'none' AND initial_delay_ms IS NULL)
         OR
-        (lease_id IS NOT NULL AND leased_at IS NOT NULL AND lease_expires_at IS NOT NULL)
+        (schedule_kind <> 'none' AND initial_delay_ms IS NOT NULL)
     ),
-    CONSTRAINT commands_lease_only_running CHECK (lease_id IS NULL OR state = 'running'),
-    CONSTRAINT commands_result_only_succeeded CHECK (result IS NULL OR state = 'succeeded'),
-
-    UNIQUE (execution_id, command_key)
+    CONSTRAINT commands_parent_shape_ck CHECK (
+        (origin = 'worker_spawn' AND parent_command_id IS NOT NULL)
+        OR
+        (origin <> 'worker_spawn' AND parent_command_id IS NULL)
+    ),
+    CONSTRAINT commands_result_shape_ck CHECK (
+        (state = 'succeeded' AND result IS NOT NULL AND result_hash IS NOT NULL)
+        OR
+        (state <> 'succeeded' AND result IS NULL AND result_hash IS NULL)
+    ),
+    CONSTRAINT commands_pending_shape_ck CHECK (
+        state <> 'pending' OR (unsatisfied_groups + unsatisfied_waits > 0)
+    ),
+    CONSTRAINT commands_child_closure_ck CHECK (
+        child_membership_closed = (state = 'succeeded')
+    ),
+    CONSTRAINT commands_terminal_shape_ck CHECK (
+        (state IN ('succeeded', 'failed', 'cancelled', 'expired', 'skipped')
+            AND finished_at IS NOT NULL AND terminal_position IS NOT NULL)
+        OR
+        (state NOT IN ('succeeded', 'failed', 'cancelled', 'expired', 'skipped')
+            AND finished_at IS NULL AND terminal_position IS NULL)
+    ),
+    CONSTRAINT commands_budget_shape_ck CHECK (
+        budget_started_at IS NULL OR next_attempt_at IS NOT NULL
+    ),
+    CONSTRAINT commands_attempt_counts_ck CHECK (consumed_attempts <= attempt_ordinal)
 );
-```
 
-`commands_pending_has_clauses` is the invariant behind the claim index: a `pending` row always has an unsatisfied clause, so reaching zero is exactly the transition to `ready`.
-
-Indexes:
-
-```sql
--- The hot claim index. Partial on 'ready' so pending/running/terminal never enter it.
-CREATE INDEX commands_claim_idx
-    ON flow.commands (lane, eligible_at, command_id)
-    WHERE state = 'ready';
-
--- Whole-execution load for plan evaluation and dependency resolution.
-CREATE INDEX commands_by_execution_idx
+CREATE INDEX commands_execution_idx
     ON flow.commands (execution_id, command_key)
-    INCLUDE (state, name, version, payload_hash, unsatisfied_clauses, optional);
+    INCLUDE (command_id, name, version, origin, parent_command_id, required,
+             state, unsatisfied_groups, unsatisfied_waits, terminal_position);
 
--- Stale-lease recovery.
-CREATE INDEX commands_lease_expiry_idx
-    ON flow.commands (lease_expires_at, command_id)
-    WHERE state = 'running';
+CREATE INDEX commands_parent_idx
+    ON flow.commands (parent_command_id, command_key)
+    WHERE parent_command_id IS NOT NULL;
 
--- Start-deadline expiry for pending and ready work.
-CREATE INDEX commands_start_deadline_idx
-    ON flow.commands (start_deadline_at, command_id)
-    WHERE start_deadline_at IS NOT NULL AND state IN ('pending','ready');
-
--- Retry scheduling and unclaimable-backlog reporting.
-CREATE INDEX commands_backlog_idx
-    ON flow.commands (name, version, state)
-    WHERE state IN ('ready','pending','retry_wait');
+CREATE INDEX commands_terminal_idx
+    ON flow.commands (execution_id, terminal_position)
+    WHERE terminal_position IS NOT NULL;
 ```
 
-**Open benchmark question (architecture §9.1).** `commands_claim_idx` does not include `(name, version)`, so a worker registering a subset of kinds filters after the index scan. The adversarial distribution is a lane whose `ready` head is dominated by kinds the process does not register — exactly the rolling-deploy case. The measurement in §7.3 decides whether to add `(name, version)` as leading columns, accepting a wider hot index and more write amplification. Until measured, the simpler index stands.
+`declaration_fingerprint` excludes definition-level operational defaults. For plan nodes it includes whether an explicit retry override was present and its canonical value. The accepted effective policy remains in `retry_policy` for execution and inspection.
 
-### 3.3 Dependency clauses
+`budget_started_at` is null while a pending node has not completed prerequisites. It becomes immutable when the initial `next_attempt_at` is established. A retry modifies only `next_attempt_at`.
+
+### 3.3 Command dispatch
+
+The hot queue row is separated from the wider command projection so lease churn and ready scans do not bloat immutable payload and topology pages.
 
 ```sql
-CREATE TABLE flow.command_deps (
-    execution_id  uuid    NOT NULL,
-    command_key   text    NOT NULL,
-    clause_idx    smallint NOT NULL,
+CREATE TABLE flow.command_dispatch (
+    command_id        uuid PRIMARY KEY
+        REFERENCES flow.commands(command_id) ON DELETE CASCADE,
+    execution_id      uuid NOT NULL
+        REFERENCES flow.executions(execution_id) ON DELETE CASCADE,
 
-    kind          text NOT NULL,
-    threshold     integer,
-    member_keys   text[],
-    member_events jsonb,
+    queue             text NOT NULL,
+    name              text NOT NULL,
+    version           integer NOT NULL CHECK (version > 0),
+    plan_name         text NOT NULL DEFAULT '',
+    plan_version      integer NOT NULL DEFAULT 0 CHECK (plan_version >= 0),
+    state             text NOT NULL,
+    next_run_at       timestamptz NOT NULL,
 
-    satisfied     boolean NOT NULL DEFAULT false,
-    unsatisfiable boolean NOT NULL DEFAULT false,
-    resolved_at   timestamptz,
+    active_attempt_id uuid,
+    lease_token       uuid,
+    lease_owner       text,
+    lease_started_at  timestamptz,
+    lease_expires_at  timestamptz,
+    updated_at        timestamptz NOT NULL,
 
-    PRIMARY KEY (execution_id, command_key, clause_idx),
-    FOREIGN KEY (execution_id, command_key)
-        REFERENCES flow.commands(execution_id, command_key) ON DELETE CASCADE,
-
-    CONSTRAINT command_deps_kind_valid CHECK (kind IN
-        ('all_succeeded','all_settled','all_unsuccessful','at_least','await_event')),
-    CONSTRAINT command_deps_threshold_shape CHECK (
-        (kind = 'at_least') = (threshold IS NOT NULL)
-    ),
-    CONSTRAINT command_deps_members_shape CHECK (
-        (kind = 'await_event' AND member_events IS NOT NULL AND member_keys IS NULL)
+    CONSTRAINT command_dispatch_state_ck CHECK
+        (state IN ('ready', 'retry_wait', 'running')),
+    CONSTRAINT command_dispatch_plan_shape_ck CHECK
+        ((plan_name = '' AND plan_version = 0)
+         OR (plan_name <> '' AND plan_version > 0)),
+    CONSTRAINT command_dispatch_lease_shape_ck CHECK (
+        (state = 'running' AND active_attempt_id IS NOT NULL AND lease_token IS NOT NULL
+         AND lease_owner IS NOT NULL AND lease_started_at IS NOT NULL AND lease_expires_at IS NOT NULL)
         OR
-        (kind <> 'await_event' AND member_keys IS NOT NULL AND member_events IS NULL)
-    ),
-    CONSTRAINT command_deps_not_both CHECK (NOT (satisfied AND unsatisfiable)),
-    CONSTRAINT command_deps_resolved_shape CHECK (
-        (resolved_at IS NULL) = (NOT satisfied AND NOT unsatisfiable)
+        (state <> 'running' AND active_attempt_id IS NULL AND lease_token IS NULL
+         AND lease_owner IS NULL AND lease_started_at IS NULL AND lease_expires_at IS NULL)
     )
 );
 
-CREATE INDEX command_deps_by_execution_idx
-    ON flow.command_deps (execution_id, command_key, clause_idx);
+CREATE INDEX command_dispatch_claim_idx
+    ON flow.command_dispatch
+       (name, version, plan_name, plan_version, next_run_at, queue, command_id)
+    INCLUDE (execution_id)
+    WHERE state IN ('ready', 'retry_wait');
+
+CREATE INDEX command_dispatch_lease_idx
+    ON flow.command_dispatch (lease_expires_at, command_id)
+    INCLUDE (execution_id, active_attempt_id, lease_token)
+    WHERE state = 'running';
+
+CREATE INDEX command_dispatch_execution_idx
+    ON flow.command_dispatch (execution_id, command_id);
 ```
 
-Members are stored as arrays rather than child rows, and there is **no reverse index from member to clause**. Resolution loads every clause for the execution in one query and computes satisfaction in memory (design rule 3). At the 1,000-node / 100-dependency ceiling this is at most a few thousand narrow rows.
+Denormalizing immutable `(queue, name, version)` and the plan pair (empty outside plan mode) is deliberate. It prevents a replica that handles a subset of kinds or plan versions from repeatedly scanning an unhandled head of a shared lane. Store tests assert these values equal the owning command and execution at insertion; they never change later.
 
-`ADD CONSTRAINT commands_exec_key_unique UNIQUE (execution_id, command_key)` on `flow.commands` provides the composite target for the foreign key above; it is created with the table in §3.2.
+### 3.4 Dependency groups and members
 
-### 3.4 Attempts
+Every builder call is one group; all groups on a dependent combine with AND.
+
+```sql
+CREATE TABLE flow.command_dependency_groups (
+    group_id             uuid PRIMARY KEY,
+    execution_id         uuid NOT NULL
+        REFERENCES flow.executions(execution_id) ON DELETE CASCADE,
+    dependent_command_id uuid NOT NULL
+        REFERENCES flow.commands(command_id) ON DELETE CASCADE,
+    ordinal              smallint NOT NULL CHECK (ordinal >= 0),
+    kind                 text NOT NULL,
+    threshold            integer,
+    state                text NOT NULL DEFAULT 'unresolved',
+    resolved_at          timestamptz,
+
+    CONSTRAINT command_dependency_groups_ordinal_uq
+        UNIQUE (dependent_command_id, ordinal),
+    CONSTRAINT command_dependency_groups_kind_ck CHECK
+        (kind IN ('all_succeeded', 'all_settled', 'all_failed', 'at_least')),
+    CONSTRAINT command_dependency_groups_threshold_ck CHECK (
+        (kind = 'at_least' AND threshold IS NOT NULL AND threshold > 0)
+        OR
+        (kind <> 'at_least' AND threshold IS NULL)
+    ),
+    CONSTRAINT command_dependency_groups_state_ck CHECK
+        (state IN ('unresolved', 'satisfied', 'unsatisfiable')),
+    CONSTRAINT command_dependency_groups_resolved_ck CHECK
+        ((state = 'unresolved') = (resolved_at IS NULL))
+);
+
+CREATE TABLE flow.command_dependency_members (
+    group_id               uuid NOT NULL
+        REFERENCES flow.command_dependency_groups(group_id) ON DELETE CASCADE,
+    predecessor_command_id uuid NOT NULL
+        REFERENCES flow.commands(command_id) ON DELETE RESTRICT,
+    execution_id           uuid NOT NULL
+        REFERENCES flow.executions(execution_id) ON DELETE CASCADE,
+    predecessor_key        text NOT NULL,
+
+    PRIMARY KEY (group_id, predecessor_command_id)
+);
+
+CREATE INDEX command_dependency_reverse_idx
+    ON flow.command_dependency_members (predecessor_command_id, group_id);
+
+CREATE INDEX command_dependency_execution_idx
+    ON flow.command_dependency_groups (execution_id, dependent_command_id, ordinal);
+```
+
+The application-level insertion validator guarantees predecessor and dependent belong to the same execution. A deferred composite foreign key may enforce that too if the implementation finds the added unique indexes worthwhile; correctness must not rely on a cross-execution key supplied by the caller.
+
+### 3.5 Event waits
+
+`event_namespace` is an internal discriminator carried by `EventName`. It distinguishes an application event definition from a derived command-success selector without adding another developer-facing event concept.
+
+```sql
+CREATE TABLE flow.command_event_waits (
+    command_id         uuid NOT NULL
+        REFERENCES flow.commands(command_id) ON DELETE CASCADE,
+    execution_id       uuid NOT NULL
+        REFERENCES flow.executions(execution_id) ON DELETE CASCADE,
+    event_namespace    text NOT NULL,
+    event_name         text NOT NULL,
+    event_version      integer NOT NULL CHECK (event_version > 0),
+    satisfied_position bigint,
+
+    PRIMARY KEY (command_id, event_namespace, event_name, event_version),
+    CONSTRAINT command_event_waits_namespace_ck CHECK
+        (event_namespace IN ('application', 'command_success')),
+    CONSTRAINT command_event_waits_position_ck CHECK
+        (satisfied_position IS NULL OR satisfied_position >= 1)
+);
+
+CREATE INDEX command_event_waits_reverse_idx
+    ON flow.command_event_waits
+       (execution_id, event_namespace, event_name, event_version, command_id)
+    WHERE satisfied_position IS NULL;
+```
+
+The once-only `wait_started_at` and `wait_deadline_at` live on the command because one `Within` bounds the node's complete `Await` set.
+
+### 3.6 Attempts
+
+Attempts cover both worker invocations and coordinator deliveries, while preserving a command-specific identity where present.
 
 ```sql
 CREATE TABLE flow.attempts (
     attempt_id            uuid PRIMARY KEY,
-    command_id            uuid NOT NULL
-        REFERENCES flow.commands(command_id) ON DELETE CASCADE,
-    execution_id          uuid NOT NULL,
-    attempt_number        integer NOT NULL CHECK (attempt_number > 0),
+    execution_id          uuid NOT NULL
+        REFERENCES flow.executions(execution_id) ON DELETE RESTRICT,
+    subject_kind          text NOT NULL,
+    command_id            uuid REFERENCES flow.commands(command_id) ON DELETE RESTRICT,
+    coordinator_id        uuid,
+    delivery_key          text,
+    attempt_ordinal       integer NOT NULL CHECK (attempt_ordinal > 0),
 
-    lease_id              uuid NOT NULL,
+    lease_token           uuid NOT NULL,
     worker_id             text NOT NULL,
     process_id            text NOT NULL,
-
     state                 text NOT NULL,
     consumes_retry_budget boolean NOT NULL DEFAULT false,
 
-    started_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
-    heartbeat_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
+    started_position      bigint NOT NULL CHECK (started_position >= 1),
+    concluded_position    bigint,
+    started_at            timestamptz NOT NULL,
     finished_at           timestamptz,
+    next_attempt_at       timestamptz,
     error                 jsonb,
 
-    CONSTRAINT attempts_state_valid CHECK (state IN
-        ('running','succeeded','failed','interrupted','lease_lost','cancelled')),
-
-    UNIQUE (command_id, attempt_number),
-    UNIQUE (lease_id)
+    CONSTRAINT attempts_subject_ck CHECK
+        (subject_kind IN ('command', 'coordinator')),
+    CONSTRAINT attempts_subject_shape_ck CHECK (
+        (subject_kind = 'command' AND command_id IS NOT NULL
+             AND coordinator_id IS NULL AND delivery_key IS NULL)
+        OR
+        (subject_kind = 'coordinator' AND command_id IS NULL
+             AND coordinator_id IS NOT NULL AND delivery_key IS NOT NULL)
+    ),
+    CONSTRAINT attempts_state_ck CHECK
+        (state IN ('running', 'succeeded', 'retry_scheduled', 'failed',
+                   'interrupted', 'lease_lost', 'cancelled', 'timed_out', 'panicked')),
+    CONSTRAINT attempts_finished_shape_ck CHECK (
+        (state = 'running' AND finished_at IS NULL AND concluded_position IS NULL)
+        OR
+        (state <> 'running' AND finished_at IS NOT NULL AND concluded_position IS NOT NULL)
+    ),
+    CONSTRAINT attempts_lease_token_uq UNIQUE (lease_token)
 );
 
-CREATE INDEX attempts_by_command_idx
-    ON flow.attempts (command_id, attempt_number DESC);
+CREATE UNIQUE INDEX attempts_command_ordinal_uq
+    ON flow.attempts (command_id, attempt_ordinal)
+    WHERE command_id IS NOT NULL;
 
-CREATE INDEX attempts_running_heartbeat_idx
-    ON flow.attempts (heartbeat_at, attempt_id)
-    WHERE state = 'running';
+CREATE UNIQUE INDEX attempts_coordinator_ordinal_uq
+    ON flow.attempts (coordinator_id, delivery_key, attempt_ordinal)
+    WHERE coordinator_id IS NOT NULL;
+
+CREATE INDEX attempts_execution_idx
+    ON flow.attempts (execution_id, started_position);
 ```
 
-`UNIQUE (lease_id)` makes the lease token a global fencing key: no two attempts can ever present the same token.
+`coordinator_id` receives its foreign key after the coordinator table exists. `delivery_key` is `start` or `event/<position>` and stays stable across retries.
 
-### 3.5 Events
+### 3.7 Journal
 
 ```sql
-CREATE TABLE flow.events (
-    event_id           uuid PRIMARY KEY,
+CREATE TABLE flow.journal (
     execution_id       uuid NOT NULL
         REFERENCES flow.executions(execution_id) ON DELETE RESTRICT,
     position           bigint NOT NULL CHECK (position >= 1),
-
-    name               text NOT NULL,
-    version            integer NOT NULL CHECK (version > 0),
-    event_key          text,
-    kind               text NOT NULL,
-
-    payload            jsonb NOT NULL,
-    payload_hash       bytea NOT NULL CHECK (octet_length(payload_hash) = 32),
+    entry_id           uuid NOT NULL,
+    entry_kind         text NOT NULL,
+    recorded_at        timestamptz NOT NULL,
+    causation_position bigint,
 
     command_id         uuid,
     attempt_id         uuid,
-    causation_event_id uuid,
-    correlation_id     text,
+    coordinator_id     uuid,
 
-    occurred_at        timestamptz NOT NULL,
-    recorded_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
+    event_id           uuid,
+    event_namespace    text,
+    event_name         text,
+    event_version      integer,
+    event_key          text,
+    event_class        text,
+    terminal_status    text,
 
-    CONSTRAINT events_kind_valid CHECK (kind IN ('completion','domain','runtime')),
-    CONSTRAINT events_completion_has_command CHECK (kind <> 'completion' OR command_id IS NOT NULL),
+    body               bytea NOT NULL,
+    body_hash          bytea NOT NULL CHECK (octet_length(body_hash) = 32),
 
-    UNIQUE (execution_id, position)
+    PRIMARY KEY (execution_id, position),
+    CONSTRAINT journal_entry_id_uq UNIQUE (entry_id),
+    CONSTRAINT journal_position_causation_ck CHECK
+        (causation_position IS NULL OR causation_position < position),
+    CONSTRAINT journal_entry_kind_ck CHECK
+        (entry_kind IN ('execution_started', 'execution_failing', 'command_created',
+                        'attempt_started', 'attempt_concluded',
+                        'event_recorded', 'coordinator_transition')),
+    CONSTRAINT journal_event_shape_ck CHECK (
+        (entry_kind = 'event_recorded'
+            AND event_id IS NOT NULL AND event_namespace IS NOT NULL
+            AND event_name IS NOT NULL AND event_version IS NOT NULL
+            AND event_class IS NOT NULL)
+        OR
+        (entry_kind <> 'event_recorded'
+            AND event_id IS NULL AND event_namespace IS NULL
+            AND event_name IS NULL AND event_version IS NULL
+            AND event_key IS NULL AND event_class IS NULL AND terminal_status IS NULL)
+    ),
+    CONSTRAINT journal_event_namespace_ck CHECK
+        (event_namespace IS NULL OR event_namespace IN ('application', 'command_success', 'runtime')),
+    CONSTRAINT journal_event_class_ck CHECK
+        (event_class IS NULL OR event_class IN
+            ('application', 'command_terminal', 'execution_terminal',
+             'plan_terminal', 'coordinator_terminal')),
+    CONSTRAINT journal_command_terminal_shape_ck CHECK (
+        event_class <> 'command_terminal'
+        OR (command_id IS NOT NULL AND terminal_status IS NOT NULL)
+    ),
+    CONSTRAINT journal_execution_terminal_shape_ck CHECK (
+        event_class <> 'execution_terminal'
+        OR terminal_status IN ('succeeded', 'failed', 'cancelled', 'expired')
+    ),
+    CONSTRAINT journal_terminal_status_ck CHECK
+        (terminal_status IS NULL OR terminal_status IN
+            ('succeeded', 'failed', 'cancelled', 'expired', 'skipped'))
 );
 
--- Idempotency is scoped across versions, per FS §9.3.
-CREATE UNIQUE INDEX events_idempotency_idx
-    ON flow.events (execution_id, name, event_key)
-    WHERE event_key IS NOT NULL;
+CREATE UNIQUE INDEX journal_event_id_uq
+    ON flow.journal (event_id)
+    WHERE event_id IS NOT NULL;
 
--- Await-clause satisfaction and plan fact reads.
-CREATE INDEX events_by_name_idx
-    ON flow.events (execution_id, name, version, position);
+-- User/worker event keys are reserved across versions of the same name.
+CREATE UNIQUE INDEX journal_application_event_key_uq
+    ON flow.journal (execution_id, event_namespace, event_name, event_key)
+    WHERE entry_kind = 'event_recorded'
+      AND event_class = 'application'
+      AND event_key IS NOT NULL;
 
--- Ordered log reads and coordinator inbox delivery.
-CREATE INDEX events_log_idx
-    ON flow.events (execution_id, position);
+CREATE UNIQUE INDEX journal_command_created_uq
+    ON flow.journal (command_id)
+    WHERE entry_kind = 'command_created';
+
+CREATE UNIQUE INDEX journal_command_terminal_uq
+    ON flow.journal (command_id)
+    WHERE entry_kind = 'event_recorded' AND event_class = 'command_terminal';
+
+CREATE UNIQUE INDEX journal_execution_terminal_uq
+    ON flow.journal (execution_id)
+    WHERE entry_kind = 'event_recorded' AND event_class = 'execution_terminal';
+
+CREATE UNIQUE INDEX journal_execution_failing_uq
+    ON flow.journal (execution_id)
+    WHERE entry_kind = 'execution_failing';
+
+CREATE UNIQUE INDEX journal_plan_terminal_uq
+    ON flow.journal (execution_id)
+    WHERE entry_kind = 'event_recorded' AND event_class = 'plan_terminal';
+
+CREATE UNIQUE INDEX journal_coordinator_terminal_uq
+    ON flow.journal (coordinator_id)
+    WHERE entry_kind = 'event_recorded' AND event_class = 'coordinator_terminal';
+
+CREATE UNIQUE INDEX journal_attempt_started_uq
+    ON flow.journal (attempt_id)
+    WHERE entry_kind = 'attempt_started';
+
+CREATE UNIQUE INDEX journal_attempt_concluded_uq
+    ON flow.journal (attempt_id)
+    WHERE entry_kind = 'attempt_concluded';
+
+CREATE INDEX journal_event_lookup_idx
+    ON flow.journal
+       (execution_id, event_namespace, event_name, event_version, position)
+    WHERE entry_kind = 'event_recorded';
+
+CREATE INDEX journal_command_events_idx
+    ON flow.journal (command_id, position)
+    WHERE command_id IS NOT NULL;
 ```
 
-`events_by_name_idx` is what makes both `Await` satisfaction and `Fact` reads single indexed lookups rather than log scans.
+`body` is a versioned canonical record. `CommandCreated` includes arguments, declaration topology, accepted schedule/policy, classification, and origin even though current projections repeat those fields. `ExecutionStarted`, attempt entries, coordinator transitions, and runtime events likewise have explicit internal body schemas owned by `internal/store/journalcodec`.
 
-### 3.6 Plan reads
+`event_namespace = 'command_success'` is the implementation detail behind `Command.Done`; failure/cancellation/expiry/skip use runtime terminal names and are exposed to a coordinator through `OnOutcome`, not by synthesizing a second event.
+
+### 3.8 Plan reads
 
 ```sql
 CREATE TABLE flow.plan_reads (
-    execution_id uuid NOT NULL
+    execution_id       uuid NOT NULL
         REFERENCES flow.executions(execution_id) ON DELETE CASCADE,
-    read_kind    text NOT NULL,
-    name         text NOT NULL,
-    version      integer NOT NULL DEFAULT 0,
-    present      boolean NOT NULL,
+    read_kind          text NOT NULL,
+    command_key        text NOT NULL DEFAULT '',
+    event_namespace    text NOT NULL DEFAULT '',
+    event_name         text NOT NULL DEFAULT '',
+    event_version      integer NOT NULL DEFAULT 0,
+    availability       text NOT NULL,
 
-    PRIMARY KEY (execution_id, read_kind, name, version),
-    CONSTRAINT plan_reads_kind_valid CHECK (read_kind IN ('fact','facts','result'))
+    PRIMARY KEY
+        (execution_id, read_kind, command_key,
+         event_namespace, event_name, event_version),
+    CONSTRAINT plan_reads_kind_ck CHECK
+        (read_kind IN ('fact', 'facts', 'children', 'result', 'outcome',
+                       'plan_command', 'dependency')),
+    CONSTRAINT plan_reads_availability_ck CHECK
+        (availability IN ('available', 'temporary', 'permanent', 'routing')),
+    CONSTRAINT plan_reads_selector_ck CHECK (
+        (read_kind IN ('fact', 'facts')
+            AND command_key = '' AND event_name <> '' AND event_version > 0)
+        OR
+        (read_kind NOT IN ('fact', 'facts')
+            AND command_key <> '' AND event_name = '' AND event_version = 0)
+    )
 );
+
+CREATE INDEX plan_reads_event_route_idx
+    ON flow.plan_reads
+       (execution_id, event_namespace, event_name, event_version)
+    WHERE read_kind IN ('fact', 'facts');
+
+CREATE INDEX plan_reads_command_route_idx
+    ON flow.plan_reads (execution_id, command_key)
+    WHERE read_kind IN ('children', 'result', 'outcome', 'plan_command', 'dependency');
 ```
 
-One row per input the latest evaluation consulted. `name` holds an event name for `fact`/`facts` and a command key for `result`; `version` is `0` for `result` reads. The whole set is replaced on each evaluation, and `executions.absent_reads` is maintained as the count of rows with `present = false`.
+The whole set is replaced after a successful evaluation. `temporary_plan_reads` is the count of public reads with `availability = 'temporary'`; implicit routing rows never affect completion.
 
-### 3.7 Coordinators
+### 3.9 Coordinators
 
 ```sql
 CREATE TABLE flow.coordinators (
-    coordinator_id    uuid PRIMARY KEY,
-    execution_id      uuid NOT NULL
+    coordinator_id        uuid PRIMARY KEY,
+    execution_id          uuid NOT NULL UNIQUE
         REFERENCES flow.executions(execution_id) ON DELETE RESTRICT,
-    name              text NOT NULL,
-    version           integer NOT NULL CHECK (version > 0),
+    name                  text NOT NULL,
+    version               integer NOT NULL CHECK (version > 0),
+    status                text NOT NULL DEFAULT 'active',
 
-    state             text NOT NULL,
-    inbox_position    bigint NOT NULL DEFAULT 0,
-    coord_state       jsonb NOT NULL,
+    state                 bytea NOT NULL,
+    state_hash            bytea NOT NULL CHECK (octet_length(state_hash) = 32),
+    state_revision        bigint NOT NULL DEFAULT 0 CHECK (state_revision >= 0),
+    state_position        bigint NOT NULL CHECK (state_position >= 1),
 
-    lease_id          uuid,
-    leased_at         timestamptz,
-    lease_expires_at  timestamptz,
+    start_pending         boolean NOT NULL DEFAULT true,
+    inbox_position        bigint NOT NULL DEFAULT 0 CHECK (inbox_position >= 0),
+    delivery_key          text,
+    delivery_position     bigint,
+    delivery_state        text NOT NULL DEFAULT 'idle',
 
-    attempt_count     integer NOT NULL DEFAULT 0,
-    consumed_attempts integer NOT NULL DEFAULT 0,
-    max_attempts      integer NOT NULL DEFAULT 5,
-    eligible_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
-    last_error        jsonb,
+    retry_policy          jsonb NOT NULL,
+    retry_policy_hash     bytea NOT NULL CHECK (octet_length(retry_policy_hash) = 32),
+    budget_started_at     timestamptz,
+    next_attempt_at       timestamptz,
+    attempt_ordinal       integer NOT NULL DEFAULT 0 CHECK (attempt_ordinal >= 0),
+    consumed_attempts     integer NOT NULL DEFAULT 0 CHECK (consumed_attempts >= 0),
 
-    created_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
-    updated_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
-    status_at         timestamptz NOT NULL DEFAULT clock_timestamp(),
-    finished_at       timestamptz,
+    active_attempt_id     uuid,
+    lease_token           uuid,
+    lease_owner           text,
+    lease_started_at      timestamptz,
+    lease_expires_at      timestamptz,
+    last_error            jsonb,
 
-    CONSTRAINT coordinators_state_valid CHECK (state IN
-        ('active','completed','failed','cancelled')),
-    CONSTRAINT coordinators_position_nonnegative CHECK (inbox_position >= 0),
+    created_at            timestamptz NOT NULL,
+    updated_at            timestamptz NOT NULL,
+    finished_at           timestamptz,
 
-    UNIQUE (execution_id, name)
+    CONSTRAINT coordinators_status_ck CHECK
+        (status IN ('active', 'completed', 'failed', 'cancelled')),
+    CONSTRAINT coordinators_delivery_state_ck CHECK
+        (delivery_state IN ('idle', 'ready', 'retry_wait', 'running')),
+    CONSTRAINT coordinators_delivery_shape_ck CHECK (
+        (delivery_state = 'idle' AND delivery_key IS NULL AND delivery_position IS NULL
+            AND active_attempt_id IS NULL AND lease_token IS NULL)
+        OR
+        (delivery_state IN ('ready', 'retry_wait') AND delivery_key IS NOT NULL
+            AND active_attempt_id IS NULL AND lease_token IS NULL)
+        OR
+        (delivery_state = 'running' AND delivery_key IS NOT NULL
+            AND active_attempt_id IS NOT NULL AND lease_token IS NOT NULL
+            AND lease_owner IS NOT NULL AND lease_started_at IS NOT NULL
+            AND lease_expires_at IS NOT NULL)
+    )
 );
 
-CREATE INDEX coordinators_dispatch_idx
-    ON flow.coordinators (name, version, eligible_at, coordinator_id)
-    WHERE state = 'active';
+ALTER TABLE flow.attempts
+    ADD CONSTRAINT attempts_coordinator_fk
+    FOREIGN KEY (coordinator_id) REFERENCES flow.coordinators(coordinator_id)
+    ON DELETE RESTRICT;
+
+CREATE INDEX coordinators_claim_idx
+    ON flow.coordinators (name, version, next_attempt_at, coordinator_id)
+    INCLUDE (execution_id, delivery_key, delivery_position)
+    WHERE status = 'active' AND delivery_state IN ('ready', 'retry_wait');
+
+CREATE INDEX coordinators_lease_idx
+    ON flow.coordinators (lease_expires_at, coordinator_id)
+    WHERE status = 'active' AND delivery_state = 'running';
+
+ALTER TABLE flow.executions
+    ADD CONSTRAINT executions_root_command_fk
+    FOREIGN KEY (root_command_id) REFERENCES flow.commands(command_id)
+    DEFERRABLE INITIALLY DEFERRED;
 ```
 
-Only hand-written coordinators occupy this table. A plan-driven execution has no row here; its equivalent state is `plan_reads` plus the command set.
+A coordinator inbox event is selected into `delivery_key = 'event/<position>'` before claim. Retry keeps that identity. Success advances `inbox_position`, clears delivery fields, and resets delivery retry counters. Start uses `delivery_key = 'start'` and clears `start_pending` on success.
 
-### 3.8 Migration metadata
+### 3.10 Migration metadata
 
 ```sql
 CREATE TABLE flow.schema_migrations (
@@ -391,7 +677,7 @@ CREATE TABLE flow.schema_migrations (
     name            text NOT NULL,
     checksum        bytea NOT NULL CHECK (octet_length(checksum) = 32),
     library_version text NOT NULL,
-    applied_at      timestamptz NOT NULL DEFAULT clock_timestamp()
+    applied_at      timestamptz NOT NULL
 );
 
 CREATE TABLE flow.schema_compatibility (
@@ -399,415 +685,315 @@ CREATE TABLE flow.schema_compatibility (
     current_version    integer NOT NULL,
     min_reader_version integer NOT NULL,
     min_writer_version integer NOT NULL,
-    updated_at         timestamptz NOT NULL DEFAULT clock_timestamp()
+    updated_at         timestamptz NOT NULL
 );
 ```
 
-## 4. Autovacuum
+## 4. Journal body contracts
 
-`commands` and `events` are the churn-heavy tables. `commands` sees inserts, claim updates, lease renewals, and terminal updates; `events` is insert-only but grows steadily.
+Internal journal bodies are versioned separately from application definitions. The encoded records contain at least:
 
-```sql
-ALTER TABLE flow.commands SET (
-    fillfactor = 80,
-    autovacuum_vacuum_scale_factor  = 0.01,
-    autovacuum_analyze_scale_factor = 0.02,
-    autovacuum_vacuum_threshold     = 1000,
-    autovacuum_analyze_threshold    = 1000
-);
+| Entry | Required body fields |
+|---|---|
+| `ExecutionStarted` | body schema version, driver name/version/mode, execution key, canonical input, explicit options, accepted deadline and command ceiling, metadata. |
+| `CommandCreated` | body schema version, ID/key/name/version, canonical args, origin/parent, required and failure-scope classification, normalized dependency and wait selectors, explicit schedule declaration, accepted absolute first schedule, accepted retry/timeout/queue, causation. |
+| `AttemptStarted` | subject identity, delivery key if coordinator, invocation ordinal, database start, worker/process, lease duration but not reusable lease token. |
+| `AttemptConcluded` | subject, classification, consumed-budget flag, database finish, safe error, and persisted next-attempt time when any. |
+| `EventRecorded` | canonical typed event payload; indexed columns hold its durable routing metadata. |
+| `ExecutionBecameFailing` | triggering required command/event, fail-fast setting, and the survivor-set decision needed to explain cancellations. |
+| `CoordinatorTransition` | handled activation/position, previous and new state revision, canonical resulting state, decision kind, and causation. |
 
-ALTER TABLE flow.attempts SET (fillfactor = 90, autovacuum_vacuum_scale_factor = 0.05);
-ALTER TABLE flow.events   SET (fillfactor = 100);
+Secrets such as lease tokens are never journaled. Worker/process identity is operational metadata and subject to configured redaction/size bounds.
+
+## 5. Store transaction API
+
+The engine and runtime call a narrow store API rather than composing SQL ad hoc:
+
+```go
+type Store interface {
+    BeginSemantic(ctx context.Context, id ExecutionID, mode LockMode) (*SemanticTx, error)
+    ProbeCommands(ctx context.Context, filter ClaimFilter, limit int) ([]Candidate, error)
+    ProbeCoordinators(ctx context.Context, filter CoordFilter, limit int) ([]CoordCandidate, error)
+    RenewCommandLeases(ctx context.Context, leases []LeaseRenewal) (LeaseRenewalResult, error)
+    RenewCoordinatorLeases(ctx context.Context, leases []LeaseRenewal) (LeaseRenewalResult, error)
+    Trace(ctx context.Context, id ExecutionID) (TraceRows, error)
+    History(ctx context.Context, id ExecutionID, after uint64, limit int) ([]JournalRow, error)
+}
+
+type SemanticTx interface {
+    DBNow() time.Time
+    LoadSnapshot(context.Context, SnapshotMask) (SnapshotRows, error)
+    TryLockCommand(context.Context, CommandID) (CommandRows, bool, error)
+    TryLockCoordinator(context.Context, CoordinatorID) (CoordinatorRows, bool, error)
+    Apply(context.Context, PersistedChangeSet) error
+    Notify(context.Context, []WakeHint) error
+    Commit(context.Context) error
+    Rollback(context.Context) error
+}
 ```
 
-`fillfactor = 80` on `commands` leaves room for HOT updates so lease renewal and state flips avoid index churn where possible. These are starting points; §7.3 records measured values.
+`BeginSemantic` locks the execution and captures `DBNow`. Library-owned and caller-owned semantic paths use blocking mode; claim alone uses skip-locked mode. The transaction-scoped caller client enforces ascending execution-lock requests before the application-write phase. `Apply` validates expected prior states and affected-row counts; it does not accept partially validated engine changes.
 
-## 5. Statements
+## 6. Core statement algorithms
 
-### 5.1 Execution lock and position allocation
-
-Every event-appending transaction opens with:
+### 6.1 Execution lock and position reservation
 
 ```sql
--- lock_execution
-SELECT execution_id, status, failing, fail_fast, next_event_position,
-       open_commands, absent_reads, deadline_at,
-       plan_name, plan_version, root_args, coordinator_name, coordinator_version
+SELECT clock_timestamp() AS db_now;
+
+SELECT *
 FROM flow.executions
 WHERE execution_id = $1
-FOR UPDATE;
-```
+FOR UPDATE;                 -- SKIP LOCKED only for the documented claim mode
 
-Positions are reserved in one statement once the transaction knows how many events it will append:
-
-```sql
--- allocate_positions
 UPDATE flow.executions
-SET next_event_position = next_event_position + $2,
-    updated_at = clock_timestamp()
+SET next_journal_position = next_journal_position + $2,
+    updated_at = $3
 WHERE execution_id = $1
-RETURNING next_event_position - $2 AS first_position;
+RETURNING next_journal_position - $2 AS first_position;
 ```
 
-Rollback restores the counter, so abandoned transactions leave no gap (architecture §7).
+Reservation happens after the engine knows the exact journal batch. A rollback restores the counter and leaves no gap.
 
-### 5.2 Claim
+### 6.2 Idempotent start
+
+Start first attempts the natural-key insert. On `executions_idempotency_uq`, it loads the existing row and compares `start_fingerprint` plus canonical bytes before checking terminal status. An equivalent repeat returns it unchanged, including its accepted command ceiling. A conflict writes nothing.
+
+New direct/plan/coordinator start inserts `ExecutionStarted` at position 1 and sets `next_journal_position` after the complete initial batch. Root or initial plan commands use the same batch insertion routine as later creation. Coordinator start stores initial state and `delivery_key = 'start'`/`delivery_state = 'ready'`.
+
+### 6.3 Command candidate probe
+
+Candidate discovery takes no lock and may return stale rows:
 
 ```sql
--- claim_commands
 WITH t AS MATERIALIZED (
-    SELECT clock_timestamp() AS now
+    SELECT clock_timestamp() AS db_now
 ),
-candidates AS (
-    SELECT c.command_id
-    FROM flow.commands c, t
-    WHERE c.lane = $1
-      AND c.state = 'ready'
-      AND c.eligible_at <= t.now
-      AND c.name = ANY($2::text[])
-      AND (c.name, c.version) IN (SELECT * FROM unnest($2::text[], $3::int[]))
-    ORDER BY c.eligible_at, c.command_id
-    FOR UPDATE OF c SKIP LOCKED
-    LIMIT $4
-),
-ord AS (
-    SELECT command_id, row_number() OVER (ORDER BY command_id)::int AS n
-    FROM candidates
-),
-claimed AS (
-    UPDATE flow.commands c
-    SET state            = 'running',
-        lease_id         = ($5::uuid[])[o.n],
-        leased_at        = t.now,
-        lease_expires_at = t.now + $6::interval,
-        attempt_count    = c.attempt_count + 1,
-        started_at       = COALESCE(c.started_at, t.now),
-        status_at        = t.now,
-        updated_at       = t.now
-    FROM ord o, t
-    WHERE c.command_id = o.command_id
-    RETURNING c.*, o.n
+registered(name, version, plan_name, plan_version) AS (
+    SELECT * FROM unnest(
+        $1::text[], $2::integer[], $3::text[], $4::integer[]
+    )
 )
-SELECT * FROM claimed ORDER BY n;
+SELECT d.execution_id, d.command_id, d.queue, d.next_run_at
+FROM registered r
+CROSS JOIN LATERAL (
+    SELECT execution_id, command_id, queue, next_run_at
+    FROM flow.command_dispatch, t
+    WHERE name = r.name
+      AND version = r.version
+      AND plan_name = r.plan_name
+      AND plan_version = r.plan_version
+      AND state IN ('ready', 'retry_wait')
+      AND next_run_at <= t.db_now
+    ORDER BY next_run_at, queue, command_id
+    LIMIT $5
+) d
+ORDER BY d.next_run_at, d.queue, d.command_id
+LIMIT $6;
 ```
 
-Notes:
+Registering a command pair makes that handler capable of every stored queue. Queue affects scheduling and concurrency, not handler compatibility. This is necessary because changing a command definition's queue default affects only new commands, while existing commands retain and must remain claimable on their accepted queue.
 
-- `$2`/`$3` are parallel arrays of the process's registered names and versions. The redundant `name = ANY($2)` predicate is a sargable pre-filter the planner can use against the index before the pair check.
-- `$4` is bounded by immediately free local capacity, never by a configured batch size alone.
-- `$5` is a Go-generated UUIDv7 array, one per requested slot; PostgreSQL arrays are one-indexed, matching `row_number()`. Surplus tokens are discarded.
-- **`eligible_at` is not written here.** Claiming touches `lease_*`, `status_at`, and `updated_at` only, preserving the taxonomy rule that grants alone move eligibility.
-- No execution row is locked, and `SKIP LOCKED` means the statement never waits — the deadlock exemption in architecture §8.3.
+The runtime groups probes by execution. For a chosen execution it begins a skip-locked semantic transaction, then locks proposed commands/dispatch rows in `command_id` order with `FOR UPDATE SKIP LOCKED`, revalidates all predicates, and may claim up to immediately free capacity. It appends one `AttemptStarted` per claim and commits before handlers receive work.
 
-Attempt insertion follows in the same transaction:
+### 6.4 Fenced command mutation
+
+Every running-command conclusion includes:
 
 ```sql
--- insert_attempts
-INSERT INTO flow.attempts
-    (attempt_id, command_id, execution_id, attempt_number, lease_id,
-     worker_id, process_id, state)
-SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::int[], $5::uuid[],
-                     $6::text[], $7::text[], array_fill('running'::text, ARRAY[$8]));
+... WHERE d.command_id = $1
+      AND d.state = 'running'
+      AND d.active_attempt_id = $2
+      AND d.lease_token = $3
+      AND d.lease_expires_at > $db_now
 ```
 
-### 5.3 Whole-execution load
+and a matching `commands.state = 'running'` check. Zero rows aborts the transaction. Success or terminal failure deletes dispatch; retry changes it to `retry_wait`, clears lease fields, and writes the already chosen `next_run_at`.
 
-One query per settle transaction feeds both plan evaluation and dependency resolution:
+### 6.5 Command creation batch
 
-```sql
--- load_execution_graph
-SELECT command_key, command_id, name, version, state, payload_hash,
-       unsatisfied_clauses, optional, eligible_at, start_deadline_at
-FROM flow.commands
-WHERE execution_id = $1;
+Under the execution lock:
 
--- load_execution_clauses
-SELECT command_key, clause_idx, kind, threshold, member_keys, member_events,
-       satisfied, unsatisfiable
-FROM flow.command_deps
-WHERE execution_id = $1;
-
--- load_event_index
-SELECT name, version, count(*) AS n, min(position) AS first_position
-FROM flow.events
-WHERE execution_id = $1
-GROUP BY name, version;
-```
-
-The event index is names and counts only. Payloads are fetched lazily, and only for names the plan actually reads:
+1. query all existing keys in the proposed set `FOR UPDATE` in ID order;
+2. compare declarations and separate new from equivalent;
+3. update execution counters using a guarded predicate:
 
 ```sql
--- load_facts
-SELECT name, version, position, payload
-FROM flow.events
-WHERE execution_id = $1 AND name = $2 AND version = $3
-ORDER BY position;
-```
-
-### 5.4 Settle
-
-```sql
--- append_events
-INSERT INTO flow.events
-    (event_id, execution_id, position, name, version, event_key, kind,
-     payload, payload_hash, command_id, attempt_id, causation_event_id,
-     correlation_id, occurred_at)
-SELECT * FROM unnest(...);
-
--- succeed_command  (fenced)
-UPDATE flow.commands
-SET state = 'succeeded', result = $3,
-    lease_id = NULL, leased_at = NULL, lease_expires_at = NULL,
-    finished_at = clock_timestamp(), status_at = clock_timestamp(),
-    updated_at = clock_timestamp()
-WHERE command_id = $1
-  AND lease_id = $2
-  AND state = 'running'
-  AND lease_expires_at > clock_timestamp()
-RETURNING command_key;
-
--- finish_attempt
-UPDATE flow.attempts
-SET state = $2, consumes_retry_budget = $3,
-    finished_at = clock_timestamp(), error = $4
-WHERE attempt_id = $1;
-
--- adjust_open_commands
 UPDATE flow.executions
-SET open_commands = open_commands + $2, updated_at = clock_timestamp()
-WHERE execution_id = $1;
+SET command_count = command_count + $new_count,
+    open_commands = open_commands + $new_open,
+    updated_at = $db_now
+WHERE execution_id = $id
+  AND (max_commands = 0 OR command_count + $new_count <= max_commands)
+RETURNING command_count;
 ```
 
-Zero rows from `succeed_command` means the lease was lost or the command is no longer running; the transaction rolls back and the runtime reports `ErrLeaseLost`.
+4. require one returned row before inserting any proposal;
+5. bulk insert commands in key order, dependency groups/members, waits, dispatch rows, and `CommandCreated` journal rows.
 
-### 5.5 Failure and retry
+All statements share the transaction, so a later failure rolls the counter back. Equivalent proposals neither increment nor append.
+
+### 6.6 Plan snapshot
+
+One narrow command query plus normalized dependency/wait/read queries load the full plan state. Event bodies are loaded only for selectors the plan actually reads and memoized during evaluation. Terminal results come from commands; journal positions provide event metadata.
+
+The snapshot queries run after the execution lock and after the triggering transition's in-transaction materializations are applied, so the plan sees the new terminal result, closed children, and emitted facts before commit.
+
+### 6.7 Event insertion and idempotency
+
+External `Publish` first looks up `(execution_id, namespace, name, key)` before rejecting a terminal execution. Equivalent canonical bytes and version return success; disagreement returns `ErrConflict`. A genuinely new event then requires a running execution and the execution lock.
+
+Worker `Emit` uses the same event-key constraint. Derived command and execution terminal events use their dedicated partial unique indexes, not caller event idempotency. Publishing a derived `Command.Done` descriptor through the public `Publish` path is rejected by descriptor validation.
+
+### 6.8 Coordinator selection and claim
+
+When an active coordinator is idle, selection first chooses `start` if pending. Otherwise it queries the lowest journal event above `inbox_position` matching any immutable registered `On` or `OnOutcome` selector. The runtime passes the selector set as rows; the journal event index supplies the scan.
+
+Selection is persisted as one delivery key before or during the skip-locked claim transaction. Retry leaves it selected. On success, a guarded update requires matching coordinator ID, delivery key, attempt, token, and lease; advances inbox to the event position, clears delivery fields, resets delivery counters, and updates state/revision. Start success clears `start_pending` without moving inbox.
+
+### 6.9 Maintenance
+
+Every sweep first probes a bounded index and then enters the ordinary execution-first semantic path:
+
+- expired command leases from `command_dispatch_lease_idx`;
+- expired coordinator leases from `coordinators_lease_idx`;
+- `wait_deadline_at` on pending commands;
+- `deadline_at` on running/failing executions.
+
+No due-retry or delayed-command state sweep exists: `next_run_at` becomes claimable naturally. Duplicate sweepers are safe because probes are stale hints and semantic locks/state predicates choose one winner.
+
+## 7. Constraints not expressible locally
+
+The store validates these in code under the execution lock and tests them as invariants:
+
+- command and all dependency members share one execution;
+- command projection and dispatch state agree;
+- `executions.command_count` equals accepted command rows;
+- `executions.open_commands` equals non-terminal command rows after each transition;
+- every command's `created_position` identifies its `CommandCreated` entry;
+- every terminal command's `terminal_position` identifies its sole terminal event;
+- coordinator state position identifies `ExecutionStarted` or its latest `CoordinatorTransition`;
+- journal causation remains inside the same execution;
+- a parent marked child-membership-closed has a complete immutable child set.
+
+Property and replay tests enforce these after arbitrary operation sequences.
+
+## 8. Autovacuum, growth, and partitioning
+
+Initial table settings prioritize the hot delivery rows:
 
 ```sql
--- retry_command  (fenced)
-UPDATE flow.commands
-SET state = 'retry_wait',
-    eligible_at = $4,                       -- a grant: eligibility legitimately moves
-    consumed_attempts = consumed_attempts + 1,
-    last_error = $3,
-    lease_id = NULL, leased_at = NULL, lease_expires_at = NULL,
-    status_at = clock_timestamp(), updated_at = clock_timestamp()
-WHERE command_id = $1 AND lease_id = $2 AND state = 'running'
-RETURNING command_key;
+ALTER TABLE flow.command_dispatch SET (
+    fillfactor = 75,
+    autovacuum_vacuum_scale_factor = 0.01,
+    autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_vacuum_threshold = 1000,
+    autovacuum_analyze_threshold = 1000
+);
 
--- fail_command  (fenced)
-UPDATE flow.commands
-SET state = 'failed', last_error = $3,
-    consumed_attempts = consumed_attempts + 1,
-    lease_id = NULL, leased_at = NULL, lease_expires_at = NULL,
-    finished_at = clock_timestamp(), status_at = clock_timestamp(),
-    updated_at = clock_timestamp()
-WHERE command_id = $1 AND lease_id = $2 AND state = 'running'
-RETURNING command_key;
+ALTER TABLE flow.coordinators SET (
+    fillfactor = 80,
+    autovacuum_vacuum_scale_factor = 0.02
+);
+
+ALTER TABLE flow.commands SET (fillfactor = 90);
+ALTER TABLE flow.attempts SET (fillfactor = 90);
+ALTER TABLE flow.journal SET (fillfactor = 100);
 ```
 
-`retry_wait → ready` happens through the maintenance sweep or directly when the retry time has already passed; the transition writes `state` only, never `eligible_at`.
+The exact values are benchmark outputs, not dogma. The migration records chosen values only after HOT-update, WAL, and dead-tuple measurements.
 
-An interruption — shutdown or lease loss — writes the attempt row and releases the command without incrementing `consumed_attempts`:
+Partitioning is deferred. M1 retains terminal executions indefinitely and supports modest per-execution topology, so premature partitions complicate unique constraints and migrations. Journal archival is the first likely reason to partition later, by time or hash while preserving execution-local reads.
 
-```sql
--- release_command
-UPDATE flow.commands
-SET state = 'ready',
-    lease_id = NULL, leased_at = NULL, lease_expires_at = NULL,
-    status_at = clock_timestamp(), updated_at = clock_timestamp()
-WHERE command_id = $1 AND lease_id = $2 AND state = 'running';
-```
+## 9. Migrations and compatibility
 
-### 5.6 Reconciliation writes
+Migration units are embedded, monotonically numbered, never rewritten after release, and each applied in its own transaction:
 
-```sql
--- insert_commands  (bulk, ordered by command_key)
-INSERT INTO flow.commands (...)
-SELECT * FROM unnest(...)
-ON CONFLICT (execution_id, command_key) DO NOTHING
-RETURNING command_key, command_id;
+1. acquire `pg_advisory_xact_lock` derived from database identity and schema;
+2. re-read migration state under the lock;
+3. verify every applied checksum;
+4. apply exactly one unit;
+5. update compatibility and record library version/checksum;
+6. commit.
 
--- insert_clauses
-INSERT INTO flow.command_deps
-    (execution_id, command_key, clause_idx, kind, threshold, member_keys, member_events)
-SELECT * FROM unnest(...);
+Suggested initial units: metadata; executions; commands/dispatch; topology/waits; coordinators/attempts; journal/plan reads; indexes/storage settings. `New` calls compatibility check only. It never migrates implicitly.
 
--- update_clause_resolution
-UPDATE flow.command_deps d
-SET satisfied = v.satisfied, unsatisfiable = v.unsatisfiable,
-    resolved_at = clock_timestamp()
-FROM (SELECT * FROM unnest($2::text[], $3::smallint[], $4::bool[], $5::bool[])
-        AS t(command_key, clause_idx, satisfied, unsatisfiable)) v
-WHERE d.execution_id = $1
-  AND d.command_key = v.command_key
-  AND d.clause_idx = v.clause_idx
-  AND NOT d.satisfied AND NOT d.unsatisfiable;      -- guard: resolve once
+Expand/migrate/contract governs rolling schema changes. The runtime refuses an unknown future writer version or an incompatible minimum reader/writer range with `ErrSchema`.
 
--- promote_ready
-UPDATE flow.commands
-SET state = 'ready', unsatisfied_clauses = 0,
-    status_at = clock_timestamp(), updated_at = clock_timestamp()
-WHERE execution_id = $1 AND command_key = ANY($2::text[]) AND state = 'pending';
+## 10. SQL error mapping
 
--- skip_commands
-UPDATE flow.commands
-SET state = 'skipped', finished_at = clock_timestamp(),
-    status_at = clock_timestamp(), updated_at = clock_timestamp()
-WHERE execution_id = $1 AND command_key = ANY($2::text[]) AND state = 'pending';
-```
-
-`ON CONFLICT DO NOTHING` on insert plus the `state = 'pending'` guards make repeated plan evaluation idempotent at the statement level, independent of the engine's in-memory checks.
-
-### 5.7 Plan reads
-
-```sql
--- replace_plan_reads
-DELETE FROM flow.plan_reads WHERE execution_id = $1;
-
-INSERT INTO flow.plan_reads (execution_id, read_kind, name, version, present)
-SELECT * FROM unnest(...);
-
-UPDATE flow.executions
-SET absent_reads = $2, updated_at = clock_timestamp()
-WHERE execution_id = $1;
-```
-
-### 5.8 Completion
-
-```sql
--- complete_execution
-UPDATE flow.executions
-SET status = $2, outcome_ref = $3, failure = $4, failing = false,
-    finished_at = clock_timestamp(), status_at = clock_timestamp(),
-    updated_at = clock_timestamp()
-WHERE execution_id = $1
-  AND status = 'running'
-  AND open_commands = 0
-  AND ($2 <> 'succeeded' OR absent_reads = 0)
-RETURNING execution_id;
-```
-
-The predicate enforces both completion conditions in the database, so an engine bug cannot produce a false success. Zero rows means the execution was no longer eligible to complete.
-
-### 5.9 Maintenance
-
-```sql
--- expire_start_deadlines
-WITH doomed AS (
-    SELECT command_id FROM flow.commands
-    WHERE start_deadline_at <= clock_timestamp()
-      AND state IN ('pending','ready')
-    ORDER BY start_deadline_at, command_id
-    FOR UPDATE SKIP LOCKED
-    LIMIT $1
-)
-UPDATE flow.commands c SET state = 'expired', ... FROM doomed WHERE c.command_id = doomed.command_id
-RETURNING c.execution_id, c.command_key;
-
--- recover_expired_leases
-SELECT command_id, execution_id, lease_id FROM flow.commands
-WHERE state = 'running' AND lease_expires_at <= clock_timestamp()
-ORDER BY lease_expires_at, command_id
-FOR UPDATE SKIP LOCKED
-LIMIT $1;
-
--- due_retries
-UPDATE flow.commands
-SET state = 'ready', status_at = clock_timestamp(), updated_at = clock_timestamp()
-WHERE command_id IN (
-    SELECT command_id FROM flow.commands
-    WHERE state = 'retry_wait' AND eligible_at <= clock_timestamp()
-    ORDER BY eligible_at, command_id
-    FOR UPDATE SKIP LOCKED
-    LIMIT $1
-)
-RETURNING lane;
-
--- expire_executions
-SELECT execution_id FROM flow.executions
-WHERE status = 'running' AND deadline_at <= clock_timestamp()
-ORDER BY deadline_at, execution_id
-FOR UPDATE SKIP LOCKED
-LIMIT $1;
-
--- unclaimable_backlog
-SELECT name, version, count(*) AS pending
-FROM flow.commands
-WHERE state = 'ready' AND eligible_at <= clock_timestamp()
-GROUP BY name, version;
-```
-
-Every sweep is bounded and uses `SKIP LOCKED`, so duplicate maintenance runners are safe with no leader election. Deadline expiry and lease recovery re-enter the settle path per execution, taking the execution lock in the ordinary way.
-
-### 5.10 Inspection
-
-```sql
--- trace: four bounded queries, all indexed
-SELECT ... FROM flow.executions  WHERE execution_id = $1;
-SELECT ... FROM flow.commands    WHERE execution_id = $1 ORDER BY created_at, command_id;
-SELECT ... FROM flow.command_deps WHERE execution_id = $1;
-SELECT ... FROM flow.events      WHERE execution_id = $1 ORDER BY position;
-SELECT ... FROM flow.attempts    WHERE execution_id = $1 ORDER BY command_id, attempt_number;
-
--- history increment
-SELECT ... FROM flow.events
-WHERE execution_id = $1 AND position > $2
-ORDER BY position LIMIT $3;
-```
-
-`Trace` runs its queries in one `REPEATABLE READ` transaction so the returned picture is self-consistent.
-
-## 6. Error mapping surface
-
-Constraint names are a stable part of the migration contract and are the sole basis for classification. Renaming one is a breaking change.
-
-| Constraint / condition | Public error |
+| Source | Public meaning |
 |---|---|
-| `executions_natural_key_idx` | compare fingerprint → existing execution or `ErrConflict` |
-| `commands` `UNIQUE (execution_id, command_key)` | compare `payload_hash` → no-op or `ErrConflict` |
-| `events_idempotency_idx` | compare `payload_hash` → existing event or `ErrConflict` |
-| `events` `UNIQUE (execution_id, position)` | internal invariant violation; never surfaced |
-| `attempts` `UNIQUE (lease_id)` | internal invariant violation |
-| `coordinators` `UNIQUE (execution_id, name)` | idempotent instance or `ErrConflict` |
-| zero rows from a fenced update | diagnostic lookup → `ErrLeaseLost`, `ErrTerminal`, or `ErrNotFound` |
-| zero rows from `complete_execution` | not eligible; retry on next settle |
-| any `CHECK` violation | `ErrInvalid` with the safe field name |
+| `executions_idempotency_uq` | compare stored start identity -> existing or `ErrConflict` |
+| `commands_execution_key_uq` | compare declaration -> equivalent or `ErrConflict` |
+| `journal_application_event_key_uq` | compare event definition/bytes -> idempotent or `ErrConflict` |
+| command/attempt/terminal partial unique indexes | internal invariant violation unless resolving an ambiguous commit |
+| known foreign key | `ErrNotFound` or `ErrInvalidState` by operation |
+| known check constraint | `ErrInvalid` with safe field/reason |
+| zero fenced rows | diagnostic read -> `ErrLeaseLost`, `ErrTerminal`, or `ErrNotFound` |
+| SQLSTATE `40001`, `40P01` | internally retry only where authorized; otherwise transient wrapped error |
+| SQLSTATE `55P03` | transient lock conflict for no-wait caller/claim path |
+| connection loss at commit | uncertain commit; caller re-derives by stable identity |
+| compatibility/checksum mismatch | `ErrSchema` |
 
-## 7. Test and benchmark plan
+The mapper never parses PostgreSQL message text and never includes SQL or canonical values in its public error.
 
-### 7.1 Constraint tests
+## 11. Inspection queries
 
-Every `CHECK` and unique index has a test asserting it rejects the invalid shape: lease without running state, result on a non-succeeded command, pending with zero clauses, both `satisfied` and `unsatisfiable`, driver-exclusivity on executions, `failing` outside `running`, negative counters.
+`History` is one bounded journal scan:
 
-### 7.2 Statement tests
+```sql
+SELECT ...
+FROM flow.journal
+WHERE execution_id = $1 AND position > $2
+ORDER BY position
+LIMIT $3;
+```
 
-- claim assigns distinct lease tokens and never returns the same command twice under 100 concurrent claimers;
-- claim writes no `eligible_at`;
-- allocation returns contiguous positions and rollback restores the counter;
-- fenced updates reject stale lease tokens;
-- reconciliation statements are idempotent when replayed;
-- `complete_execution` refuses while `open_commands > 0` or `absent_reads > 0`;
-- every maintenance sweep is bounded and safe with concurrent runners.
+`Trace` runs a small fixed query set in one `REPEATABLE READ, READ ONLY` transaction: execution; commands with dispatch; dependencies/waits; attempts; journal page(s); coordinator. It does not execute N queries per command. Live state may advance immediately after the snapshot, but the returned view is internally consistent.
 
-### 7.3 Benchmarks and plans
+`ListExecutions` uses stable `(created_at, execution_id)` cursor pagination and only the indexed filters defined in the functional spec. Metadata filtering is bounded JSON containment over the validated string map and uses `executions_metadata_idx`; arbitrary JSONPath expressions are not exposed.
 
-`EXPLAIN (ANALYZE, BUFFERS)` for the claim, whole-execution load, and event-name lookup at 10K, 100K, 1M, and 10M command rows, across representative state distributions.
+## 12. Test and benchmark plan
 
-Required measurements before the index set is frozen:
+### 12.1 DDL and constraints
 
-1. **The `(name, version)` claim question** (§3.2) — measured against a lane where 90% of `ready` head rows are unregistered kinds.
-2. Whole-execution load cost at 1,000 nodes, confirming the plan cost model in FS §10.5.
-3. Write amplification of `commands_claim_idx` under sustained claim/renew/settle churn.
-4. HOT-update rate on `commands` at `fillfactor` 80 versus 90 versus default.
-5. Dead-tuple and WAL rate on `commands` and `events` under a sustained mixed workload.
+Every named check, foreign key, unique index, partial unique index, and terminal/lease shape has a direct rejection test. Migration tests cover clean install, repeated install, concurrent migrators, checksum mismatch, failed unit rollback, custom schema quoting, compatibility ranges, and upgrade from every released fixture.
 
-## 8. Acceptance conditions
+### 12.2 Statement and concurrency tests
 
-- every table, constraint, and index above exists in migration SQL with the stated names;
-- constraint names match the error-mapping table exactly;
-- no statement writes `eligible_at` outside a documented grant;
-- no statement writes an event without holding the execution lock;
-- the claim statement takes no execution lock and never waits;
-- resolution requires no reverse-edge index and no recursive SQL;
-- all constraint, statement, and concurrency tests pass;
-- benchmark evidence is recorded for each item in §7.3, and the index set reflects it.
+- allocation is contiguous; rollback reuses the abandoned range;
+- concurrent appenders produce position order equal to commit order;
+- command creation batches increment count once and roll back wholly at the ceiling;
+- candidate probes may be stale but claims never double-own work;
+- command and coordinator claims append start history before returning;
+- stale tokens cannot conclude or renew;
+- retry changes next run only; interruption moves neither budget anchor nor consumed count;
+- event idempotency is checked before terminal rejection;
+- plan snapshots observe in-transaction trigger state;
+- every maintenance runner is bounded and duplicate-safe;
+- replay from journal equals settled projections after randomized operations.
+
+### 12.3 Required query-plan benchmarks
+
+Run `EXPLAIN (ANALYZE, BUFFERS, WAL)` at 10K, 1M, and 10M aggregate commands/journal rows with realistic ready/running/terminal distributions:
+
+1. claim with 90% of the oldest lane backlog unregistered locally;
+2. claim bursts from one 1,000-command execution and from many executions;
+3. whole-plan snapshot at 10, 100, and 1,000 commands with 100 dependencies per node at the adversarial edge;
+4. coordinator next-match lookup with sparse subscriptions and long unmatched prefixes;
+5. history paging and full 1,000-command trace;
+6. lease renewal at 500 active attempts;
+7. journal insert/WAL growth at 1 KiB, 64 KiB, and maximum payload sizes;
+8. HOT update and autovacuum behavior for dispatch/coordinator rows.
+
+## 13. Acceptance conditions
+
+- migration DDL implements every table and stable constraint above;
+- no semantic or journal statement runs without the execution lock;
+- claim uses only skip-locked execution-first locks and commits `AttemptStarted` before invocation;
+- renewal writes no journal entry and changes no durable timing anchor;
+- one complete journal source reconstructs command existence, topology, attempts, events, outcomes, and coordinator transitions;
+- command ceiling and open count are maintained without table scans and verified after randomized transitions;
+- materialization/dispatch invariants and exactly-one terminal constraints hold under concurrency and injected crashes;
+- all integration tests and the required query-plan benchmarks pass with recorded evidence.

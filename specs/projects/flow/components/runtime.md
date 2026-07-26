@@ -2,402 +2,500 @@
 status: draft
 ---
 
-# Component: Runtime and Operations
+# Component: distributed runtime and operations
 
 ## 1. Purpose and scope
 
-This component is everything that runs continuously: the worker pool, the claim loop, lease management, the notifier and wake hub, maintenance sweeps, the migration engine, error mapping, and the public test harness.
+The runtime is disposable process machinery around the durable store and deterministic engine. It owns registration, process lifecycle, command/coordinator dispatch, handler invocation, lease renewal, polling and optional notifications, maintenance, shutdown, transaction-bound clients, inspection entry points, observations, and fault injection.
 
-Responsibilities: process lifecycle, dispatch, leases, notification, maintenance, migrations, error classification, observation delivery, and `flowtest`.
+Correctness cannot depend on any runtime field surviving a crash. A new compatible replica reconstructs work solely from PostgreSQL.
 
-Non-responsibilities: SQL (`schema.md`), settle-transaction algorithms (`engine.md`), public type shapes (functional spec §4).
-
-## 2. Runtime structure
+## 2. Runtime state and lifecycle
 
 ```go
 type Runtime struct {
     db       *pgkit.DB
+    store    *store.Store
     cfg      Config
-    registry *registry          // immutable after Run
+    registry *registry
+    observer Observer
 
-    lanes    map[string]*lane   // one dispatcher per bound lane
-    leases   *leaseManager      // one per process
-    notifier *notifier          // optional, one session connection
-    hub      *wakeHub
-    maint    *maintenance
+    lifecycle atomic.Uint32
+    runCtx    context.Context
+    stop      context.CancelCauseFunc
+    group     runGroup
 
-    state    lifecycleState     // created → running → stopping → stopped
+    workers   *commandScheduler
+    coords    *coordinatorScheduler
+    leases    *leaseManager
+    wake      *wakeHub
+    notifier  *notifier
+    maint     *maintenance
 }
 ```
 
-Lifecycle is one-way:
-
 ```text
-created → running → stopping → stopped
-                  ↘ halted ───┘
+created -> running -> stopping -> stopped
+              \-> failed ------/
 ```
 
-`Register` is valid only in `created`. `Run` transitions to `running`, blocks, and may be called once. `Stop` is idempotent. There is no restart after `stopped`.
+- `New` validates options and schema compatibility, but starts no goroutine and never migrates.
+- `Register` is valid in `created`, including on an API-only runtime that never calls `Run`.
+- `Run` freezes the registry, starts components, blocks until cancellation/fatal runtime error, performs shutdown, and may be called once.
+- `Stop` is idempotent, triggers graceful shutdown, and waits subject to its context.
+- `*Runtime` implements `Client` in every non-closed lifecycle; execution operations do not require `Run`.
 
-### 2.1 Registry
+A runtime with no registered workers can be an API client. A runtime registering only a subset is a specialized pool. There is no package-global registry.
 
-The registry is built from `Registration` values and frozen at `Run`:
+## 3. Configuration
+
+The functional defaults remain normative:
+
+| Setting | Default |
+|---|---|
+| command lease | 60 seconds |
+| command retry policy | 5 budget-consuming attempts; 1s, 5s, 30s, 2m backoff with jitter |
+| elapsed retry bound | none unless declared |
+| execution deadline | 30 days |
+| commands per execution | 1,000; `0` disables |
+| idle poll | 1 second |
+| shutdown grace | 30 seconds |
+| command args/result | 256 KiB each |
+| event | 64 KiB |
+| coordinator state | 256 KiB |
+| dependencies per plan command | 100 |
+
+Process concurrency defaults to `max(1, GOMAXPROCS)` and is configurable globally and per queue. A claim batch is capped by immediately free slots and a small operational maximum; it is not a durable or public queue limit. Invalid lease/renewal relationships, negative concurrency, empty queue names, unsafe schema names, invalid sizes, or negative command ceilings fail `New`.
+
+Environment-variable parsing belongs to the application. Runtime options are typed and immutable after `New`.
+
+## 4. Registry and compatibility
+
+### 4.1 Registration forms
+
+The sealed `Registration` interface is implemented by:
+
+- `Handle(Command, worker, options...)`;
+- `PlanDef[A]`;
+- `Coordinator[S]`.
+
+This is why the worked plan process registers `ReportExecution` alongside its workers. `Command` alone is not executable without `Handle`; application `Event` definitions need no independent registration.
 
 ```go
 type registry struct {
-    workers map[nameVersion]workerEntry   // command handlers
-    plans   map[nameVersion]planEntry
-    coords  map[nameVersion]coordEntry
-    lanes   map[string][]nameVersion      // claim filter per lane
+    commands     map[nameVersion]workerEntry
+    plans        map[nameVersion]planEntry
+    coordinators map[nameVersion]coordinatorEntry
+    coordEvents  map[nameVersion]selectorSet
 }
 ```
 
-`lanes` is what the claim statement's `(name, version)` arrays are built from, and it is immutable — so a claim filter can never drift from what the process can actually execute. Duplicate registration of a `(name, version)` pair is rejected at registration time.
+It is built under a mutex while created, deeply copied/frozen by `Run`, and read lock-free afterward. Duplicate and codec/handler conflicts are rejected before any work starts.
 
-## 3. Claim loop
+### 4.2 Plan compatibility is required at the committing replica
 
-One dispatcher goroutine per bound lane.
+A plan is evaluated in the same transaction as a relevant fact or command terminal event. Therefore any runtime that performs such a transition must possess the execution's exact plan name/version:
+
+- command dispatch in a plan-driven execution requires both the command worker and plan registration;
+- `Publish`, `Issue`, and command cancellation against a plan execution require that plan registered on the calling runtime when they can trigger evaluation;
+- wait-expiry maintenance for a plan execution runs only on a replica with that plan;
+- plan start can use the receiver's definition directly, but future processing still requires deployment registration.
+
+If the capability is absent, the operation writes nothing and returns a structured unavailable/invalid-state error, or the dispatcher leaves the work unclaimed. Inspection reports `missing_plan_definition`. This preserves atomic plan semantics instead of splitting a transition and its declarations across transactions.
+
+Direct execution needs only the command worker. Coordinator command workers do not need the coordinator definition to settle; their terminal events remain in the journal until a compatible coordinator runtime consumes them. Coordinator delivery itself requires the exact coordinator version and matching registered subscription.
+
+### 4.3 Rolling deployment
+
+Claim filters are built from the immutable registry. Old replicas never claim new command versions; a coordinator replica never claims an unknown coordinator or event/command subscription version; plan commands never settle on a replica with the wrong plan version. Unknown work remains pending with no retry consumption.
+
+Unclaimable observations distinguish missing command worker, missing plan definition, missing coordinator definition, and no matching coordinator handler.
+
+## 5. Command scheduler
+
+### 5.1 Capacity model
+
+There is a global weighted semaphore and logical lane state created on demand for queues returned by the probe. A lane may have a smaller limit and weight; all lanes share the global cap. A registered command pair is capable of every queue. This is important because a changed `WithQueue` default affects new commands only and cannot make old accepted queues unclaimable. The runtime acquires a slot **before** claim and transfers it directly to one handler. There is no leased local backlog.
 
 ```go
-for {
-    free := lane.slots.Available()
-    if free == 0 {
-        lane.waitForCapacity(ctx)
+for runtimeRunning {
+    slots := scheduler.tryReserveCapacity()
+    if slots == 0 {
+        scheduler.waitCapacity(ctx)
         continue
     }
 
-    batch := min(free, lane.cfg.MaxClaimBatch)
-    claimed, err := store.ClaimCommands(ctx, lane.name, registry.lanes[lane.name], batch, cfg.LeaseDuration)
-    if err != nil {
-        lane.backoff.Next()
+    candidates := store.ProbeCommands(ctx, registry.claimFilter(), slots*probeFactor)
+    claimed := scheduler.claimCandidates(ctx, candidates, slots)
+    scheduler.releaseUnused(slots - len(claimed))
+
+    if len(claimed) == 0 {
+        scheduler.waitAfterEmptyProbe(ctx)
         continue
     }
-
-    if len(claimed) > 0 {
-        lane.backoff.Reset()
-        for _, c := range claimed {
-            leases.Register(c)
-            lane.dispatch(c)      // minimally buffered handoff
-        }
-        continue                  // immediately try for more
+    for _, c := range claimed {
+        scheduler.startHandler(c) // slot ownership moves to goroutine
     }
-
-    lane.waitAny(ctx, hub.Subscribe(lane.name), lane.nextVisibleTimer(), cfg.PollInterval)
 }
 ```
 
-Three rules the loop must not violate:
+The scheduler uses deficit round-robin across nonempty queues so a busy default lane cannot starve a low-rate lane. Fairness is process-local optimization only; database ordering remains `next_run_at, command_id` within a registered kind.
 
-1. **Never claim beyond immediately free capacity.** `batch` is bounded by `free`, not by configuration alone, so a lease never starts ticking while its command sits in a local queue.
-2. **Never hold a connection across handler execution.** The claim transaction commits before dispatch.
-3. **Empty claim arms a timer, it does not spin.** The wait is the earliest of a wake hint, the next `eligible_at` in that lane, and the fallback poll.
+### 5.2 Probe and no-wait claim
 
-`nextVisibleTimer` issues one cheap indexed query for the lane's minimum future `eligible_at`, capped by the poll interval, so a lane whose next work is an hour out does not poll every second.
+Probe uses the denormalized dispatch index and the exact local command pairs across their stored queues. It additionally filters plan-driven candidates by exact registered plan pair using immutable plan columns denormalized into dispatch. The probe returns queue names; the scheduler applies global/per-queue capacity and fairness before claim.
 
-### 3.1 Handler invocation
+Candidates are hints. The scheduler groups by execution, opens a skip-locked semantic transaction, locks the execution first and candidate commands second, and revalidates:
+
+- execution remains running/failing in a state that permits this command;
+- definition and plan capability are still locally present;
+- command/dispatch state and schedule agree;
+- database time has reached `next_run_at`;
+- execution, retry budget, and wait deadlines have not already ended it.
+
+It may claim several commands from the same execution in one short commit, bounded by free slots. Expired budgets/deadlines are settled terminally in that transaction instead of invoking the handler. Successful claim creates attempts, lease tokens, and `AttemptStarted` journal entries. Handler goroutines start only after commit success.
+
+No claim waits for another execution or work row. A skipped/busy/stale candidate returns its reserved capacity and the loop probes again or sleeps.
+
+### 5.3 Empty-probe waiting
+
+After an empty claim, the lane waits for the earliest of:
+
+- a generation-counted wake hint;
+- the next indexed future `next_run_at` among locally compatible work;
+- the fallback poll interval;
+- shutdown.
+
+The wake generation is sampled before the probe and passed to the wait, closing the hint-between-check-and-sleep race. Timers are local latency aids only; claim revalidates database time.
+
+## 6. Worker invocation
+
+### 6.1 Preparing work
+
+The claim result contains canonical arguments, accepted policy/timing, command metadata, and active attempt fence. Before user code, the runtime:
+
+1. looks up the frozen worker entry;
+2. decodes typed arguments;
+3. batch-loads every explicitly declared dependency's definition/state/result or failure;
+4. builds `Work[A]` and its staged buffer;
+5. constructs a context whose deadline is the earliest accepted per-attempt, retry-budget, and execution deadline;
+6. registers the lease and context cancel function with the lease manager.
+
+Decode/type incompatibility for a registered durable version is a permanent safe failure and an operational alert; it is never retried indefinitely as infrastructure noise.
+
+### 6.2 Running
+
+No pool connection or transaction is held while the worker runs. Panic recovery captures a bounded redacted stack fingerprint, not arbitrary arguments or locals. A context uses cancellation causes to distinguish shutdown, lost lease, command/execution cancellation, and timeouts.
+
+The runtime unregisters the active lease only after settlement has either committed, established loss of ownership, or delegated recovery to lease expiry. It does not assume that a locally returned handler still owns the command.
+
+### 6.3 Settling
+
+Success invokes the engine/store settlement from the architecture. The runtime retries only the short database transaction with the already canonical decision buffer. If the registered commit function is present, the store exposes the current `pgx.Tx` through the narrow `flow.Tx` adapter only after all Flow locks/writes are acquired.
+
+On commit-function failure the success transaction rolls back. The runtime classifies that error and starts a fresh fenced conclusion transaction, which either schedules retry or fails the command. The application function may run again after a deadlock/rollback and must be deterministic/idempotent from its durable inputs.
+
+If commit outcome is ambiguous, the runtime does not blindly run a second success settlement. It queries the stable attempt/command identity: terminal success means done; still-running same fence permits retrying the settlement; changed fence means lost ownership.
+
+External effects performed by the worker before settlement may repeat after crash or lease takeover. Documentation and observations expose `CommandID` as the preferred external idempotency key.
+
+## 7. Lease manager
+
+The lease manager owns only active attempts in this process:
 
 ```go
-func (l *lane) run(c ClaimedCommand) {
-    entry := registry.workers[c.NameVersion()]
-    hctx, cancel := withTimeout(ctx, effectiveTimeout(c, entry))
-    defer cancel()
-
-    result, err := entry.invoke(hctx, c.Payload, scope)      // panics recovered here
-    leases.Unregister(c)
-
-    switch classify(err, hctx) {
-    case outcomeSuccess:     store.Settle(c, result, scope)
-    case outcomeRetry:       store.Retry(c, retryAt(c, err), err)
-    case outcomePermanent:   store.Fail(c, err)
-    case outcomeInterrupted: store.Release(c)                // no budget consumed
-    case outcomeLeaseLost:   /* write nothing; the fence already rejects us */
-    }
+type activeLease struct {
+    subject     subjectID
+    attemptID   AttemptID
+    token       UUID
+    expiresAt   time.Time
+    cancel      context.CancelCauseFunc
 }
 ```
 
-Timeout precedence is per-node override, then command definition, then pool default, then none. A timeout is classified as a retryable failure that consumes budget; shutdown interruption and lease loss consume nothing.
+Renewal is scheduled near one third of lease duration with bounded deterministic per-attempt jitter, grouped into one statement per subject table. It uses PostgreSQL time and extends only rows that remain running with the same token. The returned set is authoritative:
 
-## 4. Lease manager
+- renewed -> update local accepted expiry;
+- missing -> cancel exactly that handler with `ErrLeaseLost` and unregister it;
+- transient database error -> retry while conservative local time indicates a safe chance remains; otherwise cancel and let durable expiry recover.
 
-One per process, tracking every active attempt.
+The manager never reacquires, resurrects, or extends an already expired token. Renewals append no journal entry and do not move status, budget, schedule, or attempt-start timestamps.
 
-```go
-type leaseManager struct {
-    active map[CommandID]*activeLease   // lease token, expiry, cancel func
-}
-```
+## 8. Coordinator scheduler
 
-Each lease is renewed at one third of its duration, bounded to 5–30 seconds, with per-lease jitter so a process holding 200 leases does not renew them in one burst. Renewal batches by lane and target duration into a single statement.
+### 8.1 Selecting deliveries
 
-```go
-func (m *leaseManager) renewBatch(ctx context.Context, batch []*activeLease) {
-    kept, err := store.RenewLeases(ctx, ids(batch), tokens(batch), m.cfg.LeaseDuration)
-    if err != nil {
-        // transient: retry only while enough lease time plausibly remains
-        return
-    }
-    for _, l := range batch {
-        if !kept.Has(l.CommandID) {
-            l.cancel(ErrLeaseLost)       // cancel only this handler's context
-            m.Unregister(l.CommandID)
-        }
-    }
-}
-```
+One loop probes active coordinator instances whose exact definition is registered locally. If an instance is idle, the store/engine selects start activation first or the lowest matching retained event above its inbox and persists a stable delivery key. If ready/retry-wait and due, claim follows the same execution-first skip-locked pattern as commands and appends `AttemptStarted`.
 
-A receipt not returned by the renewal statement has lost ownership. Only that handler's context is cancelled; other handlers in the process are untouched. The manager never attempts to reacquire an expired lease, and never claims ownership after known expiry — the fence in `schema.md` §5.4 would reject the write anyway.
+The local selector set includes ordinary `On` event selectors and terminal command selectors for `OnOutcome`. The journal query can jump over unmatched entries. Early events are retained and therefore match after start/instance creation.
 
-## 5. Notifier and wake hub
+### 8.2 Capacity and serialization
 
-### 5.1 Channel
+Coordinator decisions use a separate configurable semaphore because they should be short and must not be starved by long workers. There is at most one selected/running delivery per instance, while different coordinators and command workers run concurrently.
 
-The channel name is `flow_` plus the first 24 lowercase hex characters of SHA-256 over the normalized schema name, so multiple schemas in one database do not cross-wake and no untrusted identifier is ever interpolated into `LISTEN`.
+No database connection is held during the handler. The runtime decodes current state and received payload, invokes the exact frozen handler, and stages changes. A lease manager fences it like a worker.
 
-Payload is compact versioned JSON — a lane name or an execution ID, never payloads, arguments, errors, or credentials:
+### 8.3 Settlement and retry
+
+Nil handler return settles state revision, inbox/start acknowledgment, `CoordinatorTransition`, events, commands, and explicit completion atomically. The command ceiling is checked before any output. Handler error discards all mutated state/output and applies coordinator delivery retry policy to the same key; later events cannot overtake it.
+
+Permanent/exhausted error or deterministic output defect appends `CoordinatorFailed`, fails the execution, and cancels work. A process crash after handler code but before commit simply redelivers the same start/event after lease recovery.
+
+## 9. Notifications and polling
+
+### 9.1 Correctness boundary
+
+Every loop can operate with polling only. Notification payloads never carry work, state, payloads, results, errors, positions that act as checkpoints, or ownership. A missed, duplicated, malformed, or reordered notification changes latency only.
+
+### 9.2 Channel and payload
+
+The channel is `flow_` plus a fixed-length lowercase hex digest of normalized schema and database identity. The notifier obtains one session-capable `pgx.Conn`; when the application uses a transaction-pooling proxy it may provide a separate listener connector. Without one, the runtime is intentionally poll-only.
+
+Payloads are small versioned hints:
 
 ```json
-{"v":1,"k":"lane","n":"monitors"}
+{"v":1,"kind":"queue","key":"default"}
+{"v":1,"kind":"execution","key":"<opaque-id>"}
 ```
 
-Unknown versions or kinds trigger a process-wide catch-up wake rather than an error.
+Queue and execution hints are deduplicated within the semantic transaction, with at most one of each affected key. Unknown payload versions trigger a broad local wake rather than failure.
 
-### 5.2 Listener lifecycle
+### 9.3 Listener lifecycle
 
-The notifier owns one session-persistent `pgx.Conn`, obtained from `WithListenConnector` when queries go through a transaction-pooling proxy. Without a connector the runtime is poll-only, which is fully correct and reported through inspection rather than logged as a warning.
+On initial connect and every reconnect:
 
-On every connection:
+1. establish session and `LISTEN`;
+2. publish a catch-up generation for every registered queue and coordinator loop;
+3. receive until error/cancellation;
+4. close and reconnect with capped jittered backoff.
 
-1. connect with context and set `application_name`;
-2. execute the quoted `LISTEN` and commit it;
-3. **publish a catch-up wake for every bound lane** and ask the lease manager to revalidate fences;
-4. read notifications until error or shutdown;
-5. on error, close, report, and reconnect with capped jittered backoff.
+Catch-up after `LISTEN` closes the connection-gap race. The generation-counted wake hub uses capacity-one channels, coalesces duplicates, and never blocks a transaction observer or listener.
 
-Step 3 closes the start-up and reconnect race: work committed while no listener was attached is found by the resulting poll rather than waiting for the next unrelated notification.
+### 9.4 Transactional NOTIFY cost
 
-### 5.3 Wake hub
+PostgreSQL serializes portions of transactional notification commit processing. The implementation benchmarks notify-enabled and poll-only throughput before enabling hints by default for production guidance. Because polling is complete, operators can disable notifications without feature loss. A future decoupled best-effort hint flusher is compatible, but is not required in M1.
 
-An in-memory router keyed by lane. Each key holds a monotonically increasing generation; subscribers receive through a capacity-one channel.
+## 10. Maintenance
+
+Maintenance has no elected leader. Each task performs a bounded stale probe, then enters the ordinary semantic transaction with state/fence revalidation.
+
+| Task | Compatible runtime requirement | Effect |
+|---|---|---|
+| command lease expiry | none for release; plan registration when terminal plan work must be processed | conclude lost attempt and restore persisted schedule without budget use |
+| coordinator lease expiry | exact coordinator version | redeliver same stable delivery |
+| `Within` expiry | exact plan for plan-driven execution | expire command, resolve dependencies, re-evaluate plan |
+| execution deadline | none | expire execution, cancel commands/coordinator, no failure branches |
+| unclaimable scan | none | emit safe counts/reasons only |
+| consistency audit | none | detect impossible projection/dispatch/counter shapes; never silently rewrite semantic history |
+
+There is no due-retry or due-delay mover. Time eligibility is a claim predicate. Full maintenance batches self-wake to drain backlog rather than waiting a complete interval.
+
+A consistency audit may repair a purely derived missing wake or delete a provably orphaned nonsemantic dispatch row only through a named, journal-neutral reconciliation rule. Any repair that changes settled command/execution meaning is an administrative future capability, not automatic maintenance.
+
+## 11. Graceful shutdown
+
+`Stop` and parent context cancellation execute:
+
+1. atomically enter `stopping` and stop new probes/claims;
+2. keep notifier and lease renewal alive for in-flight handlers;
+3. wait up to the configured grace period;
+4. let handlers that return settle normally;
+5. cancel remaining handler contexts with shutdown cause;
+6. attempt bounded semantic release of their still-owned leases, appending interrupted conclusions without consuming budget;
+7. if PostgreSQL is unavailable, stop renewal and rely on lease expiry/takeover;
+8. stop maintenance, listener, wake hub, and observers;
+9. wait for goroutines and return joined fatal/shutdown errors.
+
+A shutdown release never acknowledges work. `Stop` context expiry may return while database leases remain; fencing and expiry still guarantee recovery. There is no unsafe force-complete API.
+
+## 12. Runtime as Client and transaction composition
+
+### 12.1 Ordinary client
+
+Execution methods, `Issue`, `Publish`, cancellation, and inspection borrow short connections from `pgkit.DB`. They use the same engine/store operations as background runtime paths. They never invoke a worker or coordinator inline.
+
+Bound definitions hold the `Client` interface, not `*Runtime`, so API-only and transaction-scoped use share the same surface.
+
+### 12.2 Transaction-scoped client
+
+`InTx(pgx.Tx)` wraps the supplied transaction:
+
+- begins/commits/rolls back nothing;
+- performs no automatic database retry;
+- requests Flow execution locks in ascending `ExecutionID` order and rejects a reverse request before SQL;
+- requires Flow operations before application locks/writes;
+- maps `pgx.ErrTxClosed` to `ErrClosed`;
+- emits no commit-dependent observation because pgx exposes no general post-commit hook.
+
+The narrow `flow.Tx` passed to commit functions is a different sealed capability: it permits application SQL but not Flow operations or transaction control.
+
+### 12.3 Plan-aware ingress
+
+After loading an execution, a client operation that can trigger a plan looks up its exact plan in the runtime registry before locking or writing. Applications publishing from monitors to plan executions therefore register the relevant `PlanDef` on that API runtime even if it never calls `Run`. This requirement is reported clearly and tested; the library never accepts half of an atomic plan transition.
+
+## 13. Migrations and startup compatibility
+
+Public entry points delegate to the store migration component:
 
 ```go
-gen := hub.Generation(lane)
-if claimed := tryClaim(); len(claimed) > 0 { … }
-hub.WaitSince(lane, gen)     // returns immediately if generation advanced
+func Migrate(context.Context, *pgkit.DB, ...MigrateOption) error
+func CheckSchema(context.Context, *pgkit.DB, ...MigrateOption) (SchemaStatus, error)
+func MigrationFS(...MigrateOption) (fs.FS, error)
 ```
 
-Recording the generation *before* the claim attempt and waiting on it *after* is what prevents a wake arriving between check and sleep from being lost. Duplicate hints coalesce; a process-wide wake bumps every key; shutdown wakes all waiters with terminal state.
+`New` calls `CheckSchema`; missing/incompatible schema is `ErrSchema`. It does not opportunistically migrate, even in development. Migration roles and runtime roles may be different database users; runtime SQL requires only DML/sequence-free permissions on the configured Flow schema and application permissions used by declared commit functions.
 
-### 5.4 The NOTIFY cost
+## 14. Inspection operations
 
-Transactional `NOTIFY` takes a global lock held through commit, serializing all notifying commits database-wide — the DBOS finding recorded in the architecture. Every settle transaction potentially notifies, so this is a candidate system-wide ceiling.
+- `GetExecution` and `LookupExecution` return bounded current summaries. `LookupExecution(typ, key)` treats `typ` as the receiver definition name and searches all driver modes; if the same non-empty key/name exists in more than one mode it returns `ErrConflict` rather than choosing one silently. Stable `ExecutionID` remains unambiguous.
+- `Trace` uses the store's repeatable-read fixed query set and engine projection types.
+- `History(after, limit)` pages immutable journal entries by execution-local position.
+- `ListExecutions` uses stable cursor pagination and bounded indexed filters.
+- `AwaitExecution` repeatedly reads terminal state, optionally listens for execution hints, and always polls; it consumes no worker slot or durable lease.
+- `ResultOf(ExecutionTrace, ...)` performs typed decode against the trace and definition pair without another query.
 
-Exposure is bounded by emitting **at most one hint per affected lane per transaction**, deduplicated in the change set before commit. If benchmarks show the lock is material, the sanctioned evolution is a decoupled hint flusher that buffers hints in memory and emits them in small separate transactions, accepting slightly higher wake latency. Fallback polling already covers hint loss, and PostgreSQL row state remains the only source of truth, so this change is safe by construction. It must be benchmarked before v1.
+Trace labels delayed work as derived `scheduled`, exposes accepted/current command count, missing registrant reasons, current lease age without token, dependency and wait reasons, child closure, attempts, coordinator inbox, and causation graph. It never invents a `CommandStarted` event.
 
-## 6. Maintenance
+## 15. Observations
+
+The core interface is intentionally small:
 
 ```go
-type MaintenanceConfig struct {
-    PollInterval time.Duration   // default 30s
-    BatchSize    int             // default 500
-    Concurrency  int             // default 2
+type Observer interface {
+    Observe(context.Context, Observation)
 }
 ```
 
-Tasks, each bounded and using `SKIP LOCKED`:
+`Observation` is one tagged struct with safe identifiers, timings, counters, and outcome categories. Transaction paths buffer observations and release them only after known commit/rollback. Observer calls run in a bounded asynchronous adapter outside locks; panic is recovered and queue overflow drops observations with one aggregate diagnostic rather than blocking execution.
 
-| Task | Effect |
-|---|---|
-| due retries | `retry_wait → ready` for elapsed retry times; wakes affected lanes |
-| start-deadline expiry | `pending`/`ready` past `start_deadline_at` → `expired`, then settle-path resolution |
-| lease recovery | `running` past `lease_expires_at` → `ready`, attempt marked `lease_lost`, no budget consumed |
-| execution deadline expiry | running executions past `deadline_at` → `expired`, outstanding work cancelled |
-| coordinator dispatch | claims `active` coordinators with events above their inbox position |
-| unclaimable reporting | emits backlog observations by `(name, version)` with no live registrant |
+Required measurements include:
 
-There is no leader election. Duplicate runners are safe because every task claims bounded rows with `SKIP LOCKED`. A full batch re-signals immediately so large backlogs drain without waiting a full interval.
+- start/idempotent/conflict and execution outcomes;
+- command creation, schedule kind, command-limit use/rejection;
+- probes, claims, empty claims, free capacity, handler/commit duration;
+- attempt classification, persisted retry time, elapsed/attempt budget use;
+- lease renewal/loss/recovery and long-running attempts;
+- plan evaluation passes, loaded values, nodes, reads, routing skips/assertions, duration;
+- dependency resolution, wait start/expiry, skip cascade, failure closure;
+- coordinator delivery lag, retry, state size, inbox position, outcome fan-in;
+- notification/poll wake source, reconnect, and latency;
+- unclaimable backlog by safe definition/plan/coordinator reason;
+- execution-lock wait and journal batch size.
 
-Expiry and lease recovery re-enter the settle path per execution, taking the execution lock normally — they are not a bypass.
+Payloads, results, coordinator state, raw errors, SQL, connection data, and lease tokens are forbidden dimensions.
 
-## 7. Graceful shutdown
+## 16. Error and panic handling
 
-`Stop(ctx)`:
+Runtime database errors delegate to the schema component's SQLSTATE/constraint mapper. Handler errors delegate to engine classification. Fatal process errors are limited to corrupt registry/internal invariants, incompatible schema discovered after startup, and unrecoverable component startup; ordinary database outages cause backoff and continued polling until context cancellation.
 
-1. transition to `stopping` once;
-2. stop all claim loops;
-3. keep renewing leases for in-flight handlers;
-4. wait for handlers up to the grace period (default 30s);
-5. let handlers that finished in time run their settle transactions;
-6. cancel the remainder with a shutdown cause;
-7. release their commands so another replica can claim immediately, recording attempts as `interrupted` with no budget consumed;
-8. stop the lease manager, notifier, and maintenance;
-9. return joined errors.
+Backoff uses capped full jitter and resets after success. Loops log/observe aggregate repeated errors rather than one record per failed poll. Panics in user worker/coordinator code become attempt outcomes; panics in observer adapters are isolated; panics in internal invariant code stop `Run` after best-effort graceful release because continuing may corrupt meaning.
 
-`Halt()` cancels immediately and relies on lease expiry where release cannot be persisted. Neither path ever acknowledges unfinished work.
+## 17. `flowtest` package integration
 
-## 8. Transaction composition
+`flowtest` wraps the same definition codecs and engine used in production. It supplies constructors for synthetic `CommandInfo`, PostgreSQL time, facts, outcomes, dependencies, children, command ceilings, and coordinator deliveries. It never imports `internal/store` or requires PostgreSQL.
 
-Three modes, matching architecture §8.1:
+Worker results expose returned result/error, staged events, child declarations, Optional/StartAfter, scope defects, and dependency reads. Commit tests receive a transaction double. Plan simulation exposes declarations/reads after every synthetic transition. Coordinator simulation exposes state revisions, delayed spawns, mixed outcome deliveries, inbox advance, and terminal decisions. Direct simulation recursively applies successful staged child decisions.
 
-```go
-func (r *Runtime) InTx(tx pgx.Tx) Client
-func (r *Runtime) BindTx(tx pgx.Tx) *TxBinding
-func (r *Runtime) Transact(ctx context.Context, opts pgx.TxOptions, fn func(context.Context, Client) error) error
+SQL behavior, lock/fence guarantees, actual canonical `bytea` persistence, and application commit SQL remain integration tests against real PostgreSQL.
+
+## 18. Fault injection
+
+Test-only named fault points surround:
+
+```text
+probe_return
+claim_execution_lock
+claim_before_journal
+claim_before_commit
+handler_start
+handler_return
+settle_after_fence
+settle_after_attempt
+settle_after_events
+settle_after_children
+settle_after_plan
+settle_before_commit_function
+settle_after_commit_function
+settle_before_commit
+settle_commit_ambiguous
+coordinator_after_handler
+coordinator_before_inbox_advance
+renew_before_result
+maintenance_after_probe
+notify_connect
+notify_before_wait
+migration_each_unit
 ```
 
-A bound client never begins, commits, rolls back, or retries the caller's transaction, and preserves every lock and fence rule.
+Fault tests assert durable invariants after runtime restart, not exact goroutine schedules. Hooks are absent from release builds unless an internal test build tag is enabled.
 
-Because a bare `pgx.Tx` exposes no commit hook, `InTx` **suppresses commit-dependent observations** rather than reporting a mutation that might roll back. `Transact` and `BindTx.Finish(err)` provide the hooked form; `Finish` is idempotent and never affects the transaction. Dropping an observation is always preferred over emitting a false one.
+## 19. Test plan
 
-Callers composing application writes with flow operations must perform application writes first and call flow last (architecture §8.2). Interleaving can deadlock against the engine's lock order, and a caller-owned transaction gets the error rather than an automatic replay.
+### 19.1 Lifecycle and registry
 
-## 9. Error mapping
+- New starts no goroutines and rejects invalid/incompatible configuration;
+- Register/Run/Stop state transitions and concurrent Stop calls;
+- duplicate worker/plan/coordinator and subscription conflicts;
+- API-only operations without Run;
+- plan-aware worker claim and ingress refusal when the exact PlanDef is absent;
+- rolling replicas with divergent command, plan, coordinator, and event versions.
 
-The mapper uses `errors.Is`, `errors.As`, pgx error types, SQLSTATE, and constraint names — **never message text**.
+### 19.2 Dispatch and leases
 
-| Source | Classification |
-|---|---|
-| context cancelled / deadline | preserve context error with operation detail |
-| `23505` on a known idempotency constraint | compare stored hash → success or `ErrConflict` |
-| `23503` known reference | `ErrNotFound` or `ErrConflict` by operation |
-| `23514` known check | `ErrInvalid` with the safe field name |
-| zero rows from a fenced update | diagnostic lookup → `ErrLeaseLost`, `ErrTerminal`, `ErrNotFound` |
-| `40001`, `40P01` | internal retry where authorized, else typed transient |
-| `55P03` lock not available | typed transient; no blind retry |
-| connection loss at commit | uncertain-commit detail; stable keys let the caller re-derive the outcome |
-| checksum or version mismatch | `ErrSchema`, startup-fatal |
-| unmapped | wrapped backend error with SQLSTATE, no SQL or data |
+- no claim beyond immediately free capacity;
+- no database connection held across handler execution;
+- queue fairness and no unhandled head-of-lane starvation;
+- same-execution multi-claim serializes only claim commits;
+- renewals batch and one missing lease cancels only its handler;
+- lease loss, cancellation, shutdown, and ambiguous settlement races;
+- handler deadline precedence and database revalidation.
 
-Handler errors are job-policy input, not database errors, and never enter this table.
+### 19.3 Coordinator and agents
 
-## 10. Migrations
+- start activation, early event, sparse match scan, strict matching-position order;
+- failure redelivery with unchanged state/inbox;
+- successful/failed/cancelled/expired/skipped `OnOutcome` delivery exactly once;
+- optional tool fan-out, durable wait for user input, delayed next turn, crash during tool and between turns;
+- command ceiling fails coordinator decision atomically.
 
-```go
-func MigrationFS(opts MigrationOptions) (fs.FS, error)
-func Migrate(ctx context.Context, db *pgkit.DB, opts ...MigrateOption) (SchemaStatus, error)
-func CheckSchema(ctx context.Context, db *pgkit.DB, opts ...MigrateOption) (SchemaStatus, error)
-```
+### 19.4 Polling, notification, maintenance, shutdown
 
-Units, applied in order and never renumbered:
+- poll-only processes all work;
+- notification after commit and none after rollback;
+- catch-up closes startup/reconnect gap;
+- generation hub closes check/sleep race;
+- duplicate maintenance runners and crashes are safe;
+- graceful release consumes no retry budget; database-outage shutdown recovers by expiry;
+- no goroutine, timer, slot, or connection leak under `go test -race`.
 
-1. migration metadata and compatibility tables;
-2. executions;
-3. commands and dependency clauses;
-4. attempts;
-5. events;
-6. plan reads and coordinators;
-7. autovacuum settings and cross-table indexes.
+### 19.5 Transactions, errors, and safety
 
-Per unit: begin, `pg_advisory_xact_lock` on two fixed keys derived from database identity and schema hash, re-check the next required version under the lock, verify checksums of everything already applied, execute exactly one unit, record version/name/checksum/library version, commit. Concurrent migrators interleave only at unit boundaries and never apply a unit twice.
+- `InTx` commits/rolls back with application write, performs Flow first, and inverse order receives a database error without hidden retry;
+- transaction-bound definition use after close returns `ErrClosed`;
+- commit-dependent observations are suppressed for bare caller transactions;
+- every constraint maps by name/SQLSTATE;
+- ambiguous commit is re-derived by identity;
+- no error/observation contains payload, token, SQL, or secret.
 
-Checksum mismatch, unknown future version, or an incompatible reader/writer range stops without mutation. `New` verifies compatibility and never migrates implicitly.
+### 19.6 Benchmarks
 
-## 11. Observability
+- end-to-end claim/execute/settle throughput by queue and replica count;
+- execution-row contention for wide fan-out completion;
+- registry filters with rolling-deploy distributions;
+- 500 active lease renewals;
+- coordinator high-rate delivery and sparse matching;
+- poll latency/load at multiple intervals;
+- transactional notification versus poll-only commit throughput;
+- shutdown at 10, 100, and 1,000 active handlers.
 
-One `Observation` struct, one `Observer` interface, no-op by default. Observations are buffered inside transactions and flushed only after the commit result is known.
+## 20. Acceptance conditions
 
-Required measurements:
-
-- claims, empty claims, claim latency, batch sizes;
-- handler duration and outcome by classification;
-- attempt outcomes split by **operational interruption vs application failure**;
-- retry depth and scheduled retry times;
-- lease renewals, renewal latency, lease losses;
-- **plan evaluations, evaluations skipped, nodes evaluated, evaluation duration**;
-- dependency resolutions and cascading skips per settle;
-- `absent_reads` per execution;
-- unclaimable backlog by `(name, version)`;
-- execution row lock wait time;
-- notification latency versus poll-only, listener reconnects;
-- maintenance rows processed per task.
-
-Dimensions: execution type and ID, command key, name, version, lane, worker and process identity, correlation and causation IDs, outcome category. Never payloads, arguments, results, errors, lease tokens, or SQL.
-
-Observer callbacks run outside transactions and locks. Panics are recovered and reported through a final diagnostic hook; a slow or broken observer can never change a durable result.
-
-## 12. The `flowtest` harness
-
-Public, so applications test their own handlers and plans without a database.
-
-```go
-package flowtest
-
-// Workers: an ordinary function call with staged output captured.
-func RunWorker[A, R any](t *testing.T, h func(context.Context, *flow.Work[A]) (R, error), payload A, opts ...WorkOption) WorkerResult[R]
-
-type WorkerResult[R any] struct {
-    Result   R
-    Err      error
-    Events   []StagedEvent      // from Emit
-    Commands []StagedCommand    // from Send
-    Writes   int                // OnCommit callbacks registered
-}
-
-// Plans: a pure function over a constructed world.
-func RunPlan[A any](t *testing.T, p flow.PlanDef[A], args A, w World) PlanResult
-
-type World struct {
-    Facts []Fact                          // published events
-    Nodes map[string]NodeState            // declared command states
-}
-
-type PlanResult struct {
-    Declared []DeclaredNode               // key, command, payload, clauses
-    Reads    []Read                       // name, kind, present
-    Absent   int
-    Err      error
-}
-
-// Assertions
-func (r PlanResult) AssertDeclares(t *testing.T, keys ...string)
-func (r PlanResult) AssertWaits(t *testing.T, key string, on ...string)
-func (r PlanResult) AssertNoAbsentReads(t *testing.T)
-
-// Determinism and encoding safety
-func AssertPlanDeterministic[A any](t *testing.T, p flow.PlanDef[A], args A, w World)
-func AssertCanonicalStable[T any](t *testing.T, values ...T)
-```
-
-`AssertCanonicalStable` round-trips a payload type through canonical encoding repeatedly and diffs the bytes, catching the nondeterministic `MarshalJSON` hazard from architecture §17 in the application's own tests.
-
-Integration tests use a privileged harness that creates one uniquely named schema per run and drops only that schema on cleanup.
-
-## 13. Fault injection
-
-Named fault points, available only under a test build tag:
-
-`after_claim`, `before_handler`, `after_handler`, `before_settle_lock`, `after_position_alloc`, `after_event_insert`, `after_resolution`, `after_reconcile`, `before_oncommit`, `after_oncommit`, `before_notify`, `after_commit_send`, `before_commit_response`, `listener_connect`, `each_maintenance_move`, `each_migration_unit`.
-
-Tests restart runtimes and assert durable invariants rather than goroutine timing.
-
-## 14. Test plan
-
-**Runtime and dispatch** — claims never exceed free capacity; no connection held during handler execution; weighted lanes avoid starvation; empty claim arms the correct timer; 100+ concurrent handlers under `-race`.
-
-**Leases** — renewal batching; isolated lease loss cancels one handler only; expired lease cannot settle; renewal under database outage; shutdown race with in-flight renewal.
-
-**Notifications** — notify after commit and none after rollback; catch-up closes the start-up race; duplicate, malformed, and unknown-version hints stay safe; the generation counter prevents a lost wake between check and sleep; poll-only mode processes everything; reconnect leaks no goroutines or connections.
-
-**Maintenance** — multiple runners divide work safely; full batches self-wake; crash mid-move leaves source or destination, never an invalid state; expiry re-enters the settle path correctly.
-
-**Migrations** — clean install; repeated install; concurrent migrators; checksum mismatch; unknown future version; failing unit rolls back; upgrade from every released fixture; custom schema rendering; runtime role cannot alter migration structure.
-
-**Composition** — bound client never commits or retries; `Transact` and `BindTx` observation results match actual commit; bare `InTx` suppresses rather than falsifies; ambiguous commit is not reported as rollback.
-
-**Errors and safety** — every named constraint maps as specified; no observation or error contains payloads, tokens, or SQL; observer panic and latency cannot affect durable results.
-
-**Benchmarks** — claim throughput by lane count and concurrency; lease renewal at 500 active leases; **transactional `NOTIFY` commit throughput versus a batched flusher versus poll-only** (§5.4); maintenance sweep cost at large backlogs; shutdown latency with long handlers.
-
-## 15. Acceptance conditions
-
-- claims are bounded by immediately free capacity and hold no connection during handler execution;
-- the claim filter is built from the immutable registry and cannot drift;
-- leases renew automatically, and lease loss cancels exactly one handler;
-- catch-up on listener connect closes the start-up race, and poll-only mode is fully correct;
-- at most one wake hint per lane per transaction;
-- the `NOTIFY` ceiling is benchmarked before v1, with the batched flusher designed but unshipped unless measurement demands it;
-- maintenance is bounded, leaderless, and safe with duplicate runners;
-- migrations are per-unit transactional, advisory-locked, checksummed, and concurrent-safe;
-- error classification depends only on codes and constraint names;
-- commit-dependent observations are never emitted before the outcome is known;
-- `flowtest` runs workers and plans with no database, and ships the determinism and canonical-stability assertions;
-- all runtime, fault-injection, migration, and benchmark tests pass.
+- Runtime correctness and recovery work with notifications disabled and every prior process gone;
+- registration is frozen for `Run`, and claims cannot drift from executable local definitions;
+- plan transitions are accepted only where the exact plan code is available for the same transaction;
+- claimed handlers start only after `AttemptStarted` commits and never hold a database resource while running;
+- immediately free capacity bounds claims, and stale leases cannot settle;
+- coordinator state/inbox/output is serial, fenced, and redeliverable;
+- shutdown never acknowledges unfinished work and interruption consumes no retry budget;
+- caller-owned transactions preserve Flow-before-application order and receive no false commit observation;
+- poll, notification, maintenance, inspection, migration, error, fault, race, and benchmark suites pass.

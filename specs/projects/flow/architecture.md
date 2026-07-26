@@ -4,447 +4,555 @@ status: draft
 
 # Architecture: flow
 
-## 1. Purpose and scope
+## 1. Purpose and authority
 
-This document translates the overview and functional specification into technical structure: data model, transaction rules, concurrency rules, package layout, and the algorithms behind command dispatch, bounded child spawning, terminal outcome events, event ordering, plan evaluation, and completion.
+This document turns the approved project overview and functional specification into an implementation architecture for `github.com/goware/flow`. It owns the decisions that cross storage, the deterministic execution engine, and the distributed runtime: durable identity, journal ordering, transactions, locks, command delivery, plan and coordinator activation, failure, and recovery.
 
-It is the authority on cross-cutting decisions and invariants. Three component documents own exact DDL, SQL, and per-component test matrices:
+The component documents contain the implementation-level detail:
 
-1. `components/schema.md` — complete DDL, indexes, constraints, and every statement.
-2. `components/engine.md` — plan evaluation, dependency resolution, coordinator inbox, completion.
-3. `components/runtime.md` — claim loop, leases, notifier, maintenance, migrations, error mapping.
+1. [`components/schema.md`](components/schema.md) — PostgreSQL tables, constraints, indexes, statement contracts, migrations, and database tests.
+2. [`components/engine.md`](components/engine.md) — typed definitions, staged decisions, plan reconciliation, dependencies, coordinator decisions, retry policy, and completion.
+3. [`components/runtime.md`](components/runtime.md) — registration, claiming, handler invocation, leases, polling and notifications, shutdown, inspection, and `flowtest`.
 
-No UI architecture is required.
+Those three components are intentional. PostgreSQL is the durable mechanism, the engine is the deterministic state-transition core, and the runtime is disposable process machinery. Adding more public concepts or backend abstractions is not part of Milestone 1. No UI architecture is included.
 
-## 2. Architecture decisions
+## 2. Architectural thesis
 
-| Area | Decision | Rationale |
-|---|---|---|
-| Backend | PostgreSQL 15+ via `pgkit/v2` over `pgx/v5` | Product constraint; enables atomic application/flow transactions. |
-| Package shape | One public package `flow` plus `internal/` | No backend abstraction exists to justify a contract layer (FS §2.1). |
-| IDs | UUIDv7 generated in Go, stored as `uuid`, exposed as opaque typed strings | Distributed generation, index locality, no public dependency on a UUID package. |
-| Serialization point | **The execution row lock** | One mechanism provides commit serialization, gap-free event positions, and consistent plan evaluation. |
-| Event positions | Counter on the execution row, allocated under that lock | Gap-free and commit-ordered by construction (§7). |
-| Command claiming | `FOR UPDATE SKIP LOCKED` on command rows only, never the execution lock | Claiming appends no event and changes no execution state, so it must not serialize per execution. |
-| Pending work | Declared-but-unrunnable nodes are command rows in state `pending` | One table, one lifecycle, uniform trace; no parallel node abstraction. |
-| Command creation | Plans use repeatable `Do`; handlers stage asynchronous `Spawn`; clients use `Issue` | The verbs expose different idempotency and causation semantics while sharing one command lifecycle. |
-| Worker fan-out | Spawned work is stored as direct children on `commands`; successful parent settlement closes membership | Bounded dynamic fan-out needs no coordinator or fan-out table. |
-| Dependencies | Clause rows plus a denormalized unsatisfied-clause counter | Supports all five builders with an O(1) readiness check. |
-| Terminal outcomes | Exactly one terminal event per command, enforced by a partial unique index | Success, failure, cancellation, expiry, and skip are replayable facts; attempts remain operational history. |
-| Identity | Canonical JSON (RFC 8785) hashed with SHA-256 | Deterministic identity independent of Go memory layout or database formatting. |
-| Time | `clock_timestamp()` for all durable scheduling and lease decisions | Avoids worker clock skew. |
-| Notifications | `LISTEN`/`NOTIFY` advisory only, always with poll fallback | Polling is the correctness path. |
-| Schema | Configurable, default `flow`; all SQL fully qualified | Avoids `search_path` and PgBouncer session-state assumptions. |
-| Migrations | Embedded, explicit, checksummed, advisory-locked per unit | Supports library-driven or application-driven schema management. |
-
-Decisions I am making on your behalf and would revisit on request: PostgreSQL 15 as the floor (nothing here needs 16+; UUIDv7 is generated in Go), RFC 8785 rather than a hand-rolled canonicalizer, and three component documents rather than one large architecture file.
-
-## 3. System context
+`flow` is a PostgreSQL-backed, event-driven durable execution library:
 
 ```text
-      application processes                     worker processes
-   (Client only — Start/Publish)            (Runtime — claim and execute)
-                  │                                      │
-                  └──────────────────┬───────────────────┘
-                                     ▼
-              ┌──────────────────────────────────────────┐
-              │  github.com/goware/flow                  │
-              │                                          │
-              │  definitions · plans · client · runtime  │
-              │  engine · worker pool · notifier         │
-              └──────────────────┬───────────────────────┘
-                                 │  pgkit/v2 · pgx/v5
-                                 ▼
-              ┌──────────────────────────────────────────┐
-              │  PostgreSQL                              │
-              │                                          │
-              │  executions · commands · command_deps    │
-              │  attempts · events · coordinators        │
-              │  schema_migrations                       │
-              └──────────────────────────────────────────┘
+command -> worker -> event
+                 \-> optional child commands
+
+event or terminal command outcome -> optional plan/coordinator -> more commands
 ```
 
-PostgreSQL is the only durable authority. Goroutines, channels, timers, notification payloads, and caches are accelerators.
+Every execution has two related representations:
 
-## 4. Package structure
+- an immutable, gap-free, execution-local **journal**, which is the complete accepted history of orchestration decisions and lifecycle transitions; and
+- indexed mutable **materializations**, which make claiming, dependency checks, retry scheduling, and current-state inspection efficient.
+
+The journal is authoritative for causal history and settled orchestration projections. Materializations are authoritative for current delivery ownership. Application tables remain authoritative for business data. Rebuilding Flow projections never replays user handlers, commit functions, or external effects.
+
+The architecture deliberately does not introduce a global event stream. Each execution owns one total order. Future cross-execution behavior must cross an explicit idempotent export or execution-start boundary and retains the source execution and position; it never merges journals or promises global order.
+
+## 3. Load-bearing invariants
+
+The implementation must preserve these invariants even if physical tables or internal packages later change.
+
+1. **PostgreSQL is the only correctness authority.** Polling alone recovers all progress; notifications and memory only reduce latency.
+2. **One orchestration authority per execution.** The driver is exactly one of direct root command, pure plan, or durable coordinator.
+3. **One execution row serializes semantic commits.** Every transaction that changes settled execution meaning or appends journal history locks that execution row first.
+4. **Journal order is gap-free and commit-ordered within one execution.** Positions are allocated under the execution lock and rolled back with the transaction.
+5. **Every accepted command has exactly one `CommandCreated` entry and at most one materialized row.** Every terminal command has exactly one terminal event.
+6. **Attempt mechanics are history, not application facts.** Starts and conclusions are journaled; leases and renewals are not `Event[T]` and cannot drive plans.
+7. **Handlers execute at least once, progression commits once.** A current lease token fences every settlement; external effects still require application idempotency or reconciliation.
+8. **Handler decisions are staged.** An error, panic, cancellation, lost lease, output conflict, or rolled-back transaction exposes none of the staged events or children.
+9. **A successful worker closes direct-child membership atomically.** No child may appear later under that parent.
+10. **Plans only grow.** A plan may discover new declarations but cannot rewrite or withdraw accepted work.
+11. **Coordinator decisions are serialized by journal position.** State, inbox advance, outputs, and the transition record commit together.
+12. **The accepted command ceiling belongs to the execution.** Every replica checks the stored value and increments the stored count under the execution lock.
+13. **Durable time is PostgreSQL time.** Creation, first eligibility, retries, waits, deadlines, claims, and leases never depend on an application clock.
+14. **Flow locks precede application locks.** Library-owned settlement acquires Flow state before invoking a commit function; caller-owned transactions call Flow before touching application rows.
+
+## 4. Technology and dependency decisions
+
+| Area | Decision | Reason |
+|---|---|---|
+| Database | PostgreSQL 15+ | Required backend; row locks, `SKIP LOCKED`, transactional DDL, and optional `LISTEN`/`NOTIFY` are sufficient. |
+| Database access | `pgkit/v2` and `pgx/v5` | Existing ecosystem fit and caller-owned `pgx.Tx` composition. |
+| IDs | UUIDv7 generated in Go, stored as `uuid` | Distributed creation with index locality. Public IDs remain opaque typed strings. |
+| Encoding | RFC 8785 canonical JSON bytes plus SHA-256 | Stable durable identity across replicas and Go processes. |
+| Isolation | `READ COMMITTED` plus explicit locks, predicates, and constraints | The invariants require targeted serialization, not transaction-wide serializable isolation. |
+| Wake-up | Polling for correctness; optional `LISTEN`/`NOTIFY` hints | Works behind transaction-pooling proxies and survives missed hints. |
+| Schema | Configurable, default `flow`; all SQL qualified | No `search_path` dependency. |
+| Migrations | Embedded, explicit, checksummed, advisory-locked | `New` never mutates schema; applications retain deployment control. |
+| Observability | Small no-op observer contract in core | OpenTelemetry, metrics, and logging adapters remain optional packages. |
+
+Initial direct dependencies are `github.com/goware/pgkit/v2`, `github.com/jackc/pgx/v5`, and `github.com/google/uuid`; canonical JSON is implemented in `internal/canonical` against RFC 8785 test vectors rather than exposing another library's types. There is no ORM, broker client, distributed-lock service, or mandatory telemetry SDK. New dependencies require a concrete reduction in implementation or verification risk.
+
+There is one public package plus `flowtest`; internal packages exist for dependency direction, not as user-facing layers.
+
+## 5. System and package structure
+
+```text
+API-only process             mixed/worker process             monitor/webhook
+Runtime as Client            Runtime.Run                       Runtime.InTx(tx)
+       |                           |                                  |
+       +---------------------------+----------------------------------+
+                                   |
+                     github.com/goware/flow
+              definitions | client | inspection
+                         internal engine
+                    internal PostgreSQL store
+                                   |
+                              PostgreSQL
+                 journal + materializations + leases
+```
+
+Suggested package layout:
 
 ```text
 github.com/goware/flow
-├── flow.go            // Runtime, Client, New, Run, Stop, InTx
-├── define.go          // DefineCommand/Event/Plan/Coordinator, Register, RegisterAll
-├── command.go         // Command[A,R], Work[A], Handle, Spawn, CommandOutcome[R]
-├── event.go           // Event[T], EventName, Received[T]
-├── plan.go            // Plan, Node, Do, Fact, Facts, Result, Outcome
-├── coordinator.go     // Coordinator[S], Coordination[S], On
-├── execute.go         // Start, StartWith, Issue, Publish, Cancel*
-├── inspect.go         // Get, Lookup, Trace, History, List, Await, ResultOf
-├── errors.go          // sentinels and typed Error
-├── options.go         // Option, CommandOption, StartOption, ...
-├── migrate.go         // Migrate, CheckSchema, MigrationFS
-├── migrations/        // embedded .sql units
-├── flowtest/          // database-free harness for workers and plans
+├── runtime.go          Runtime, Client, New, Run, Stop, InTx
+├── definitions.go      Command, Event, PlanDef, Coordinator, With
+├── worker.go           Handle, Work, Commit, Emit, Spawn
+├── plan.go             Plan, Do, reads, Node builders
+├── coordinator.go      handlers, Coordination, On*, completion decisions
+├── execute.go          Execute, Issue, Publish, cancellation
+├── retry.go            immutable RetryPolicy and error classification
+├── inspect.go          Get, Lookup, Trace, History, List, Await
+├── errors.go           sentinels and safe structured errors
+├── migrate.go          migration entry points
+├── flowtest/           database-free application test harness
 └── internal/
-    ├── store/         // every SQL statement, row types, scanning
-    ├── engine/        // plan evaluation, reconciliation, dependency resolution, completion
-    ├── worker/        // claim loop, dispatch, lease manager, shutdown
-    ├── notify/        // listener, wake hub, poll fallback
-    ├── canonical/     // RFC 8785 encoding and SHA-256 identity
-    └── maint/         // reconciler, deadline expiry, unclaimable reporting
+    ├── canonical/      canonical encode/decode and fingerprints
+    ├── definition/     erased descriptors and registration validation
+    ├── engine/         snapshots, decisions, reconciliation, completion
+    ├── store/          all SQL and row codecs
+    ├── runtime/        dispatchers, leases, coordinator loop, shutdown
+    ├── notify/         optional listener and coalescing wake hub
+    └── observe/        post-commit observation buffering
 ```
 
-Rules: the public package holds types and thin entry points only; all SQL lives in `internal/store`; `flowtest` is public so applications can test their own handlers; no package exists solely to hold one type.
+The root package owns generic type safety and delegates through erased internal descriptors containing codecs and immutable definition metadata. `internal/store` is the only package allowed to issue Flow SQL. `internal/engine` has no pool, goroutine, clock, or SQL dependency; it consumes snapshots and returns validated decisions.
 
-## 5. Dependencies
+## 6. Durable model
 
-- `github.com/goware/pgkit/v2` — querying and transaction-bound `DB.InTx`
-- `github.com/jackc/pgx/v5` — transactions, batches, pool, PostgreSQL errors, dedicated `LISTEN` sessions
-- `github.com/google/uuid` v1.6.0 — UUIDv7 generation and parsing
-- Go standard library — JSON, contexts, sync, `embed`, `log/slog`
+The physical schema is specified in `components/schema.md`. The logical records are:
 
-No ORM, no distributed-lock service, no broker, no mandatory observability SDK. New dependencies require a demonstrated reduction in complexity.
+| Record | Purpose |
+|---|---|
+| execution | Driver identity, immutable start input, lifecycle, deadline, accepted command ceiling/count, open count, and journal allocator. |
+| command | One logical request, accepted configuration, topology, state/result projection, immutable budget anchor, and child-membership status. |
+| command dispatch | Narrow hot row for queue, kind, next-run time, and current lease; absent for pending and terminal commands. |
+| dependency group/member | Normalized `After*` and `AfterAny` conditions with reverse lookup by predecessor. |
+| event wait | Normalized `Await` membership and the satisfying event position. |
+| attempt | One command or coordinator invocation, including durable start/conclusion and retry-budget classification. |
+| journal entry | Immutable ordered history, including the full logical payload needed by `History` and graph reconstruction. |
+| plan read | The latest plan's consulted inputs and availability classification, plus implicit observations of plan-owned commands. |
+| coordinator instance | Current typed state projection, start activation, inbox, current delivery, retry state, and lease. |
+| migration metadata | Applied unit, checksum, writer version, and compatibility range. |
 
-## 6. Data model
+Command and execution payloads are stored in both their current projection and the corresponding journal record in the initial implementation. This is intentional simplicity: the journal can stand alone, while hot operations avoid decoding history. A later physical optimization may content-address or normalize immutable bytes as long as `History` and replay observe the same logical records.
 
-### 6.1 Tables
+The command count is not computed by scanning. `executions.command_count` increments once for each genuinely new root, `Do`, `Spawn`, or `Issue` command and is checked with `max_commands` while the row is locked. Attempts, retries, duplicate reconciliation, events, coordinator activations, and journal rows do not change it.
 
-| Table | Holds | Lifecycle owner |
-|---|---|---|
-| `executions` | identity, type, key, status, deadline, counters, **event position allocator**, plan/coordinator binding | execution lifecycle |
-| `commands` | one row per logical command including declared-but-pending nodes and worker-spawned children | command lifecycle |
-| `command_deps` | dependency clauses and their members | plan/coordinator declaration |
-| `attempts` | one row per claimed execution of a command | worker runtime |
-| `events` | the append-only per-execution log | append only |
-| `plan_reads` | inputs the latest plan evaluation consulted | plan engine |
-| `coordinators` | instance state and inbox position (hand-written coordinators only) | coordinator lifecycle |
-| `schema_migrations` | migration metadata | migration engine |
+## 7. Journal model and ordering proof
 
-### 6.2 Key columns
+### 7.1 Entry classes
 
-`executions` carries the counters that make hot-path decisions O(1):
+The journal uses one table and a discriminated body. Milestone 1 entry classes are:
 
-- `next_event_position bigint` — the allocator (§7);
-- `open_commands int` — non-terminal command count;
-- `absent_reads int` — consulted-but-absent inputs from the latest evaluation;
-- `failing bool` and `fail_fast bool` — outcome state machine;
-- `plan_name`, `plan_version` or `coordinator_name`, `coordinator_version`.
+- `ExecutionStarted`;
+- `CommandCreated`;
+- `AttemptStarted` and `AttemptConcluded` for command and coordinator invocations;
+- `EventRecorded` for application events, command terminal events, plan/coordinator failures, and execution terminal events;
+- `ExecutionBecameFailing` for the one non-terminal execution lifecycle transition;
+- `CoordinatorTransition`.
 
-`commands` carries `unsatisfied_clauses int`, decremented as clauses resolve; zero means runnable. It also carries:
+There is no `CommandStarted` application event and no lease-renewal entry. A command's final transition is represented once by its terminal `EventRecorded`; an execution's final transition is likewise represented by its terminal event, not by a duplicate state-change row. Entering `failing` is not terminal, so its one internal lifecycle entry is required to keep replay complete.
 
-- `source_kind` (`plan`, `worker`, `coordinator`, or `external`) and `parent_command_id`, which is non-null only for worker-spawned direct children;
-- `required bool`, set false by `Node.Optional()` or `flow.Optional()`;
-- canonical payload identity and the terminal result/failure projection used by `Result` and `Outcome`;
-- the lease triple (`lease_id`, `leased_at`, `lease_expires_at`), `eligible_at`, and the timestamp taxonomy from FS §17 as four distinct columns.
+Every entry carries `ExecutionID`, `JournalEntryID`, position, PostgreSQL recorded time, kind, and causation. Typed event entries additionally carry `EventID`, event name/version/key, event class, canonical payload, and origin identifiers. Operational entries remain visible through `History` but cannot be passed to `Fact`, `Await`, or `On`.
 
-`events` carries `(execution_id, position)` as a unique key, `(execution_id, name, event_key)` as the idempotency key for published facts, `event_kind`, and nullable `command_id` / `attempt_id` origins. A partial unique index on `command_id` for terminal command event kinds enforces exactly one of completion, failure, cancellation, expiry, or skip per command.
+### 7.2 Position allocation
 
-### 6.3 Why pending nodes are commands
-
-A plan node that cannot yet run is a `commands` row in state `pending`, not a row in a separate node table. Its payload is known at declaration time, so nothing is deferred. Worker-spawned children are ordinary `ready` command rows with a parent link. This gives one lifecycle, one execution-wide key namespace, one set of indexes, and a trace where declared, spawned, waiting, and running work are the same shape. The claim query simply never sees `pending`.
-
-## 7. Event ordering: the central proof
-
-FS §9.4 requires that a checkpoint never permanently skip an event whose transaction becomes visible later. The design satisfies this by construction rather than by a watermark protocol.
-
-**Rule: every transaction that appends an event to an execution first takes `SELECT … FROM executions WHERE id = $1 FOR UPDATE`.** Positions are allocated by incrementing `next_event_position` under that lock.
-
-It follows that:
-
-1. Only one transaction at a time can allocate positions for an execution.
-2. A later allocator blocks until the current holder commits or rolls back, so it observes the committed counter.
-3. A rolled-back append returns its positions; no gap is created.
-4. Position order therefore equals commit order, and there is no window in which position *n* is visible while *n−1* is still uncommitted.
-5. A reader that has consumed through position *n* can never later discover an unseen event at a position below *n*.
-
-This is the jobqueue EventStore's singleton-allocator argument scoped to one execution — but here the lock is already required for commit serialization (FS §12.5), so ordering costs nothing extra. The database-wide allocator that dominated the jobqueue design does not exist because no ordering spans executions.
-
-Consequence: per-execution append throughput is bounded by that row lock, which is the documented per-execution ceiling (FS §16.6).
-
-The ordered event log is replayable orchestration history, not the sole persistence model. Command rows durably record issuance, source, parentage, and current projection; attempts preserve transient mechanics; terminal events and domain events preserve immutable facts. A trace or replacement read model rebuilds from all four. Runtime recovery resumes non-terminal materialized commands and never re-invokes historical successful handlers merely to reconstruct state.
-
-## 8. Transaction model
-
-### 8.1 Transaction kinds
-
-| Kind | Takes execution lock | Purpose |
-|---|---|---|
-| **Claim** | no | `ready` → `running`, create attempt |
-| **Settle** | yes | worker result → spawned children, completion event, plan evaluation, reconciliation, outcome |
-| **Ingress** | yes | `Start`, `Issue`, `Publish`, `Cancel*` |
-| **Maintenance** | yes, one execution at a time | deadline expiry, dispatch reconciliation |
-| **Renew** | no | batched lease extension |
-
-### 8.2 Lock order
-
-Within any transaction that takes the execution lock:
-
-1. `executions` row;
-2. existing `commands` rows in ascending `command_id` order, then new command inserts in ascending command key order;
-3. `command_deps`, `attempts`, `coordinators` for those commands;
-4. `events` insert;
-5. application writes registered through `OnCommit`;
-6. `pg_notify`;
-7. commit.
-
-`OnCommit` callbacks run at step 5 — after all flow-owned rows are locked and before notification. Application tables therefore sit outside this order; a caller-owned transaction that locks application rows first and then calls into `flow` can deadlock. The rule for callers (FS §12.7) is: perform application writes first, call `flow` operations last, and let `InTx` participate rather than interleaving.
-
-### 8.3 Claim is the no-wait exception
-
-The claim transaction never takes the execution lock and never waits for a row: it uses `FOR UPDATE SKIP LOCKED` on candidate command rows and abandons any candidate it cannot lock immediately. A path that never waits cannot deadlock, so claiming is exempt from the order above.
-
-This is why claiming does not serialize per execution: many commands of one execution can be claimed concurrently across replicas, and they queue only when they settle.
-
-Races are resolved by state predicates rather than ordering. A claim that wins the row transitions `ready → running` under `WHERE state = 'ready'`; a concurrent cancel holding the execution lock blocks on the same row, then observes `running` and cancels with fencing. Reversed, the claim skips the locked row entirely.
-
-### 8.4 Isolation and retry
-
-`READ COMMITTED` throughout. Correctness comes from row locks, state predicates, lease fences, and unique constraints. Library-owned transactions retry SQLSTATE `40001` and `40P01` up to three times with full-jitter backoff of 5–100 ms; caller-owned transactions return the error. Handler code never re-runs on a database retry — only the settle transaction replays, from the already-buffered outputs.
-
-## 9. Command dispatch
-
-### 9.1 Claim query
-
-Per lane, a worker claims with one statement:
+Every semantic transaction does this before appending:
 
 ```sql
-WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now),
-candidates AS (
-    SELECT c.command_id
-    FROM flow.commands c, t
-    WHERE c.lane = $1
-      AND c.state = 'ready'
-      AND c.eligible_at <= t.now
-      AND (c.name, c.version) = ANY($2::flow.name_version[])
-    ORDER BY c.eligible_at, c.command_id
-    FOR UPDATE OF c SKIP LOCKED
-    LIMIT $3
-)
-UPDATE flow.commands …            -- state, lease triple, from t.now
+SELECT ... FROM flow.executions WHERE execution_id = $1 FOR UPDATE;
 ```
 
-`$2` is the process's registered `(name, version)` set, which is what makes rolling deployments safe (FS §7.6). `$3` is bounded by immediately free local capacity, never by a configured batch alone, so leases never expire in a local queue.
+Once its complete output is known, it increments `next_journal_position` by the exact batch size and assigns consecutive positions. The counter update and inserts are in the same transaction.
 
-The supporting index is `(lane, state, eligible_at, command_id)` partial on `state = 'ready'`, keeping pending, running, and terminal rows out of the hot index entirely. Whether `(name, version)` belongs in that index is a benchmark question deferred to `components/schema.md`; the adversarial case is a lane whose head is dominated by kinds the process does not register.
+The proof is direct:
 
-### 9.2 Leases and fencing
+1. Only one transaction can hold an execution row lock.
+2. A later appender cannot allocate until the earlier transaction commits or rolls back.
+3. Rollback restores the counter and removes every inserted entry.
+4. Therefore committed positions are gap-free and allocation order equals commit order.
+5. A reader that has consumed position `n` can never later see a newly committed position below `n`.
 
-Claiming writes a fresh `lease_id`. Every subsequent write for that attempt — settle, fail, renew — carries `WHERE lease_id = $x AND lease_expires_at > clock_timestamp()`. Zero affected rows maps to `ErrLeaseLost`.
+No visibility watermark, singleton database allocator, or cross-execution checkpoint protocol is required.
 
-Renewal is batched per process: one statement extends many leases from database time using `unnest` pairs, and any receipt not returned has lost ownership, cancelling only that handler's context.
+### 7.3 Deterministic order inside one commit
 
-## 10. The settle transaction
+The engine emits a stable batch order so traces do not depend on map iteration:
 
-This is the system's central algorithm. On a successful worker return:
+1. attempt conclusion or coordinator transition cause;
+2. application events in handler call order;
+3. spawned `CommandCreated` entries in command-key order;
+4. the current command's terminal event;
+5. plan-created `CommandCreated` entries in command-key order;
+6. dependency-derived terminal events in stable graph/key order;
+7. `ExecutionBecameFailing` and fail-fast cancellation events when applicable;
+8. coordinator or execution terminal events.
 
-1. lock the execution row; reject if terminal;
-2. verify the attempt's fence: command `running`, matching `lease_id`, unexpired;
-3. prevalidate the complete buffered output: canonical sizes, the applicable total-command ceiling, duplicate child keys, and conflicts against every existing execution key; deterministic output conflicts become a permanent command failure rather than a futile retry;
-4. insert all worker-spawned children in command-key order, with `source_kind = worker`, `parent_command_id` set to the current command, inherited execution identity and causation, and `required` from the spawn option; increment `open_commands` for the batch;
-5. allocate positions and append the worker's emitted domain events, then its **completion event** carrying the typed result;
-6. mark the parent command `succeeded`, store its result projection, clear its lease, and decrement `open_commands`;
-7. **resolve dependencies** naming the parent (§11);
-8. **evaluate the plan** if required (§12), against a snapshot that already includes the parent result and complete child set, reconciling plan declarations and creating newly runnable commands;
-9. run `OnCommit` callbacks;
-10. evaluate completion or fail-fast (§13–14);
-11. `pg_notify` every affected lane;
-12. commit.
+Some transactions omit steps. Plan outputs are caused by the durable event or ingress record that triggered evaluation. Worker outputs are caused by the attempt conclusion; coordinator outputs are caused by the handled activation or event and recorded transition. Exact positions are assigned only after the full batch validates.
 
-Children are buffered in Go while the handler runs; `Spawn` performs no SQL. Step 3 validates the entire set before step 4 writes any row. Equivalent duplicate keys inside one buffer coalesce. Different buffered content, collision with a key owned by another creation source, or a command-count overflow is a structured permanent output failure: no staged child, domain event, completion result, or `OnCommit` write commits; instead the parent records `CommandFailed` and follows ordinary dependency and execution-failure rules.
+## 8. Transaction and lock discipline
 
-A retryable handler error records only attempt history and `retry_wait`; it commits no terminal event or staged output. Exhaustion, `Permanent`, cancellation, expiry, and dependency skipping use the same execution lock and each append exactly one `CommandFailed`, `CommandCancelled`, `CommandExpired`, or `CommandSkipped` event before resolving dependents. Skip cascades allocate one ordered event per skipped command.
+### 8.1 Semantic transaction kinds
 
-A plan defect found at step 8 is handled specially because repeating accepted worker work cannot repair plan code. The engine discards the plan declaration buffer, preserves the parent success and its staged outputs, appends `PlanFailed`, cancels every non-terminal command including newly inserted children with terminal outcome events, appends `ExecutionFailed`, runs the parent's `OnCommit` callbacks, and commits. It does not select plan failure branches and consumes no worker retry budget.
+| Transaction | Main work |
+|---|---|
+| start | Insert execution, `ExecutionStarted`, root/initial plan commands or coordinator activation. |
+| ingress | `Issue`, `Publish`, or cancellation against one execution. |
+| claim | Create attempt, lease a command/coordinator delivery, append `AttemptStarted`. |
+| worker settle | Fence attempt; record result/error; stage events/children; run plan; resolve dependencies; run commit function; finish execution if eligible. |
+| coordinator settle | Fence delivery; commit state/inbox/outputs; finish or retry/fail coordinator. |
+| maintenance settle | Recover lease, expire wait/command/execution, and run ordinary dependency/completion logic. |
+| renewal | Extend active leases only; no execution lock or journal entry. |
 
-Database-level retries replay only the already-buffered settle algorithm, never the handler. An ordinary transactional failure, including an `OnCommit` error, rolls the whole settlement back and leaves the command eligible for normal retry; a recovered plan defect is a deliberate committed terminal outcome, not such a failure.
+### 8.2 Blocking lock order
 
-## 11. Dependency resolution
+Every library-owned semantic transaction concerns one execution and acquires blocking locks in this order:
 
-### 11.1 Clause model
+1. execution row;
+2. coordinator instance, when applicable;
+3. existing command rows in ascending `CommandID`;
+4. dispatch, dependency, wait, and attempt rows belonging to those commands;
+5. journal inserts and other new rows in deterministic key order;
+6. application rows through the declared commit function;
+7. optional `pg_notify` hint;
+8. commit.
 
-A command's readiness is a conjunction of clauses:
+New command rows are inserted by command key after conflicting existing rows have been locked and validated. The engine never holds an application lock and then returns to Flow-owned rows.
 
-| Builder | Clause kind | Satisfied when |
+### 8.3 Claim is execution-first and no-wait
+
+Claims must append `AttemptStarted`, so they also need the execution lock. Candidate discovery is an unlocked, indexed probe. For each candidate execution the claimer opens a short transaction and uses `FOR UPDATE SKIP LOCKED` first on the execution row, then on the revalidated command/dispatch or coordinator row. If either is unavailable or no longer eligible, the candidate is abandoned immediately.
+
+The claim path acquires only skip-locked rows and never waits. It is therefore exempt from assumptions about blocking lock waits, while still following the execution-first category order. Claim commits for one execution serialize briefly; the claimed handlers then run concurrently without locks or database connections.
+
+### 8.4 Caller-owned transactions
+
+`Runtime.InTx(tx)` never begins, commits, rolls back, or retries the caller's transaction. The required cross-boundary order is:
+
+```text
+Flow operation -> application-table locks/writes -> caller commit
+```
+
+This matches worker settlement, where Flow locks are acquired before `WithCommit` runs. A transaction must not call Flow after it has acquired application locks, and it must not interleave Flow and application lock phases. The transaction-scoped client tracks execution locks it requests and rejects a later lower `ExecutionID`, so multiple Flow operations use one deterministic order before the application phase. Arbitrary application locks cannot be detected; PostgreSQL may abort a transaction that violates the documented order, and the library returns that error without replaying caller code.
+
+M1 public operations each target one existing execution. If an application needs several executions plus application rows in one atomic transaction, it must acquire the execution IDs in lexical order through an internal ordered operation helper exposed only when that public use case is specified; ad hoc reverse-order locking is not permitted.
+
+### 8.5 Isolation and retry
+
+The store uses `READ COMMITTED`. Library-owned transactions may retry SQLSTATE `40001`, `40P01`, and safe pre-commit connection failures with capped full-jitter backoff. A worker or coordinator handler is never re-invoked merely because its short settlement transaction retries; the already canonicalized decision buffer is reused. Caller-owned transactions return the error to their owner.
+
+An ambiguous commit is never reported as a definite rollback. Stable execution, command, event, and inbox identities let the next call or recovery loop discover whether it committed.
+
+## 9. Public definition and registration architecture
+
+`Command[A,R]`, `Event[T]`, `PlanDef[A]`, and `Coordinator[S]` are immutable value descriptors. Their durable identity excludes a private `Client` binding. `.With(client)` copies the descriptor and replaces only that binding, preserving the same static type. `Handle`, `PlanDef`, and `Coordinator` implement the sealed registration capability; `Event` and a bare `Command` do not.
+
+Each typed descriptor contains an internal erased descriptor with:
+
+- stable name and positive version;
+- canonical encode/decode functions and a runtime Go type fingerprint used for registration diagnostics;
+- immutable definition options;
+- for a command, payload/result codecs and its derived success-event descriptor;
+- for a plan or coordinator, input/state codec and function/handler metadata.
+
+Definitions do not mutate global state. `Registration` values populate a runtime-local registry, frozen by `Run`. Registration rejects duplicate workers, conflicting codecs for a durable pair, duplicate coordinator handlers, multiple commit functions, and overlapping success-only `On(cmd.Done())` with `OnOutcome(cmd)`.
+
+The registry is also the rolling-deployment capability map. A dispatcher claims only exact command or coordinator definition versions that process can execute. A registered command pair is executable on any stored queue; `WithQueue` is a creation-time scheduling default, not a second handler identity, so changing it cannot strand existing work on its previously accepted queue. Unknown work remains durable and consumes no retry budget.
+
+## 10. Command creation and identity
+
+All creation paths call one store/engine operation. A proposed command has two fingerprints:
+
+- **declaration identity**: name/version, canonical arguments, origin/parent, required classification, normalized dependencies and waits, explicit `Delay`, `Within`, `StartAfter`, and explicit plan-node retry override;
+- **accepted operation settings**: resolved queue, per-attempt timeout, and effective declarative retry policy copied at creation.
+
+Plan reconciliation and idempotent rediscovery compare declaration identity. They do not compare the command definition's current operational defaults, so a deployment may tune defaults without rewriting or conflicting with existing work. Duplicate declarations inside one plan evaluation must nevertheless resolve to identical effective settings. Explicit plan-node retry overrides are declaration identity and may not change for an existing key.
+
+Creation while holding the execution lock proceeds as one batch:
+
+1. canonicalize and validate every proposal before writing;
+2. coalesce equivalent repeated keys and reject conflicts;
+3. resolve references against durable commands plus the complete proposed set;
+4. compute genuinely new count and enforce `max_commands` against `executions.command_count`;
+5. insert commands, dependencies, waits, and any ready dispatch rows in key order;
+6. append one complete `CommandCreated` record per inserted command;
+7. increment `command_count` and `open_commands` by the inserted count.
+
+No member of a fan-out or plan evaluation appears if the batch fails. The behavior on a deterministic ceiling violation depends on its source exactly as the functional specification requires: public `Issue` writes nothing and returns `ErrInvalid`; a worker records a permanent command failure; a coordinator records coordinator failure; a plan records `PlanFailed`.
+
+## 11. Command delivery, attempts, and retry
+
+### 11.1 Eligibility
+
+Only commands with satisfied dependencies and waits have a dispatch row. `ready` and `retry_wait` dispatch rows carry `next_run_at`; no separate scheduled state exists. The claim probe filters by queue, exact registered name/version, and PostgreSQL `next_run_at <= now`.
+
+The first eligibility transition sets `BudgetStartedAt` exactly once:
+
+- an immediate command uses the transition's PostgreSQL time;
+- `Delay` starts after dependencies and waits resolve, and the anchor is the delayed eligible time;
+- `StartAfter` uses the accepting transaction's time plus the staged duration;
+- a retry changes only `next_run_at`, never the anchor.
+
+### 11.2 Claim
+
+After the no-wait locks in §8.3, claim revalidates execution state/deadline, command state, definition pair, schedule, and remaining elapsed retry budget using one captured `clock_timestamp()`. It creates a new attempt, increments the invocation ordinal, stores a fresh random lease token and owner, changes command/dispatch to `running`, and appends `AttemptStarted` atomically.
+
+`CommandInfo` is built from these accepted database values. The effective handler context deadline is the earliest of per-attempt timeout, retry elapsed deadline, and execution deadline. Local timers only cancel the goroutine; the settlement transaction rechecks PostgreSQL time.
+
+### 11.3 Conclusion and policy
+
+The runtime first classifies the conclusion as success, retryable error, explicit `RetryAfter`, permanent error, panic, attempt timeout, shutdown interruption, cancellation, or lease loss. The immutable retry policy then decides whether another attempt is allowed. Permanent errors cannot be made retryable. Shutdown interruption and lease loss do not consume retry budget.
+
+The selected retry time is computed once from database time, persisted in the command/dispatch projection, and written to `AttemptConcluded`. Restarts never recompute jitter. Retry exhaustion records the terminal `CommandFailed` event in the same semantic transition that resolves dependencies.
+
+### 11.4 Fencing
+
+Every worker and coordinator settlement checks all of:
+
+- execution is in a compatible non-terminal state;
+- subject is still `running` on the same attempt;
+- lease token matches;
+- lease has not expired at PostgreSQL time.
+
+Zero affected rows means no staged output may commit. A diagnostic lookup maps it to `ErrLeaseLost`, `ErrTerminal`, or `ErrNotFound`. Renewals only extend the lease row under the same token; they never change journal, command state, or retry time.
+
+## 12. Worker decision and settlement
+
+`Work[A]` is an in-memory scope containing decoded immutable arguments, `CommandInfo`, preloaded dependency outcomes, and a staged decision buffer. `Emit` and `Spawn` validate and canonicalize immediately but perform no SQL. `ResultOf` and `OutcomeOf` read only terminal commands named by durable dependency edges and use a batch loaded before invocation.
+
+On `(result, nil)`, the runtime canonicalizes the result and enters one settlement transaction:
+
+1. acquire the execution/command/attempt fence;
+2. validate the complete decision buffer, child-key equivalence, payload limits, and command ceiling;
+3. append `AttemptConcluded` and materialize the successful parent result;
+4. append emitted events in call order;
+5. insert and journal the complete child set, closing parent membership;
+6. append the parent success event after its additional events;
+7. resolve dependencies and awaited facts;
+8. evaluate/reconcile the plan if this transition is relevant;
+9. apply fail-fast and completion logic;
+10. write all Flow materializations and journal records;
+11. invoke the statically registered commit function, if any, using only durable `Args`, `Result`, `Info`, and a narrow transaction capability;
+12. emit at most one wake hint per affected queue and commit.
+
+The Flow writes in step 10 occur before application writes in step 11, but they remain invisible until the shared transaction commits. If the commit function returns an error, the transaction rolls back. The error is then settled through the ordinary retry/permanent path; no success event, child, emitted event, plan output, or application write remains.
+
+A deterministic staged-output defect takes a different path: the proposed success is rejected, its outputs and commit function are discarded, and the command becomes permanently failed without rerunning code that cannot repair the decision.
+
+A plan defect discovered after accepting the worker result does not rerun the worker. The transaction keeps the successful result, emitted facts, children, and commit-function write; appends `PlanFailed`; cancels outstanding work; and fails the execution. This preserves accepted application work while making invalid orchestration terminal and inspectable.
+
+## 13. Plans
+
+### 13.1 Snapshot and capability boundary
+
+Plan evaluation occurs while the execution lock is held, against one transaction-consistent snapshot containing root arguments, every command's immutable identity/final state, closed child memberships, relevant event facts, normalized dependencies, and the previous consulted-input set. The plan receives no context, database, client, clock, transaction, randomness, or worker scope.
+
+The engine catches panics and records declarations and reads. `flowtest` and an optional debug mode evaluate identical snapshots twice and compare canonical declarations, normalized topology, effective settings, reads, and availability classifications.
+
+### 13.2 Reconciliation
+
+After the function returns, the engine:
+
+1. validates every read and definition match;
+2. validates forward dependency references against durable plus newly declared keys;
+3. normalizes clauses and detects cycles in the plan-owned dependency graph;
+4. coalesces equivalent duplicate declarations and rejects disagreement;
+5. compares existing plan-owned keys by declaration identity;
+6. retains previously declared keys absent from this evaluation;
+7. classifies new nodes as ready, pending, or immediately skipped;
+8. applies the batch command-ceiling check and emits a delta.
+
+Reconciliation runs to a bounded fixed point inside the transaction. After accepting a non-empty declaration delta, the pure plan is evaluated again against that in-transaction state. This normally produces no further command; if a newly created command was immediately skipped/expired or otherwise opens another branch, the next delta is applied and evaluation continues. Monotonic growth plus the execution command ceiling bounds the loop. `plan_quiescent` is true only for the final no-new-command pass, preventing an execution from waiting for a transition that its own reconciliation already produced.
+
+Operational definition defaults are resolved only for genuinely new nodes. The latest read set records `available`, `temporary`, or `permanent`. Only temporary reads prevent successful completion.
+
+### 13.3 Evaluation routing
+
+Evaluation is mandatory at start and after:
+
+- an event name consulted by the latest evaluation is recorded;
+- a command read by the plan becomes terminal;
+- a command named in a dependency becomes terminal; or
+- a plan-owned command becomes terminal, which is an implicit observation needed to establish final quiescence.
+
+The last category is stored as a routing observation rather than exposed as another public read. It ensures a plan that simply declares one command receives the final evaluation required for completion.
+
+Unconsulted event names normally skip evaluation. This is safe because plans are pure and facts and terminal outcomes are immutable and retained: a later consulted transition that opens a new branch can still read the older fact. Debug routing mode may over-evaluate a normally skipped transition and assert that declarations and reads are unchanged.
+
+Evaluation and its fixed point run inside the semantic transaction because declarations must commit with the triggering fact or terminal outcome. This lengthens the execution-row critical section, so plan pass count, duration, and command count are measured and benchmarked at the default ceiling. A plan must remain CPU-only and bounded.
+
+The exact plan code is therefore a commit-time capability. A replica may claim a command in a plan-driven execution only when it registers both that command worker and the execution's plan name/version. Likewise, `Publish`, `Issue`, command cancellation, and wait expiry that can trigger plan evaluation require the exact plan on the committing runtime. Missing plan code leaves work untouched or rejects ingress before writing; it never commits a fact now and hopes a different process reconciles the plan later. Direct and coordinator-driven command settlement do not have this requirement.
+
+## 14. Dependency and wait resolution
+
+Each builder call creates a normalized condition group. Groups combine with logical AND:
+
+| Group | Satisfied | Permanently unsatisfiable |
 |---|---|---|
-| `After(k…)` | `all_succeeded` | every member succeeded |
-| `AfterSettled(k…)` | `all_settled` | every member terminal |
-| `AfterFailed(k…)` | `all_unsuccessful` | every member failed, expired, cancelled, or skipped |
-| `AfterAny(n, k…)` | `at_least` | ≥ n members succeeded |
-| `Await(e…)` | `await_event` | an event of each named `(name, version)` exists |
+| `After` | all members succeeded | any member terminal unsuccessful |
+| `AfterSettled` | all members terminal | never |
+| `AfterFailed` | all members terminal unsuccessful | any member succeeded |
+| `AfterAny(n)` | at least `n` succeeded | successes plus non-terminal members are fewer than `n` |
+| `Await` | every named event exists | never before its deadline/execution expiry |
 
-Each clause stores its kind, threshold, and members in `command_deps`. A member is resolved by the execution-wide command key and may have been created by `Do`, `Spawn`, or `Issue`. `commands.unsatisfied_clauses` counts clauses not yet satisfied; a command is runnable at zero.
+Terminal command and new event positions seed an in-memory resolution work queue. Reverse indexes locate affected groups; each group transition is guarded so it resolves once. Newly ready commands receive dispatch rows. Permanently impossible nodes become `skipped`, append exactly one terminal event, decrement `open_commands`, and seed further resolution. Stable key ordering makes cascading output deterministic.
 
-### 11.2 Resolution algorithm
+`Within` is stored on a node with `Await` only. When all command-dependency groups settle successfully, the engine checks retained facts first. If any awaited fact is missing, it writes `wait_started_at = db_now` and a once-only deadline capped by the execution deadline. An early fact satisfies the wait immediately. Expiry makes the command `expired`, not skipped, so failure branches can react.
 
-When a command reaches a terminal state, in the same transaction:
+## 15. Fail-fast and completion
 
-1. select clauses naming it, joined to their dependents, locking dependents in `command_id` order;
-2. for each clause, recompute satisfied and unsatisfiable status from member states;
-3. a newly satisfied clause decrements `unsatisfied_clauses`; reaching zero transitions the dependent `pending → ready` with `eligible_at = max(now, declared delay)`;
-4. a clause that has become **permanently unsatisfiable** transitions the dependent to `skipped`, appends its unique `CommandSkipped` outcome event, decrements `open_commands`, and recurses to step 1.
+When a required command becomes failed, cancelled, or expired, the transaction first records its terminal event and resolves all dependencies. It then changes the execution to `failing` and, when fail-fast is enabled, cancels non-terminal work outside the failure-handling closure. The closure begins with work made viable by `AfterFailed`/`AfterSettled`, includes its descendants, and preserves already running commands. Failure handling therefore cannot be cancelled before it is selected.
 
-Reconciliation validates that every new dependency targets an existing command or another declaration in the same plan evaluation and that the resulting graph is acyclic. Spawned and externally issued commands have no dependency clauses of their own. Resolution is bounded by the command limit and processed as an explicit work queue, not actual recursion.
+Optional unsuccessful commands resolve dependencies but do not make the execution fail. A coordinator that wants to interpret child failure normally uses optional children plus `OnOutcome`.
 
-Every guarded update carries its expected prior state, so a redelivered or concurrent resolution is a no-op rather than a double decrement.
+Completion rules are mode-specific:
 
-### 11.3 Await clauses
+- **direct**: `open_commands == 0`; closed child membership makes this a complete tree test;
+- **plan**: `open_commands == 0`, latest evaluation has no temporary read, and the latest relevant evaluation introduced no command; if already failing, temporary reads are ignored and only explicit remaining work matters;
+- **coordinator**: a fenced handler has staged `SucceedExecution` or `FailExecution`; success additionally requires no non-terminal command after the same decision, while failure cancels outstanding work.
 
-An `await_event` clause is satisfied by existence, and events are append-only, so satisfaction is monotonic. Rather than scanning the log, the engine checks satisfaction when an event of a matching `(name, version)` is appended — one indexed lookup of pending clauses awaiting that name.
+Every terminal transition appends one execution terminal event and closes any coordinator. Execution cancellation and completion race on the execution lock; the first committed terminal event wins. Terminal state never reopens.
 
-## 12. Plan evaluation
+## 16. Coordinators and durable agents
 
-### 12.1 When
+One coordinator instance belongs to one coordinator-driven execution. It stores current canonical state, a state revision, whether the start activation is pending, the last consumed journal position, and at most one current delivery/lease.
 
-Per FS §10.3, evaluation is required at execution start, when a terminal outcome is appended for a command in `plan_reads` or `command_deps`, or when another event arrives whose name appears in `plan_reads`. Claim, lease, `running`, and `retry_wait` changes are invisible to plans and do not trigger evaluation. The engine reads these narrow indexes in the settle transaction and skips evaluation otherwise. Because plans are pure, skipping is sound; the implementation may over-evaluate freely.
+After start activation, the dispatcher finds the lowest matching event position above the inbox for the registered coordinator definition. Matching includes ordinary `On` subscriptions and the existing command terminal event viewed through `OnOutcome`; no second failure event is written. Registration rejects overlap with success-only `On(cmd.Done())`.
 
-### 12.2 How
+The selected event position becomes the durable delivery identity until acknowledged. One handler runs without a database transaction, stages state mutation/events/spawns/completion, and then settles under the execution and coordinator fences. Success appends `CoordinatorTransition`, commits the new state, advances the inbox to the handled position, applies outputs, and clears delivery retry state atomically. Error leaves the inbox unchanged and schedules the same delivery. Exhaustion appends `CoordinatorFailed`, fails the execution, and cancels work.
 
-Inside any transaction evaluating a plan while holding the execution lock:
+Unmatched journal entries need not be delivered one by one. The indexed query jumps to the next matching event and safely advances past unmatched positions because the coordinator definition/version and subscriptions are immutable for that execution.
 
-1. load the complete command set for this execution: `(key, name, version, source_kind, parent_command_id, required, state, payload_hash, result/failure locator)` — one narrow indexed query;
-2. load the event index: `(name, version)` present, and fetch payloads or command outcomes lazily for `Fact`, `Facts`, `Result`, and `Outcome`;
-3. construct a `*Plan` bound to that snapshot and invoke the user's plan function in Go;
-4. collect the declared node set and the consulted-input set;
-5. validate every declaration, dependency, and read before writing; recover a panic as a typed plan defect;
-6. reconcile (§12.3), or apply §10's terminal plan-defect path;
-7. replace `plan_reads` with the new consulted set and update `executions.absent_reads`.
+For an adaptive agent, the execution is the episode, coordinator state is bounded orchestration memory, model/tool/sub-agent activities are commands, and terminal outcomes are ordered observations. `StartAfter` creates the next durable turn without sleeping. External user input is an idempotent published event. Large transcripts and artifacts remain application data referenced from state. A recursively adaptive sub-agent will use a future child execution rather than nesting another coordinator authority inside the parent execution.
 
-The plan API exposes no I/O capability: no context, database, client, transaction, clock, randomness, or handler scope. Go cannot prevent application code from reaching a package global, so this is a contract rather than a sandbox. `flowtest.AssertDeterministic` evaluates an identical snapshot at least twice and compares canonical declarations and consulted reads; an optional debug runtime mode does likewise. Reconciliation conflicts, invalid reads, panics, and debug-mode divergence are plan defects, never worker failures.
+## 17. Distribution, wake-up, and recovery
 
-`Result` and `Outcome` resolve the key in either the declarations already buffered by the current evaluation or the complete durable command snapshot, then verify the supplied definition's name and version. A missing key or definition mismatch is invalid. A newly declared command has no outcome yet. `Result` records an absent read until the command succeeds; `Outcome` records an absent read until it is terminal. A durable command need not be owned by the plan, which is how a plan joins worker-spawned children.
+Every replica is anonymous. It may register a subset of command and coordinator definitions, poll the same database, and claim compatible work. There is no leader, partition assignment, sticky ownership, or correctness dependency on process identity.
 
-The §10 terminal plan-defect path is shared by every transaction that evaluates a plan. During `Start`, the new execution is retained as failed with `PlanFailed` and `ExecutionFailed`; during ingress, the accepted triggering command or fact is retained before the same terminal transition. The public operation returns a typed error containing the durable `ExecutionID`, so inspection is possible and an idempotent retry resolves to the same execution rather than evaluating again.
+Queue dispatch uses a narrow materialization containing immutable name/version and queue columns, so a rolling-deployment worker does not repeatedly probe an unhandled head-of-lane backlog. The exact index and adversarial benchmark are specified in the schema component.
 
-### 12.3 Reconciliation
+Notifications are transactional hints containing only schema-safe queue/execution identifiers. On initial listener connection and reconnect the runtime performs a catch-up poll before sleeping. A generation-counted local wake hub closes the check-then-sleep race. Poll-only operation is fully supported.
 
-| Declared key | Action |
+Recovery tasks are bounded and leaderless:
+
+- expired command lease -> conclude attempt as interrupted/lease-lost, return command to its persisted retry/ready schedule without consuming budget;
+- expired coordinator lease -> same delivery remains selected and retryable;
+- expired `Within` or execution deadline -> ordinary fenced terminal transition and dependency/completion processing;
+- due delayed/retry work -> no state migration is necessary; the claim index becomes eligible by time;
+- unclaimable registered-version gap -> observation and inspection only, never automatic failure.
+
+Optional local affinity is not in M1. A later implementation may store a preferred replica and a short preference window, but another compatible replica must always take over after that window and no handler may depend on local cache state.
+
+## 18. Canonical encoding and durable evolution
+
+Canonical encoding happens at API or staging boundaries, before locks where possible. The library rejects invalid JSON values, non-finite numbers, unsupported map keys, excessive nesting, and configured size limits. Custom `MarshalJSON` output is canonicalized after marshaling; application tests should use `flowtest.AssertCanonicalStable` for custom types.
+
+SHA-256 accelerates equality but is not trusted as the sole comparison on a conflict path: equal digests compare canonical bytes. Stored durable names and versions define schema meaning. A material payload, result, coordinator-state, or commit-semantics change requires a new version; behavior-preserving worker implementation changes do not.
+
+Errors and observations never include canonical bytes, payloads, connection strings, SQL, lease tokens, or unredacted application failures. Stored failures use bounded structured code/message data and a configurable redaction hook.
+
+## 19. Error model
+
+Public sentinels support `errors.Is`; a structured error adds safe operation, resource, identifier, and reason. Database mapping uses SQLSTATE and stable constraint names, never message text.
+
+| Condition | Result |
 |---|---|
-| absent, all clauses satisfied | insert command as `ready`, `open_commands++` |
-| absent, clauses unsatisfied | insert command as `pending` with clause rows, `open_commands++` |
-| absent, any clause permanently unsatisfiable | insert command as `skipped`, append `CommandSkipped`, do not increment `open_commands` |
-| present and `source_kind = plan` | compare stored payload, definition, required flag, and normalized clauses; any mismatch → plan defect |
-| present from worker, coordinator, or external ingress | `Do` ownership conflict → plan defect; reads and dependency references remain valid |
-| previously declared, now absent | retained untouched |
+| repeated equivalent execution/command/event | existing success/no-op |
+| same stable key with different canonical identity | `ErrConflict` |
+| invalid option, dependency, state transition, or ceiling on ingress | `ErrInvalid` / `ErrInvalidState` |
+| stale lease or delivery | `ErrLeaseLost` |
+| operation against non-idempotently terminal target | `ErrTerminal` |
+| size limit | `ErrPayloadTooLarge` |
+| expired transaction-bound client | `ErrClosed` |
+| schema/version/checksum mismatch | `ErrSchema` |
+| serialization or deadlock conflict in caller transaction | wrapped transient database error |
 
-For a plan-driven execution, the engine validates all references, the 1,000-total-command limit including children and ingress, dependency counts, and acyclicity before inserting anything. All inserts happen in the one transaction, satisfying FS §12.4's atomicity requirement. Insert order is by command key so concurrent executions cannot deadlock on shared unique indexes.
+Handler errors are separately classified into retryable, explicit retry delay, permanent, panic, timeout, interruption, and lost lease. Deterministic plan/output/coordinator decision defects are permanent and are recorded durably rather than retried forever.
 
-### 12.4 Snapshot consistency
+## 20. Inspection and projection
 
-Because the execution row lock is held, the snapshot cannot change under the evaluation, and two evaluations for one execution can never interleave. This is what lets the plan be a plain pure function with no concurrency contract.
+`History` reads the journal alone in position order and supports an after-position cursor. `Trace` combines replayable settled history with current materializations for live lease, next-run time, unresolved dependency, wait deadline, and coordinator-delivery detail.
 
-## 13. Outcome and fail-fast
+The causal graph reducer uses:
 
-`executions.failing` and `open_commands` drive the outcome machine.
+- `ExecutionStarted` for the run root;
+- `CommandCreated` for vertices and dependency/parent edges;
+- attempt records for operational activity;
+- events and terminal events for facts/outcomes;
+- `CoordinatorTransition` for durable state decisions;
+- causation identifiers for decision edges.
 
-On a `failed`, `expired`, or `cancelled` terminal transition of a required command, regardless of whether its source is plan, worker, coordinator, or external ingress, within the same transaction and in FS §6.3's mandated order:
+A replay conformance test rebuilds settled execution, command, dependency, and coordinator projections from retained history and compares them with live materializations. Live lease-renewal state is deliberately excluded. Replay never invokes application code.
 
-1. record the terminal state;
-2. **resolve all dependency clauses naming it first**, so `AfterFailed` and `AfterSettled` dependents become runnable and success-only dependents become `skipped`;
-3. set `failing = true` and cancel remaining non-terminal commands **except** the failure-handling closure — the dependents just made runnable, their transitive dependents, and anything already `running`;
-4. leave the execution non-terminal until that closure resolves.
+Terminal executions and complete journals are retained indefinitely in M1. Retention/archival may later remove bulky payload bodies before causal skeletons, but doing so explicitly narrows historical simulation and rebuild guarantees.
 
-The closure is computed by walking outward from the newly runnable set over `command_deps`, bounded by the command limit. Ordering matters: step 2 strictly precedes step 3, which is what guarantees a refund branch its chance to run. With fail-fast disabled, siblings continue and outcome is evaluated only after all commands settle.
+## 21. Observability
 
-Optional commands still append their terminal outcome events and resolve dependencies, but an unsuccessful optional outcome does not set `executions.failing`. A plan may use `Outcome` plus `AfterSettled` to build a partial-result command from those facts.
+The core observer receives post-commit records for execution and command transitions, claim/attempt outcomes, retry schedules and budget use, initial delays, wait starts/expiry, plan size/duration/routing, coordinator delivery, command-ceiling use/rejection, lease renewal/loss, unclaimable backlog, notification versus polling wake-up, and execution-lock wait.
 
-## 14. Completion
+Observer calls happen after commit or known rollback and outside locks. Bare caller-owned `InTx` has no commit hook, so commit-dependent observations are suppressed rather than emitted falsely. Adapter packages may translate observations into OpenTelemetry, metrics, or structured logs later.
 
-A plan-driven execution succeeds when, at the end of a settle transaction:
+## 22. Verification strategy
 
-- `failing = false` and no required command ended failed, expired, or cancelled;
-- `open_commands = 0`;
-- `absent_reads = 0`;
-- the final evaluation declared no new node.
+### 22.1 Pure and database-free
 
-These are cheap reads on the already-locked execution row. If `failing` is true, reaching zero open commands completes as failed after the failure-handling closure settles. `open_commands` counts plan-declared, spawned, and externally issued commands alike, so unfinished child work cannot disappear from completion. `absent_reads` prevents a plan that branches on a never-arriving fact or non-terminal child outcome from reporting false success (FS §10.1).
+- canonical encoding/fingerprints and retry-policy decisions;
+- staged worker output, dependency-scoped `ResultOf`/`OutcomeOf`, and commit-function inputs;
+- plan declaration, read availability, determinism, routing assertion, reconciliation, and fragment composition;
+- dependency condition matrices, cascaded skip, fail-fast closure, and mode-specific completion;
+- coordinator event matching, `OnOutcome`, ordered state transitions, delayed turns, mixed successful/unsuccessful fan-in, and command ceiling.
 
-A coordinator-driven execution succeeds only on an explicit `SucceedExecution`, validated against `open_commands = 0`.
+### 22.2 PostgreSQL integration
 
-Either way the transition writes the terminal state, cancels anything outstanding, and appends `ExecutionSucceeded` or `ExecutionFailed` at the next position.
+- gap-free journal positions under concurrent ingress, claims, settlements, and rollbacks;
+- exactly one creation record and terminal event per command;
+- no stale lease settlement after cancellation, expiry, recovery, or takeover;
+- all-or-nothing worker/plan/coordinator batches and commit-function writes;
+- Flow-before-application lock order and deliberate inverse-order failure test;
+- immutable retry budget anchor across delay, retry, restart, and lease loss;
+- early/late facts, `Within`, dependency resolution, failure handling, and completion;
+- coordinator start, historical event delivery, failure redelivery, and typed terminal outcome fan-in;
+- command ceiling across every creation path and changed replica defaults;
+- rolling deployments with disjoint registered versions;
+- poll-only recovery and listener reconnect catch-up;
+- replayed settled projections equal live projections.
 
-## 15. Coordinator inbox
+### 22.3 Fault injection and properties
 
-A hand-written coordinator holds `inbox_position` on its row. Delivery selects the lowest-positioned event above it whose `(name, version)` the definition subscribes to, takes the execution lock, invokes the handler, and in one transaction persists new state, staged outputs, and the advanced position.
+Crash points surround claim commit, handler return, every settlement phase, commit-function invocation, notification, ambiguous commit, lease recovery, coordinator inbox advance, and migration units. Properties include monotonic journal position, monotonic plan growth, nonnegative counters, one terminal event per terminal command, immutable closed child membership, and equality between `command_count` and accepted logical commands.
 
-Head-of-line blocking is intended (FS §9.4): a failed delivery does not advance the position, so ordering is preserved and the coordinator retries under the standard policy. A new instance starts at position 0 and scans the retained log in order; no separate broker replay protocol or in-memory backlog exists.
+### 22.4 Benchmarks
 
-## 16. Notifications and wake-up
+- claim throughput with 90% locally unregistered head-of-lane kinds;
+- same-execution parallel claim and settlement contention;
+- plan evaluation and reconciliation at 10, 100, and 1,000 commands;
+- 1,000-child fan-out and 1,000-result concurrent fan-in;
+- one coordinator processing a high-rate event stream;
+- lease renewal at hundreds of active handlers;
+- transactional `NOTIFY` versus poll-only commit throughput;
+- WAL, dead tuples, autovacuum, and journal growth at realistic payload sizes.
 
-One optional session-persistent `pgx.Conn` per process runs `LISTEN` on a channel derived from a SHA-256 hash of the configured schema (`flow_<hash>`), isolating schemas that share a database. Payload is compact versioned JSON naming the lane or execution — never payloads, arguments, or errors.
+## 23. Known trade-offs and extension boundaries
 
-On connect the notifier issues `LISTEN`, then performs a catch-up wake for every bound lane before relying on notifications, closing the start-up race. A local wake hub coalesces duplicate hints and uses a per-key generation counter so a wake arriving between an empty claim and a sleep is not lost.
+- The execution row lock serializes short semantic commits and coordinator decisions within one execution. This buys simple ordering and atomic progression; very large independent adaptive branches should become child executions later.
+- Plan evaluation occurs inside that critical section. The 1,000-command default and plan metrics make the cost explicit; direct and coordinator modes avoid repeated whole-graph evaluation.
+- The initial journal duplicates some immutable bytes also present in projections. Simplicity and standalone history win in M1; content addressing is a compatible storage optimization.
+- Coordinator processing is deliberately single-threaded per execution. Parallel work belongs in spawned commands; the coordinator remains the short durable decision point.
+- Transactional notifications can impose a database-wide commit cost. They are optional hints, measured before default enablement, and can be disabled without changing correctness.
+- Child executions, administrative fork/retry, recurring schedules, local affinity, retention, cross-execution export, UI, and telemetry adapters are additive boundaries. None may weaken per-execution ordering or introduce a second orchestration authority into one execution.
 
-Transactional `NOTIFY` takes a global lock through commit, serializing notifying commits database-wide — the DBOS finding recorded in the jobqueue architecture. Exposure here is bounded because settle transactions emit at most one hint per affected lane. The sanctioned evolution, if benchmarks demand it, is a decoupled hint flusher batching hints into separate small transactions; fallback polling already covers hint loss. This must be benchmarked early.
+## 24. Component responsibility matrix
 
-## 17. Canonical identity
+| Concern | Schema | Engine | Runtime |
+|---|---:|---:|---:|
+| DDL, indexes, constraints, SQL contracts | owner | consumer | consumer |
+| journal batch shape and replay reducer | physical owner | semantic owner | driver |
+| canonical typed definitions | storage codec | owner | registry |
+| command/dependency/plan/coordinator state machines | persistence | owner | invokes |
+| worker/coordinator invocation and leases | statements | decision contracts | owner |
+| polling, notification, shutdown, recovery | statements | transition contracts | owner |
+| migration and SQL error mapping | owner | — | entry points |
+| `Trace`/`History` | queries | projection semantics | public API |
+| `flowtest` | — | pure harness core | public package |
 
-`internal/canonical` implements RFC 8785 (JSON Canonicalization Scheme) and hashes with SHA-256 into a 32-byte column. Canonical bytes back every identity comparison: execution start idempotency, command payload equality on re-declaration, and event idempotency.
-
-Types with custom `MarshalJSON` are canonicalized from their emitted JSON, so a marshaler that is itself nondeterministic produces unstable identity. This constraint is documented rather than enforced; `flowtest` provides a round-trip stability assertion applications can run over their own payload types.
-
-## 18. Errors
-
-Sentinels support `errors.Is`; a typed `Error` carries operation, resource, identifier, and reason. The PostgreSQL adapter maps by SQLSTATE and constraint name — **never message text** — and retains the underlying `*pgconn.PgError` through wrapping.
-
-| Condition | Mapping |
-|---|---|
-| `23505` on an idempotency constraint | compare stored hash, then success or `ErrConflict` |
-| staged child key conflicts with another creation source | permanent parent `CommandFailed`; no staged output commits |
-| staged batch exceeds the execution command limit | permanent parent `CommandFailed`; no staged output commits |
-| `23503` ownership reference | `ErrNotFound` or `ErrConflict` by operation |
-| `23514` check violation | `ErrInvalid` with the safe field name |
-| zero fenced update rows | diagnostic lookup → `ErrLeaseLost`, `ErrTerminal`, or `ErrNotFound` |
-| `40001` / `40P01` | internal retry where authorized, else typed transient |
-| connection loss at commit | uncertain-commit detail; stable keys let the caller re-derive outcome |
-| checksum or version mismatch | `ErrSchema`, startup-fatal |
-
-Constraint names are a stable part of the migration contract and cannot be renamed casually.
-
-## 19. Migrations
-
-SQL is embedded with `go:embed` and also exposed as an `fs.FS` with the configured schema rendered in, so applications may run it through their own tooling.
-
-`Migrate` applies one unit per transaction, each guarded by `pg_advisory_xact_lock` keyed on database identity and schema hash: acquire, re-check the next required version, verify checksums of applied units, apply, record version/name/checksum/library version, commit. Concurrent migrators interleave only at unit boundaries and never apply a unit twice.
-
-Startup verifies compatibility without mutating. Schema evolution follows expand/migrate/contract, and durable-schema evolution of payloads is handled by `(name, version)` pairs rather than by migrations.
-
-## 20. Observability
-
-The root package defines one `Observation` struct and an `Observer` interface with a no-op default. Transactional code buffers observations and emits them only after the commit or rollback result is known; a bare `InTx` suppresses commit-dependent observations because a `pgx.Tx` exposes no commit hook, and `Transact`/`BindTx` provide the hooked form.
-
-Required measurements: claim rate and empty claims, handler duration, attempt outcomes split by operational interruption versus application failure, retry schedule depth, lease renewal and loss, spawned-child count and settle conflicts, **plan evaluation count, total command count, and duration**, plan defects and debug determinism failures, evaluations skipped, dependency resolutions per settle, `absent_reads` per execution, unclaimable backlog by `(name, version)`, notification latency versus poll, and per-execution lock wait.
-
-Observer callbacks run outside transactions and locks; panics are recovered and cannot affect durable results.
-
-## 21. Testing strategy
-
-**Unit** — validation, state machines, retry decisions, clause satisfaction, canonical encoding stability, error classification, wake-hub generation logic.
-
-**`flowtest`** — the public harness. A worker is exercised as a function with inspection of staged children, events, and `OnCommit` callbacks. A plan is exercised as a pure function over `(args, facts, command states)` asserting declarations, clauses, `Result` / `Outcome` reads, and consulted inputs. `AssertDeterministic` compares repeated evaluation of the identical snapshot. No database.
-
-**Integration against real PostgreSQL** — hundreds of concurrent claimers; lease expiry and stale fencing; claim/cancel races; settle/cancel races; crash injection at every step of §10; all-or-nothing child spawning; parent retry and duplicate child keys; spawned-child `Result` / `Outcome` joins; exactly one terminal event for success, failure, cancellation, expiry, and skip; publish-before-declare and declare-before-publish; repeated evaluation creating no duplicate commands; plan-defect terminal handling without worker retry; `absent_reads` blocking false success; fail-fast preserving `AfterFailed` branches; `Await` expiry; gap-free positions under concurrent ingress; coordinator head-of-line ordering; migration concurrency and checksums; rolling deployments with divergent registered versions.
-
-**Property tests** — `unsatisfied_clauses` never negative; a command becomes `ready` at most once; a command has exactly one terminal event iff it is terminal; a successful parent has an immutable complete direct-child set; positions are gap-free and strictly increasing per execution; `open_commands` equals the true non-terminal count after any operation sequence.
-
-**Benchmarks** — claim throughput and plan cost at the 1,000-command ceiling; settle latency with worker-spawned and plan-declared fan-out; per-execution lock contention; transactional `NOTIFY` commit throughput versus a batched flusher versus poll-only; autovacuum and WAL behavior on `commands` and `events`.
-
-## 22. Performance strategy
-
-Correctness precedes throughput claims. Every hot query is checked with `EXPLAIN (ANALYZE, BUFFERS)` against representative distributions, including the adversarial claim case in §9.1. Index changes require write-amplification measurement, not only read plans.
-
-`commands` and `events` are the churn-heavy tables and get explicit autovacuum settings in the initial migration, with the fillfactor and thresholds recorded in `components/schema.md`. Partitioning is deferred pending evidence; `events` and terminal executions are the first candidates.
-
-No connection is held for handler duration. One optional listener connection plus short pool borrows support many worker goroutines.
-
-## 23. Component responsibilities
-
-**`components/schema.md`** — every table's DDL, constraints, and indexes; the claim, settle, resolution, and maintenance statements verbatim; autovacuum settings; index benchmark results including the `(name, version)` question from §9.1.
-
-**`components/engine.md`** — staged-child validation and insertion; plan snapshot construction and the `Plan` binding; `Result` / `Outcome`; reconciliation and resolution as executable pseudocode; terminal outcome uniqueness; the failure closure computation; plan-defect settlement; completion evaluation; coordinator inbox delivery; the plan-purity test matrix.
-
-**`components/runtime.md`** — worker pool, capacity-aware dispatch, lease manager, notifier and wake hub, maintenance tasks, migration engine, error mapping tables, and the `flowtest` harness API.
-
-## 24. References
-
-- [`pgkit/v2`](https://github.com/goware/pgkit) · [`pgx/v5`](https://github.com/jackc/pgx) · [`google/uuid`](https://github.com/google/uuid)
-- [PostgreSQL `SELECT`, row locks, `SKIP LOCKED`](https://www.postgresql.org/docs/15/sql-select.html) · [explicit locking](https://www.postgresql.org/docs/15/explicit-locking.html) · [`LISTEN`](https://www.postgresql.org/docs/15/sql-listen.html) · [`NOTIFY`](https://www.postgresql.org/docs/15/sql-notify.html) · [routine vacuuming](https://www.postgresql.org/docs/15/routine-vacuuming.html)
-- [RFC 8785 — JSON Canonicalization Scheme](https://www.rfc-editor.org/rfc/rfc8785)
-- [DBOS: Postgres LISTEN/NOTIFY scalability](https://www.dbos.dev/blog/postgres-listen-notify-scalability) · [HN discussion](https://news.ycombinator.com/item?id=49040296)
+The implementation plan must treat the functional specification's §22 acceptance criteria as milestone exit criteria, not as optional follow-up tests.
