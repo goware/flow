@@ -19,13 +19,15 @@ A command is a durable instruction to perform work. A worker handles the command
 
 Execution is distributed by default. Calling `.Execute` durably enqueues work in PostgreSQL and does not assign it to the caller. Any compatible replica running `Runtime.Run` may claim the command; events and child commands committed by that worker may wake and be handled by other replicas. No execution requires one process to remain alive or retain in-memory state.
 
-There is one event concept. Conceptually, workers emit events. In the API, returning `(result, nil)` automatically records an immutable event carrying the command's typed result; workers call `flow.Emit` only for additional application facts. Failure, cancellation, expiry, and skipping are also recorded as ordinary events. Every command that ends therefore produces exactly one final fact, so progress is observable and "wait for this work" and "wait for this fact" use the same durable mechanism. A retryable error records attempt history but no final event because the command has not finished.
+There is one developer-facing event concept. Conceptually, workers emit events. In the API, returning `(result, nil)` automatically records an immutable event carrying the command's typed result; workers call `flow.Emit` only for additional application facts. Failure, cancellation, expiry, and skipping are also recorded as ordinary events. Every command that ends therefore produces exactly one final fact, so progress is observable and "wait for this work" and "wait for this fact" use the same durable mechanism. A retryable error records attempt history but no final event because the command has not finished.
+
+Every execution also has one immutable ordered **journal**. It contains the broader durable history needed to explain the run: execution transitions, creation of every command, attempt lifecycle, application and terminal events, dependencies, parentage, and causation. An `Event[T]` is a plan- and coordinator-visible fact recorded in that journal; `CommandCreated`, `AttemptStarted`, and similar operational entries are history, not additional developer-facing event concepts. The journal is the complete account of execution decisions and lifecycle transitions accepted by `flow`; it does not claim to observe an external effect whose result never reached PostgreSQL.
 
 Commands and events belong to an **execution**. A plan is optional. The simplest execution starts one root command directly; its workers may form a bounded command tree with `Spawn`, and the execution finishes when that tree settles. When progression requires dependencies, joins, waits, or branches across commands, a **plan** declares that orchestration as a pure function re-evaluated over all relevant events and command results recorded so far. "React" does not mean that the plan receives one event callback. Where membership is open-ended or a plan cannot express the logic, a hand-written **coordinator** reacts to events directly.
 
 Application code begins any mode by binding its command, plan, or coordinator definition with `With(runtime)` and calling `.Execute` on the returned immutable copy. The call durably schedules the execution and returns an `ExecutionHandle`; it never runs a worker or coordinator handler inline.
 
-Commands are the executable vertices of the runtime graph, events explain progression, and causation supplies the edges. The graph is a projection of durable history, extended by the plan's record of work that is declared but not yet runnable.
+Commands are the executable vertices of the runtime graph, events explain progression, and causation supplies the edges. Because command creation itself is journaled, the graph is reconstructible from retained durable history, extended by the plan's record of work that is declared but not yet runnable.
 
 ## 2. Scope
 
@@ -33,7 +35,7 @@ Commands are the executable vertices of the runtime graph, events explain progre
 
 PostgreSQL is the sole required backend. `flow` has no broker abstraction and does not attempt to make PostgreSQL, Kafka, and SQS interchangeable.
 
-This is a product feature: application writes, command completion, plan reconciliation, emitted events, and spawned commands can share one transaction. PostgreSQL notifications may reduce latency, but polling is always sufficient for correctness.
+This is a product feature: a declared short application commit function, command completion, plan reconciliation, emitted events, and spawned commands can share one transaction. PostgreSQL notifications may reduce latency, but polling is always sufficient for correctness.
 
 ### 2.2 Milestone 1
 
@@ -41,6 +43,7 @@ This is a product feature: application writes, command completion, plan reconcil
 - direct root-command execution requiring no plan or coordinator;
 - one `.Execute` verb on command, plan, and coordinator definitions, using immutable runtime binding through `With`;
 - typed, versioned commands carrying both a payload type and a **result** type;
+- one immutable ordered journal entry for every accepted command creation, including its payload, origin, parent where applicable, dependencies, classification, and causation;
 - exactly one event recording how each command ends, with successful worker results recorded automatically as typed events;
 - worker registration, command scheduling, leases, attempts, retries, timeouts, and fencing;
 - bounded worker-spawned child commands committed atomically with the event recording the parent's success;
@@ -51,7 +54,8 @@ This is a product feature: application writes, command completion, plan reconcil
 - historical matching-event delivery to plans and coordinators;
 - delayed commands as the durable timer primitive;
 - execution and command cancellation;
-- atomic worker, plan, and coordinator outputs including application writes;
+- optional declared worker commit functions for short application-table writes that must commit atomically with command success;
+- atomic worker, plan, and coordinator outputs, including writes made by declared worker commit functions;
 - inspection, causal trace, immutable history, listing, and waiting;
 - embedded migrations;
 - a database-free handler and plan test harness;
@@ -69,7 +73,7 @@ This is a product feature: application writes, command completion, plan reconcil
 - cancel-remaining join policies;
 - arbitrary subtree cancellation;
 - recurring schedules;
-- archival and configurable terminal-history retention;
+- archival and configurable terminal-journal retention;
 - cross-execution subscriptions and event export to Kafka or analytics systems through an explicit idempotent boundary that preserves the source `(ExecutionID, position)` and neither merges execution logs nor promises cross-execution order (§9.4);
 - plan simulation and dry-run tooling that uses the exact plan version and a retained execution snapshot to preview declarations and reads after historical or candidate transitions, without executing workers or external effects (§9.6);
 - optional soft local affinity with bounded preference for the replica that starts an execution and automatic takeover by another replica;
@@ -78,8 +82,8 @@ This is a product feature: application writes, command completion, plan reconcil
 
 ### 2.5 Explicit non-goals
 
-- a general-purpose message broker or event-streaming platform, or implicit cross-execution pub/sub inside the core event log;
-- a database-wide event log, global event position, or total ordering guarantee across executions;
+- a general-purpose message broker or event-streaming platform, or implicit cross-execution pub/sub inside an execution journal;
+- a database-wide journal, global position, or total ordering guarantee across executions;
 - framework-owned copies of application/domain state;
 - deterministic replay of arbitrary Go code;
 - exactly-once external side effects;
@@ -96,7 +100,8 @@ This is a product feature: application writes, command completion, plan reconcil
 | **Command** | One immutable logical request for work, with typed payload and typed result. Keeps one `CommandID` across attempts. |
 | **Attempt** | One invocation of a command handler, identified separately from the command. |
 | **Worker** | A registered typed handler for one command name and version. |
-| **Event** | An immutable fact in an execution's ordered log, never destructively consumed. A successful worker return records one automatically; the runtime records one when a command ends another way; workers and applications may record additional facts. |
+| **Event** | An immutable fact in an execution's ordered journal, never destructively consumed. A successful worker return records one automatically; the runtime records one when a command ends another way; workers and applications may record additional facts. |
+| **Journal** | The complete immutable per-execution sequence of accepted execution decisions and lifecycle transitions. It includes command creation, attempts, events, outcomes, and causation; only event entries are exposed as `Event[T]` facts. |
 | **Plan** | An optional pure function declaring the commands an execution needs and what each one waits for. Used for dependencies, joins, waits, and branching across commands. |
 | **Spawn** | A worker or coordinator staging an asynchronous command; a worker-spawned command is a direct child of the current command. |
 | **Coordinator** | Durable typed state reacting to events for orchestration that is open-ended or unsuitable for a plan. |
@@ -148,8 +153,21 @@ func (c Command[A, R]) With(client Client) Command[A, R]
 func Handle[A, R any](
     cmd Command[A, R],
     worker func(context.Context, *Work[A]) (R, error),
-    opts ...WorkerOption,
+    opts ...WorkerOption[A, R],
 ) Registration
+
+type Commit[A, R any] struct {
+    Args   A
+    Result R
+    Info   CommandInfo
+}
+
+type Tx interface{ /* narrow Exec, Query, and QueryRow transaction capability */ }
+type WorkerOption[A, R any] interface{ /* sealed by flow */ }
+
+func WithCommit[A, R any](
+    fn func(context.Context, Tx, Commit[A, R]) error,
+) WorkerOption[A, R]
 
 func DefinePlan[A any](name string, version int, plan func(*Plan, A)) PlanDef[A]
 func (p PlanDef[A]) With(client Client) PlanDef[A]
@@ -167,9 +185,9 @@ func WithQueue(string) CommandOption            // worker lane
 
 A command declares both what it takes and what it returns. `Command.Done()` is the event carrying that result; it shares the command's name and version, needs no separate declaration, and is what `After` waits on. It is an ordinary `Event[R]`, not a separate event category.
 
-Names are stable durable identifiers. Every definition carries an explicit positive integer version; `0` is invalid. A `(name, version)` pair has immutable payload and result meaning once used, while its handler implementation may change and redeploy freely. A runtime claims only work for pairs it has registered; unknown pairs stay pending for a compatible process and consume no retry budget.
+Names are stable durable identifiers. Every definition carries an explicit positive integer version; `0` is invalid. A `(name, version)` pair has immutable payload and result meaning once used, while behavior-preserving handler and commit-function implementation changes may redeploy freely. A material change to commit semantics requires a new command version just like a material change to payload or result meaning. A runtime claims only work for pairs it has registered; unknown pairs stay pending for a compatible process and consume no retry budget.
 
-Registration is explicit and runtime-local; definitions mutate no package-global state. A runtime rejects duplicate workers for one command pair, more than one `OnStart` handler for a coordinator, and duplicate handlers for one event pair within a coordinator.
+Registration is explicit and runtime-local; definitions mutate no package-global state. A runtime rejects duplicate workers for one command pair, more than one declared commit function for a worker, more than one `OnStart` handler for a coordinator, and duplicate handlers for one event pair within a coordinator.
 
 `With` returns a new immutable, concurrency-safe value of the **same definition type**, carrying the client capability in private non-durable state. It never mutates or registers the original definition, performs no I/O, and creates no execution. Definition identity, serialization, event references, and registration ignore the binding.
 
@@ -282,7 +300,15 @@ Calling `With(client)` on any definition returns the same static type with that 
 
 ```go
 type Work[A any] struct {
-    Payload A
+    Args A
+}
+
+type CommandInfo struct {
+    ExecutionID ExecutionID
+    CommandID   CommandID
+    CommandKey  string
+    Name        string
+    Version     int
 }
 
 type ResultSource interface{ /* sealed by flow */ }
@@ -301,11 +327,17 @@ func SucceedExecution(s CoordinatorScope, resultRef string) error
 func FailExecution(s CoordinatorScope, reason error) error
 
 func (w *Work[A]) Info() CommandInfo
-func (w *Work[A]) OnCommit(func(context.Context, pgx.Tx) error)
-func (c *Coordination[S]) OnCommit(func(context.Context, pgx.Tx) error)
 ```
 
-A worker returns `(R, error)`. Conceptually, the worker emits an event when its command finishes. The API makes the common success path automatic: returning `(result, nil)` records the event carrying `R`, together with any additional events, spawned commands, and `OnCommit` writes it staged — all in one short transaction. Returning an error discards every staged output. A retryable error produces attempt history but no final event; a final failure records `CommandFailed` after the retry policy is exhausted or the error is classified permanent.
+`Work.Args` is the typed argument value supplied when the command was created. The API uses **arguments** for what a worker receives, **result** for what it returns, **payload** for serialized command or event data, and **state** for coordinator memory.
+
+A worker returns `(R, error)`. Conceptually, the worker emits an event when its command finishes. The API makes the common success path automatic: returning `(result, nil)` records the event carrying `R`, together with any additional events and spawned commands it staged — all in one short transaction. Returning an error discards every staged output. A retryable error produces attempt history but no final event; a final failure records `CommandFailed` after the retry policy is exhausted or the error is classified permanent.
+
+Most workers register no commit function. A worker that must make a short PostgreSQL application write inseparable from its successful command outcome may register one declared function with `WithCommit` (§4.2). The runtime invokes it only after the handler returns `(result, nil)`, output and fence validation succeed, and the short settlement transaction has begun. Its `Commit[A, R]` value contains canonical durable arguments, the successful typed result, and command metadata. The application write, result event, journal entries, staged outputs, plan reconciliation, and materialized state then commit or roll back together.
+
+A commit function is a statically registered transactional tail, not a dynamically captured worker output. Values that drive its write must appear in `Args`, `Result`, or `Info`; in particular, a worker-local value must be added to `R` before the commit function may use it. The function must be deterministic from those durable inputs, perform only bounded local PostgreSQL work through the supplied narrow `Tx`, and avoid external I/O, clocks, randomness, mutable globals, goroutines, and nested `flow` operations. `Tx` exposes query execution but not commit, rollback, or nested-transaction control and is intentionally easy for application repositories to accept and tests to replace. Go cannot completely prohibit global access, so this is a contract reinforced by direct testing and optional static analysis rather than a sandbox.
+
+A commit-function error rolls back ordinary settlement and is classified with the command's retry rules; the worker may consequently run again. External work in that worker must therefore still use `CommandID` or another stable key for idempotency or reconciliation. A database write that is part of the meaning of one command's success belongs in the commit function. Work needing its own identity, retry policy, event, or graph vertex is a separate command instead. Coordinator handlers have no commit function: application work belongs in commands, while a coordinator atomically changes only its orchestration state, inbox, events, and spawned commands.
 
 `Do` and `Spawn` are both asynchronous, but intentionally use different verbs. `Do` is a repeatable declarative operation evaluated many times and reconciled by key. `Spawn` is an imperative staged output of one successful handler decision. It never calls the child handler inline.
 
@@ -322,7 +354,8 @@ Requirements:
 - `Emit` and `Spawn` are available to both worker and coordinator scopes; a plan uses `Do`, never `Spawn`;
 - duplicate equivalent `Spawn` calls for one key within one handler decision coalesce, while different content for one key returns `ErrConflict` and commits nothing;
 - execution completion functions are available only to coordinator scopes; direct and plan-driven executions complete automatically (§6.4);
-- `OnCommit` is for application-table writes. Nested `flow` operations use staged outputs or a caller-owned transaction, never a recursive call from inside a callback.
+- a declared commit function is available only on worker registration; coordinator application work is expressed as commands;
+- nested `flow` operations use staged outputs or a caller-owned transaction, never a recursive call from inside a commit function.
 
 ### 4.6 Inspection
 
@@ -351,14 +384,14 @@ func RetryAfter(d time.Duration, err error) error
 | Category | Exported |
 |---|---|
 | Runtime | `New`, `Migrate`, `Register`, `Run`, `Stop`, `InTx` |
-| Definitions | `DefineCommand`, `DefineEvent`, `DefinePlan`, `DefineCoordinator`, `Handle`, `OnStart`, `On`, `Done`, `Name`, `Version`, `With` |
+| Definitions | `DefineCommand`, `DefineEvent`, `DefinePlan`, `DefineCoordinator`, `Handle`, `WithCommit`, `OnStart`, `On`, `Done`, `Name`, `Version`, `With` |
 | Plans | `Do`, `Fact`, `Facts`, `Children`, `Result`, `Outcome`, plus 10 command builder methods |
 | Execution | `Execute` on `Command`, `PlanDef`, and `Coordinator`; `Issue`, `Publish`, `CancelExecution`, `CancelCommand` |
-| Handler output | `Emit`, `Spawn`, `Optional`, `OnCommit`, `Info`, `SucceedExecution`, `FailExecution` |
+| Handler output | `Emit`, `Spawn`, `Optional`, `Info`, `SucceedExecution`, `FailExecution` |
 | Inspection | `GetExecution`, `LookupExecution`, `Trace`, `History`, `ListExecutions`, `AwaitExecution`, `ResultOf` |
 | Errors | `Permanent`, `RetryAfter` |
 
-The smallest path is `DefineCommand`, `Handle`, `With(runtime)`, `Command.Execute`, and `Run`. Store the returned same-type copy when a definition is executed repeatedly. Add `Spawn` when a worker discovers bounded children. Add `DefinePlan`, `Do`, `PlanDef.Execute`, and event reads only when the execution needs cross-command dependencies, joins, waits, or branching. Coordinators, cancellation, transaction composition, and policy customization form the advanced operational surface.
+The smallest path is `DefineCommand`, `Handle`, `With(runtime)`, `Command.Execute`, and `Run`. Store the returned same-type copy when a definition is executed repeatedly. Add `Spawn` when a worker discovers bounded children. Add `WithCommit` only when one command's successful meaning includes a short atomic application-table write. Add `DefinePlan`, `Do`, `PlanDef.Execute`, and event reads only when the execution needs cross-command dependencies, joins, waits, or branching. Coordinators, cancellation, transaction composition, and policy customization form the advanced operational surface.
 
 ## 5. Worked examples
 
@@ -372,13 +405,23 @@ type ReceiptArgs struct {
     Email   string
 }
 
-var SendReceipt = flow.DefineCommand[ReceiptArgs, flow.None]("send_receipt", 1)
+type ReceiptSent struct {
+    ProviderMessageID string
+}
 
-func sendReceipt(ctx context.Context, w *flow.Work[ReceiptArgs]) (flow.None, error) {
-    if err := mailer.SendReceipt(ctx, w.Payload.OrderID, w.Payload.Email); err != nil {
-        return flow.None{}, err
+var SendReceipt = flow.DefineCommand[ReceiptArgs, ReceiptSent]("send_receipt", 1)
+
+func sendReceipt(ctx context.Context, w *flow.Work[ReceiptArgs]) (ReceiptSent, error) {
+    sent, err := mailer.SendReceiptOnce(
+        ctx,
+        string(w.Info().CommandID), // stable across attempts
+        w.Args.OrderID,
+        w.Args.Email,
+    )
+    if err != nil {
+        return ReceiptSent{}, err
     }
-    return flow.None{}, nil
+    return ReceiptSent{ProviderMessageID: sent.MessageID}, nil
 }
 
 rt, err := flow.New(db)
@@ -397,13 +440,13 @@ h, err := SendReceipt.With(rt).Execute(
 )
 ```
 
-`Runtime.Run` claims the queued command and invokes the registered `sendReceipt` worker. `Command.Execute` returns an `ExecutionHandle` immediately. When the command succeeds, its result event and the execution's `ExecutionSucceeded` event are recorded. If the worker spawns required children, the execution remains running until those descendants also settle.
+`Runtime.Run` claims the queued command and invokes the registered `sendReceipt` worker. `Command.Execute` returns an `ExecutionHandle` immediately. The journal first records creation of the root command with its canonical arguments and causation. When the command succeeds, it records the typed `ReceiptSent` event and the execution's `ExecutionSucceeded` event. Attempt starts and interruptions remain operational history rather than plan-visible events. If the worker spawns required children, the execution remains running until those descendants also settle. Because sending mail is external, the worker uses the stable `CommandID` as an application/provider idempotency key.
 
 An application may bind its frequently used definitions once:
 
 ```go
 type AppFlows struct {
-    SendReceipt flow.Command[ReceiptArgs, flow.None]
+    SendReceipt flow.Command[ReceiptArgs, ReceiptSent]
     Report      flow.PlanDef[ReportArgs]
     Intent      flow.Coordinator[IntentState]
 }
@@ -432,7 +475,7 @@ Definitions remain available separately for worker registration, typed result ac
 // ---- definitions ----
 
 var (
-    PrepareReport = flow.DefineCommand[PrepareArgs, flow.None]("prepare_report", 1)
+    PrepareReport = flow.DefineCommand[PrepareArgs, PrepareResult]("prepare_report", 1)
     AnalyzePart   = flow.DefineCommand[AnalysisArgs, AnalysisResult](
         "analyze_report_part", 1,
         flow.WithMaxAttempts(5),
@@ -445,6 +488,10 @@ var (
 type GenerateArgs struct {
     CompanyID    string
     AnalysisKeys []string
+}
+
+type PrepareResult struct {
+    AnalysisCount int
 }
 
 // ---- the plan: high-level progression and joins ----
@@ -476,39 +523,51 @@ func planReport(p *flow.Plan, args ReportArgs) {
 
 // ---- a worker may expand one command into bounded direct children ----
 
-func prepareReport(ctx context.Context, w *flow.Work[PrepareArgs]) (flow.None, error) {
-    analyses, err := determineAnalyses(ctx, w.Payload.CompanyID)
+func prepareReport(ctx context.Context, w *flow.Work[PrepareArgs]) (PrepareResult, error) {
+    analyses, err := determineAnalyses(ctx, w.Args.CompanyID)
     if err != nil {
-        return flow.None{}, err
+        return PrepareResult{}, err
     }
 
     for _, analysis := range analyses {
         key := "analysis/" + analysis.ID
         if err := flow.Spawn(w, key, AnalyzePart, analysis.Args); err != nil {
-            return flow.None{}, err
+            return PrepareResult{}, err
         }
     }
 
-    w.OnCommit(func(ctx context.Context, tx pgx.Tx) error {
-        return reports.MarkPrepared(ctx, tx, w.Payload.CompanyID, len(analyses))
-    })
-    return flow.None{}, nil
+    return PrepareResult{AnalysisCount: len(analyses)}, nil
+}
+
+// This short local write is part of what PrepareReport succeeding means.
+// Its inputs are already durable in the command arguments and result.
+func commitPrepareReport(
+    ctx context.Context,
+    tx flow.Tx,
+    c flow.Commit[PrepareArgs, PrepareResult],
+) error {
+    return reports.MarkPrepared(
+        ctx,
+        tx,
+        c.Args.CompanyID,
+        c.Result.AnalysisCount,
+    )
 }
 
 func analyzePart(ctx context.Context, w *flow.Work[AnalysisArgs]) (AnalysisResult, error) {
-    return analyzers.For(w.Payload.Kind).Analyze(ctx, w.Payload)
+    return analyzers.For(w.Args.Kind).Analyze(ctx, w.Args)
 }
 
 func generateReport(ctx context.Context, w *flow.Work[GenerateArgs]) (ReportResult, error) {
-    results := make([]AnalysisResult, 0, len(w.Payload.AnalysisKeys))
-    for _, key := range w.Payload.AnalysisKeys {
+    results := make([]AnalysisResult, 0, len(w.Args.AnalysisKeys))
+    for _, key := range w.Args.AnalysisKeys {
         result, err := flow.ResultOf(w, key, AnalyzePart)
         if err != nil {
             return ReportResult{}, err
         }
         results = append(results, result)
     }
-    return reports.Generate(ctx, w.Payload.CompanyID, results)
+    return reports.Generate(ctx, w.Args.CompanyID, results)
 }
 ```
 
@@ -520,7 +579,7 @@ if err != nil {
     return err
 }
 if err := rt.Register(
-    flow.Handle(PrepareReport, prepareReport),
+    flow.Handle(PrepareReport, prepareReport, flow.WithCommit(commitPrepareReport)),
     flow.Handle(AnalyzePart, analyzePart),
     flow.Handle(GenerateReport, generateReport),
     flow.Handle(RecordAnalysisFailure, recordAnalysisFailure),
@@ -547,15 +606,17 @@ h, err := ReportExecution.With(flowDB).Execute(
 )
 ```
 
-The first plan evaluation declares only `prepare`. Its worker discovers the complete analysis membership and stages every child with `Spawn`; the children and the event returned by `PrepareReport.Done()` become visible atomically. `Children` then exposes that authoritative closed membership, and the next evaluation declares every failure branch and the pending `generate` command together. Analysis workers run in parallel. Once every `After` dependency succeeds, `generate` becomes runnable and its worker reads the immutable typed dependency results through `ResultOf`.
+The first plan evaluation declares only `prepare`, whose creation is appended to the execution journal with its arguments, dependencies, origin, and causation. Its worker discovers the complete analysis membership and stages every child with `Spawn`. The declared commit function then marks the application report prepared using only the durable command arguments and result. That write, every child-creation journal entry and command row, the event returned by `PrepareReport.Done()`, and closed membership become visible atomically. `Children` then exposes that authoritative membership, and the next evaluation declares every failure branch and the pending `generate` command together. Analysis workers run in parallel. Once every `After` dependency succeeds, `generate` becomes runnable and its worker reads the immutable typed dependency results through `ResultOf`.
 
-If the preparation handler fails partway through staging, no child is committed. If one analysis exhausts retries, it records `CommandFailed`, the already-declared corresponding `AfterFailed` branch runs, `generate` becomes `skipped`, and the execution ultimately fails after the remaining analyses settle. Child membership is never duplicated in `PrepareReport`'s result, and routine value plumbing introduces no result-loop early-return trap. The plan needs no coordinator because this fan-out membership closes with one successful parent return.
+If the preparation handler, commit function, or settlement fails, no child, result event, or application write is committed; the command retries under its policy. Any slow or external operation in that worker must therefore be idempotent even though the commit function itself is local. If one analysis exhausts retries, it records `CommandFailed`, the already-declared corresponding `AfterFailed` branch runs, `generate` becomes `skipped`, and the execution ultimately fails after the remaining analyses settle. Child membership is never duplicated in `PrepareReport`'s result, and routine value plumbing introduces no result-loop early-return trap. The plan needs no coordinator because this fan-out membership closes with one successful parent return.
 
 ## 6. Executions
 
 ### 6.1 Identity and idempotent start
 
 An execution has a generated `ExecutionID`, a driver mode, an execution type, and a caller-supplied key. The driver mode is `direct`, `plan`, or `coordinator`. The type is the receiver definition's name: command, plan, or coordinator respectively. `(driver_mode, execution_type, execution_key)` is unique for as long as the execution is retained; an empty key enforces no uniqueness.
+
+Creating an execution appends one `ExecutionStarted` journal entry in the same transaction. It records the execution identity, driver definition and version, canonical root arguments or initial coordinator state, deadline, materially relevant options, metadata allowed by the serialization policy, and causation. It is operational history rather than a plan-visible event. An idempotent repeated start that finds equivalent content appends nothing.
 
 Repeating `.Execute` on the same definition with the same key, definition version, canonical arguments or initial state, and materially relevant options returns the existing execution with `Created == false`. Reusing that identity with materially different content returns `ErrConflict` and changes nothing.
 
@@ -619,6 +680,8 @@ A command added by `Issue` is required for outcome purposes in Milestone 1. Deta
 
 Every command has a `CommandID` stable across attempts, an `ExecutionID`, a name and version, a `CommandKey` unique within its execution, a canonical typed payload, a required/optional classification, and causation identifying what created it. A worker-spawned command additionally records the current command as its direct parent.
 
+Accepting a command by any creation path appends one immutable `CommandCreated` journal entry in the same transaction that materializes the command and its dependencies. The entry records its ID and key, name and version, canonical payload, creation origin, parent where applicable, required/optional classification, declared dependencies and waits, policy that affects execution semantics, and causation. Reconciliation that finds an equivalent existing command appends nothing; creation and idempotent rediscovery remain distinguishable.
+
 A plan-declared command's key is its command key. All creation paths share one execution-wide key namespace. Re-declaring the same plan-owned key with an equivalent definition, canonical payload, and policy is a no-op; different content returns `ErrConflict`. A plan may read or depend on an existing spawned command, but attempting to take ownership of its key with `Do` is a plan defect.
 
 ### 7.2 Lifecycle
@@ -640,13 +703,13 @@ pending → skipped
 
 When a command reaches a final state, `flow` records exactly one event describing how it ended.
 
-For success, returning `(result, nil)` records the event returned by `Command.Done()`, carrying the typed result and sharing the command's name and version. This is automatic and cannot be suppressed. It is the fact that `After` waits for, which makes "wait for work" and "wait for a fact" one mechanism.
+For success, returning `(result, nil)` records the event returned by `Command.Done()`, carrying the typed result and sharing the command's name and version. Final-state metadata records whether the command's declared commit function was applied in that same transaction. This is automatic and cannot be suppressed. It is the fact that `After` waits for, which makes "wait for work" and "wait for a fact" one mechanism.
 
 A worker may additionally call `Emit` to record application events. Those are recorded at earlier positions than the event recording success, so any reader observing success has already observed them.
 
-Failure, cancellation, expiry, or skipping records exactly one `CommandFailed`, `CommandCancelled`, `CommandExpired`, or `CommandSkipped` event instead. All are ordinary events in the same log. A database constraint prevents more than one event recording the final state of a command. Retryable attempt failures are history, not events, because the command has not ended.
+Failure, cancellation, expiry, or skipping records exactly one `CommandFailed`, `CommandCancelled`, `CommandExpired`, or `CommandSkipped` event instead. All are ordinary events in the same journal. A database constraint prevents more than one event recording the final state of a command. Retryable attempt failures are history, not events, because the command has not ended.
 
-This invariant makes every terminal command transition plan-observable and auditable, and lets plan simulation follow terminal progress when combined with retained command, dependency, and child-membership records. It does **not** make the event log alone a complete source for command or execution state: the immutable command row remains the issuance record (§9.6).
+Together, the `CommandCreated` journal entry and exactly one terminal event make every command's existence, topology, arguments, and final outcome reconstructible from retained history. This makes terminal progress plan-observable and auditable and lets historical plan simulation fold one ordered source. The command, dependency, and child tables remain indexed materializations for claiming and current-state queries rather than a second logical history (§9.6).
 
 ### 7.4 Bounded child spawning
 
@@ -656,7 +719,7 @@ For a worker handler:
 
 - every spawned command is a direct child of the current logical command;
 - stable child keys are unique across the execution and remain stable across parent retries;
-- all staged children, emitted application events, the event recording the parent's success, and `OnCommit` writes commit atomically on successful return;
+- all staged children and their `CommandCreated` entries, emitted application events, the event recording the parent's success, and any declared commit-function write commit atomically on successful return;
 - if the handler returns an error, panics, loses its lease, is cancelled, or the settle transaction rolls back, none of its staged children become visible;
 - after the parent succeeds, its direct-child membership is closed permanently, although the children remain independently active;
 - spawned children are required unless created with `flow.Optional()`.
@@ -684,6 +747,8 @@ Unclaimable backlog — a `(name, version)` with pending work and no live worker
 ### 8.1 Separate attempt identity
 
 Each claimed execution of a command creates an attempt record with its own identity, worker and process identity, timings, structured error, and whether it consumed retry budget. The logical command keeps one `CommandID` throughout.
+
+Attempt start and conclusion are also appended to the ordered journal. A conclusion records success handoff, retryable failure and chosen next-eligibility time, permanent failure, timeout, shutdown interruption, or lease loss as applicable. These entries explain operational execution but are not `Event[T]` facts and cannot drive a plan or coordinator.
 
 ### 8.2 Default behavior
 
@@ -731,23 +796,27 @@ flow.Do(p, "partial-report", GeneratePartialReport, PartialArgs{Analyses: outcom
     AfterSettled(keys...)
 ```
 
-## 9. Events
+## 9. Events and the execution journal
 
-### 9.1 Immutable facts
+### 9.1 Immutable journal and facts
 
-Every event has an `EventID`, `ExecutionID`, name and version, optional key, canonical typed payload, an immutable per-execution position, occurrence time, causation, and where applicable the originating command and attempt.
+Every journal entry has an `ExecutionID`, immutable per-execution position, recorded time, entry kind, and causation. Entry kinds cover the durable semantic and operational history needed to explain topology, progress, attempts, and outcome: execution lifecycle, command creation, attempt start and conclusion, event recording, coordinator processing, and execution transitions. A command's final transition is represented by its required terminal event rather than a duplicate operational entry. High-frequency maintenance such as lease-renewal heartbeats, polling, and notifications is deliberately excluded.
 
-Events are append-only and never destructively consumed. Unlike a command, which one worker handles, an event is observed independently by the plan and by any coordinator subscribing to it.
+Every event entry additionally has an `EventID`, name and version, optional key, canonical typed payload, occurrence time, and where applicable the originating command and attempt.
+
+The journal is append-only and never destructively consumed. Events are one kind of journal entry and the only kind exposed through the typed `Event[T]`, `Fact`, `Facts`, and coordinator-subscription APIs. Unlike a command, which one worker handles, an event is observed independently by the plan and by any coordinator subscribing to it. `CommandCreated`, `AttemptStarted`, and other operational entries appear in `History` and `Trace` but do not create additional event abstractions and cannot be awaited as application facts.
 
 ### 9.2 How events are recorded
 
-There is one event model and one typed abstraction: `Event[T]`. Events enter the log in three ways:
+There is one event model and one typed abstraction: `Event[T]`. Event entries enter the journal in three ways:
 
 - a successful worker return automatically records the event returned by `Command.Done()`, carrying its result;
 - workers and coordinators call `Emit`, while application code, webhooks, and monitors call `Publish`, to record additional facts;
 - the runtime records facts such as `CommandFailed`, `CommandCancelled`, `CommandExpired`, `CommandSkipped`, `PlanFailed`, `CoordinatorFailed`, `ExecutionSucceeded`, `ExecutionFailed`, `ExecutionCancelled`, and `ExecutionExpired`.
 
-These are different event names and payloads, not different event systems or developer-facing categories. Attempt failures, lease renewals, and lease loss remain operational history rather than events, so transient mechanics never masquerade as permanent facts.
+These are different event names and payloads, not different event systems or developer-facing categories. Attempt failures and lease loss remain operational history rather than events, while lease renewals are omitted maintenance; transient mechanics never masquerade as permanent facts.
+
+Command creation is also not an event. Every accepted `Do`, `Spawn`, `Issue`, and direct root creation appends the internal `CommandCreated` journal entry required by §7.1. Plans already observe command state through typed command reads and dependencies; exposing creation again as `Event[T]` would create a duplicate progression mechanism.
 
 The runtime deliberately does not append a `CommandStarted` event. `Trace` derives whether a command is currently running from command state and its active lease, and reads when and where attempts ran from attempt records and operational history. An attempt start is durable operational history, while the command's single terminal event is the permanent plan-visible fact. This avoids duplicate representations of running state and prevents plans from reacting to retry mechanics.
 
@@ -764,13 +833,13 @@ Idempotency is checked before terminal-execution rejection: retrying an existing
 
 ### 9.4 Ordering
 
-Events receive a durable total position within their execution, reflecting commit order rather than the time an external fact occurred.
+All journal entries receive a durable total position within their execution, reflecting commit order rather than the time an external fact or operational activity occurred. An event's position is its journal position; plans and coordinators skip non-event entries without creating a second position namespace.
 
 Plans and coordinators observe matching events in increasing position order. A failed delivery blocks later events for that reader until it succeeds or the reader becomes terminal.
 
 Checkpointing must never permanently skip an event whose creating transaction becomes visible later; architecture must either make per-execution positions gap-free at commit or use a cursor that revisits unresolved gaps. Because positions are scoped to one execution — which is already the serialization point for its own commits — this is materially simpler than database-wide ordering.
 
-There is no position or ordering relationship across executions. A future export, subscription, or execution-start bridge may interleave events from several executions in any order, but it must retain each event's source `(ExecutionID, position)`, cross an explicit idempotent boundary, and make no claim that the resulting stream is one merged `flow` log.
+There is no position or ordering relationship across executions. A future export, subscription, or execution-start bridge may interleave events from several executions in any order, but it must retain each event's source `(ExecutionID, position)`, cross an explicit idempotent boundary, and make no claim that the resulting stream is one merged `flow` journal.
 
 ### 9.5 Payloads and result references
 
@@ -778,9 +847,9 @@ Small durable results may be carried in payloads. Large or sensitive outputs bel
 
 ### 9.6 Replay and recovery boundary
 
-`flow` preserves replayable orchestration history without being a strict event-sourced runtime. Immutable command rows record requested work and parentage; events record how commands ended and any additional application facts; attempts record transient execution mechanics; materialized command and execution states make claiming and inspection efficient.
+`flow` is journal-first for its orchestration control plane without event-sourcing application state. `CommandCreated` entries record requested work and topology; event entries record how commands ended and additional facts; attempt entries record transient execution mechanics; materialized command and execution state makes claiming and current-state inspection efficient. The retained journal is the logical source for the causal graph and settled orchestration projections. Architecture may normalize or share immutable payload storage rather than physically duplicating large canonical bytes, provided `History` preserves the same complete logical record.
 
-Plans may be re-evaluated from the retained arguments, command states, results, closed child memberships, and events, and inspection projections may be rebuilt from commands, dependencies, attempts, events, and causation. Accurate historical plan simulation additionally requires the exact plan version and the retained plan-visible snapshot as it existed at each simulated transition; an event prefix alone is insufficient because command issuance, dependencies, and closed child membership are not all events. Recovery and simulation never replay arbitrary Go handlers or repeat their historical external side effects. A command row is itself the durable record that the command was issued, so Milestone 1 does not add a redundant `CommandIssued` event.
+Plans may be re-evaluated by folding the retained journal: command creation establishes declarations, dependencies, and closed membership; events establish results and facts; attempts explain operational execution without becoming plan inputs. Accurate historical plan simulation additionally requires the exact plan version that produced the historical declarations. Recovery and simulation never replay arbitrary Go handlers or declared commit functions, repeat historical external side effects, or rebuild application tables. Application-owned tables remain authoritative for business state; the journal records the durable inputs and accepted outcome of a commit function, not a promise that arbitrary domain state is a projection of events.
 
 ## 10. Plans
 
@@ -909,7 +978,7 @@ Each evaluation costs:
 | loading command states and the consulted input set | O(commands), narrow indexed columns |
 | database writes | O(newly runnable commands) only |
 
-Writes are proportional to the delta, but the read and the Go evaluation are proportional to the whole command set, and an execution produces at least one terminal event per command. Total plan work over an execution's life is therefore approximately **O(commands²)**, which is what bounds plan-driven execution size.
+Writes are proportional to the delta, but the read and the Go evaluation are proportional to the whole command set, and an execution produces at least one creation entry and one terminal event per command. Total plan work over an execution's life is therefore approximately **O(commands²)**, which is what bounds plan-driven execution size.
 
 The default safety limit is **1,000 total commands within one plan-driven execution**, including commands created by `Do`, `Spawn`, and `Issue`, with 100 dependencies per plan-declared command. It is configurable, and `0` explicitly disables it. The limit is validated against the complete staged batch before any child or plan command is inserted, so a fan-out cannot commit partially at the configured ceiling. At the default ceiling an execution performs on the order of a million narrow row reads across its lifetime; operators raising or disabling the limit accept the plan's approximately O(commands²) cost.
 
@@ -929,7 +998,7 @@ A coordinator is durable typed state that reacts to events. Direct-child records
 
 A definition has a stable name, positive version, typed state schema, an optional start handler declared with `OnStart`, and exact typed event subscriptions declared with `On`. Its instance holds typed canonical state, a durable inbox position, and a lifecycle of `active → completed | failed | cancelled`.
 
-`Coordinator.Execute` durably creates the instance and enqueues one initial activation in the same transaction. It never invokes coordinator code inline. A runtime registering the exact coordinator name and version later claims the activation and invokes `OnStart`, when present; without `OnStart`, the activation is acknowledged as a no-op and the coordinator waits for events. Events, commands, state changes, and `OnCommit` writes staged by `OnStart` follow the same atomic processing and retry rules as an event handler.
+`Coordinator.Execute` durably creates the instance and enqueues one initial activation in the same transaction. It never invokes coordinator code inline. A runtime registering the exact coordinator name and version later claims the activation and invokes `OnStart`, when present; without `OnStart`, the activation is acknowledged as a no-op and the coordinator waits for events. Events, command creation, and orchestration-state changes staged by `OnStart` follow the same atomic processing and retry rules as an event handler.
 
 ### 11.2 Historical matching-event delivery
 
@@ -937,7 +1006,7 @@ An instance begins with its inbox at the start of the execution and receives **e
 
 ### 11.3 Serialized processing
 
-At most one handler runs per coordinator instance at a time; workers and other executions run concurrently. On a `nil` return, one transaction records the event as processed, persists new state, commits spawned commands, events, and `OnCommit` writes, and advances the inbox. On error or lease loss none of it commits, and redelivery cannot apply a decision twice.
+At most one handler runs per coordinator instance at a time; workers and other executions run concurrently. On a `nil` return, one transaction appends a `CoordinatorTransition` journal entry recording the activation or handled event position, prior state revision, resulting canonical state or durable state reference, and causation; appends spawned-command creation and event entries; materializes the new orchestration state and outputs; and advances the inbox. On error or lease loss none of it commits, and redelivery cannot apply a decision twice. Architecture may normalize or content-address large state versions, but retained history must preserve the same logical transition.
 
 ### 11.4 Failure
 
@@ -945,9 +1014,9 @@ Coordinator handler errors retry under the default policy. A permanent or exhaus
 
 ### 11.5 State boundary
 
-Coordinator state may store orchestration facts such as selected route, expected keys, observed outcome flags, or local progress. It must never become a second source of truth for application entities; balances, intent status, transaction records, and report contents remain in application-owned tables, with `OnCommit` keeping coordination and domain writes atomic when they must change together.
+Coordinator state may store orchestration facts such as selected route, expected keys, observed outcome flags, or local progress. It must never become a second source of truth for application entities; balances, intent status, transaction records, and report contents remain in application-owned tables.
 
-Coordinator handlers are for short decisions. External work belongs in commands.
+Coordinator handlers are for short orchestration decisions and have no application-transaction hook. Application work belongs in commands. A local domain write that is inseparable from one command's success uses that worker's declared commit function; independently retryable or externally visible work is its own command.
 
 ### 11.6 Rolling deployments
 
@@ -967,19 +1036,19 @@ Sources of re-execution are retry after failure, lease loss, and shutdown interr
 
 ### 12.3 Fencing
 
-Attempts and coordinator deliveries hold renewable leases. Every completion verifies current ownership and non-terminal execution state. A stalled, partitioned, cancelled, or superseded handler cannot commit its staged outputs or `OnCommit` writes. Leases renew automatically; handlers never implement heartbeats.
+Attempts and coordinator deliveries hold renewable leases. Every completion verifies current ownership and non-terminal execution state. A stalled, partitioned, cancelled, or superseded handler cannot commit its staged outputs or declared commit-function write. Leases renew automatically; handlers never implement heartbeats.
 
-Fencing guarantees only that such a handler cannot commit **flow-managed records or its `OnCommit` writes**. Effects it already performed against external systems are beyond the library's control.
+Fencing guarantees only that such a handler cannot commit **flow-managed records or its declared commit-function write**. Effects it already performed against external systems are beyond the library's control.
 
 ### 12.4 Short atomic completion
 
 User handlers never hold a PostgreSQL transaction for the duration of their work. They perform work and stage outputs; the runtime opens a short transaction after a successful return.
 
-That one transaction commits the event carrying the command result, its additionally emitted events, its complete staged child set, plan reconciliation and every command that reconciliation creates, dependency resolution, execution outcome transitions, history, and `OnCommit` writes. If ordinary settlement fails, none commits and the command is retried.
+That one transaction appends the event carrying the command result, its additionally emitted events, a `CommandCreated` entry for every staged child and plan-created command, attempt conclusion, and any execution outcome transition; executes the worker's optional declared commit function; and materializes the complete child set, plan reconciliation, dependencies, command state, and execution state. If ordinary settlement fails, none commits and the command is retried.
 
 A recovered plan panic, nondeterministic conflict, or invalid plan read is different: the accepted worker result and its staged outputs commit, `PlanFailed` and `ExecutionFailed` are appended, and outstanding commands are cancelled. A plan defect never turns successful application work into another worker attempt.
 
-If an application deliberately writes outside `OnCommit`, those writes are outside `flow` fencing and atomicity.
+If a worker deliberately writes application state outside its declared commit function, those writes are outside `flow` fencing and settlement atomicity. Caller-owned transactions remain atomic at execution ingress (§12.7), and external effects remain subject to at-least-once execution (§12.2).
 
 ### 12.5 Serialized execution commits
 
@@ -1005,7 +1074,7 @@ Outputs created inside handlers automatically inherit execution identity and cau
 
 `CancelExecution` marks the execution `cancelled`, cancels non-terminal commands, closes the coordinator, and records `ExecutionCancelled`. `CancelCommand` cancels one command; if it is required, the execution fails under §6.3 including its failure-handling branches.
 
-Cancellation and completion race on the execution row, and whichever commits first wins. A handler whose command was cancelled cannot commit its result, staged outputs, or `OnCommit` writes.
+Cancellation and completion race on the execution row, and whichever commits first wins. A handler whose command was cancelled cannot commit its result, staged outputs, or declared commit-function write.
 
 Cancellation cannot undo external side effects already performed and cannot forcibly stop a non-cooperative goroutine; fencing only guarantees such a goroutine commits nothing.
 
@@ -1030,11 +1099,11 @@ Payload, state, configured plan-command-count, and dependency-count limits are e
 - attempt summaries per command, distinguishing operational interruptions from application failures;
 - the causal edges linking all of the above.
 
-Because the plan records what is still expected, a trace answers both *what happened* and *what this execution is waiting for* — the latter being something pure causation cannot express.
+The causal graph and every settled command state are derivable from retained journal entries; command, dependency, and child tables are indexed materializations used to answer the query efficiently. Live lease ownership, current running duration, and other mutable delivery details come from current operational materializations and are not reconstructed from lease-renewal noise. Because the plan records what is still expected, a trace answers both *what happened* and *what this execution is waiting for* — the latter being something pure causation cannot express.
 
 ### 15.2 History
 
-`History` returns the immutable ordered log. Supplying an after-position returns only newer entries, so a UI or CLI can poll a live execution incrementally.
+`History` returns the immutable execution journal in per-execution commit order. It includes command creation with canonical arguments and topology, attempt starts and conclusions, application and terminal events, coordinator processing, and execution transitions. Entries have distinct kinds, but only event entries are typed application facts or plan/coordinator inputs. Supplying an after-position returns only newer entries, so a UI or CLI can poll a live execution incrementally and build a timeline or causal graph without reconciling a separately ordered command source.
 
 ### 15.3 List and await
 
@@ -1044,7 +1113,7 @@ Every record carries correlation and causation identifiers for joining to extern
 
 ### 15.4 Retention
 
-Terminal executions and their history are retained indefinitely in Milestone 1. Archival and configurable retention are later capabilities.
+Terminal executions and their complete journals are retained indefinitely in Milestone 1. Archival and configurable retention are later capabilities. A future policy may discard bulky canonical command payloads before retaining command-creation skeletons, causation, and terminal outcomes for longer; once payloads are removed, full historical plan simulation and complete projection rebuilding are no longer promised for that prefix.
 
 ## 16. Runtime and distribution
 
@@ -1125,7 +1194,7 @@ Messages carry identifiers, never payloads, arguments, secrets, or connection st
 
 ## 20. Observability and UI readiness
 
-The runtime emits optional, no-op-by-default observations for execution start and outcome, command transitions, handler duration, retries, waits and wait expiry, events published, plan evaluation size and duration, lease renewal and loss, claim activity, unclaimable backlog, reconciliation repairs, and long-running attempts.
+The runtime emits optional, no-op-by-default observations for execution start and outcome, command creation and transitions, handler and commit-function duration, retries, waits and wait expiry, events published, plan evaluation size and duration, lease renewal and loss, claim activity, unclaimable backlog, reconciliation repairs, and long-running attempts.
 
 Observations carry execution type and ID, command key, name and version, worker identity, correlation and causation IDs, and outcome category — never payload data. No logging, metrics, or tracing vendor is imposed; adapters are near-term follow-ons (§2.3).
 
@@ -1135,14 +1204,15 @@ The durable model is deliberately sufficient for an operational UI without a UI 
 
 The library ships a test package so direct command trees, workers, plans, and coordinators are testable without a database:
 
-- a worker is an ordinary function — given a payload and an immutable set of explicitly declared dependency results, assert `ResultOf` reads, its returned result or error, its staged events and spawned children, direct-child keys, optional classification, and registered application writes;
+- a worker is an ordinary function — given command arguments and an immutable set of explicitly declared dependency results, assert `ResultOf` reads, its returned result or error, its staged events and spawned children, direct-child keys, and optional classification;
+- a declared commit function is an ordinary function of durable `Args`, `Result`, and `Info` plus a transaction capability; tests invoke it directly, assert those inputs, and use an application transaction double where available, while SQL behavior is integration-tested against PostgreSQL;
 - a direct-execution harness begins with one root worker decision and settles staged descendants, allowing completion and failure policy to be asserted without defining a plan;
 - a plan is a pure function — given root arguments, facts, command states, and closed child memberships, assert its declarations, dependencies, read availability, outcomes, waits, and complete expected key set; a determinism assertion evaluates the identical snapshot repeatedly and compares canonical output;
 - a plan harness may advance through an ordered sequence of synthetic durable snapshots — including facts, terminal command outcomes, and closed child memberships — and return or assert the canonical declarations, dependencies, consulted inputs, and read-availability classifications after each transition, without running workers or external effects;
 - a plan-routing assertion mode evaluates selected transitions that normal consulted-input routing would skip and verifies that the canonical output and reads remain unchanged;
 - a coordinator harness delivers the durable start activation and events in order, allowing `OnStart`, state changes, outputs, retry, and completion decisions to be asserted.
 
-Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, publish-before-declare and declare-before-publish ordering, all-or-nothing worker fan-out, authoritative child reads, batched worker dependency results, repeated plan evaluation creating no duplicate commands, unknown dependency rejection, terminally unavailable results not blocking failure, failure branches surviving fail-fast, `Await` expiry, and rolling deployments with divergent registered versions.
+Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, publish-before-declare and declare-before-publish ordering, exactly one command-creation journal entry per accepted command, journal/graph reconstruction, all-or-nothing worker fan-out and commit-function writes, authoritative child reads, batched worker dependency results, repeated plan evaluation creating no duplicate commands or history, unknown dependency rejection, terminally unavailable results not blocking failure, failure branches surviving fail-fast, `Await` expiry, and rolling deployments with divergent registered versions.
 
 ## 22. Acceptance criteria
 
@@ -1154,6 +1224,7 @@ Milestone 1 is complete when:
 - calling `With` on an already bound definition replaces the client only in the returned copy, enabling an explicit per-call runtime override without mutating a shared definition;
 - calling `.Execute` on an unbound definition returns `ErrInvalid` without writing;
 - the same definition may be bound independently to multiple runtimes, while a transaction-bound value cannot execute after its transaction closes;
+- every newly accepted execution records exactly one ordered `ExecutionStarted` entry with its driver definition and version, canonical input, deadline, material options, and causation; an equivalent idempotent start records no duplicate;
 - `Command.Execute` durably queues one typed root command and returns immediately without requiring a plan or coordinator;
 - `PlanDef.Execute` durably creates the execution and atomically enqueues every command made ready by its initial pure evaluation;
 - `Coordinator.Execute` durably creates the instance and queues its start activation without invoking `OnStart` inline;
@@ -1162,7 +1233,13 @@ Milestone 1 is complete when:
 - the worked example in §5 compiles and runs against PostgreSQL;
 - a mistyped command or event reference, or a wrong payload, result, or event payload type, fails to compile;
 - every command that ends records exactly one event describing how it ended, with success carrying its typed result and transient attempt failures excluded;
-- a worker that successfully spawns several children commits the complete direct-child set, the event recording parent success, additionally emitted events, and `OnCommit` writes atomically;
+- every accepted root, `Do`, `Spawn`, coordinator-spawned, or `Issue` command records exactly one ordered `CommandCreated` journal entry with canonical payload, origin, parent where applicable, classification, dependencies, policy, and causation; equivalent reconciliation appends no duplicate;
+- every claimed attempt records ordered start and conclusion entries, including retry scheduling or interruption where applicable, without exposing transient attempt mechanics through `Event[T]`;
+- a worker that successfully spawns several children commits the complete direct-child set, every child-creation journal entry, the event recording parent success, additionally emitted events, and its optional declared commit-function write atomically;
+- a declared commit function receives only durable command arguments, successful result, and metadata plus the supplied transaction; its write and ordinary settlement commit or roll back together, its error follows command retry classification, and it cannot be registered dynamically from a worker;
+- a successful terminal event records whether its declared commit function was applied, without exposing that operational metadata as a second application event;
+- coordinator handlers expose no application-transaction hook; application work is expressed as commands, with worker commit functions reserved for local writes inseparable from command success;
+- every successful coordinator decision records its handled activation or event, prior state revision, resulting state or durable reference, causation, inbox advance, and staged outputs atomically;
 - a worker that errors, panics, loses its lease, or exceeds the configured plan-command limit after staging children commits none of them;
 - equivalent repeated child keys within one handler decision coalesce, conflicting content fails atomically, and no parent retry can duplicate a committed child;
 - spawned children are required by default, `flow.Optional()` removes them from execution outcome, and both classifications remain visible in `Trace`;
@@ -1184,12 +1261,13 @@ Milestone 1 is complete when:
 - the plan determinism harness detects different declarations or consulted reads from an identical snapshot, and fragment tests can assert the complete intended key set;
 - the database-free plan harness can advance synthetic facts, terminal outcomes, and closed child memberships and expose canonical declarations, dependencies, consulted inputs, and read availability after each transition without executing workers;
 - plan evaluation at the documented command ceiling stays within its benchmarked budget; events whose names the latest evaluation did not consult trigger no normal evaluation, a later consulted transition still exposes any stored fact to a newly reached branch, and routing assertion mode detects if a skipped evaluation would differ;
-- a command result, emitted events, spawned children, plan-created commands, dependency resolution, and application writes commit atomically or not at all;
+- a command result, emitted events, spawned and plan-created command journal entries and materializations, dependency resolution, execution transitions, and declared commit-function writes commit atomically or not at all;
 - a stalled worker cannot commit after losing its lease;
 - an event published before its plan-declared command or coordinator existed is still observed by it;
 - event positions are total only within one execution, and no API or projection implies a total order across executions;
+- all retained journal entries share that execution-local position order; `History` can reconstruct command existence, arguments, topology, attempts, events, causation, and settled outcomes without reconciling a separately ordered command source, while lease heartbeats remain excluded maintenance;
 - an idempotent republish of a stored event succeeds after the execution becomes terminal, while a genuinely new event is rejected;
 - crash at any commit boundary leaves the execution recoverable and internally consistent;
 - workers registering different `(name, version)` sets share a database without failing each other's work;
-- `Trace` returns both what happened and what the execution is waiting for, including parent-child edges, every final command state, current running state, and attempt start history in one call, without a `CommandStarted` event;
-- worker and plan unit tests run without a database.
+- `Trace` returns both what happened and what the execution is waiting for, including parent-child edges, every final command state, current running state, and attempt start history in one call, without a `CommandStarted` application event;
+- worker, declared commit-function input, and plan unit tests run without requiring a running Flow runtime; SQL integration tests use PostgreSQL.
