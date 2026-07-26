@@ -61,16 +61,18 @@ The implementation must preserve these invariants even if physical tables or int
 | Area | Decision | Reason |
 |---|---|---|
 | Database | PostgreSQL 15+ | Required backend; row locks, `SKIP LOCKED`, transactional DDL, and optional `LISTEN`/`NOTIFY` are sufficient. |
-| Database access | `pgkit/v2` and `pgx/v5` | Existing ecosystem fit and caller-owned `pgx.Tx` composition. |
+| Database access | Application-owned `pgkit/v2` handle and `pgx/v5` transactions | The application and Flow share one database adapter and pool; caller-owned `pgx.Tx` composition remains possible. |
 | IDs | UUIDv7 generated in Go, stored as `uuid` | Distributed creation with index locality. Public IDs remain opaque typed strings. |
 | Encoding | RFC 8785 canonical JSON bytes plus SHA-256 | Stable durable identity across replicas and Go processes. |
 | Isolation | `READ COMMITTED` plus explicit locks, predicates, and constraints | The invariants require targeted serialization, not transaction-wide serializable isolation. |
 | Wake-up | Polling for correctness; optional `LISTEN`/`NOTIFY` hints | Works behind transaction-pooling proxies and survives missed hints. |
-| Schema | Configurable, default `flow`; all SQL qualified | No `search_path` dependency. |
+| Tables | Fixed `flow_` prefix in a configurable schema, default `public`; all SQL qualified | Flow coexists visibly with application tables without requiring a dedicated database or schema and never depends on `search_path`. |
 | Migrations | Embedded, explicit, checksummed, advisory-locked | `New` never mutates schema; applications retain deployment control. |
 | Observability | Small no-op observer contract in core | OpenTelemetry, metrics, and logging adapters remain optional packages. |
 
 Initial direct dependencies are `github.com/goware/pgkit/v2`, `github.com/jackc/pgx/v5`, and `github.com/google/uuid`; canonical JSON is implemented in `internal/canonical` against RFC 8785 test vectors rather than exposing another library's types. There is no ORM, broker client, distributed-lock service, or mandatory telemetry SDK. New dependencies require a concrete reduction in implementation or verification risk.
+
+`New` and `Migrate` receive the application's existing `*pgkit.DB`; Flow does not create or own a second pool. All ordinary runtime, application, and commit-function work can therefore use one PostgreSQL adapter. An optional dedicated session connection for `LISTEN` may be borrowed from that pool or supplied through a listener connector when required by a proxy, but it is only a wake-up optimization and not another durable backend.
 
 There is one public package plus `flowtest`; internal packages exist for dependency direction, not as user-facing layers.
 
@@ -129,7 +131,7 @@ The physical schema is specified in `components/schema.md`. The logical records 
 | command dispatch | Narrow hot row for queue, kind, next-run time, and current lease; absent for pending and terminal commands. |
 | dependency group/member | Normalized `After*` and `AfterAny` conditions with reverse lookup by predecessor. |
 | event wait | Normalized `Await` membership and the satisfying event position. |
-| attempt | One command or coordinator invocation, including durable start/conclusion and retry-budget classification. |
+| attempt history | `AttemptStarted`/`AttemptConcluded` journal records for one command or coordinator invocation; current ownership remains on the dispatch/coordinator row rather than in another projection. |
 | journal entry | Immutable ordered history, including the full logical payload needed by `History` and graph reconstruction. |
 | plan read | The latest plan's consulted inputs and availability classification, plus implicit observations of plan-owned commands. |
 | coordinator instance | Current typed state projection, start activation, inbox, current delivery, retry state, and lease. |
@@ -137,7 +139,7 @@ The physical schema is specified in `components/schema.md`. The logical records 
 
 Command and execution payloads are stored in both their current projection and the corresponding journal record in the initial implementation. This is intentional simplicity: the journal can stand alone, while hot operations avoid decoding history. A later physical optimization may content-address or normalize immutable bytes as long as `History` and replay observe the same logical records.
 
-The command count is not computed by scanning. `executions.command_count` increments once for each genuinely new root, `Do`, `Spawn`, or `Issue` command and is checked with `max_commands` while the row is locked. Attempts, retries, duplicate reconciliation, events, coordinator activations, and journal rows do not change it.
+The command count is not computed by scanning. `flow_executions.command_count` increments once for each genuinely new root, `Do`, `Spawn`, or `Issue` command and is checked with `max_commands` while the row is locked. Attempts, retries, duplicate reconciliation, events, coordinator activations, and journal rows do not change it.
 
 ## 7. Journal model and ordering proof
 
@@ -161,7 +163,7 @@ Every entry carries `ExecutionID`, `JournalEntryID`, position, PostgreSQL record
 Every semantic transaction does this before appending:
 
 ```sql
-SELECT ... FROM flow.executions WHERE execution_id = $1 FOR UPDATE;
+SELECT ... FROM public.flow_executions WHERE execution_id = $1 FOR UPDATE;
 ```
 
 Once its complete output is known, it increments `next_journal_position` by the exact batch size and assigns consecutive positions. The counter update and inserts are in the same transaction.
@@ -212,7 +214,7 @@ Every library-owned semantic transaction concerns one execution and acquires blo
 1. execution row;
 2. coordinator instance, when applicable;
 3. existing command rows in ascending `CommandID`;
-4. dispatch, dependency, wait, and attempt rows belonging to those commands;
+4. dispatch, dependency, and wait rows belonging to those commands;
 5. journal inserts and other new rows in deterministic key order;
 6. application rows through the declared commit function;
 7. optional `pg_notify` hint;
@@ -278,7 +280,7 @@ Creation while holding the execution lock proceeds as one batch:
 1. canonicalize and validate every proposal before writing;
 2. coalesce equivalent repeated keys and reject conflicts;
 3. resolve references against durable commands plus the complete proposed set;
-4. compute genuinely new count and enforce `max_commands` against `executions.command_count`;
+4. compute genuinely new count and enforce `max_commands` against `flow_executions.command_count`;
 5. insert commands, dependencies, waits, and any ready dispatch rows in key order;
 6. append one complete `CommandCreated` record per inserted command;
 7. increment `command_count` and `open_commands` by the inserted count.
@@ -300,7 +302,7 @@ The first eligibility transition sets `BudgetStartedAt` exactly once:
 
 ### 11.2 Claim
 
-After the no-wait locks in §8.3, claim revalidates execution state/deadline, command state, definition pair, schedule, and remaining elapsed retry budget using one captured `clock_timestamp()`. It creates a new attempt, increments the invocation ordinal, stores a fresh random lease token and owner, changes command/dispatch to `running`, and appends `AttemptStarted` atomically.
+After the no-wait locks in §8.3, claim revalidates execution state/deadline, command state, definition pair, schedule, and remaining elapsed retry budget using one captured `clock_timestamp()`. It increments the invocation ordinal, stores a fresh random attempt ID, lease token, owner, and start time on the current dispatch/coordinator row, changes the delivery to `running`, and appends `AttemptStarted` atomically. No separate attempt projection is written.
 
 `CommandInfo` is built from these accepted database values. The effective handler context deadline is the earliest of per-attempt timeout, retry elapsed deadline, and execution deadline. Local timers only cancel the goroutine; the settlement transaction rechecks PostgreSQL time.
 
@@ -327,7 +329,7 @@ Zero affected rows means no staged output may commit. A diagnostic lookup maps i
 
 On `(result, nil)`, the runtime canonicalizes the result and enters one settlement transaction:
 
-1. acquire the execution/command/attempt fence;
+1. acquire the execution and command/dispatch fence;
 2. validate the complete decision buffer, child-key equivalence, payload limits, and command ceiling;
 3. append `AttemptConcluded` and materialize the successful parent result;
 4. append emitted events in call order;

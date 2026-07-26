@@ -10,6 +10,8 @@ The runtime is disposable process machinery around the durable store and determi
 
 Correctness cannot depend on any runtime field surviving a crash. A new compatible replica reconstructs work solely from PostgreSQL.
 
+The `db` handle is application-owned and may be the same `*pgkit.DB` used by every application repository. The runtime borrows it, never closes it, and does not create a second connection pool.
+
 ## 2. Runtime state and lifecycle
 
 ```go
@@ -64,6 +66,7 @@ The functional defaults remain normative:
 | event | 64 KiB |
 | coordinator state | 256 KiB |
 | dependencies per plan command | 100 |
+| PostgreSQL schema | `public`; every Flow table retains its fixed `flow_` prefix |
 
 Process concurrency defaults to `max(1, GOMAXPROCS)` and is configurable globally and per queue. A claim batch is capped by immediately free slots and a small operational maximum; it is not a durable or public queue limit. Invalid lease/renewal relationships, negative concurrency, empty queue names, unsafe schema names, invalid sizes, or negative command ceilings fail `New`.
 
@@ -157,7 +160,7 @@ Candidates are hints. The scheduler groups by execution, opens a skip-locked sem
 - database time has reached `next_run_at`;
 - execution, retry budget, and wait deadlines have not already ended it.
 
-It may claim several commands from the same execution in one short commit, bounded by free slots. Expired budgets/deadlines are settled terminally in that transaction instead of invoking the handler. Successful claim creates attempts, lease tokens, and `AttemptStarted` journal entries. Handler goroutines start only after commit success.
+It may claim several commands from the same execution in one short commit, bounded by free slots. Expired budgets/deadlines are settled terminally in that transaction instead of invoking the handler. Successful claim stores the current attempt ID and lease on each dispatch row and appends its `AttemptStarted` journal entry; it creates no separate attempt row. Handler goroutines start only after commit success.
 
 No claim waits for another execution or work row. A skipped/busy/stale candidate returns its reserved capacity and the loop probes again or sleeps.
 
@@ -351,7 +354,7 @@ func CheckSchema(context.Context, *pgkit.DB, ...MigrateOption) (SchemaStatus, er
 func MigrationFS(...MigrateOption) (fs.FS, error)
 ```
 
-`New` calls `CheckSchema`; missing/incompatible schema is `ErrSchema`. It does not opportunistically migrate, even in development. Migration roles and runtime roles may be different database users; runtime SQL requires only DML/sequence-free permissions on the configured Flow schema and application permissions used by declared commit functions.
+`New` calls `CheckSchema`; missing/incompatible schema is `ErrSchema`. It does not opportunistically migrate, even in development. Migration roles and runtime roles may be different database users; runtime SQL requires only DML/sequence-free permissions on the `flow_` tables in the configured schema and application permissions used by declared commit functions. The default is the application's `public` schema; choosing another schema changes only qualification, never the fixed table prefix.
 
 ## 14. Inspection operations
 
@@ -362,7 +365,7 @@ func MigrationFS(...MigrateOption) (fs.FS, error)
 - `AwaitExecution` repeatedly reads terminal state, optionally listens for execution hints, and always polls; it consumes no worker slot or durable lease.
 - `ResultOf(ExecutionTrace, ...)` performs typed decode against the trace and definition pair without another query.
 
-Trace labels delayed work as derived `scheduled`, exposes accepted/current command count, missing registrant reasons, current lease age without token, dependency and wait reasons, child closure, attempts, coordinator inbox, and causation graph. It never invents a `CommandStarted` event.
+Trace labels delayed work as derived `scheduled`, exposes accepted/current command count, missing registrant reasons, current lease age without token, dependency and wait reasons, child closure, attempts reconstructed from journal history plus current delivery state, coordinator inbox, and causation graph. It never invents a `CommandStarted` event.
 
 ## 15. Observations
 
