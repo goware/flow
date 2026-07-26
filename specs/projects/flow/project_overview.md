@@ -8,9 +8,9 @@ status: draft
 
 `flow` is a Go library for durable, event-driven execution backed entirely by PostgreSQL.
 
-The model is one sentence: **a command asks for work, a worker performs it, and the worker's success records an event.** Every command yields exactly one completion fact, so progress is always visible as an immutable event. Commands and events belong to an execution, and causation links record which command or event produced each subsequent record.
+The model is one sentence: **a command asks for work, a worker performs it, and the runtime records the outcome as an event.** A successful worker return records a typed completion event; terminal failure, cancellation, expiry, and skipping record their own outcome events. Commands and events belong to an execution, and causation links record which command or event produced each subsequent record.
 
-Most executions have a shape the application knows how to describe, so the primary way to compose work is a **plan**: a small function that declares the commands an execution needs and what each one waits for. The plan is re-evaluated whenever a new fact arrives, so branches that depend on runtime information simply appear once the fact that decides them exists. For the cases a plan cannot express, a hand-written **coordinator** reacts to events directly.
+Most executions have a high-level shape the application knows how to describe, so the primary way to compose work is a **plan**: a small pure function that declares commands and joins by durable key. The plan is re-evaluated whenever a relevant fact or command outcome arrives; it never sleeps in memory. A worker may also **spawn** a bounded set of direct child commands when performing one command reveals more work. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
 
 The intended experience is closer to using an in-process Go library than operating Kafka or a separate workflow platform: a small type-safe API, ordinary Go handlers, PostgreSQL transactions, and one operational backend.
 
@@ -23,9 +23,9 @@ Hand-rolling this produces a status column per table, a poll loop per status, a 
 `flow` makes that infrastructure a library, and keeps each unit of application code small:
 
 - A **command** says what work should be attempted.
-- A **worker** knows how to perform one kind of work and returns its typed result.
+- A **worker** knows how to perform one kind of work, may atomically spawn direct child commands, and returns its typed result.
 - An **event** says what has happened, and can be observed by anything interested.
-- A **plan** declares which commands an execution needs and what each waits for.
+- A **plan** purely declares high-level commands and joins over durable outcomes.
 - A **coordinator** is the escape hatch: durable memory that reacts to events when a plan is not enough.
 
 ## Product model
@@ -34,7 +34,7 @@ Hand-rolling this produces a status column per table, a poll loop per status, a 
 
 A command is a durable, immutable request for work. It has a typed name, version, payload type, and **result type**. It belongs to an execution and is delivered to a compatible worker with lease, attempt, and retry semantics. One logical command keeps the same `CommandID` across its separately recorded attempts.
 
-A command is the executable vertex of the projected graph; `flow` needs no second node abstraction. A deterministic `CommandKey` gives it a stable, human-readable identity within its execution and an idempotency boundary for repeated decisions.
+A command is the executable vertex of the projected graph; `flow` needs no second node abstraction. A deterministic `CommandKey` gives it a stable, human-readable identity within its execution and an idempotency boundary for repeated decisions. Plan-declared, worker-spawned, coordinator-spawned, and externally issued commands share one key namespace and one lifecycle.
 
 ### Workers
 
@@ -59,17 +59,40 @@ func sendTxn(ctx context.Context, work *flow.Work[SendArgs]) (SendResult, error)
 
 A command declares its payload type and its result type together, and the handler is an ordinary Go function over them. Use `flow.None` as the result type for a command that produces nothing meaningful.
 
-Returning successfully records the command's **completion event** carrying that result, atomically with any application writes the handler registered and any additional events or commands it staged. If the transaction does not commit, none of it becomes visible.
+Returning successfully records the command's **completion event** carrying that result, atomically with any application writes the handler registered and any additional events or child commands it staged. If the transaction does not commit, none of it becomes visible.
 
-Because every successful command produces exactly one completion fact, the rest of the system never has to guess whether work finished. Waiting on a command and waiting on an external fact are the same operation.
+When work discovers a complete bounded fan-out, the worker may spawn those children directly:
 
-The runtime owns leases, attempts, retry policy, backoff, and timeouts. A retryable handler error records an attempt failure and retries the same logical command; only exhausted retry policy produces a terminal command failure. A negative *domain* outcome is a successful command whose result says so.
+```go
+func prepareReport(ctx context.Context, work *flow.Work[PrepareArgs]) (PrepareResult, error) {
+    analyses, err := determineAnalyses(ctx, work.Payload.CompanyID)
+    if err != nil {
+        return PrepareResult{}, err
+    }
+
+    keys := make([]string, 0, len(analyses))
+    for _, analysis := range analyses {
+        key := "analysis/" + analysis.ID
+        if err := flow.Spawn(work, key, AnalyzeReportPart, analysis.Args); err != nil {
+            return PrepareResult{}, err
+        }
+        keys = append(keys, key)
+    }
+    return PrepareResult{AnalysisKeys: keys}, nil
+}
+```
+
+`Spawn` is asynchronous: it stages a direct child rather than calling its handler. On success all children, the parent's result event, extra events, and `OnCommit` writes become visible together. On error none do. The successful return closes that parent's direct-child membership — it says no more children will be added by that command, not that the children have finished.
+
+Because every terminal command produces exactly one outcome fact, the rest of the system never has to guess whether work finished. Waiting on successful work and waiting on an external fact use the same event mechanism; all-terminal joins additionally recognize failure, cancellation, expiry, and skip outcomes.
+
+The runtime owns leases, attempts, retry policy, backoff, and timeouts. A retryable handler error records an attempt failure and retries the same logical command; only exhausted retry policy produces a terminal command failure event. A negative *domain* outcome is a successful command whose result says so.
 
 ### Events
 
 An event is an immutable fact in the execution log. Events are never consumed destructively: unlike a command, which one worker handles, an event may be observed independently by the plan and by any number of coordinators.
 
-Completion events are recorded automatically from worker results. Workers may emit additional domain events. Application code and external integrations may publish events into a running execution — a webhook recording a confirmed deposit, a monitor recording a bridge delivery. Runtime events record durable execution facts such as terminal command failure or execution termination.
+Completion events are recorded automatically from successful worker results. Terminal unsuccessful commands record `CommandFailed`, `CommandCancelled`, `CommandExpired`, or `CommandSkipped`; retryable attempt errors remain operational history rather than pretending to be final facts. Workers may emit additional domain events. Application code and external integrations may publish events into a running execution — a webhook recording a confirmed deposit, a monitor recording a bridge delivery. Runtime events also record execution termination and plan or coordinator defects.
 
 ### Plans
 
@@ -91,37 +114,42 @@ func planIntent(p *flow.Plan, args ExecuteArgs) {
 }
 ```
 
-The plan is re-evaluated whenever a new fact arrives and reconciled by node key: declaring a node that already exists does nothing, and declaring a new one whose prerequisites are met issues its command. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. A plan only ever grows; it never withdraws work it already asked for.
+The plan is re-evaluated whenever a relevant fact or command outcome arrives and reconciled by command key: declaring a command that already exists does nothing, and declaring a new one whose prerequisites are met issues it. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. `Result` and `Outcome` can read a command declared earlier in that evaluation or any existing command key, including a direct child spawned by a worker. A plan only ever grows; it never withdraws work it already asked for.
 
-`After` waits for another node's completion fact. `Await` waits for any event, including one published from outside the execution. They are the same mechanism, because a command's completion is itself an event.
+`After` waits for another command's completion fact. `AfterSettled` waits for terminal success or failure, and `Outcome` exposes the typed result or structured terminal reason. `Await` waits for any event, including one published from outside the execution. They are the same durable mechanism, because a command's outcome is itself an event.
+
+Purity is a contract rather than a Go sandbox: the plan receives no context, database, client, clock, or transaction capability, but Go cannot prevent a function from calling a package global. Reconciliation rejects conflicting declarations, plan panics and conflicts fail the execution as plan defects rather than retrying completed work, and `flowtest` evaluates plans repeatedly against identical snapshots to detect nondeterminism.
 
 ### Coordinators
 
-A coordinator is durable memory that reacts to events. It exists because "wait for three things" needs somewhere to remember you have seen two.
+A coordinator is durable memory that reacts to events. It is not needed for a bounded fan-out returned by one worker; the parent result and direct-child records already preserve that membership. It exists for open-ended processes — work discovered over time, cycles, or several event streams — where no single command completion can close the decision.
 
-One coordinator runs per execution. A plan is the coordinator most applications will use; writing one by hand is the escape hatch for logic a declarative plan cannot express. Its state is typed, its event inbox is durable, and recording an event as processed, updating state, and emitting commands and events all commit atomically. Coordinator state holds orchestration facts only — never a second copy of application data.
+One coordinator runs per execution. A plan is the coordinator most applications will use; writing one by hand is the escape hatch for logic a declarative plan cannot express. Its state is typed, its event inbox is durable, and recording an event as processed, updating state, and spawning commands and emitting events all commit atomically. Coordinator state holds orchestration facts only — never a second copy of application data.
 
 ### Execution identity and causation
 
 An `ExecutionID` groups all commands, attempts, events, decisions, and outcomes for one run. Every derived record identifies its direct cause.
 
 ```text
-root command
-    -> completion event
-        -> plan decision
-            -> command A -> completion event A
-            -> command B -> completion event B
-                -> plan decision
-                    -> final command -> completion event
+execution start
+    -> plan decision -> prepare command
+prepare command
+    -> Prepare.Done
+    -> child command A -> completion event A
+    -> child command B -> completion event B
+completion events A + B
+    -> plan decision -> final command -> completion event
 ```
 
-The runtime graph is therefore a projection of durable history: commands are its vertices, events are its facts, and causation provides its edges. A plan additionally records work that is declared but not yet runnable, so an execution can be asked not only what happened but what it is currently waiting for.
+The runtime graph is therefore a projection of durable history: commands are its vertices, terminal outcomes and domain events are its facts, and dependencies, parent-child relationships, and causation provide its edges. A plan additionally records work that is declared but not yet runnable, so an execution can be asked not only what happened but what it is currently waiting for.
+
+This is deliberately not strict event sourcing. Immutable command records, attempt history, events, and materialized command state together are the durable authority. They are sufficient to rebuild inspection projections and re-evaluate plans, but recovery never replays arbitrary Go handlers or repeats historical external side effects.
 
 ## Core user experience
 
 1. Define typed commands (payload and result) and typed events.
-2. Register a worker for each command kind.
-3. Write a plan, or a coordinator where a plan is not enough.
+2. Register a worker for each command kind; a worker may spawn bounded direct children.
+3. Write a plan for high-level progression and joins, or a coordinator where the process is open-ended.
 4. Start an execution.
 5. Inspect any `ExecutionID` for its graph, pending work, attempts, events, waits, and outcome.
 
@@ -130,12 +158,12 @@ Handlers are ordinary Go and may call normal application services. Business data
 ## Goals
 
 - **Small and intuitive:** few core concepts and a low public method count.
-- **Local reasoning:** a worker understands one command; a plan reads top to bottom.
+- **Local reasoning:** a worker understands one command and its direct children; a plan reads high-level progression and joins top to bottom.
 - **Type safety:** command payloads, command results, event payloads, and handler signatures checked by Go.
-- **Dynamic composition:** runtime branching, chaining, fan-out, fan-in, waits, and long-running executions without a fully predeclared graph.
+- **Dynamic composition:** runtime branching, worker-spawned child commands, fan-out, fan-in, waits, and long-running executions without a fully predeclared graph.
 - **Durability:** commands, attempts, events, decisions, and causal relationships survive process and machine failure.
 - **Failure correctness:** bounded retries, backoff, leases, timeouts, cancellation, terminal failure, and explicit operator-visible outcomes.
-- **Atomic progression:** handler state, application writes, inbox progress, emitted events, and emitted commands commit together.
+- **Atomic progression:** handler state, application writes, inbox progress, emitted events, and spawned commands commit together.
 - **Traceability:** explain what is running, what is waiting, what failed, what was retried, and why every command exists.
 - **Horizontal operation:** many API processes and workers cooperating on one PostgreSQL database.
 - **Testability:** workers and plans unit-testable without starting a distributed system.
@@ -150,7 +178,8 @@ Handlers are ordinary Go and may call normal application services. Business data
 - Commands and events are versioned durable data whose schemas may outlive the code version that created them.
 - Rolling deployments where processes temporarily recognize different command or event versions.
 - Runtime correctness must never depend on a process retaining in-memory state.
-- Durable history must be sufficient to build inspection, telemetry, and a graph view without a UI in the core runtime.
+- Every command reaches exactly one persisted terminal outcome event; transient attempt failures remain separately inspectable history.
+- Durable commands, events, attempts, dependencies, child relationships, and causation must be sufficient to rebuild inspection, telemetry, and a graph view without a UI in the core runtime.
 
 ## Non-goals
 
