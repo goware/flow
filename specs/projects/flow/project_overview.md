@@ -8,9 +8,24 @@ status: draft
 
 `flow` is a Go library for durable, event-driven execution backed entirely by PostgreSQL.
 
-The model is one sentence: **a command asks for work, a worker performs it, and the runtime records the outcome as an event.** A successful worker return records a typed completion event; terminal failure, cancellation, expiry, and skipping record their own outcome events. Commands and events belong to an execution, and causation links record which command or event produced each subsequent record.
+Its core loop is deliberately small:
 
-Most executions have a high-level shape the application knows how to describe, so the primary way to compose work is a **plan**: a small pure function that declares commands and joins by durable key. The plan is re-evaluated whenever a relevant fact or command outcome arrives; it never sleeps in memory. A worker may also **spawn** a bounded set of direct child commands when performing one command reveals more work. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
+```text
+command  →  worker  →  event
+                     └→ optional child commands
+```
+
+The developer model is:
+
+- **Commands** are durable instructions to perform work.
+- **Workers** handle commands and perform that work.
+- **Events** record facts about what happened.
+- **Plans** react to recorded events and coordinate the overall execution.
+- **Workers** may spawn child commands when their work reveals more work.
+
+There is one event concept. When a worker returns successfully, `flow` automatically records an event carrying its typed result. When a command instead ends in failure, cancellation, expiry, or skipping, `flow` records an event describing that fact. A worker may explicitly emit additional application facts. All are ordinary events in the same execution log.
+
+Most executions have a high-level shape the application knows how to describe, so the primary way to compose work is a **plan**: a small pure function that declares commands and joins by durable key. The plan does not receive one event callback. It is re-evaluated over all relevant events and command results recorded so far; it never sleeps in memory. A worker may also **spawn** a bounded set of direct child commands when performing one command reveals more work. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
 
 The intended experience is closer to using an in-process Go library than operating Kafka or a separate workflow platform: a small type-safe API, ordinary Go handlers, PostgreSQL transactions, and one operational backend.
 
@@ -22,10 +37,10 @@ Hand-rolling this produces a status column per table, a poll loop per status, a 
 
 `flow` makes that infrastructure a library, and keeps each unit of application code small:
 
-- A **command** says what work should be attempted.
-- A **worker** knows how to perform one kind of work, may atomically spawn direct child commands, and returns its typed result.
-- An **event** says what has happened, and can be observed by anything interested.
-- A **plan** purely declares high-level commands and joins over durable outcomes.
+- A **command** is a durable instruction to perform work.
+- A **worker** handles one command kind, may atomically spawn direct child commands, and returns its typed result.
+- An **event** records a fact about what happened and may be observed by anything interested.
+- A **plan** purely declares high-level commands and joins over recorded events and command states.
 - A **coordinator** is the escape hatch: durable memory that reacts to events when a plan is not enough.
 
 ## Product model
@@ -59,7 +74,9 @@ func sendTxn(ctx context.Context, work *flow.Work[SendArgs]) (SendResult, error)
 
 A command declares its payload type and its result type together, and the handler is an ordinary Go function over them. Use `flow.None` as the result type for a command that produces nothing meaningful.
 
-Returning successfully records the command's **completion event** carrying that result, atomically with any application writes the handler registered and any additional events or child commands it staged. If the transaction does not commit, none of it becomes visible.
+Conceptually, workers emit events. In the API, returning `(result, nil)` automatically records the command's event carrying that result. Workers call `flow.Emit` only for additional application facts. A retryable error does not record a final event because the command has not finished.
+
+The result event is recorded atomically with any application writes the handler registered and any additional events or child commands it staged. If the transaction does not commit, none of it becomes visible.
 
 When work discovers a complete bounded fan-out, the worker may spawn those children directly:
 
@@ -84,15 +101,17 @@ func prepareReport(ctx context.Context, work *flow.Work[PrepareArgs]) (PrepareRe
 
 `Spawn` is asynchronous: it stages a direct child rather than calling its handler. On success all children, the parent's result event, extra events, and `OnCommit` writes become visible together. On error none do. The successful return closes that parent's direct-child membership — it says no more children will be added by that command, not that the children have finished.
 
-Because every terminal command produces exactly one outcome fact, the rest of the system never has to guess whether work finished. Waiting on successful work and waiting on an external fact use the same event mechanism; all-terminal joins additionally recognize failure, cancellation, expiry, and skip outcomes.
+Because every command that finishes produces exactly one event recording how it ended, the rest of the system never has to guess whether work finished. Waiting on successful work and waiting on an external fact use the same event mechanism; all-terminal joins additionally recognize failure, cancellation, expiry, and skipping.
 
-The runtime owns leases, attempts, retry policy, backoff, and timeouts. A retryable handler error records an attempt failure and retries the same logical command; only exhausted retry policy produces a terminal command failure event. A negative *domain* outcome is a successful command whose result says so.
+The runtime owns leases, attempts, retry policy, backoff, and timeouts. A retryable handler error records an attempt failure and retries the same logical command; only exhausted retry policy ends the command and records `CommandFailed`. A negative application result is a successful command whose typed result says so.
 
 ### Events
 
-An event is an immutable fact in the execution log. Events are never consumed destructively: unlike a command, which one worker handles, an event may be observed independently by the plan and by any number of coordinators.
+An event is an immutable fact in the execution log. Events are never consumed destructively: unlike a command, which one worker handles, an event may be observed independently by the plan and by any number of coordinators. There is one event abstraction: `flow.Event[T]`.
 
-Completion events are recorded automatically from successful worker results. Terminal unsuccessful commands record `CommandFailed`, `CommandCancelled`, `CommandExpired`, or `CommandSkipped`; retryable attempt errors remain operational history rather than pretending to be final facts. Workers may emit additional domain events. Application code and external integrations may publish events into a running execution — a webhook recording a confirmed deposit, a monitor recording a bridge delivery. Runtime events also record execution termination and plan or coordinator defects.
+The runtime automatically records an event carrying a successful worker result. It records facts such as `CommandFailed`, `CommandCancelled`, `CommandExpired`, or `CommandSkipped` when a command ends another way. Workers may emit additional application events, and external integrations may publish events into a running execution — for example, a webhook recording a confirmed deposit or a monitor recording a bridge delivery. Facts such as `ExecutionSucceeded` and `PlanFailed` use the same event model. These names describe what happened; they do not define separate event systems or developer concepts.
+
+Retryable attempt errors remain attempt history rather than events because the command has not finished yet.
 
 ### Plans
 
@@ -114,9 +133,9 @@ func planIntent(p *flow.Plan, args ExecuteArgs) {
 }
 ```
 
-The plan is re-evaluated whenever a relevant fact or command outcome arrives and reconciled by command key: declaring a command that already exists does nothing, and declaring a new one whose prerequisites are met issues it. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. `Result` and `Outcome` can read a command declared earlier in that evaluation or any existing command key, including a direct child spawned by a worker. A plan only ever grows; it never withdraws work it already asked for.
+The plan is re-evaluated whenever a relevant event is recorded or an observed command reaches a final state, and reconciled by command key: declaring a command that already exists does nothing, and declaring a new one whose prerequisites are met issues it. "React" does not mean that the plan receives a single event callback. Each evaluation is a pure function over the execution arguments and all relevant events and command results recorded so far. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. `Result` and `Outcome` can read a command declared earlier in that evaluation or any existing command key, including a direct child spawned by a worker. A plan only ever grows; it never withdraws work it already asked for.
 
-`After` waits for another command's completion fact. `AfterSettled` waits for terminal success or failure, and `Outcome` exposes the typed result or structured terminal reason. `Await` waits for any event, including one published from outside the execution. They are the same durable mechanism, because a command's outcome is itself an event.
+`After` waits for the event recording another command's success. `AfterSettled` waits for the command to reach any final state, and `Outcome` exposes the typed result or structured reason. `Await` waits for any event, including one published from outside the execution. `Result` and `Outcome` are plan-reading operations over command state and its recorded event; they are not additional event categories.
 
 Purity is a contract rather than a Go sandbox: the plan receives no context, database, client, clock, or transaction capability, but Go cannot prevent a function from calling a package global. Reconciliation rejects conflicting declarations, plan panics and conflicts fail the execution as plan defects rather than retrying completed work, and `flowtest` evaluates plans repeatedly against identical snapshots to detect nondeterminism.
 
@@ -135,13 +154,13 @@ execution start
     -> plan decision -> prepare command
 prepare command
     -> Prepare.Done
-    -> child command A -> completion event A
-    -> child command B -> completion event B
-completion events A + B
-    -> plan decision -> final command -> completion event
+    -> child command A -> event A
+    -> child command B -> event B
+events A + B
+    -> plan decision -> final command -> event
 ```
 
-The runtime graph is therefore a projection of durable history: commands are its vertices, terminal outcomes and domain events are its facts, and dependencies, parent-child relationships, and causation provide its edges. A plan additionally records work that is declared but not yet runnable, so an execution can be asked not only what happened but what it is currently waiting for.
+The runtime graph is therefore a projection of durable history: commands are its vertices, events are its facts, and dependencies, parent-child relationships, and causation provide its edges. A plan additionally records work that is declared but not yet runnable, so an execution can be asked not only what happened but what it is currently waiting for.
 
 This is deliberately not strict event sourcing. Immutable command records, attempt history, events, and materialized command state together are the durable authority. They are sufficient to rebuild inspection projections and re-evaluate plans, but recovery never replays arbitrary Go handlers or repeats historical external side effects.
 
@@ -178,7 +197,7 @@ Handlers are ordinary Go and may call normal application services. Business data
 - Commands and events are versioned durable data whose schemas may outlive the code version that created them.
 - Rolling deployments where processes temporarily recognize different command or event versions.
 - Runtime correctness must never depend on a process retaining in-memory state.
-- Every command reaches exactly one persisted terminal outcome event; transient attempt failures remain separately inspectable history.
+- Every command that ends has exactly one persisted event recording how it ended; transient attempt failures remain separately inspectable history.
 - Durable commands, events, attempts, dependencies, child relationships, and causation must be sufficient to rebuild inspection, telemetry, and a graph view without a UI in the core runtime.
 
 ## Non-goals
