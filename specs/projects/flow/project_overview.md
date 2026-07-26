@@ -174,13 +174,17 @@ Plans normally pass the resulting child keys to a dependent command and declare 
 
 Because every command that finishes produces exactly one event recording how it ended, the rest of the system never has to guess whether work finished. Waiting on successful work and waiting on an external fact use the same event mechanism; all-terminal joins additionally recognize failure, cancellation, expiry, and skipping.
 
-The runtime owns leases, attempts, retry policy, backoff, and timeouts. A retryable handler error records an attempt failure and retries the same logical command; only exhausted retry policy ends the command and records `CommandFailed`. A negative application result is a successful command whose typed result says so.
+The runtime owns leases, attempts, retry policy, backoff, and timeouts. A retryable handler error records an attempt failure and retries the same logical command; only exhausted retry policy ends the command and records `CommandFailed`. Retry policies are immutable declarative values, not application callbacks. They may bound work by attempt count, total elapsed retry duration, or both. The elapsed budget starts once, when the command first becomes eligible for its initial claim after dependencies, waits, and initial delay, and never resets when an attempt retries, a lease expires, or another replica takes over; the separately stored next-attempt time moves as retries are scheduled. Workers may inspect their immutable PostgreSQL creation, budget-start, attempt-number, and attempt-start values, while plans receive no clock or timing capability. A negative application result is a successful command whose typed result says so.
+
+Retry, timeout, and queue settings on a command definition are creation-time operational defaults. Each command snapshots and journals the accepted settings for its lifetime. Tuning a default affects newly created commands without changing the command version, rewriting existing work, or causing an in-flight plan to fail reconciliation. Changing the policy of an already-created command, if later supported administratively, is an explicit journaled operation rather than a deployment side effect.
 
 ### Events and execution history
 
 An event is an immutable fact recorded in the execution journal. Events are never consumed destructively: unlike a command, which one worker handles, an event may be observed independently by the plan and by any number of coordinators. There is one developer-facing event abstraction: `flow.Event[T]`.
 
 The runtime automatically records an event carrying a successful worker result. It records facts such as `CommandFailed`, `CommandCancelled`, `CommandExpired`, or `CommandSkipped` when a command ends another way. Workers may emit additional application events, and external integrations may publish events into a running execution — for example, a webhook recording a confirmed deposit or a monitor recording a bridge delivery. Facts such as `ExecutionSucceeded` and `PlanFailed` use the same event model. These names describe what happened; they do not define separate event systems or developer concepts.
+
+Long external waits normally remain outside a claimed worker. A webhook or efficient batch monitor observes the external system, then uses `Runtime.InTx` to publish one idempotent fact in the same PostgreSQL transaction as its application-table update. A plan-declared command waiting with `Await` holds no worker, connection, goroutine, or lease; the published fact makes it eligible atomically at commit. Facts retained before the plan reaches that branch are still observed later, so this pattern replaces fragile one-shot release writes without requiring one polling command per execution.
 
 The journal additionally records the creation of every command, including its canonical arguments, origin, parent where applicable, dependencies, required/optional classification, and causation. Together with the exactly-one-terminal-event rule, those entries make the execution graph and its final command states reconstructible from retained history. Attempt starts, retryable failures, interruptions, and retry scheduling remain operational journal entries rather than events because the command has not finished yet. Lease-renewal heartbeats and polling noise are maintenance, not history.
 
@@ -215,6 +219,8 @@ The plan is re-evaluated whenever a relevant event is recorded or an observed co
 
 `After` waits for the event recording another command's success. `AfterSettled` waits for the command to reach any final state, and `Outcome` exposes the typed result or structured reason. `Await` waits for any event, including one published from outside the execution. Plan reads internally distinguish an input that may still arrive from one that resolved without a value, so an unsuccessful command can never leave an execution waiting forever for an impossible result. These are plan-reading operations over durable state and events, not additional event categories.
 
+`Within` gives an `Await` a fact-wait deadline. Its clock starts only after that command's `After`, `AfterSettled`, `AfterFailed`, and `AfterAny` prerequisites are satisfied, so a natural declaration such as `After("origin").Await(BridgeDelivered).Within(time.Hour)` gives the bridge a full hour without hiding the declaration behind a result-reading gate. An early fact is retained and satisfies the wait immediately once the command prerequisites resolve.
+
 Purity is a contract rather than a Go sandbox: the plan receives no context, database, client, clock, or transaction capability, but Go cannot prevent a function from calling a package global. Reconciliation rejects conflicting declarations, plan panics and conflicts fail the execution as plan defects rather than retrying completed work, and `flowtest` evaluates plans repeatedly against identical snapshots to detect nondeterminism.
 
 Plans compose through ordinary Go functions rather than another orchestration abstraction. A reusable plan fragment accepts `*flow.Plan` plus a caller-chosen key prefix, and its caller invokes it like any other function. Each logical fragment instance should use a distinct prefix: conflicting reuse fails as a plan defect, while equivalent duplicate declarations intentionally coalesce, so tests should assert the complete intended key set.
@@ -224,6 +230,8 @@ Plans compose through ordinary Go functions rather than another orchestration ab
 A coordinator is durable memory that reacts to events. It is not needed for a direct command tree or a bounded fan-out returned by one worker; the authoritative direct-child records already preserve that membership. It exists for open-ended processes — work discovered over time, cycles, or several event streams — where no single command completion can close the decision.
 
 An execution uses exactly one driver mode: a direct root command, a plan, or a hand-written coordinator. A runtime-bound copy of each definition exposes the same `.Execute` method and returns an `ExecutionHandle`. Direct executions need no coordinator. A plan is the built-in orchestration authority for most multi-command graphs; writing a coordinator by hand is the escape hatch for logic a declarative plan cannot express. Its state is typed, its event inbox is durable, and recording an event as processed, updating state, and spawning commands and emitting events all commit atomically. Coordinator state holds orchestration facts only — never a second copy of application data.
+
+A coordinator subscribes to application facts with `On` and to every terminal result of a typed command with `OnOutcome`. The latter receives the existing command event as `CommandOutcome[R]`: success includes `R`, while failure, cancellation, expiry, and skipping include their structured terminal reason. It creates no additional event. Commands whose failures the coordinator intends to interpret are normally spawned `Optional()`, leaving the coordinator to decide the aggregate result instead of triggering automatic fail-fast first.
 
 ### Execution identity and causation
 
@@ -273,6 +281,9 @@ Handlers are ordinary Go and may call normal application services. Business data
 - PostgreSQL tables, transactions, indexes, and notifications or polling for dispatch and wakeups.
 - First-class support for sharing a caller-owned PostgreSQL transaction.
 - Delivery is asynchronous and at least once; the API must not imply exactly-once execution of user code or external effects.
+- Declarative retry policies with attempt-count and elapsed-time bounds, using an immutable PostgreSQL-time budget anchor distinct from the moving next-attempt schedule.
+- Command-definition retry, timeout, and queue defaults are snapshotted at command creation; tuning affects new commands without rewriting existing commands or causing reconciliation conflicts.
+- Worker metadata exposes accepted PostgreSQL creation, retry-budget, and attempt timing without exposing mutable update or scheduling timestamps; plans remain clock-free.
 - Commands and events are versioned durable data whose schemas may outlive the code version that created them.
 - Rolling deployments where processes temporarily recognize different command or event versions.
 - Runtime correctness must never depend on a process retaining in-memory state.
@@ -281,6 +292,10 @@ Handlers are ordinary Go and may call normal application services. Business data
 - Every accepted command creation has one immutable ordered journal entry recording its payload, origin, dependencies, classification, and causation; every command that ends has exactly one persisted event recording how it ended.
 - The retained execution journal must be sufficient to rebuild the causal graph and settled orchestration projections; indexed command and execution tables remain operational materializations for claiming and current-state queries.
 - Transient attempt lifecycle is separately identifiable in the journal and never exposed as application events; lease-renewal and polling maintenance is not journaled.
+- External monitors and webhooks may publish idempotent execution facts atomically with application-table writes; commands awaiting those facts consume no runtime worker capacity while pending.
+- `Within` bounds only an awaited-fact stage and starts after the command's non-event prerequisites resolve.
+- Coordinators can consume typed success and unsuccessful command outcomes through one subscription over the command's existing terminal event.
+- Transactions that compose Flow operations with application writes acquire Flow-owned state first and application rows second.
 
 ## Non-goals
 
@@ -299,7 +314,7 @@ Handlers are ordinary Go and may call normal application services. Business data
 
 - an operational UI with execution timelines, causal graph views, pending waits, retries, and failures;
 - OpenTelemetry, metrics, and structured-logging adapters;
-- administrative retry, fork, repair, and compensation tools;
+- administrative retry, fork, explicit policy amendment, repair, and compensation tools;
 - child coordinators for decomposing very large executions;
 - optional local affinity that makes a bounded best effort to keep causally related work on the replica that started it, while always allowing another replica to take over;
 - archival and configurable journal retention, including the option to discard bulky command payloads before retaining their causal skeletons for longer;

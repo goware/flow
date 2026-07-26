@@ -46,11 +46,12 @@ This is a product feature: a declared short application commit function, command
 - one immutable ordered journal entry for every accepted command creation, including its payload, origin, parent where applicable, dependencies, classification, and causation;
 - exactly one event recording how each command ends, with successful worker results recorded automatically as typed events;
 - worker registration, command scheduling, leases, attempts, retries, timeouts, and fencing;
+- immutable declarative retry policies bounded by attempts, total elapsed retry duration, or both, with a PostgreSQL-time budget anchor that retries and crash recovery never reset;
 - bounded worker-spawned child commands committed atomically with the event recording the parent's success;
 - authoritative plan reads of closed direct-child membership, without duplicating membership into application result payloads;
 - typed, versioned events, including facts published from outside the execution;
 - **plans**: declarative command graphs reconciled by key, with dependencies, waits, fan-out, joins, and failure branches;
-- hand-written coordinators with durable typed state and ordered event inboxes;
+- hand-written coordinators with durable typed state, ordered event inboxes, and typed observation of every terminal command outcome;
 - historical matching-event delivery to plans and coordinators;
 - delayed commands as the durable timer primitive;
 - execution and command cancellation;
@@ -65,7 +66,7 @@ This is a product feature: a declared short application commit function, command
 
 - an operational UI for execution timelines, causal graphs, pending waits, retries, and failures;
 - OpenTelemetry, metrics, and structured-logging adapters;
-- administrative retry, execution fork, repair, and compensation tools.
+- administrative retry, execution fork, explicit policy amendment, repair, and compensation tools.
 
 ### 2.4 Later capabilities
 
@@ -104,7 +105,7 @@ This is a product feature: a declared short application commit function, command
 | **Journal** | The complete immutable per-execution sequence of accepted execution decisions and lifecycle transitions. It includes command creation, attempts, events, outcomes, and causation; only event entries are exposed as `Event[T]` facts. |
 | **Plan** | An optional pure function declaring the commands an execution needs and what each one waits for. Used for dependencies, joins, waits, and branching across commands. |
 | **Spawn** | A worker or coordinator staging an asynchronous command; a worker-spawned command is a direct child of the current command. |
-| **Coordinator** | Durable typed state reacting to events for orchestration that is open-ended or unsuitable for a plan. |
+| **Coordinator** | Durable typed state reacting to application events and typed terminal command outcomes for orchestration that is open-ended or unsuitable for a plan. |
 | **Causation** | The direct durable record or decision responsible for creating another record. |
 
 ## 4. Public developer surface
@@ -141,6 +142,7 @@ type Command[A, R any]  struct{}
 type Event[T any]       struct{}
 type PlanDef[A any]     struct{}
 type Coordinator[S any] struct{}
+type RetryPolicy        struct{ /* immutable value sealed by flow */ }
 
 func DefineCommand[A, R any](name string, version int, opts ...CommandOption) Command[A, R]
 func DefineEvent[T any](name string, version int) Event[T]
@@ -176,6 +178,15 @@ func DefineCoordinator[S any](name string, version int, handlers ...Handler[S]) 
 func (c Coordinator[S]) With(client Client) Coordinator[S]
 func OnStart[S any](h func(context.Context, *Coordination[S]) error) Handler[S]
 func On[S, T any](event Event[T], h func(context.Context, *Coordination[S], Received[T]) error) Handler[S]
+func OnOutcome[S, A, R any](
+    cmd Command[A, R],
+    h func(context.Context, *Coordination[S], Received[CommandOutcome[R]]) error,
+) Handler[S]
+
+func RetryFor(maxElapsed time.Duration) RetryPolicy
+func (p RetryPolicy) Attempts(max int) RetryPolicy
+func (p RetryPolicy) Backoff(delays ...time.Duration) RetryPolicy
+func (p RetryPolicy) Jitter(fraction float64) RetryPolicy
 
 func WithMaxAttempts(int) CommandOption
 func WithRetryPolicy(RetryPolicy) CommandOption
@@ -187,7 +198,13 @@ A command declares both what it takes and what it returns. `Command.Done()` is t
 
 Names are stable durable identifiers. Every definition carries an explicit positive integer version; `0` is invalid. A `(name, version)` pair has immutable payload and result meaning once used, while behavior-preserving handler and commit-function implementation changes may redeploy freely. A material change to commit semantics requires a new command version just like a material change to payload or result meaning. A runtime claims only work for pairs it has registered; unknown pairs stay pending for a compatible process and consume no retry budget.
 
-Registration is explicit and runtime-local; definitions mutate no package-global state. A runtime rejects duplicate workers for one command pair, more than one declared commit function for a worker, more than one `OnStart` handler for a coordinator, and duplicate handlers for one event pair within a coordinator.
+Registration is explicit and runtime-local; definitions mutate no package-global state. A runtime rejects duplicate workers for one command pair, more than one declared commit function for a worker, more than one `OnStart` handler for a coordinator, duplicate `On` handlers for one event pair, duplicate `OnOutcome` handlers for one command pair, and overlapping `On(command.Done(), ...)` and `OnOutcome(command, ...)` subscriptions within one coordinator.
+
+`RetryPolicy` is declarative library data rather than an application-implemented callback. `RetryFor` starts with the default backoff and an elapsed-time bound; its immutable builder methods return modified copies. `Attempts` adds an attempt-count bound, `Backoff` supplies the ordered retry delays, and `Jitter` supplies a proportional fraction in `[0, 1]`. When an elapsed policy needs more retries than its delay list contains, the last delay repeats. A policy must contain a positive attempt bound, a positive elapsed bound, or both. Invalid durations, attempts, jitter, or an empty explicit backoff fail definition or plan validation. `WithMaxAttempts` is the concise attempt-only form using default backoff and cannot be combined with `WithRetryPolicy` on one command definition. A plan node may override the definition with either `MaxAttempts` or `RetryPolicy`, but not both.
+
+When accepting a command, the runtime resolves its definition defaults together with any explicit plan-node override, then copies and canonicalizes the resulting policy. That accepted policy is immutable for the command's lifetime and is recorded in `CommandCreated` history and inspection. Application clocks, closures, arbitrary interfaces, and mutable policy state therefore cannot influence a retry decision.
+
+Definition-level execution options — retry policy, per-attempt timeout, and queue lane — are **creation-time operational defaults**, not command schema identity. Changing one does not require a command-version bump, rewrite an existing command, or make its later plan reconciliation fail; only commands created after the change receive the new default. An explicit plan-node `MaxAttempts` or `RetryPolicy` is different: its presence and canonical value are part of that plan declaration and must remain stable for an existing key. Duplicate declarations of one key within the same evaluation must also resolve to the same effective operational settings. A future administrative change to an already-created command's accepted policy must be an explicit journaled operation, never a side effect of redeployment.
 
 `With` returns a new immutable, concurrency-safe value of the **same definition type**, carrying the client capability in private non-durable state. It never mutates or registers the original definition, performs no I/O, and creates no execution. Definition identity, serialization, event references, and registration ignore the binding.
 
@@ -230,7 +247,7 @@ func (n *Node) AfterSettled(keys ...string) *Node   // all named commands termin
 func (n *Node) AfterFailed(keys ...string) *Node    // all named commands unsuccessful
 func (n *Node) AfterAny(count int, keys ...string) *Node
 func (n *Node) Await(events ...EventName) *Node     // named facts have arrived
-func (n *Node) Within(time.Duration) *Node          // bound on waiting to become runnable
+func (n *Node) Within(time.Duration) *Node          // awaited-fact deadline after command dependencies settle
 func (n *Node) Delay(time.Duration) *Node           // earliest start once runnable
 func (n *Node) Optional() *Node                     // does not determine execution outcome
 func (n *Node) MaxAttempts(int) *Node
@@ -250,6 +267,8 @@ A read key that is neither currently declared nor durably present is a plan defe
 ```go
 type ExecutionID string
 type CommandID   string
+type EventID     string
+type JournalPosition uint64
 
 type ExecutionHandle struct {
     ID            ExecutionID
@@ -309,6 +328,19 @@ type CommandInfo struct {
     CommandKey  string
     Name        string
     Version     int
+
+    CreatedAt        time.Time
+    BudgetStartedAt  time.Time
+    Attempt          int
+    AttemptStartedAt time.Time
+}
+
+type Received[T any] struct {
+    EventID    EventID
+    Key        string
+    Position   JournalPosition
+    RecordedAt time.Time
+    Payload    T
 }
 
 type ResultSource interface{ /* sealed by flow */ }
@@ -330,6 +362,10 @@ func (w *Work[A]) Info() CommandInfo
 ```
 
 `Work.Args` is the typed argument value supplied when the command was created. The API uses **arguments** for what a worker receives, **result** for what it returns, **payload** for serialized command or event data, and **state** for coordinator memory.
+
+`CommandInfo` exposes identity plus durable database timing for the current logical command and attempt. `CreatedAt` is immutable command creation time. `BudgetStartedAt` is set once to the command's first claim-eligible time after dependencies, waits, and initial `Delay`; it never moves on retry, claim, interruption, lease recovery, or replica takeover. `Attempt` is the one-based durable invocation ordinal; it may be greater than the number of retry-budget-consuming attempts because an interrupted invocation still has operational identity. `AttemptStartedAt` is the PostgreSQL time at which this invocation began. Every field is fixed before the handler starts. Mutable update time and the moving next-attempt schedule are deliberately not exposed through `CommandInfo`: update time is maintenance data, while retry timing belongs to policy and inspection. `Commit.Info` carries the same accepted values.
+
+`Received[T]` is the coordinator's typed view of one event. Position, key, and recorded time are retained metadata. For `On`, `Key` is the event's idempotency key and `Payload` is its canonical typed value. For `OnOutcome`, `Key` is the command key and `Payload` is the lossless typed `CommandOutcome[R]` view of that terminal event. `RecordedAt` is PostgreSQL acceptance time. Application-domain occurrence time belongs in `T` in Milestone 1; no separate caller-supplied occurrence-time option is implied. Coordinators use `Position` for ordering.
 
 A worker returns `(R, error)`. Conceptually, the worker emits an event when its command finishes. The API makes the common success path automatic: returning `(result, nil)` records the event carrying `R`, together with any additional events and spawned commands it staged — all in one short transaction. Returning an error discards every staged output. A retryable error produces attempt history but no final event; a final failure records `CommandFailed` after the retry policy is exhausted or the error is classified permanent.
 
@@ -387,11 +423,12 @@ func RetryAfter(d time.Duration, err error) error
 | Category | Exported |
 |---|---|
 | Runtime | `New`, `Migrate`, `Register`, `Run`, `Stop`, `InTx` |
-| Definitions | `DefineCommand`, `DefineEvent`, `DefinePlan`, `DefineCoordinator`, `Handle`, `WithCommit`, `OnStart`, `On`, `Done`, `Name`, `Version`, `With` |
+| Definitions | `DefineCommand`, `DefineEvent`, `DefinePlan`, `DefineCoordinator`, `Handle`, `WithCommit`, `OnStart`, `On`, `OnOutcome`, `Done`, `Name`, `Version`, `With` |
 | Plans | `Do`, `Fact`, `Facts`, `Children`, `Result`, `Outcome`, plus 10 command builder methods |
 | Execution | `Execute` on `Command`, `PlanDef`, and `Coordinator`; `Issue`, `Publish`, `CancelExecution`, `CancelCommand` |
 | Handler output | `Emit`, `Spawn`, `Optional`, `Info`, `SucceedExecution`, `FailExecution` |
 | Inspection | `GetExecution`, `LookupExecution`, `Trace`, `History`, `ListExecutions`, `AwaitExecution`, `ResultOf`, `OutcomeOf` |
+| Retry policy | `RetryFor`, `RetryPolicy.Attempts`, `RetryPolicy.Backoff`, `RetryPolicy.Jitter`, `WithMaxAttempts`, `WithRetryPolicy` |
 | Errors | `Permanent`, `RetryAfter` |
 
 The smallest path is `DefineCommand`, `Handle`, `With(runtime)`, `Command.Execute`, and `Run`. Store the returned same-type copy when a definition is executed repeatedly. Add `Spawn` when a worker discovers bounded children. Add `WithCommit` only when one command's successful meaning includes a short atomic application-table write. Add `DefinePlan`, `Do`, `PlanDef.Execute`, and event reads only when the execution needs cross-command dependencies, joins, waits, or branching. Coordinators, cancellation, transaction composition, and policy customization form the advanced operational surface.
@@ -613,6 +650,65 @@ The first plan evaluation declares only `prepare`, whose creation is appended to
 
 If the preparation handler, commit function, or settlement fails, no child, result event, or application write is committed; the command retries under its policy. Any slow or external operation in that worker must therefore be idempotent even though the commit function itself is local. If one analysis exhausts retries, it records `CommandFailed`, the already-declared corresponding `AfterFailed` branch runs and may inspect that structured failure through `OutcomeOf`, `generate` becomes `skipped`, and the execution ultimately fails after the remaining analyses settle. Child membership is never duplicated in `PrepareReport`'s result, and routine value plumbing introduces no result-loop early-return trap. The plan needs no coordinator because this fan-out membership closes with one successful parent return.
 
+### 5.3 External monitor publishes a fact
+
+Long external waits should not normally occupy one Flow worker per execution. An existing webhook or batch monitor can observe many external operations efficiently, publish one typed fact into the matching execution, and release a plan-declared command that was waiting without holding a worker or lease.
+
+```go
+type BridgeDelivery struct {
+    IntentID string
+    TxHash   string
+}
+
+var (
+    BridgeDelivered = flow.DefineEvent[BridgeDelivery]("bridge_delivered", 1)
+    SendOrigin = flow.DefineCommand[OriginArgs, OriginResult](
+        "send_origin", 1,
+        flow.WithRetryPolicy(flow.RetryFor(10*time.Minute)),
+    )
+    SendDestination = flow.DefineCommand[DestinationArgs, DestinationResult]("send_destination", 1)
+    IntentExecution = flow.DefinePlan[IntentArgs]("intent_execution", 1, planIntent)
+)
+
+func planIntent(p *flow.Plan, args IntentArgs) {
+    flow.Do(p, "origin", SendOrigin, args.Origin)
+    flow.Do(p, "destination", SendDestination, args.Destination).
+        After("origin").
+        Await(BridgeDelivered).
+        Within(time.Hour)
+}
+```
+
+`SendOrigin` may retry as often as its backoff permits, but not beyond ten minutes from its first claim-eligible time. Process restart, lease recovery, and replica takeover do not restart that budget. The destination's one-hour `Within` bound is different: its clock begins only after `origin` succeeds and limits the remaining wait for the bridge fact. The plan can therefore declare the complete structure in its natural order without a timing gate or a result read.
+
+The external monitor publishes through the transaction-scoped client in the same PostgreSQL transaction as its application-table update. The Flow operation appears first so the transaction follows the library-wide lock order defined by architecture; if either write fails, neither commits.
+
+```go
+func recordBridgeDelivery(
+    ctx context.Context,
+    db *pgkit.DB,
+    rt *flow.Runtime,
+    executionID flow.ExecutionID,
+    delivery BridgeDelivery,
+) error {
+    return pgx.BeginFunc(ctx, db.Conn, func(tx pgx.Tx) error {
+        if err := flow.Publish(
+            ctx,
+            rt.InTx(tx),
+            executionID,
+            BridgeDelivered,
+            delivery.TxHash, // stable natural idempotency key
+            delivery,
+        ); err != nil {
+            return err
+        }
+        return transfers.MarkDelivered(ctx, tx, delivery.IntentID, delivery.TxHash)
+    })
+}
+```
+
+The fact and application update become visible together. If the fact arrives before `origin` succeeds, retained historical delivery satisfies `Await` immediately when the command dependency resolves. Repeated equivalent publication coalesces by event key. A normal provider response of “still pending” produces no Flow attempt and no event; the external monitor continues its own bounded batch polling. Provider failure, refund, or delivery is published only when it becomes a meaningful execution fact.
+
 ## 6. Executions
 
 ### 6.1 Identity and idempotent start
@@ -622,6 +718,8 @@ An execution has a generated `ExecutionID`, a driver mode, an execution type, an
 Creating an execution appends one `ExecutionStarted` journal entry in the same transaction. It records the execution identity, driver definition and version, canonical root arguments or initial coordinator state, deadline, materially relevant options, metadata allowed by the serialization policy, and causation. It is operational history rather than a plan-visible event. An idempotent repeated start that finds equivalent content appends nothing.
 
 Repeating `.Execute` on the same definition with the same key, definition version, canonical arguments or initial state, and materially relevant options returns the existing execution with `Created == false`. Reusing that identity with materially different content returns `ErrConflict` and changes nothing.
+
+Current command-definition operational defaults are not re-compared on an idempotent direct-command start. The existing root retains the retry, timeout, and queue settings accepted when it was created, just as an existing plan command does during reconciliation.
 
 The idempotency check happens before terminal-state rejection, so a caller retrying after a lost response receives the existing terminal execution rather than an error.
 
@@ -685,7 +783,7 @@ Every command has a `CommandID` stable across attempts, an `ExecutionID`, a name
 
 Accepting a command by any creation path appends one immutable `CommandCreated` journal entry in the same transaction that materializes the command and its dependencies. The entry records its ID and key, name and version, canonical payload, creation origin, parent where applicable, required/optional classification, declared dependencies and waits, policy that affects execution semantics, and causation. Reconciliation that finds an equivalent existing command appends nothing; creation and idempotent rediscovery remain distinguishable.
 
-A plan-declared command's key is its command key. All creation paths share one execution-wide key namespace. Re-declaring the same plan-owned key with an equivalent definition, canonical payload, and policy is a no-op; different content returns `ErrConflict`. A plan may read or depend on an existing spawned command, but attempting to take ownership of its key with `Do` is a plan defect.
+A plan-declared command's key is its command key. All creation paths share one execution-wide key namespace. Re-declaring the same plan-owned key with an equivalent definition, canonical payload, topology, classification, and explicit node override is a no-op; different content returns `ErrConflict`. A change only to the command definition's current operational defaults leaves the existing command and its accepted settings untouched. A plan may read or depend on an existing spawned command, but attempting to take ownership of its key with `Do` is a plan defect.
 
 ### 7.2 Lifecycle
 
@@ -698,7 +796,7 @@ pending | ready → expired
 pending → skipped
 ```
 
-`pending` means declared but not yet runnable — dependencies unresolved or awaited facts not yet arrived. `ready` means runnable and claimable, possibly at a future time. There is no persisted "scheduled" state; a `ready` command with a future eligibility time is scheduled, and inspection derives that classification.
+`pending` means declared but not yet runnable — dependencies unresolved or awaited facts not yet arrived. `ready` means those prerequisites are resolved and the initial attempt is scheduled; its next-attempt time may be now or in the future because of `Delay`. There is no persisted `scheduled` state: inspection derives it from a `ready` command whose next-attempt time has not arrived. For an initially delayed command, `BudgetStartedAt` is that future first claim-eligible time, not the earlier transition to `ready`.
 
 `skipped` means a dependency condition became permanently unsatisfiable, so the command will never run. It is terminal and unsuccessful, but it is not a failure and does not by itself fail the execution.
 
@@ -735,9 +833,13 @@ For a coordinator handler, `Spawn` has the same buffering and atomicity but the 
 
 ### 7.5 Waiting and scheduling
 
-A command becomes runnable when all declared dependencies are satisfied and all awaited facts have arrived. `Within` bounds how long it may remain pending, measured from when it was declared; on expiry it becomes `expired` and dependents resolve through the failure branch. `Await` without `Within` inherits the execution deadline, so no wait is ever unbounded.
+A command becomes runnable when all declared command dependencies are satisfied and all awaited facts have arrived. `Within` is specifically an awaited-fact deadline and is valid only on a node that also declares `Await`; using it without `Await` is a plan defect. Its clock starts, using PostgreSQL time, when every non-`Await` command dependency on that node has been satisfied. With no command dependency it starts when the node is first declared. If the awaited facts already exist at that point, the command becomes runnable immediately and no wait expires. Otherwise the deadline is persisted once, capped by the execution deadline, and the command becomes `expired` if any awaited fact remains absent when it passes; dependents then resolve through the failure branch.
+
+`Within` does not consume time spent running or waiting for predecessor commands. Those commands have their own retry bounds and share the execution deadline. `Await` without `Within` inherits the execution deadline; only an execution explicitly started with `WithoutExecutionDeadline` opts out of that bound and the bounded-completion guarantee (§12.6).
 
 `Delay` sets the earliest time a runnable command may be claimed. **A delayed command is the durable timer primitive**; there is no separate timer concept. A waiting or delayed command holds no worker, connection, goroutine, or lease.
+
+For a long wait owned by an external system, the preferred pattern is §5.3: keep an efficient webhook or batch monitor outside the execution, publish an idempotent fact through `InTx` when meaningful progression occurs, and let a command wait with `Await`. Normal external “still pending” observations are polling maintenance, not failed Flow attempts or events.
 
 ### 7.6 Claiming and rolling deployments
 
@@ -751,11 +853,17 @@ Unclaimable backlog — a `(name, version)` with pending work and no live worker
 
 Each claimed execution of a command creates an attempt record with its own identity, worker and process identity, timings, structured error, and whether it consumed retry budget. The logical command keeps one `CommandID` throughout.
 
-Attempt start and conclusion are also appended to the ordered journal. A conclusion records success handoff, retryable failure and chosen next-eligibility time, permanent failure, timeout, shutdown interruption, or lease loss as applicable. These entries explain operational execution but are not `Event[T]` facts and cannot drive a plan or coordinator.
+Attempt start and conclusion are also appended to the ordered journal. A conclusion records success handoff, retryable failure and chosen next-attempt time, permanent failure, timeout, shutdown interruption, or lease loss as applicable. These entries explain operational execution but are not `Event[T]` facts and cannot drive a plan or coordinator.
 
 ### 8.2 Default behavior
 
-The default policy allows 5 attempts — one execution and 4 retries — with delays of 1s, 5s, 30s, and 2m, each with proportional jitter. Attempt count and policy are configurable per command definition and per plan-declared command. The chosen retry time is persisted, so inspection shows exactly when a command runs again. A per-attempt timeout cancels the handler context and is treated as a retryable error unless the command policy classifies it otherwise; exhaustion ends in `failed`, not `expired`. `expired` means the command never became or remained eligible within its waiting or execution deadline.
+The default policy allows 5 attempts — one execution and 4 retries — with delays of 1s, 5s, 30s, and 2m, each with proportional jitter. Attempt count and policy are configurable per command definition and per plan-declared command. The chosen next-attempt time is persisted, so inspection shows exactly when a command may run again.
+
+An effective retry policy is immutable declarative data with an optional positive maximum attempt count, an optional positive maximum elapsed duration, an ordered non-empty backoff, and proportional jitter. At least one bound is required. `RetryFor(d)` uses the default backoff and no attempt-count bound unless `Attempts` adds one. `WithMaxAttempts(n)` uses the default backoff, no elapsed bound, and is shorthand for the common attempt-only case. If both bounds exist, reaching either one stops retrying. Policy builders return copies; command creation copies and canonicalizes the resulting value.
+
+Elapsed retry time is measured using PostgreSQL time from the command's immutable `BudgetStartedAt`, set to its first claim-eligible time after dependencies, waits, and initial delay. Claims, retries, shutdown interruption, lease loss, and crash recovery never move this anchor. Retry scheduling changes only the separately stored next-attempt time. At attempt start and conclusion the runtime evaluates the remaining elapsed budget using database time. It caps the handler context by the earliest of the configured per-attempt timeout, retry-budget deadline, and execution deadline. A retryable conclusion that has exhausted either policy bound ends the command in `failed`; it is not rescheduled beyond the deadline.
+
+The runtime classifies the worker conclusion before applying policy. `Permanent` always stops immediately and no policy may convert it into a retry. `RetryAfter` supplies the desired delay for a retryable conclusion but remains subject to attempt and elapsed bounds. Plain errors, panics, and per-attempt timeouts use the policy backoff unless explicitly wrapped otherwise. Jitter may randomize the chosen delay, but the resulting next-attempt time is recorded once and never recomputed after restart or takeover.
 
 | Worker return | Effect | Retry budget |
 |---|---|---|
@@ -765,13 +873,15 @@ The default policy allows 5 attempts — one execution and 4 retries — with de
 | `flow.Permanent(err)` | command fails immediately | consumed |
 | panic | recovered, treated as retryable | consumed |
 
+Retry policy is for failures while attempting work. A successful external query whose result is merely not ready should ordinarily leave the command pending on a published fact as in §5.3, rather than return an error repeatedly. A workload that intentionally performs its own bounded polling inside one handler still uses the per-attempt context deadline and must honor cancellation.
+
 ### 8.3 Operational interruption
 
 Shutdown interruption, lease loss, and unregistered-version deferral never consume retry budget and never make a command terminal. They are retained as operational history and observations, not as domain progression.
 
 ### 8.4 Terminal failure
 
-A command that exhausts its attempts, or returns a permanent error, becomes `failed` and records `CommandFailed`, with its full attempt history preserved.
+A command that exhausts its attempt count or elapsed retry duration, or returns a permanent error, becomes `failed` and records `CommandFailed`, with its full attempt history preserved.
 
 Attempt failures are not application results. A negative application result is a **successful** command whose typed result says so — a distinction that keeps retry mechanics out of application semantics.
 
@@ -822,9 +932,9 @@ Plan-side `Outcome` remains appropriate when a terminal result changes which com
 
 Every journal entry has an `ExecutionID`, immutable per-execution position, recorded time, entry kind, and causation. Entry kinds cover the durable semantic and operational history needed to explain topology, progress, attempts, and outcome: execution lifecycle, command creation, attempt start and conclusion, event recording, coordinator processing, and execution transitions. A command's final transition is represented by its required terminal event rather than a duplicate operational entry. High-frequency maintenance such as lease-renewal heartbeats, polling, and notifications is deliberately excluded.
 
-Every event entry additionally has an `EventID`, name and version, optional key, canonical typed payload, occurrence time, and where applicable the originating command and attempt.
+Every event entry additionally has an `EventID`, name and version, optional key, canonical typed payload, and where applicable the originating command and attempt. Application-domain occurrence time belongs in the typed payload in Milestone 1; the event metadata's `RecordedAt` is authoritative PostgreSQL acceptance time.
 
-The journal is append-only and never destructively consumed. Events are one kind of journal entry and the only kind exposed through the typed `Event[T]`, `Fact`, `Facts`, and coordinator-subscription APIs. Unlike a command, which one worker handles, an event is observed independently by the plan and by any coordinator subscribing to it. `CommandCreated`, `AttemptStarted`, and other operational entries appear in `History` and `Trace` but do not create additional event abstractions and cannot be awaited as application facts.
+The journal is append-only and never destructively consumed. Events are one kind of journal entry and the only kind exposed through the typed `Event[T]`, `Fact`, `Facts`, and coordinator-subscription APIs; `OnOutcome` is a typed view over a command's terminal event, not exposure of an operational entry. Unlike a command, which one worker handles, an event is observed independently by the plan and by any coordinator subscribing to it. `CommandCreated`, `AttemptStarted`, and other operational entries appear in `History` and `Trace` but do not create additional event abstractions and cannot be awaited as application facts.
 
 ### 9.2 How events are recorded
 
@@ -879,7 +989,7 @@ A plan is optional. Applications use one only when a direct root command and its
 
 The public name is intentionally `Plan`, not `Workflow`: the execution is the whole durable workflow, while a plan is only the optional pure declaration function that coordinates some executions.
 
-When present, a plan is a pure function of the execution's root arguments and the events, command states, and results recorded so far. It declares commands; it never performs work. It must not do I/O, read clocks, use randomness, start goroutines, or depend on mutable globals, and must be deterministic given identical inputs. Although a plan reacts to events, it does not receive one event callback; each evaluation sees the relevant durable snapshot accumulated so far.
+When present, a plan is a pure function of the execution's root arguments and the events, command states, and results recorded so far. It declares commands; it never performs work. It must not do I/O, read clocks, use randomness, start goroutines, or depend on mutable globals, and must be deterministic given identical inputs. Although a plan reacts to events, it does not receive one event callback; each evaluation sees the relevant durable snapshot accumulated so far. Command creation, retry-budget, next-attempt, attempt-start, and recorded-time metadata are deliberately unavailable to plans. Time-based progression is expressed through `Delay`, `Within`, execution deadlines, and declarative retry policy rather than branches over a clock.
 
 Ordinary Go cannot be sandboxed completely. `flow` therefore enforces purity by capability and verification: a plan receives no context, client, database, transaction, clock, or worker scope; declarations are reconciled by canonical identity; panics and conflicts are plan defects; and `flowtest` can evaluate the same snapshot repeatedly and compare declarations and reads. A debug runtime option may perform the same double evaluation. A plan defect records `PlanFailed`, fails the execution, and cancels outstanding work; it never consumes a worker's retry budget or reruns a worker whose result was already accepted.
 
@@ -946,11 +1056,13 @@ The plan is evaluated at execution start and again whenever a relevant event is 
 | does not exist, dependencies satisfied | its command is created and becomes `ready` |
 | does not exist, dependencies unsatisfied | recorded as a `pending` command with its dependencies |
 | does not exist, a dependency is permanently unsatisfiable | recorded directly as `skipped` with `CommandSkipped` |
-| already exists and owned by this plan | verified against the stored definition, policy, dependencies, and canonical payload; a mismatch is a plan defect |
+| already exists and owned by this plan | verify definition, canonical payload, topology, classification, and explicit node override; changed definition defaults leave the accepted command untouched; any other mismatch is a plan defect |
 | already exists from `Spawn` or `Issue` | may be read or named as a dependency, but `Do` using its key is a plan defect |
 | previously declared, no longer declared | retained unchanged |
 
 **A plan only grows.** It cannot withdraw, rewrite, or re-point work it already declared. Application plan logic must therefore be additive: new durable facts may reveal more declarations but may not invalidate an earlier one. A mismatch is treated as a plan defect.
+
+Operational defaults are resolved only when a command is created. Re-evaluating a key after a retry, timeout, or queue default has changed neither mutates the accepted settings nor creates a conflict. Explicit `MaxAttempts` and `RetryPolicy` node overrides remain declaration data: adding, removing, or changing one for an existing key is a mismatch. Within one evaluation, repeated declarations of a key must agree on their complete effective settings so contradictory code cannot coalesce silently.
 
 Every command made runnable by one evaluation is created in that single transaction, so a crash exposes either all of them or none.
 
@@ -1016,9 +1128,13 @@ A coordinator is durable typed state that reacts to events. Direct-child records
 
 ### 11.1 Definition, start activation, and instance
 
-A definition has a stable name, positive version, typed state schema, an optional start handler declared with `OnStart`, and exact typed event subscriptions declared with `On`. Its instance holds typed canonical state, a durable inbox position, and a lifecycle of `active → completed | failed | cancelled`.
+A definition has a stable name, positive version, typed state schema, an optional start handler declared with `OnStart`, exact typed event subscriptions declared with `On`, and typed command-terminal subscriptions declared with `OnOutcome`. Its instance holds typed canonical state, a durable inbox position, and a lifecycle of `active → completed | failed | cancelled`.
 
 `Coordinator.Execute` durably creates the instance and enqueues one initial activation in the same transaction. It never invokes coordinator code inline. A runtime registering the exact coordinator name and version later claims the activation and invokes `OnStart`, when present; without `OnStart`, the activation is acknowledged as a no-op and the coordinator waits for events. Events, command creation, and orchestration-state changes staged by `OnStart` follow the same atomic processing and retry rules as an event handler.
+
+`OnOutcome(command, handler)` observes the existing exactly-one terminal event for every command with that name and version and presents it as `CommandOutcome[R]`. Success carries the typed result; failure, cancellation, expiry, and skipping carry their status and structured reason. `Received.Key` is the execution-wide command key and the remaining `Received` metadata comes from that same persisted terminal event. This is a typed subscription over the ordinary event already in the journal, not another event category or a second row.
+
+`On(command.Done(), ...)` remains the success-only convenience. Because one coordinator must make one deterministic decision for a matching journal position, registering it together with `OnOutcome(command, ...)` for the same command pair is rejected as an overlapping subscription. A coordinator that intends to decide how child failure affects the execution normally spawns that child with `Optional()` and consumes `OnOutcome`; otherwise the required child's ordinary fail-fast policy may fail the execution before a coordinator-managed fallback can complete.
 
 ### 11.2 Historical matching-event delivery
 
@@ -1026,7 +1142,7 @@ An instance begins with its inbox at the start of the execution and receives **e
 
 ### 11.3 Serialized processing
 
-At most one handler runs per coordinator instance at a time; workers and other executions run concurrently. On a `nil` return, one transaction appends a `CoordinatorTransition` journal entry recording the activation or handled event position, prior state revision, resulting canonical state or durable state reference, and causation; appends spawned-command creation and event entries; materializes the new orchestration state and outputs; and advances the inbox. On error or lease loss none of it commits, and redelivery cannot apply a decision twice. Architecture may normalize or content-address large state versions, but retained history must preserve the same logical transition.
+At most one handler runs per coordinator instance at a time; workers and other executions run concurrently. An `On` event handler receives `Received[T]`; an `OnOutcome` handler receives `Received[CommandOutcome[R]]`. Both carry the source event's ID, key, execution-local journal position, and PostgreSQL recorded time; `On` carries the canonical event payload, while `OnOutcome` carries its lossless typed terminal-outcome view. Position rather than a timestamp determines delivery order. On a `nil` return, one transaction appends a `CoordinatorTransition` journal entry recording the activation or handled event position, prior state revision, resulting canonical state or durable state reference, and causation; appends spawned-command creation and event entries; materializes the new orchestration state and outputs; and advances the inbox. On error or lease loss none of it commits, and redelivery cannot apply a decision twice. Architecture may normalize or content-address large state versions, but retained history must preserve the same logical transition.
 
 ### 11.4 Failure
 
@@ -1040,7 +1156,7 @@ Coordinator handlers are for short orchestration decisions and have no applicati
 
 ### 11.6 Rolling deployments
 
-A coordinator delivery is claimed only by a runtime registering the instance's exact coordinator name and version and, for an event delivery, the matching event name and version. A process understanding neither side leaves the delivery pending without consuming retry budget, and unclaimable coordinator backlog is visible through inspection and observability.
+A coordinator delivery is claimed only by a runtime registering the instance's exact coordinator name and version and either the matching event name and version for `On` or the matching command name and version for `OnOutcome`. A process understanding neither side leaves the delivery pending without consuming retry budget, and unclaimable coordinator backlog is visible through inspection and observability.
 
 ## 12. Transactional guarantees
 
@@ -1084,7 +1200,9 @@ Two situations lie outside this and are reported rather than absorbed: an execut
 
 ### 12.7 Caller-owned transactions
 
-`Runtime.InTx(tx)` returns a transaction-scoped `Client` and allows every definition's `.Execute`, plus `Issue`, `Publish`, and cancellation, to commit atomically with caller-owned application writes. Definitions may bind that capability with `With`, but the resulting value must not outlive the transaction. The library defines and enforces one transaction ordering discipline across execution, command, event, plan, coordinator, and application operations; its exact lock order belongs in the architecture.
+`Runtime.InTx(tx)` returns a transaction-scoped `Client` and allows every definition's `.Execute`, plus `Issue`, `Publish`, and cancellation, to commit atomically with caller-owned application writes. Definitions may bind that capability with `With`, but the resulting value must not outlive the transaction.
+
+The cross-boundary ordering invariant is **Flow-owned operation first, application-table writes second**. Library-owned settlement follows the same order by acquiring every required Flow lock before invoking a declared commit function. A caller-owned transaction must call its Flow operation before acquiring application-row locks and must not interleave the two categories; this is why §5.3 publishes before `MarkDelivered`. `InTx` cannot detect arbitrary locks the caller acquired earlier, so violating this documented discipline may deadlock and returns the database error rather than being retried invisibly. Architecture defines the exact Flow-internal lock order and may provide an ordered transaction helper, but it may not reverse this invariant.
 
 ### 12.8 Causation
 
@@ -1115,7 +1233,7 @@ Payload, state, configured plan-command-count, and dependency-count limits are e
 - the execution: driver mode, type, key, status, deadline, timings, outcome, and failure;
 - every command: key, name, version, state, payload, result, last error, retry schedule, deadlines, and current running duration;
 - every command not yet runnable, with its creation source, parent where applicable, dependencies, and awaited facts;
-- every event: name, version, key, position, payload, arrival time, originating command and final-state metadata where applicable, and causation;
+- every event: name, version, key, position, payload, PostgreSQL recorded time, originating command and final-state metadata where applicable, and causation;
 - attempt summaries per command, distinguishing operational interruptions from application failures;
 - the causal edges linking all of the above.
 
@@ -1171,18 +1289,22 @@ Per-execution commit rate is bounded by its row lock, suiting executions of tens
 
 ## 17. Time and clocks
 
-All durable scheduling and lease decisions use PostgreSQL time. Application clocks never determine ownership or eligibility, and are used only for local timers, jitter, deadlines, and duration measurement.
+All durable scheduling, retry-budget, deadline, and lease decisions use PostgreSQL time. Application clocks never determine durable ownership, eligibility, or elapsed budget. Local clocks may drive cancellable in-process timers and duration observations, but the corresponding durable decision is validated against database time before it commits.
 
-Timestamps follow a strict taxonomy; each answers exactly one question, and no timeout is anchored on a column the loop reading it can write:
+Timestamps follow a strict taxonomy; each answers exactly one question, and no timeout is anchored on a column the loop enforcing it can move:
 
 | Column class | Question | Written by |
 |---|---|---|
-| creation time | when was this row created? | insert only, immutable |
-| update time | when did anything last write it? | every write including claim; crash recovery only |
-| status time | when did the state last change? | state transitions only |
-| eligibility time | when was this permitted to run? | grants only — declaration, release, retry scheduling |
+| creation time | when was this command created? | insert only, immutable |
+| update time | when did anything last write this row? | every write, including claim and renewal; recovery/inspection only |
+| status time | when did the durable state last change? | actual state transitions only |
+| budget-start time | when did the command first become claim-eligible after dependencies, waits, and initial delay? | set once, immutable thereafter |
+| next-attempt time | what is the earliest time the next claim may begin? | initial scheduling and retry scheduling; intentionally moves |
+| attempt-start time | when did this particular attempt begin? | each successful claim, immutable for that attempt |
 
-Claiming a command is a write: it updates lease and update times and never eligibility or deadline anchors. This is what prevents work that retries forever without ever timing out.
+`Within` has a persisted wait-start and deadline set once when the node's command dependencies resolve, while the execution deadline has the anchor defined in §6.5. Claiming updates lease and update time and creates an attempt with its own start time; it never moves creation time, fact-wait start, budget-start time, next-attempt time, or a deadline. Retry scheduling moves only next-attempt time. Lease expiry, shutdown interruption, crash recovery, and takeover move neither the retry budget's anchor nor its deadline. This separation prevents the retry loop from granting itself a fresh elapsed budget on every pass.
+
+The runtime supplies the accepted database values to a worker through `CommandInfo` before invoking it. `UpdatedAt` and next-attempt time are intentionally absent from that handler view: the former is maintenance state and the latter is a scheduling decision. Plans receive no clock or timing metadata (§10.1).
 
 ## 18. Configuration and defaults
 
@@ -1190,6 +1312,7 @@ Claiming a command is a write: it updates lease and update times and never eligi
 |---|---|
 | attempt lease duration | 60 seconds, renewed automatically |
 | attempts per command | 5 (one execution plus 4 retries) |
+| elapsed retry budget | none unless configured by `RetryFor` or an explicit policy |
 | retry delays | 1s, 5s, 30s, 2m, jittered |
 | per-attempt timeout | none unless configured |
 | execution deadline | 30 days; removable per execution |
@@ -1225,14 +1348,15 @@ The durable model is deliberately sufficient for an operational UI without a UI 
 The library ships a test package so direct command trees, workers, plans, and coordinators are testable without a database:
 
 - a worker is an ordinary function — given command arguments and an immutable set of explicitly declared dependency results and terminal outcomes, assert `ResultOf` and `OutcomeOf` reads, its returned result or error, its staged events and spawned children, direct-child keys, and optional classification;
+- a retry policy is immutable data — given synthetic database timestamps, attempt counts, and error classifications, assert its retry/stop decision and persisted next-attempt time without calling a clock or application callback;
 - a declared commit function is an ordinary function of durable `Args`, `Result`, and `Info` plus a transaction capability; tests invoke it directly, assert those inputs, and use an application transaction double where available, while SQL behavior is integration-tested against PostgreSQL;
 - a direct-execution harness begins with one root worker decision and settles staged descendants, allowing completion and failure policy to be asserted without defining a plan;
 - a plan is a pure function — given root arguments, facts, command states, and closed child memberships, assert its declarations, dependencies, read availability, outcomes, waits, and complete expected key set; a determinism assertion evaluates the identical snapshot repeatedly and compares canonical output;
 - a plan harness may advance through an ordered sequence of synthetic durable snapshots — including facts, terminal command outcomes, and closed child memberships — and return or assert the canonical declarations, dependencies, consulted inputs, and read-availability classifications after each transition, without running workers or external effects;
 - a plan-routing assertion mode evaluates selected transitions that normal consulted-input routing would skip and verifies that the canonical output and reads remain unchanged;
-- a coordinator harness delivers the durable start activation and events in order, allowing `OnStart`, state changes, outputs, retry, and completion decisions to be asserted.
+- a coordinator harness delivers the durable start activation, ordinary events, and typed command outcomes in order, allowing `OnStart`, `On`, `OnOutcome`, state changes, outputs, retry, and completion decisions to be asserted.
 
-Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, publish-before-declare and declare-before-publish ordering, exactly one command-creation journal entry per accepted command, journal/graph reconstruction, all-or-nothing worker fan-out and commit-function writes, authoritative child reads, batched worker dependency results and terminal outcomes, repeated plan evaluation creating no duplicate commands or history, unknown dependency rejection, terminally unavailable results not blocking failure, failure branches surviving fail-fast, `Await` expiry, and rolling deployments with divergent registered versions.
+Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, immutable retry-budget anchors across retry, interruption, restart, and takeover, elapsed-budget exhaustion independent of attempt count, changed definition defaults leaving existing commands untouched, explicit node-policy conflict detection, dependency-gated `Within` anchors, publish-before-declare and declare-before-publish ordering, atomic external-monitor fact publication with its application write, Flow-before-application transaction ordering, exactly one command-creation journal entry per accepted command, journal/graph reconstruction, all-or-nothing worker fan-out and commit-function writes, authoritative child reads, batched worker dependency results and terminal outcomes, repeated plan evaluation creating no duplicate commands or history, unknown dependency rejection, terminally unavailable results not blocking failure, failure branches surviving fail-fast, typed coordinator fan-in across successful and unsuccessful command outcomes, `Await` expiry, and rolling deployments with divergent registered versions.
 
 ## 22. Acceptance criteria
 
@@ -1250,15 +1374,22 @@ Milestone 1 is complete when:
 - `Coordinator.Execute` durably creates the instance and queues its start activation without invoking `OnStart` inline;
 - a direct execution remains running through every required spawned descendant, then completes without relying on temporary quiescence;
 - a direct required-command failure produces the configured fail-fast or settle-all result without plan evaluation;
-- the worked example in §5 compiles and runs against PostgreSQL;
+- the worked examples in §5 compile and run against PostgreSQL;
 - a mistyped command or event reference, or a wrong payload, result, or event payload type, fails to compile;
 - every command that ends records exactly one event describing how it ended, with success carrying its typed result and transient attempt failures excluded;
 - every accepted root, `Do`, `Spawn`, coordinator-spawned, or `Issue` command records exactly one ordered `CommandCreated` journal entry with canonical payload, origin, parent where applicable, classification, dependencies, policy, and causation; equivalent reconciliation appends no duplicate;
+- changing a command definition's retry, per-attempt-timeout, or queue default requires no command-version bump, leaves every existing command and its accepted journaled settings unchanged, does not fail plan reconciliation, and affects only commands created afterward;
+- adding, removing, or changing an explicit plan-node retry override for an existing key is a plan defect, while duplicate declarations within one evaluation must agree on their effective operational settings;
 - every claimed attempt records ordered start and conclusion entries, including retry scheduling or interruption where applicable, without exposing transient attempt mechanics through `Event[T]`;
+- `CommandInfo` supplies immutable PostgreSQL creation, budget-start, current-attempt number, and attempt-start values; retry scheduling, claim renewal, recovery, and takeover never move the budget start, and mutable update or next-attempt timestamps are not exposed to handlers;
+- a declarative `RetryPolicy` can bound retries by attempts, elapsed PostgreSQL time, or both; `RetryFor` remains bounded across process restarts regardless of attempt count, permanent errors cannot be made retryable, and the chosen next-attempt time is persisted rather than recomputed;
+- a running handler's context is bounded by the earliest applicable per-attempt timeout, elapsed retry-budget deadline, and execution deadline;
 - a worker that successfully spawns several children commits the complete direct-child set, every child-creation journal entry, the event recording parent success, additionally emitted events, and its optional declared commit-function write atomically;
 - a declared commit function receives only durable command arguments, successful result, and metadata plus the supplied transaction; its write and ordinary settlement commit or roll back together, its error follows command retry classification, and it cannot be registered dynamically from a worker;
 - a successful terminal event records whether its declared commit function was applied, without exposing that operational metadata as a second application event;
 - coordinator handlers expose no application-transaction hook; application work is expressed as commands, with worker commit functions reserved for local writes inseparable from command success;
+- `OnOutcome(command, handler)` receives the existing exactly-one terminal event for that command name and version as a typed `CommandOutcome[R]`, including unsuccessful states without creating a second event; overlapping `On(command.Done(), ...)` and `OnOutcome(command, ...)` registration is rejected;
+- a coordinator can spawn managed children as `Optional()`, consume all of their terminal outcomes through `OnOutcome`, durably fan in their results in position order, and decide the aggregate execution result without an unsuccessful child triggering automatic fail-fast first;
 - every successful coordinator decision records its handled activation or event, prior state revision, resulting state or durable reference, causation, inbox advance, and staged outputs atomically;
 - a worker that errors, panics, loses its lease, or exceeds the configured plan-command limit after staging children commits none of them;
 - equivalent repeated child keys within one handler decision coalesce, conflicting content fails atomically, and no parent retry can duplicate a committed child;
@@ -1271,7 +1402,9 @@ Milestone 1 is complete when:
 - a plan branch appears only once the fact deciding it exists, and never withdraws work already declared;
 - every command made runnable by one plan evaluation is created in a single transaction;
 - a command with `Await` becomes runnable when its fact arrives, whether that fact was published before or after the command was declared;
-- an awaited fact that never arrives expires its command within the declared bound, and dependents resolve through the failure branch;
+- an external monitor can publish an idempotent fact through `InTx` atomically with its application-table update; a command awaiting that fact occupies no worker or lease while pending, and retained early publication still releases it when declared later;
+- `Within` is rejected without `Await`, starts exactly once when all of the node's command dependencies become satisfied, does not consume predecessor runtime, and is capped by the execution deadline;
+- an awaited fact that already exists when the `Within` clock would start satisfies the wait immediately; one that never arrives expires the command within the declared bound, and dependents resolve through the failure branch;
 - a failure branch declared with `AfterFailed` runs to completion under fail-fast, and the execution becomes terminal only after it resolves;
 - a plan-driven execution succeeds exactly when every declared command is terminal, nothing remains pending or awaited, no read is temporarily unavailable, and re-evaluation declares nothing new; it never succeeds on temporary quiescence;
 - a required terminal command failure reaches terminal execution failure after its explicit failure-handling subgraph resolves, even when the latest plan evaluation contains temporarily unavailable reads;
@@ -1280,16 +1413,19 @@ Milestone 1 is complete when:
 - plan reads distinguish available, temporarily unavailable, and permanently unavailable inputs internally: `Result` becomes available only on success, `Outcome` on any terminal state, and an unsuccessful terminal `Result` cannot block completion as though it might later succeed;
 - after each evaluation, dependency keys are validated against durable commands plus every declaration in that evaluation, so forward references work and a nonexistent key fails immediately as a plan defect;
 - a plan panic, conflicting declaration, or invalid read records `PlanFailed` and fails the execution without consuming worker retry budget or rerunning accepted work;
+- plans cannot read command timing, retry-budget, next-attempt, attempt-start, or event recorded-time metadata and therefore cannot branch on a clock;
 - the plan determinism harness detects different declarations or consulted reads from an identical snapshot, and fragment tests can assert the complete intended key set;
 - the database-free plan harness can advance synthetic facts, terminal outcomes, and closed child memberships and expose canonical declarations, dependencies, consulted inputs, and read availability after each transition without executing workers;
 - plan evaluation at the documented command ceiling stays within its benchmarked budget; events whose names the latest evaluation did not consult trigger no normal evaluation, a later consulted transition still exposes any stored fact to a newly reached branch, and routing assertion mode detects if a skipped evaluation would differ;
 - a command result, emitted events, spawned and plan-created command journal entries and materializations, dependency resolution, execution transitions, and declared commit-function writes commit atomically or not at all;
+- caller-owned transactions perform their Flow operation before acquiring application-row locks; the §5.3 composition commits both categories or neither, and the architecture never prescribes the inverse order;
 - a stalled worker cannot commit after losing its lease;
-- an event published before its plan-declared command or coordinator existed is still observed by it;
+- an event published before its plan-declared command or coordinator existed is still observed by it, including a terminal command event matched later through `OnOutcome`;
+- a coordinator receives each event with its stable event ID, execution-local journal position, and PostgreSQL recorded time; `On` exposes the event key and typed payload, `OnOutcome` exposes the command key and typed terminal-outcome view, position determines delivery order, and domain occurrence time, when needed, is part of an application payload;
 - event positions are total only within one execution, and no API or projection implies a total order across executions;
 - all retained journal entries share that execution-local position order; `History` can reconstruct command existence, arguments, topology, attempts, events, causation, and settled outcomes without reconciling a separately ordered command source, while lease heartbeats remain excluded maintenance;
 - an idempotent republish of a stored event succeeds after the execution becomes terminal, while a genuinely new event is rejected;
 - crash at any commit boundary leaves the execution recoverable and internally consistent;
 - workers registering different `(name, version)` sets share a database without failing each other's work;
 - `Trace` returns both what happened and what the execution is waiting for, including parent-child edges, every final command state, current running state, and attempt start history in one call, without a `CommandStarted` application event;
-- worker, declared commit-function input, and plan unit tests run without requiring a running Flow runtime; SQL integration tests use PostgreSQL.
+- worker, declared commit-function input, plan, and coordinator unit tests run without requiring a running Flow runtime; SQL integration tests use PostgreSQL.
