@@ -188,6 +188,8 @@ The runtime automatically records an event carrying a successful worker result. 
 
 Long external waits normally remain outside a claimed worker. A webhook or efficient batch monitor observes the external system, then uses `Runtime.InTx` to publish one idempotent fact in the same PostgreSQL transaction as its application-table update. A plan-declared command waiting with `Await` holds no worker, connection, goroutine, or lease; the published fact makes it eligible atomically at commit. Facts retained before the plan reaches that branch are still observed later, so this pattern replaces fragile one-shot release writes without requiring one polling command per execution.
 
+An event used only by a durably stored `Await` condition is resolved by the engine and does not require the publishing monitor to register or execute the Go plan. If the plan itself reads that event through `Fact` or `Facts`, the publishing runtime must have the exact plan version so the fact and any resulting declarations can commit together. This keeps ordinary monitors small without weakening atomic plan decisions.
+
 The journal additionally records the creation of every command, including its canonical arguments, origin, parent where applicable, dependencies, required/optional classification, and causation. Together with the exactly-one-terminal-event rule, those entries make the execution graph and its final command states reconstructible from retained history. Attempt starts, retryable failures, interruptions, and retry scheduling remain operational journal entries rather than events because the command has not finished yet. Lease-renewal heartbeats and polling noise are maintenance, not history.
 
 ### Plans
@@ -294,6 +296,7 @@ Handlers are ordinary Go and may call normal application services. Business data
 - Commands and events are versioned durable data whose schemas may outlive the code version that created them.
 - Rolling deployments where processes temporarily recognize different command or event versions.
 - Runtime correctness must never depend on a process retaining in-memory state.
+- A replica settling plan-driven commands must register the execution's exact plan version. Ingress processes need that plan only when their transition changes an input the plan actually reads; satisfying a materialized `Await` alone remains plan-free.
 - `Runtime` directly satisfies the lightweight client capability, and definitions bind to that capability immutably for concise execution and application wiring.
 - A direct command execution requires neither a plan nor a coordinator and completes from its closed command tree.
 - Every accepted command creation has one immutable ordered journal entry recording its payload, origin, dependencies, classification, and causation; every command that ends has exactly one persisted event recording how it ended.
@@ -327,6 +330,6 @@ Handlers are ordinary Go and may call normal application services. Business data
 - OpenTelemetry, metrics, and structured-logging adapters;
 - administrative retry, fork, explicit policy amendment, repair, and compensation tools;
 - optional local affinity that makes a bounded best effort to keep causally related work on the replica that started it, while always allowing another replica to take over;
-- archival and configurable journal retention, including the option to discard bulky command payloads before retaining their causal skeletons for longer;
+- near-term archival and configurable journal retention, including the option to discard bulky command payloads before retaining their causal skeletons for longer;
 - optional event export and cross-execution subscriptions through explicit idempotent boundaries that preserve each source execution's identity and order without promising order across executions;
 - plan simulation and dry-run tooling that, when the exact plan version and retained execution snapshot are available, shows declarations and consulted inputs after historical or candidate transitions without executing workers or external effects.

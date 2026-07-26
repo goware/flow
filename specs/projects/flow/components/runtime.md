@@ -92,16 +92,18 @@ type registry struct {
 
 It is built under a mutex while created, deeply copied/frozen by `Run`, and read lock-free afterward. Duplicate and codec/handler conflicts are rejected before any work starts.
 
-### 4.2 Plan compatibility is required at the committing replica
+### 4.2 Plan compatibility at the committing replica
 
 A plan is evaluated in the same transaction as a relevant fact or command terminal event. Therefore any runtime that performs such a transition must possess the execution's exact plan name/version:
 
 - command dispatch in a plan-driven execution requires both the command worker and plan registration;
-- `Publish`, `Issue`, and command cancellation against a plan execution require that plan registered on the calling runtime when they can trigger evaluation;
+- `Publish` and command cancellation against a plan execution require that plan on the calling runtime only when durable routing metadata says they trigger evaluation;
 - wait-expiry maintenance for a plan execution runs only on a replica with that plan;
 - plan start can use the receiver's definition directly, but future processing still requires deployment registration.
 
-If the capability is absent, the operation writes nothing and returns a structured unavailable/invalid-state error, or the dispatcher leaves the work unclaimed. Inspection reports `missing_plan_definition`. This preserves atomic plan semantics instead of splitting a transition and its declarations across transactions.
+`Issue` creation is not a plan input and does not evaluate the plan. Likewise, publishing an event used only by persisted `Await` rows performs generic wait/readiness resolution and needs no plan registration. If the same event is present in the latest `Fact`/`Facts` read set, the exact plan is required so its declarations commit with the fact.
+
+If a required capability is absent, the operation writes nothing and returns structured `ErrInvalidState`, or the dispatcher leaves the work unclaimed. Inspection reports `missing_plan_definition`. This preserves atomic plan semantics instead of splitting a transition and its declarations across transactions.
 
 Direct execution needs only the command worker. Coordinator command workers do not need the coordinator definition to settle; their terminal events remain in the journal until a compatible coordinator runtime consumes them. Coordinator delivery itself requires the exact coordinator version and matching registered subscription.
 
@@ -109,7 +111,9 @@ Direct execution needs only the command worker. Coordinator command workers do n
 
 Claim filters are built from the immutable registry. Old replicas never claim new command versions; a coordinator replica never claims an unknown coordinator or event/command subscription version; plan commands never settle on a replica with the wrong plan version. Unknown work remains pending with no retry consumption.
 
-Unclaimable observations distinguish missing command worker, missing plan definition, missing coordinator definition, and no matching coordinator handler.
+Rolling deployment assumes that one durable name/version has one orchestration meaning. The registry can diagnose codec and selector conflicts inside one process but cannot compare Go function bodies across replicas. Material plan or coordinator behavior changes therefore deploy under a new version; intentionally mixing divergent code under the same version is unsupported.
+
+Unclaimable observations distinguish missing command worker, missing plan definition, missing coordinator definition, and no matching coordinator handler. These are deployment gaps, not attempts, and consume no retry budget.
 
 ## 5. Command scheduler
 
@@ -193,7 +197,7 @@ The runtime unregisters the active lease only after settlement has either commit
 
 Success invokes the engine/store settlement from the architecture. The runtime retries only the short database transaction with the already canonical decision buffer. If the registered commit function is present, the store exposes the current `pgx.Tx` through the narrow `flow.Tx` adapter only after all Flow locks/writes are acquired.
 
-On commit-function failure the success transaction rolls back. The runtime classifies that error and starts a fresh fenced conclusion transaction, which either schedules retry or fails the command. The application function may run again after a deadlock/rollback and must be deterministic/idempotent from its durable inputs.
+On commit-function failure the success transaction rolls back. This includes any plan defect discovered while evaluating that candidate success: neither the success nor `PlanFailed` existed outside the rolled-back transaction. The runtime classifies the commit-function error and starts a fresh fenced conclusion transaction, which either schedules retry or fails the command. The application function may run again after a deadlock/rollback and must be deterministic/idempotent from its durable inputs.
 
 If commit outcome is ambiguous, the runtime does not blindly run a second success settlement. It queries the stable attempt/command identity: terminal success means done; still-running same fence permits retrying the settlement; changed fence means lost ownership.
 
@@ -225,7 +229,7 @@ The manager never reacquires, resurrects, or extends an already expired token. R
 
 ### 8.1 Selecting deliveries
 
-One loop probes active coordinator instances whose exact definition is registered locally. If an instance is idle, the store/engine selects start activation first or the lowest matching retained event above its inbox and persists a stable delivery key. If ready/retry-wait and due, claim follows the same execution-first skip-locked pattern as commands and appends `AttemptStarted`.
+One loop probes active coordinator instances whose exact definition is registered locally. If an instance is idle, the store/engine selects start activation first or the lowest matching retained event above its inbox and persists a stable delivery key. Ordinary event selectors use journal routing columns; `OnOutcome` selectors join a terminal row's `command_id` to the immutable command name/version projection. If ready/retry-wait and due, claim follows the same execution-first skip-locked pattern as commands and appends `AttemptStarted`.
 
 The local selector set includes ordinary `On` event selectors and terminal command selectors for `OnOutcome`. The journal query can jump over unmatched entries. Early events are retained and therefore match after start/instance creation.
 
@@ -281,9 +285,9 @@ Maintenance has no elected leader. Each task performs a bounded stale probe, the
 
 | Task | Compatible runtime requirement | Effect |
 |---|---|---|
-| command lease expiry | none for release; plan registration when terminal plan work must be processed | conclude lost attempt and restore persisted schedule without budget use |
+| command lease expiry | none | conclude lost attempt and restore persisted schedule without budget use |
 | coordinator lease expiry | exact coordinator version | redeliver same stable delivery |
-| `Within` expiry | exact plan for plan-driven execution | expire command, resolve dependencies, re-evaluate plan |
+| `Within` expiry | exact plan for plan-driven execution | expire command from its persisted deadline, ignoring any fact recorded later; resolve dependencies and re-evaluate plan |
 | execution deadline | none | expire execution, cancel commands/coordinator, no failure branches |
 | unclaimable scan | none | emit safe counts/reasons only |
 | consistency audit | none | detect impossible projection/dispatch/counter shapes; never silently rewrite semantic history |
@@ -327,11 +331,15 @@ Bound definitions hold the `Client` interface, not `*Runtime`, so API-only and t
 - maps `pgx.ErrTxClosed` to `ErrClosed`;
 - emits no commit-dependent observation because pgx exposes no general post-commit hook.
 
+A typed plan-defect error may accompany a terminal failure change set staged inside the caller's transaction. Returning that error from a `pgx.BeginFunc` callback rolls the change set back; handling it and allowing the caller transaction to commit retains the terminal history. The runtime does neither implicitly and reports no post-commit observation in either case.
+
 The narrow `flow.Tx` passed to commit functions is a different sealed capability: it permits application SQL but not Flow operations or transaction control.
 
 ### 12.3 Plan-aware ingress
 
-After loading an execution, a client operation that can trigger a plan looks up its exact plan in the runtime registry before locking or writing. Applications publishing from monitors to plan executions therefore register the relevant `PlanDef` on that API runtime even if it never calls `Run`. This requirement is reported clearly and tested; the library never accepts half of an atomic plan transition.
+An ingress operation locks the execution and loads its current plan-routing metadata before writing. If the mutation changes an input the plan reads, the runtime resolves the exact plan from its registry and evaluates it in that transaction. If the capability is absent, the operation rolls back and returns `ErrInvalidState`.
+
+`Issue` and `Await`-only publication need no plan lookup: command creation is not a plan input, and stored wait resolution belongs to the engine. A monitor therefore registers the relevant `PlanDef` only when it publishes an event the plan currently reads through `Fact` or `Facts`; it does not become a worker and need not call `Run`. This routing decision is made under the execution lock, so it cannot race a concurrent plan evaluation that changes the read set.
 
 ## 13. Migrations and startup compatibility
 
@@ -437,7 +445,7 @@ Fault tests assert durable invariants after runtime restart, not exact goroutine
 - Register/Run/Stop state transitions and concurrent Stop calls;
 - duplicate worker/plan/coordinator and subscription conflicts;
 - API-only operations without Run;
-- plan-aware worker claim and ingress refusal when the exact PlanDef is absent;
+- plan-aware worker claim, routed-ingress refusal when the exact PlanDef is absent, and plan-free `Await`-only publication;
 - rolling replicas with divergent command, plan, coordinator, and event versions.
 
 ### 19.2 Dispatch and leases
@@ -470,7 +478,7 @@ Fault tests assert durable invariants after runtime restart, not exact goroutine
 
 ### 19.5 Transactions, errors, and safety
 
-- `InTx` commits/rolls back with application write, performs Flow first, and inverse order receives a database error without hidden retry;
+- `InTx` commits/rolls back with application write, performs Flow first, preserves caller ownership of plan-defect commit versus rollback, and inverse order receives a database error without hidden retry;
 - transaction-bound definition use after close returns `ErrClosed`;
 - commit-dependent observations are suppressed for bare caller transactions;
 - every constraint maps by name/SQLSTATE;

@@ -54,6 +54,7 @@ The implementation must preserve these invariants even if physical tables or int
 12. **The accepted command ceiling belongs to the execution.** Every replica checks the stored value and increments the stored count under the execution lock.
 13. **Durable time is PostgreSQL time.** Creation, first eligibility, retries, waits, deadlines, claims, and leases never depend on an application clock.
 14. **Flow locks precede application locks.** Library-owned settlement acquires Flow state before invoking a commit function; caller-owned transactions call Flow before touching application rows.
+15. **Plan decisions commit with their trigger.** A transition that requires the Go plan commits only on a runtime with that exact plan version; satisfying stored dependencies or an `Await` without changing a plan read remains engine-owned and plan-free.
 
 ## 4. Technology and dependency decisions
 
@@ -219,6 +220,8 @@ Every library-owned semantic transaction concerns one execution and acquires blo
 
 New command rows are inserted by command key after conflicting existing rows have been locked and validated. The engine never holds an application lock and then returns to Flow-owned rows.
 
+For a blocking semantic transaction, the store captures its single PostgreSQL decision time immediately after acquiring the execution row lock, never before a potentially long lock wait. Claim uses the same rule after its successful no-wait execution lock. This timestamp drives every deadline, schedule, and journal time in that transition.
+
 ### 8.3 Claim is execution-first and no-wait
 
 Claims must append `AttemptStarted`, so they also need the execution lock. Candidate discovery is an unlocked, indexed probe. For each candidate execution the claimer opens a short transaction and uses `FOR UPDATE SKIP LOCKED` first on the execution row, then on the revalidated command/dispatch or coordinator row. If either is unavailable or no longer eligible, the candidate is abandoned immediately.
@@ -235,7 +238,9 @@ Flow operation -> application-table locks/writes -> caller commit
 
 This matches worker settlement, where Flow locks are acquired before `WithCommit` runs. A transaction must not call Flow after it has acquired application locks, and it must not interleave Flow and application lock phases. The transaction-scoped client tracks execution locks it requests and rejects a later lower `ExecutionID`, so multiple Flow operations use one deterministic order before the application phase. Arbitrary application locks cannot be detected; PostgreSQL may abort a transaction that violates the documented order, and the library returns that error without replaying caller code.
 
-M1 public operations each target one existing execution. If an application needs several executions plus application rows in one atomic transaction, it must acquire the execution IDs in lexical order through an internal ordered operation helper exposed only when that public use case is specified; ad hoc reverse-order locking is not permitted.
+Each public operation targets one execution. An application that composes several existing executions in one caller-owned transaction sorts those operations by lexical `ExecutionID`, invokes every Flow operation first, and then performs its application writes. The existing transaction-scoped client enforces the ordering; M1 adds no batch or ordered-helper API.
+
+Durable-on-error behavior is necessarily different at this boundary. A library-owned transaction may commit a terminal `PlanFailed` change set and then return its typed error. `InTx` can only stage that same change set: the caller may commit it deliberately or roll it back with the rest of the composition. The library never commits behind the caller's transaction and never claims a rolled-back failure is durable.
 
 ### 8.5 Isolation and retry
 
@@ -339,7 +344,7 @@ The Flow writes in step 10 occur before application writes in step 11, but they 
 
 A deterministic staged-output defect takes a different path: the proposed success is rejected, its outputs and commit function are discarded, and the command becomes permanently failed without rerunning code that cannot repair the decision.
 
-A plan defect discovered after accepting the worker result does not rerun the worker. The transaction keeps the successful result, emitted facts, children, and commit-function write; appends `PlanFailed`; cancels outstanding work; and fails the execution. This preserves accepted application work while making invalid orchestration terminal and inspectable.
+A plan defect discovered while settling a successful worker decision does not by itself rerun the worker. If the complete transaction commits, it keeps the successful result, emitted facts, children, and commit-function write; appends `PlanFailed`; cancels outstanding work; and fails the execution. If the commit function returns an error, no success or plan defect was accepted: the transaction rolls back and that commit-function error follows the ordinary command retry path. This preserves committed application work without pretending a rolled-back candidate result was already accepted.
 
 ## 13. Plans
 
@@ -362,7 +367,9 @@ After the function returns, the engine:
 7. classifies new nodes as ready, pending, or immediately skipped;
 8. applies the batch command-ceiling check and emits a delta.
 
-Reconciliation runs to a bounded fixed point inside the transaction. After accepting a non-empty declaration delta, the pure plan is evaluated again against that in-transaction state. This normally produces no further command; if a newly created command was immediately skipped/expired or otherwise opens another branch, the next delta is applied and evaluation continues. Monotonic growth plus the execution command ceiling bounds the loop. `plan_quiescent` is true only for the final no-new-command pass, preventing an execution from waiting for a transition that its own reconciliation already produced.
+Reconciliation runs to a bounded fixed point inside the transaction only when applying the declaration delta creates a plan-observable terminal transition, such as a newly declared command that is immediately skipped or expired. The pure plan is then evaluated against that in-transaction outcome, and the cycle continues while another accepted delta produces another immediate terminal transition. Creating ordinary `ready` or `pending` work stops the current cycle with `plan_quiescent = false`: the open command already prevents completion, and its eventual terminal transition supplies the next evaluation. A no-new-command pass sets `plan_quiescent = true`.
+
+Every additional fixed-point pass follows at least one genuinely new terminal command, so the stored execution command ceiling bounds that cycle when enabled. The engine also applies a high fixed technical guard to total plan invocations in one transaction, including lazy value-loading passes. Crossing it is a deterministic plan defect rather than an unbounded execution-lock hold. The guard does not limit how many commands one pass may declare.
 
 Operational definition defaults are resolved only for genuinely new nodes. The latest read set records `available`, `temporary`, or `permanent`. Only temporary reads prevent successful completion.
 
@@ -379,9 +386,11 @@ The last category is stored as a routing observation rather than exposed as anot
 
 Unconsulted event names normally skip evaluation. This is safe because plans are pure and facts and terminal outcomes are immutable and retained: a later consulted transition that opens a new branch can still read the older fact. Debug routing mode may over-evaluate a normally skipped transition and assert that declarations and reads are unchanged.
 
-Evaluation and its fixed point run inside the semantic transaction because declarations must commit with the triggering fact or terminal outcome. This lengthens the execution-row critical section, so plan pass count, duration, and command count are measured and benchmarked at the default ceiling. A plan must remain CPU-only and bounded.
+Evaluation and any required fixed-point continuation run inside the semantic transaction because declarations must commit with the triggering fact or terminal outcome. This lengthens the execution-row critical section, so plan pass count, duration, and command count are measured and benchmarked at the default ceiling. A plan must remain CPU-only and bounded.
 
-The exact plan code is therefore a commit-time capability. A replica may claim a command in a plan-driven execution only when it registers both that command worker and the execution's plan name/version. Likewise, `Publish`, `Issue`, command cancellation, and wait expiry that can trigger plan evaluation require the exact plan on the committing runtime. Missing plan code leaves work untouched or rejects ingress before writing; it never commits a fact now and hopes a different process reconciles the plan later. Direct and coordinator-driven command settlement do not have this requirement.
+The exact plan code is therefore a commit-time capability whenever evaluation is required. A replica may claim a command in a plan-driven execution only when it registers both that command worker and the execution's plan name/version. A plan-mode command may become observed while its handler is running, so claim capability is intentionally conservative rather than trying to predict the future read set.
+
+Ingress is narrower. After locking the execution, the engine uses durable routing metadata to decide whether the mutation changes a plan input. A `Publish` matching the latest `Fact`/`Facts` read set requires the exact plan; a publication used only to satisfy persisted `Await` rows resolves those rows without calling the plan. `Issue` creation is not itself plan-observable and does not evaluate the plan. Command cancellation and maintenance expiry require the plan only when the resulting terminal transition is routed to evaluation. If required plan code is missing, the transaction writes nothing and returns a structured `ErrInvalidState`, or background work remains untouched. It never commits half of an atomic plan decision. Direct and coordinator-driven command settlement do not have this requirement.
 
 ## 14. Dependency and wait resolution
 
@@ -397,7 +406,11 @@ Each builder call creates a normalized condition group. Groups combine with logi
 
 Terminal command and new event positions seed an in-memory resolution work queue. Reverse indexes locate affected groups; each group transition is guarded so it resolves once. Newly ready commands receive dispatch rows. Permanently impossible nodes become `skipped`, append exactly one terminal event, decrement `open_commands`, and seed further resolution. Stable key ordering makes cascading output deterministic.
 
-`Within` is stored on a node with `Await` only. When all command-dependency groups settle successfully, the engine checks retained facts first. If any awaited fact is missing, it writes `wait_started_at = db_now` and a once-only deadline capped by the execution deadline. An early fact satisfies the wait immediately. Expiry makes the command `expired`, not skipped, so failure branches can react.
+Dependency and wait resolution uses stored topology and does not invoke application plan code. After a new event satisfies waits and the resulting readiness/skip cascade is complete, the routing set determines whether the same event also changed a public plan read and therefore requires evaluation in that transaction.
+
+`Within` is stored on a node with `Await` only. When all command-dependency groups settle successfully, the engine checks retained facts first. If any awaited fact is missing, it writes `wait_started_at = db_now` and a once-only deadline capped by the execution deadline. An early fact satisfies the wait immediately.
+
+The persisted deadline, not sweeper timing, decides a race. A matching event whose PostgreSQL `recorded_at` is no later than the deadline satisfies the wait. A later event remains in the journal but leaves that wait unresolved; plan-free publication does not synthesize expiry. Plan-capable maintenance subsequently makes the command `expired`, not skipped, so failure branches can react.
 
 ## 15. Fail-fast and completion
 
@@ -417,7 +430,7 @@ Every terminal transition appends one execution terminal event and closes any co
 
 One coordinator instance belongs to one coordinator-driven execution. It stores current canonical state, a state revision, whether the start activation is pending, the last consumed journal position, and at most one current delivery/lease.
 
-After start activation, the dispatcher finds the lowest matching event position above the inbox for the registered coordinator definition. Matching includes ordinary `On` subscriptions and the existing command terminal event viewed through `OnOutcome`; no second failure event is written. Registration rejects overlap with success-only `On(cmd.Done())`.
+After start activation, the dispatcher finds the lowest matching event position above the inbox for the registered coordinator definition. Ordinary `On` selectors match indexed event metadata. `OnOutcome` matches command-terminal journal rows by joining their `command_id` to the immutable command name/version projection; its typed result or failure comes from the same terminal row. No second failure event or denormalized outcome stream is written. Registration rejects overlap with success-only `On(cmd.Done())`.
 
 The selected event position becomes the durable delivery identity until acknowledged. One handler runs without a database transaction, stages state mutation/events/spawns/completion, and then settles under the execution and coordinator fences. Success appends `CoordinatorTransition`, commits the new state, advances the inbox to the handled position, applies outputs, and clears delivery retry state atomically. Error leaves the inbox unchanged and schedules the same delivery. Exhaustion appends `CoordinatorFailed`, fails the execution, and cancels work.
 
@@ -439,7 +452,7 @@ Recovery tasks are bounded and leaderless:
 - expired coordinator lease -> same delivery remains selected and retryable;
 - expired `Within` or execution deadline -> ordinary fenced terminal transition and dependency/completion processing;
 - due delayed/retry work -> no state migration is necessary; the claim index becomes eligible by time;
-- unclaimable registered-version gap -> observation and inspection only, never automatic failure.
+- unclaimable command, plan, or coordinator registration gap -> observation and inspection only, never automatic failure.
 
 Optional local affinity is not in M1. A later implementation may store a preferred replica and a short preference window, but another compatible replica must always take over after that window and no handler may depend on local cache state.
 
@@ -447,7 +460,7 @@ Optional local affinity is not in M1. A later implementation may store a preferr
 
 Canonical encoding happens at API or staging boundaries, before locks where possible. The library rejects invalid JSON values, non-finite numbers, unsupported map keys, excessive nesting, and configured size limits. Custom `MarshalJSON` output is canonicalized after marshaling; application tests should use `flowtest.AssertCanonicalStable` for custom types.
 
-SHA-256 accelerates equality but is not trusted as the sole comparison on a conflict path: equal digests compare canonical bytes. Stored durable names and versions define schema meaning. A material payload, result, coordinator-state, or commit-semantics change requires a new version; behavior-preserving worker implementation changes do not.
+SHA-256 accelerates equality but is not trusted as the sole comparison on a conflict path: equal digests compare canonical bytes. Stored durable names and versions define schema and orchestration meaning. A material payload, result, coordinator-state/subscription/decision, plan declaration/read, or commit-semantics change requires a new version; behavior-preserving worker implementation changes do not. Go function bodies are not made durable or hashed, so deploying divergent plan or coordinator behavior under one name/version is explicitly invalid.
 
 Errors and observations never include canonical bytes, payloads, connection strings, SQL, lease tokens, or unredacted application failures. Stored failures use bounded structured code/message data and a configurable redaction hook.
 
@@ -484,7 +497,7 @@ The causal graph reducer uses:
 
 A replay conformance test rebuilds settled execution, command, dependency, and coordinator projections from retained history and compares them with live materializations. Live lease-renewal state is deliberately excluded. Replay never invokes application code.
 
-Terminal executions and complete journals are retained indefinitely in M1. Retention/archival may later remove bulky payload bodies before causal skeletons, but doing so explicitly narrows historical simulation and rebuild guarantees.
+Terminal executions and complete journals are retained indefinitely in M1. Retention/archival is a near-term operational follow-on and may remove bulky payload bodies before causal skeletons, but doing so explicitly narrows historical simulation and rebuild guarantees.
 
 ## 21. Observability
 
@@ -526,6 +539,7 @@ Crash points surround claim commit, handler return, every settlement phase, comm
 - claim throughput with 90% locally unregistered head-of-lane kinds;
 - same-execution parallel claim and settlement contention;
 - plan evaluation and reconciliation at 10, 100, and 1,000 commands;
+- immediate-terminal fixed-point chains and the technical pass guard;
 - 1,000-child fan-out and 1,000-result concurrent fan-in;
 - one coordinator processing a high-rate event stream;
 - lease renewal at hundreds of active handlers;
@@ -539,7 +553,7 @@ Crash points surround claim commit, handler return, every settlement phase, comm
 - The initial journal duplicates some immutable bytes also present in projections. Simplicity and standalone history win in M1; content addressing is a compatible storage optimization.
 - Coordinator processing is deliberately single-threaded per execution. Parallel work belongs in spawned commands; the coordinator remains the short durable decision point.
 - Transactional notifications can impose a database-wide commit cost. They are optional hints, measured before default enablement, and can be disabled without changing correctness.
-- Child executions, administrative fork/retry, recurring schedules, local affinity, retention, cross-execution export, UI, and telemetry adapters are additive boundaries. None may weaken per-execution ordering or introduce a second orchestration authority into one execution.
+- Child executions, administrative fork/retry, recurring schedules, local affinity, cross-execution export, UI, and telemetry adapters are additive boundaries. Retention is the first operational follow-on but does not change M1 semantics. None may weaken per-execution ordering or introduce a second orchestration authority into one execution.
 
 ## 24. Component responsibility matrix
 

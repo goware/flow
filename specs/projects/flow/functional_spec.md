@@ -70,14 +70,14 @@ This is a product feature: a declared short application commit function, command
 - child executions for independently durable sub-agents and other nested work, with an idempotent parent link, a separate execution-scoped journal, exactly one terminal outcome delivered back across an explicit boundary, and defined completion, failure, cancellation, and recursion policies;
 - an operational UI for execution timelines, causal graphs, pending waits, retries, and failures;
 - OpenTelemetry, metrics, and structured-logging adapters;
-- administrative retry, execution fork, explicit policy amendment, repair, and compensation tools.
+- administrative retry, execution fork, explicit policy amendment, repair, and compensation tools;
+- archival and configurable terminal-journal retention, including two-stage removal of bulky payloads before causal skeletons.
 
 ### 2.4 Later capabilities
 
 - cancel-remaining join policies;
 - arbitrary subtree cancellation;
 - recurring schedules;
-- archival and configurable terminal-journal retention;
 - cross-execution subscriptions and event export to Kafka or analytics systems through an explicit idempotent boundary that preserves the source `(ExecutionID, position)` and neither merges execution logs nor promises cross-execution order (§9.4);
 - plan simulation and dry-run tooling that uses the exact plan version and a retained execution snapshot to preview declarations and reads after historical or candidate transitions, without executing workers or external effects (§9.6);
 - optional soft local affinity with bounded preference for the replica that starts an execution and automatic takeover by another replica;
@@ -202,7 +202,7 @@ func WithQueue(string) CommandOption            // worker lane
 
 A command declares both what it takes and what it returns. `Command.Done()` is the event carrying that result; it shares the command's name and version, needs no separate declaration, and is what `After` waits on. It is an ordinary `Event[R]`, not a separate event category.
 
-Names are stable durable identifiers. Every definition carries an explicit positive integer version; `0` is invalid. A `(name, version)` pair has immutable payload and result meaning once used, while behavior-preserving handler and commit-function implementation changes may redeploy freely. A material change to commit semantics requires a new command version just like a material change to payload or result meaning. A runtime claims only work for pairs it has registered; unknown pairs stay pending for a compatible process and consume no retry budget.
+Names are stable durable identifiers. Every definition carries an explicit positive integer version; `0` is invalid. A `(name, version)` pair has immutable schema and orchestration meaning once used. Behavior-preserving command-handler and commit-function implementation changes may redeploy freely, while a material change to command payload, result, or commit semantics requires a new command version. A material plan change that can alter declarations or consulted reads for the same durable snapshot requires a new plan version. A material coordinator change to state meaning, subscriptions, or decisions requires a new coordinator version. Replicas cannot compare Go function bodies, so reusing one version for divergent plan or coordinator logic is an invalid deployment rather than a supported rollout. A runtime claims only work for pairs it has registered; unknown pairs stay pending for a compatible process and consume no retry budget.
 
 Registration is explicit and runtime-local; definitions mutate no package-global state. A runtime rejects duplicate workers for one command pair, more than one declared commit function for a worker, more than one `OnStart` handler for a coordinator, duplicate `On` handlers for one event pair, duplicate `OnOutcome` handlers for one command pair, and overlapping `On(command.Done(), ...)` and `OnOutcome(command, ...)` subscriptions within one coordinator.
 
@@ -718,6 +718,8 @@ func recordBridgeDelivery(
 
 The fact and application update become visible together. If the fact arrives before `origin` succeeds, retained historical delivery satisfies `Await` immediately when the command dependency resolves. Repeated equivalent publication coalesces by event key. A normal provider response of “still pending” produces no Flow attempt and no event; the external monitor continues its own bounded batch polling. Provider failure, refund, or delivery is published only when it becomes a meaningful execution fact.
 
+`BridgeDelivered` is used only by the already-materialized `Await`, so this monitor needs the event definition and client but does not register or execute `IntentExecution`. The engine can satisfy the stored wait and make `destination` ready without calling the Go plan. If a plan also consults that event through `Fact` or `Facts`, the publishing runtime must register the exact plan version, or route the publication through an application service that does, because the fact and resulting declarations must then commit atomically.
+
 ### 5.4 Durable adaptive agent
 
 A long-running agent is a coordinator-driven execution, not one worker that retains an agent loop in memory. Model calls, tools, and bounded sub-agent tasks are commands. Their terminal results are events consumed through `OnOutcome`, so failure, cancellation, expiry, or replica loss cannot leave an in-memory pending counter stranded.
@@ -1093,6 +1095,8 @@ For a coordinator handler, `Spawn` has the same buffering and atomicity but the 
 
 A command becomes runnable when all declared command dependencies are satisfied and all awaited facts have arrived. `Within` is specifically an awaited-fact deadline and is valid only on a node that also declares `Await`; using it without `Await` is a plan defect. Its clock starts, using PostgreSQL time, when every non-`Await` command dependency on that node has been satisfied. With no command dependency it starts when the node is first declared. If the awaited facts already exist at that point, the command becomes runnable immediately and no wait expires. Otherwise the deadline is persisted once, capped by the execution deadline, and the command becomes `expired` if any awaited fact remains absent when it passes; dependents then resolve through the failure branch.
 
+Deadline outcome depends on PostgreSQL acceptance time under the execution lock, not on when a maintenance sweep happens. A matching fact whose recorded acceptance time is no later than the persisted `Within` deadline satisfies the wait even if expiry maintenance runs afterward. A fact first accepted after that deadline remains immutable execution history but does not satisfy or resurrect the wait; plan-capable maintenance records the command's expiry. An `Await`-only publisher does not need plan code merely because it observes a late fact.
+
 `Within` does not consume time spent running or waiting for predecessor commands. Those commands have their own retry bounds and share the execution deadline. `Await` without `Within` inherits the execution deadline; only an execution explicitly started with `WithoutExecutionDeadline` opts out of that bound and the bounded-completion guarantee (§12.6).
 
 Plan `Delay` and spawn `StartAfter` set the earliest time a runnable command may be claimed. **A delayed command is the one-shot durable timer primitive**; there is no separate timer record or sleeping handler. A waiting or delayed command holds no worker, connection, goroutine, or lease.
@@ -1105,9 +1109,9 @@ For a long wait owned by an external system, the preferred pattern is §5.3: kee
 
 ### 7.6 Claiming and rolling deployments
 
-A worker claims only `(name, version)` pairs it has registered, using row-level locking that skips rows another process is claiming. A process that does not recognize a command leaves it pending, consumes no retry budget, and never fails it, so old and new versions of a service may share one database.
+A worker claims only `(name, version)` pairs it has registered, using row-level locking that skips rows another process is claiming. Plan-driven command claims additionally require the execution's exact plan registration (§16.3). A process lacking the complete capability leaves the command pending, consumes no retry budget, and never fails it, so old and new versions of a service may share one database.
 
-Unclaimable backlog — a `(name, version)` with pending work and no live worker registering it — is surfaced through inspection and observability rather than stalling silently.
+Unclaimable backlog—a missing command worker, exact plan, coordinator definition, or matching coordinator handler—is surfaced through inspection and observability rather than stalling silently.
 
 ## 8. Attempts, retries, and failure
 
@@ -1255,7 +1259,9 @@ When present, a plan is a pure function of the execution's root arguments and th
 
 Ordinary Go cannot be sandboxed completely. `flow` therefore enforces purity by capability and verification: a plan receives no context, client, database, transaction, clock, or worker scope; declarations are reconciled by canonical identity; panics and conflicts are plan defects; and `flowtest` can evaluate the same snapshot repeatedly and compare declarations and reads. A debug runtime option may perform the same double evaluation. A plan defect records `PlanFailed`, fails the execution, and cancels outstanding work; it never consumes a worker's retry budget or reruns a worker whose result was already accepted.
 
-The terminal plan-defect rule also applies to the initial evaluation in `PlanDef.Execute` and evaluations caused by ingress. The execution and accepted triggering command or fact remain durable for inspection; the operation returns a typed error carrying the `ExecutionID`, and an idempotent retry finds the same terminal execution.
+The terminal plan-defect rule also applies to the initial evaluation in `PlanDef.Execute` and evaluations caused by ingress. With a library-owned transaction, the execution and accepted triggering command or fact remain durable for inspection; the operation returns a typed error carrying the `ExecutionID`, and an idempotent retry finds the same terminal execution.
+
+`InTx` cannot make an error durable independently of its caller. A plan-defect change set produced there remains pending in the caller-owned transaction like every other Flow write. The typed error still carries the affected execution identity, but the caller chooses whether to commit that terminal history or roll the entire composition back; returning the error from a `pgx.BeginFunc` callback normally chooses rollback. This is ordinary transaction ownership, not a different plan outcome.
 
 `Fact` and `Facts` read events already recorded in this execution. `Children` reads a command's authoritative direct-child membership after that membership closes successfully. `Result` reads a successful command's typed result. `Outcome` reads any terminal result or structured failure, including for worker-spawned commands. A branch that genuinely changes topology according to runtime information is an ordinary Go conditional over those reads. Routine success and failure value plumbing belongs in a dependent worker through `ResultOf` or `OutcomeOf`, as shown in §5.2 and §8.5.
 
@@ -1313,6 +1319,8 @@ The success gate is automatic and cannot be forgotten, because it derives from t
 
 The plan is evaluated at execution start and again whenever a relevant event is appended or an observed command changes state. Evaluation runs in the same transaction as that durable transition and reconciles the declared set against what already exists. Worker-spawned children are inserted before evaluation, so the parent's successful result and every child key are visible in the same snapshot.
 
+The exact plan name and version are therefore a capability of any runtime committing a transition that requires evaluation. Plan-declared command settlement always has that capability because plan-driven work is claimed only by replicas registering both the worker and plan. Ingress requires it only when the stored plan-read routing set says the mutation changes an input the plan reads. Merely satisfying a persisted dependency or `Await` condition is ordinary engine resolution and does not execute the plan.
+
 | Declared key | Action |
 |---|---|
 | does not exist, dependencies satisfied | its command is created and becomes `ready` |
@@ -1328,6 +1336,8 @@ Operational defaults are resolved only when a command is created. Re-evaluating 
 
 Every command made runnable by one evaluation is created in that single transaction, so a crash exposes either all of them or none.
 
+Reconciliation continues to a bounded fixed point only when applying a declaration batch itself creates a new plan-observable terminal transition, such as a command that is immediately skipped or expired. The engine re-evaluates against that in-transaction outcome and repeats until no such transition opens another branch. Creating ordinary `ready` or `pending` work does not force a redundant second pass: that open work already prevents completion, and its later terminal transition supplies the next required evaluation. One durable transition may therefore invoke the pure plan more than once, but invocation count is never application-visible behavior.
+
 After the plan function returns, every command key named by a dependency builder is validated against the union of commands already durable and commands declared anywhere in that evaluation. This permits forward references within the function but rejects a typo or a reference to work that does not exist as a plan defect; such a dependency can never sit pending until the execution deadline. Future externally supplied facts use `Await`, and future externally issued commands cannot be anticipated by an undeclared dependency key.
 
 The consulted-input set and each read's availability classification from the latest evaluation are persisted alongside the declared set. They determine both whether the execution may succeed (§10.1) and when the plan must next be evaluated (§10.3).
@@ -1338,11 +1348,14 @@ A plan's declared output is a pure function of its root arguments and the durabl
 
 - at execution start;
 - when an event arrives whose name the latest evaluation consulted;
-- when a final event is appended for a command read by the plan or named by one of its dependencies.
+- when a final event is appended for a command read by the plan or named by one of its dependencies; or
+- when the latest evaluation introduced work and a later terminal transition must establish the next no-new-command pass.
 
 Claim, lease renewal, `running`, and `retry_wait` transitions do not trigger plan evaluation because no plan API can observe them. The event recorded when the command ends does.
 
 Events of names the latest evaluation did not consult cannot change that evaluation's control path by themselves and do not trigger evaluation. Skipping is sound because plans are pure and facts are immutable, append-only, and durably re-readable; terminal command outcomes and closed child memberships are likewise immutable. If another consulted input later opens a branch that reads an older, previously ignored fact, that consulted input triggers evaluation and the older fact is still present for the newly reached branch.
+
+An event named only by a node's `Await` is not a plan read. Its arrival updates the stored wait and command readiness directly; it triggers the Go plan only when the same event is also present in the latest `Fact` or `Facts` read set. This distinction lets external monitors publish ordinary release facts without linking orchestration code.
 
 Evaluation is idempotent, so an implementation may always evaluate more often than required — including on every event — without changing behavior.
 
@@ -1381,6 +1394,8 @@ This is not a queue-capacity, database-backlog, or concurrency limit. The databa
 The runtime validates `existing command count + genuinely new staged commands` under the execution lock before inserting any member of a batch. A worker fan-out, coordinator decision, or plan evaluation therefore never commits partially at the ceiling. Exceeding the limit is a deterministic permanent decision error rather than a retryable infrastructure error: a plan records `PlanFailed`; a worker records `CommandFailed` without committing its staged success or outputs; a coordinator records `CoordinatorFailed`; and an external `Issue` returns `ErrInvalid` without writing. `Trace` exposes the configured ceiling, accepted count, and structured limit reason.
 
 The shared ceiling has an additional performance role for plans. At 1,000 commands a plan-driven execution performs on the order of a million narrow row reads across its lifetime; operators raising or disabling the limit for a plan accept its approximately O(commands²) cost. Direct and coordinator-driven executions do not pay repeated whole-graph evaluation cost, but use the same ceiling as a runaway-topology guard. The 100-dependency limit remains specific to each plan-declared command.
+
+Immediate terminal cascades and lazy durable-value loading may invoke a plan more than once in one semantic transaction, but every additional fixed-point pass must follow at least one genuinely new terminal declaration. This does not change the approximately O(commands²) lifetime bound when the command ceiling is enabled. A high implementation safety guard bounds total plan invocations in one transaction, including value-loading and fixed-point passes; it is a transaction-resource guard, not a queue, concurrency, or total-command limit, and a plan that exceeds it fails deterministically rather than holding the execution lock indefinitely.
 
 Architecture must maintain or validate the execution command count without scanning the command table, make each plan-evaluation state load one narrow indexed query, and benchmark evaluation at the documented default ceiling.
 
@@ -1446,7 +1461,7 @@ User handlers never hold a PostgreSQL transaction for the duration of their work
 
 That one transaction appends the event carrying the command result, its additionally emitted events, a `CommandCreated` entry for every staged child and plan-created command, attempt conclusion, and any execution outcome transition; executes the worker's optional declared commit function; and materializes the complete child set, plan reconciliation, dependencies, command state, and execution state. If ordinary settlement fails, none commits and the command is retried.
 
-A recovered plan panic, nondeterministic conflict, or invalid plan read is different: the accepted worker result and its staged outputs commit, `PlanFailed` and `ExecutionFailed` are appended, and outstanding commands are cancelled. A plan defect never turns successful application work into another worker attempt.
+A recovered plan panic, nondeterministic conflict, or invalid plan read is different: provided the candidate success transaction itself can commit, the worker result, staged outputs, and optional commit-function write are accepted, `PlanFailed` and `ExecutionFailed` are appended, and outstanding commands are cancelled. That committed application work never becomes another worker attempt. If the commit function itself fails, however, no part of the candidate success—including the plan defect—was accepted; the whole transaction rolls back and the commit-function error follows the ordinary command retry rules.
 
 If a worker deliberately writes application state outside its declared commit function, those writes are outside `flow` fencing and settlement atomicity. Caller-owned transactions remain atomic at execution ingress (§12.7), and external effects remain subject to at-least-once execution (§12.2).
 
@@ -1460,13 +1475,15 @@ Serialization applies to **commits, not work**. Commands of one execution run co
 
 Every non-terminal command has a bounded path to terminal: direct eligibility, dependencies that will resolve, an awaited fact with a deadline, a retry schedule, a `Within` bound, or the execution deadline. Direct executions additionally have bounded topology because every worker publishes its complete direct-child set and closes membership in one successful return and the execution-wide command ceiling bounds recursive generations unless the operator explicitly disables it. A background reconciler repairs dispatch state after crashes without duplicating work.
 
-Three situations lie outside this and are reported rather than absorbed: an execution started with `WithoutExecutionDeadline` whose commands declare no bounds; an execution whose command ceiling is explicitly disabled and whose handlers or coordinator continue creating work indefinitely; and a command whose `(name, version)` no live worker registers.
+Three situations lie outside this and are reported rather than absorbed: an execution started with `WithoutExecutionDeadline` whose commands declare no bounds; an execution whose command ceiling is explicitly disabled and whose handlers or coordinator continue creating work indefinitely; and work for which no live replica registers the complete required capability—its command worker, its exact plan as additionally required in plan mode, or its coordinator definition. Unknown work remains durable and consumes no retry budget while that deployment gap exists.
 
 ### 12.7 Caller-owned transactions
 
 `Runtime.InTx(tx)` returns a transaction-scoped `Client` and allows every definition's `.Execute`, plus `Issue`, `Publish`, and cancellation, to commit atomically with caller-owned application writes. Definitions may bind that capability with `With`, but the resulting value must not outlive the transaction.
 
-The cross-boundary ordering invariant is **Flow-owned operation first, application-table writes second**. Library-owned settlement follows the same order by acquiring every required Flow lock before invoking a declared commit function. A caller-owned transaction must call its Flow operation before acquiring application-row locks and must not interleave the two categories; this is why §5.3 publishes before `MarkDelivered`. `InTx` cannot detect arbitrary locks the caller acquired earlier, so violating this documented discipline may deadlock and returns the database error rather than being retried invisibly. Architecture defines the exact Flow-internal lock order and may provide an ordered transaction helper, but it may not reverse this invariant.
+The cross-boundary ordering invariant is **Flow-owned operation first, application-table writes second**. Library-owned settlement follows the same order by acquiring every required Flow lock before invoking a declared commit function. A caller-owned transaction must call its Flow operation before acquiring application-row locks and must not interleave the two categories; this is why §5.3 publishes before `MarkDelivered`. `InTx` cannot detect arbitrary locks the caller acquired earlier, so violating this documented discipline may deadlock and returns the database error rather than being retried invisibly. Architecture defines the exact Flow-internal lock order but may not reverse this invariant.
+
+When one caller-owned transaction performs Flow operations against multiple existing executions, it must invoke them in ascending lexical `ExecutionID` order before beginning application writes. The transaction-scoped client tracks requested execution locks and returns `ErrInvalidState` before requesting a lower ID after a higher one. The ordinary one-execution case requires no sorting or additional API.
 
 ### 12.8 Causation
 
@@ -1515,7 +1532,7 @@ Every record carries correlation and causation identifiers for joining to extern
 
 ### 15.4 Retention
 
-Terminal executions and their complete journals are retained indefinitely in Milestone 1. Archival and configurable retention are later capabilities. A future policy may discard bulky canonical command payloads before retaining command-creation skeletons, causation, and terminal outcomes for longer; once payloads are removed, full historical plan simulation and complete projection rebuilding are no longer promised for that prefix.
+Terminal executions and their complete journals are retained indefinitely in Milestone 1. Archival and configurable retention are a near-term operational follow-on. A future policy may discard bulky canonical command payloads before retaining command-creation skeletons, causation, and terminal outcomes for longer; once payloads are removed, full historical plan simulation and complete projection rebuilding are no longer promised for that prefix.
 
 ## 16. Runtime and distribution
 
@@ -1536,6 +1553,8 @@ A later optional **local affinity** mode may prefer the replica that starts an e
 ### 16.3 Roles
 
 `Runtime` is the ordinary configured application handle and also implements the lightweight `Client` capability used by execution operations. Calling `Run` adds worker and coordinator processing; omitting it leaves an API-only handle. Deployments may mix one binary doing both, split request-serving from worker replicas, or run several pools registering different command names and versions, which scale independently against one database. `InTx` supplies the same operations through a transaction-scoped capability.
+
+For plan-driven executions, a pool settling a command also registers every exact plan version under which that command may run; pools still scale independently in capacity and may register only their relevant workers and plans. An API-only process needs a plan definition only for an operation that changes a currently plan-observed input. Publishing a fact used solely by a persisted `Await` remains plan-free. Coordinator-driven command settlement has no corresponding coordinator-code requirement because its terminal event may wait durably for a compatible coordinator replica.
 
 ### 16.4 Concurrency and wake-up
 
@@ -1624,7 +1643,7 @@ The library ships a test package so direct command trees, workers, plans, and co
 - direct, plan, and coordinator harnesses accept a synthetic per-execution command ceiling and assert accepted logical-command count, duplicate coalescing, and all-or-nothing rejection without treating attempts as new commands;
 - the durable-agent harness scenario fans out optional tool commands, delivers mixed successful and unsuccessful outcomes in position order, parks for an external event, schedules a later turn, and reaches an explicit result without any in-memory wait.
 
-Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, immutable retry-budget anchors across retry, interruption, restart, and takeover, elapsed-budget exhaustion independent of attempt count, changed definition defaults leaving existing commands untouched, explicit node-policy conflict detection, dependency-gated `Within` anchors, PostgreSQL-anchored `StartAfter` scheduling and deadline expiry, publish-before-declare and declare-before-publish ordering, atomic external-monitor fact publication with its application write, Flow-before-application transaction ordering, exactly one command-creation journal entry per accepted command, execution-wide command-ceiling enforcement for root, `Do`, `Spawn`, and `Issue`, journal/graph reconstruction, all-or-nothing worker and coordinator fan-out and commit-function writes, authoritative child reads, batched worker dependency results and terminal outcomes, repeated plan evaluation creating no duplicate commands or history, unknown dependency rejection, terminally unavailable results not blocking failure, failure branches surviving fail-fast, typed coordinator fan-in across successful and unsuccessful command outcomes, durable-agent continuation after process loss, `Await` expiry, and rolling deployments with divergent registered versions.
+Integration behavior is verified against real PostgreSQL: concurrent claims, lease expiry and fencing, cancellation races, crash recovery at every commit boundary, immutable retry-budget anchors across retry, interruption, restart, and takeover, elapsed-budget exhaustion independent of attempt count, changed definition defaults leaving existing commands untouched, explicit node-policy conflict detection, dependency-gated `Within` anchors, PostgreSQL-anchored `StartAfter` scheduling and deadline expiry, publish-before-declare and declare-before-publish ordering, atomic external-monitor fact publication with its application write, plan-free `Await`-only publication, exact-plan rejection for routed plan inputs, Flow-before-application and ascending multi-execution transaction ordering, exactly one command-creation journal entry per accepted command, execution-wide command-ceiling enforcement for root, `Do`, `Spawn`, and `Issue`, journal/graph reconstruction, all-or-nothing worker and coordinator fan-out and commit-function writes, authoritative child reads, batched worker dependency results and terminal outcomes, immediate-terminal fixed-point reconciliation, repeated plan evaluation creating no duplicate commands or history, unknown dependency rejection, terminally unavailable results not blocking failure, failure branches surviving fail-fast, typed coordinator fan-in across successful and unsuccessful command outcomes, durable-agent continuation after process loss, `Await` expiry, and rolling deployments with divergent registered versions.
 
 ## 22. Acceptance criteria
 
@@ -1651,6 +1670,7 @@ Milestone 1 is complete when:
 - every command that ends records exactly one event describing how it ended, with success carrying its typed result and transient attempt failures excluded;
 - every accepted root, `Do`, worker- or coordinator-spawned, or `Issue` command records exactly one ordered `CommandCreated` journal entry with canonical payload, origin, parent where applicable, classification, dependencies, accepted initial schedule, policy, and causation; equivalent reconciliation appends no duplicate;
 - changing a command definition's retry, per-attempt-timeout, or queue default requires no command-version bump, leaves every existing command and its accepted journaled settings unchanged, does not fail plan reconciliation, and affects only commands created afterward;
+- a material plan declaration/read change or coordinator state/subscription/decision change uses a new definition version; rolling replicas never intentionally run divergent orchestration logic under one name/version pair;
 - adding, removing, or changing an explicit plan-node retry override for an existing key is a plan defect, while duplicate declarations within one evaluation must agree on their effective operational settings;
 - every claimed attempt records ordered start and conclusion entries, including retry scheduling or interruption where applicable, without exposing transient attempt mechanics through `Event[T]`;
 - `CommandInfo` supplies immutable PostgreSQL creation, budget-start, current-attempt number, and attempt-start values; retry scheduling, claim renewal, recovery, and takeover never move the budget start, and mutable update or next-attempt timestamps are not exposed to handlers;
@@ -1678,10 +1698,13 @@ Milestone 1 is complete when:
 - re-evaluating a plan many times creates each declared command exactly once;
 - a plan branch appears only once the fact deciding it exists, and never withdraws work already declared;
 - every command made runnable by one plan evaluation is created in a single transaction;
+- a declaration that becomes immediately skipped or expired is visible to another pure plan pass in the same transaction, while ordinary ready or pending declarations do not cause an otherwise redundant pass;
 - a command with `Await` becomes runnable when its fact arrives, whether that fact was published before or after the command was declared;
 - an external monitor can publish an idempotent fact through `InTx` atomically with its application-table update; a command awaiting that fact occupies no worker or lease while pending, and retained early publication still releases it when declared later;
+- publishing a fact used only by a persisted `Await` does not require the monitor to register the plan; publishing a fact in the latest `Fact`/`Facts` read set requires the exact plan and writes nothing when that capability is absent;
 - `Within` is rejected without `Await`, starts exactly once when all of the node's command dependencies become satisfied, does not consume predecessor runtime, and is capped by the execution deadline;
 - an awaited fact that already exists when the `Within` clock would start satisfies the wait immediately; one that never arrives expires the command within the declared bound, and dependents resolve through the failure branch;
+- a fact accepted under the execution lock by its `Within` deadline wins even if maintenance runs later, while a fact accepted after the deadline remains history but cannot satisfy or resurrect that wait;
 - a failure branch declared with `AfterFailed` runs to completion under fail-fast, and the execution becomes terminal only after it resolves;
 - a plan-driven execution succeeds exactly when every declared command is terminal, nothing remains pending or awaited, no read is temporarily unavailable, and re-evaluation declares nothing new; it never succeeds on temporary quiescence;
 - a required terminal command failure reaches terminal execution failure after its explicit failure-handling subgraph resolves, even when the latest plan evaluation contains temporarily unavailable reads;
@@ -1689,13 +1712,15 @@ Milestone 1 is complete when:
 - `Children`, `Result`, and `Outcome` read commands declared earlier in the evaluation or durably created by `Do`, `Spawn`, or `Issue`, while any other read key is rejected as a plan defect;
 - plan reads distinguish available, temporarily unavailable, and permanently unavailable inputs internally: `Result` becomes available only on success, `Outcome` on any terminal state, and an unsuccessful terminal `Result` cannot block completion as though it might later succeed;
 - after each evaluation, dependency keys are validated against durable commands plus every declaration in that evaluation, so forward references work and a nonexistent key fails immediately as a plan defect;
-- a plan panic, conflicting declaration, or invalid read records `PlanFailed` and fails the execution without consuming worker retry budget or rerunning accepted work;
+- a plan panic, conflicting declaration, or invalid read records `PlanFailed` and fails the execution without consuming worker retry budget or rerunning work whose complete success transaction committed; a commit-function error still rolls that candidate success back and follows ordinary command retry rules;
 - plans cannot read command timing, retry-budget, next-attempt, attempt-start, or event recorded-time metadata and therefore cannot branch on a clock;
 - the plan determinism harness detects different declarations or consulted reads from an identical snapshot, and fragment tests can assert the complete intended key set;
 - the database-free plan harness can advance synthetic facts, terminal outcomes, and closed child memberships and expose canonical declarations, dependencies, consulted inputs, and read availability after each transition without executing workers;
 - plan evaluation at the documented command ceiling stays within its benchmarked budget; events whose names the latest evaluation did not consult trigger no normal evaluation, a later consulted transition still exposes any stored fact to a newly reached branch, and routing assertion mode detects if a skipped evaluation would differ;
 - a command result, emitted events, spawned and plan-created command journal entries and materializations, dependency resolution, execution transitions, and declared commit-function writes commit atomically or not at all;
 - caller-owned transactions perform their Flow operation before acquiring application-row locks; the §5.3 composition commits both categories or neither, and the architecture never prescribes the inverse order;
+- caller-owned transactions touching several existing executions invoke their Flow operations in ascending lexical `ExecutionID` order, and the transaction-scoped client rejects a reverse request before acquiring it;
+- a plan defect reached through `InTx` returns its typed execution identity but remains subject to the caller's commit or rollback; Flow never commits terminal failure history behind the caller's transaction;
 - a stalled worker cannot commit after losing its lease;
 - an event published before its plan-declared command or coordinator existed is still observed by it, including a terminal command event matched later through `OnOutcome`;
 - a coordinator receives each event with its stable event ID, execution-local journal position, and PostgreSQL recorded time; `On` exposes the event key and typed payload, `OnOutcome` exposes the command key and typed terminal-outcome view, position determines delivery order, and domain occurrence time, when needed, is part of an application payload;

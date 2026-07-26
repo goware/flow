@@ -71,7 +71,7 @@ type coordinatorDef struct {
 }
 ```
 
-A `codec` exposes canonical encode/decode plus a diagnostic Go type token. Type tokens are never durable identity; name/version and canonical schema meaning are.
+A `codec` exposes canonical encode/decode plus a diagnostic Go type token. Type tokens are never durable identity; name/version and canonical schema meaning are. Function bodies are likewise not fingerprinted: applications must bump a plan version when declarations/reads can change for one snapshot, and a coordinator version when state, subscriptions, or decisions materially change.
 
 `Command.Done()` returns the descriptor's derived success event. Its internal namespace prevents external `Publish` from impersonating command completion while preserving one public `Event[T]` model. `OnOutcome` is a typed view over all terminal events for the command pair, not another event descriptor or row.
 
@@ -301,7 +301,7 @@ The internal availability matrix is exactly the functional specification's avail
 
 The narrow initial snapshot contains all command states and event headers but may omit large bodies. When a read finds a known available value whose bytes are not loaded, it records a `valueMiss` and returns the public zero/false for that provisional pass. The engine discards that pass's declarations, returns `NeedValues`, and the store loads all requested locators in one query. The pure plan is invoked again.
 
-This repeats until one pass has no misses. Each pass discovers at least one new locator, so it terminates for a bounded plan. It permits lazy loading without giving the engine SQL or a callback and makes it explicit that a pure plan may be invoked more than once for one durable transition.
+This repeats until one pass has no misses. Each pass discovers at least one new locator, so it terminates for a bounded plan. Value-loading passes count toward the same per-transaction invocation guard as fixed-point continuations. This permits lazy loading without giving the engine SQL or a callback and makes it explicit that a pure plan may be invoked more than once for one durable transition.
 
 Debug determinism compares only complete passes. A plan with side effects already violates its contract; repeated internal evaluation is another reason that such code is unsupported.
 
@@ -332,9 +332,13 @@ For each genuinely new declaration, the engine evaluates groups/waits against th
 - missing awaited fact after command groups satisfy -> pending, initialize `Within` when configured;
 - early awaited facts -> mark waits satisfied before readiness.
 
-Each declaration delta goes through the execution command ceiling once. Existing equivalent declarations append no history and do not change counters. After applying a non-empty delta to the in-memory snapshot, the engine evaluates the pure plan again. It repeats until one complete pass inserts no command. This fixed point is normally two passes for an initial declaration and is essential when a newly created node is immediately skipped/expired and opens another branch in the same transaction. Monotonic growth and a positive stored command ceiling bound the loop. The pass guard is `max_commands + 1` when bounded and 10,000 when the command ceiling is disabled; exceeding it is a plan defect that rolls back that evaluation rather than holding the execution lock forever. The guard limits sequential fixed-point depth, not the number of commands one pass may declare, and is exposed through plan diagnostics.
+Each declaration delta goes through the execution command ceiling once. Existing equivalent declarations append no history and do not change counters. Applying ordinary `ready` or `pending` declarations ends the current cycle with `plan_quiescent = false`; their open state already prevents completion, and a later routed terminal transition provides the next evaluation.
 
-The final latest read set includes public reads plus routing-only observations for every plan-owned declaration and dependency key. `plan_quiescent` is true only for the final no-new-command pass.
+The engine evaluates the pure plan again in the same transaction only if applying the delta also created a plan-observable terminal transition, such as an immediately skipped or expired command. It repeats while each new delta produces another such terminal transition, then stops on either a no-new-command pass (`plan_quiescent = true`) or an ordinary open declaration (`plan_quiescent = false`). This is the fixed point needed to prevent an immediate skip/expiry cascade from waiting for a wake that can no longer arrive, without doubling every normal plan evaluation.
+
+Every continuation accepts at least one genuinely new terminal command. A positive stored command ceiling therefore bounds the fixed-point cycle. Independently, a fixed technical guard of 10,000 total plan invocations per semantic transaction—including lazy value-loading and fixed-point passes—protects the execution lock. Exceeding it is a plan defect. The guard does not limit the number of commands one pass may declare and is exposed through plan diagnostics.
+
+The latest accepted read set includes public reads plus the routing-only observations required by the architecture. An event selector present only in a stored `Await` is topology, not a plan read. `plan_quiescent` records whether the latest completed cycle reached a no-new-command pass.
 
 ### 8.5 Purity and routing verification
 
@@ -377,7 +381,7 @@ Terminal changes seed only groups found through the reverse index. The engine up
 
 ### 9.2 Wait evaluation
 
-An event selector is satisfied by its earliest retained matching event. When a new event arrives, unresolved matching wait rows receive that position and decrement the dependent's wait count once.
+An event selector is satisfied by its earliest retained matching event that is timely for the wait. With no `Within`, any retained match before the execution remains terminal is timely. With `Within`, the event's PostgreSQL `RecordedAt` must be no later than the persisted wait deadline. When a timely new event arrives, unresolved matching wait rows receive that position and decrement the dependent's wait count once. A late event remains in the snapshot/history but does not mutate the wait.
 
 When command groups first become satisfied:
 
@@ -385,7 +389,7 @@ When command groups first become satisfied:
 2. if all exist, apply initial `Delay` and create dispatch;
 3. otherwise, set `wait_started_at = DBNow` and, for `Within`, set the capped deadline once.
 
-An expired wait terminates the command as `expired`, appends its terminal event, removes any dispatch, and seeds dependency/plan processing. `Await` without `Within` remains bounded by execution deadline unless the execution explicitly has none.
+An expired wait terminates the command as `expired`, appends its terminal event, removes any dispatch, and seeds dependency/plan processing. Expiry uses the persisted deadline even when a matching event was recorded later, so sweep timing cannot change the winner. `Await` without `Within` remains bounded by execution deadline unless the execution explicitly has none.
 
 ### 9.3 Readiness and initial schedule
 
@@ -501,9 +505,9 @@ The transaction preserves the durable transition that triggered evaluation:
 - after ingress, retain the accepted event/command;
 - after worker success, retain result, emitted events, children, and declared commit-function write.
 
-It discards the invalid plan delta, appends `PlanFailed`, cancels outstanding commands with terminal events, appends `ExecutionFailed`, and commits. It never turns accepted work into another worker attempt.
+It discards the invalid plan delta, appends `PlanFailed`, cancels outstanding commands with terminal events, appends `ExecutionFailed`, and proposes that complete change set. If its optional commit invocation also succeeds and the transaction commits, none of that accepted work becomes another worker attempt. If the commit invocation fails, the entire proposed change set—including the plan defect—rolls back and the commit-function error follows the ordinary command retry path; no worker success had yet been accepted.
 
-The public call that triggered an initial/ingress defect returns a typed error containing the durable `ExecutionID`. An idempotent repeat finds the terminal record rather than evaluating again.
+The public call that triggered an initial/ingress defect returns a typed error containing the affected `ExecutionID`. A library-owned transaction commits the terminal record before returning, so an idempotent repeat finds it rather than evaluating again. Under `InTx`, the change set remains subject to the caller's commit or rollback like every other engine output.
 
 ## 13. Coordinator engine
 
@@ -541,11 +545,11 @@ Direct start creates `root` and its dispatch in the execution-start transaction.
 
 ### 14.2 Issue
 
-`Issue` is rejected in direct mode and against a genuinely terminal execution. Under the execution lock it performs declaration idempotency, ceiling validation, creation/journaling, and mode-specific plan routing/completion. It has no dependencies in M1 and is required.
+`Issue` is rejected in direct mode and against a genuinely terminal execution. Under the execution lock it performs declaration idempotency, ceiling validation, creation/journaling, and completion-counter maintenance. Command creation is not a plan-observable input and does not by itself invoke the plan. `Issue` has no dependencies in M1 and is required.
 
 ### 14.3 Publish
 
-`Publish` validates canonical bytes and checks event-key idempotency before terminal rejection. A new event appends, satisfies waits, may trigger plan evaluation, and becomes available to a coordinator's later indexed scan. Direct mode retains the fact without progression.
+`Publish` validates canonical bytes and checks event-key idempotency before terminal rejection. A new event appends, satisfies stored waits, and becomes available to a coordinator's later indexed scan. In plan mode it invokes the plan in the same transaction only when the durable `Fact`/`Facts` routing set says the event changes a plan input; an event used solely by `Await` is resolved without plan code. Direct mode retains the fact without progression.
 
 ### 14.4 Cancel
 
@@ -591,7 +595,7 @@ Test worlds provide synthetic canonical facts, command states/results/outcomes, 
 - Spawn/Emit duplicate equivalence, poisoning, Optional, and StartAfter validation;
 - all dependency matrices and monotonic group transitions;
 - early/late waits, `Within`, Delay, deadline, and immutable budget anchor;
-- plan read availability, lazy value passes, forward references, ownership, cycles, growth, fragments, deterministic/routing assertions;
+- plan read availability, lazy value passes, forward references, ownership, cycles, growth, fragments, deterministic/routing assertions, and immediate-terminal fixed points without redundant normal passes;
 - fail-fast branch declaration after failure, survivor inheritance, multiple failures, and skip cascades;
 - direct/plan/coordinator completion and plan temporary-read failure exception;
 - coordinator start, event matching, `OnOutcome`, retry, state discard, mixed fan-in, and explicit terminal decisions;

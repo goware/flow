@@ -16,7 +16,7 @@ All examples use schema `flow`. Migration rendering substitutes a separately val
 
 1. The journal and materializations commit in one transaction.
 2. No journal insert occurs without first locking its execution row.
-3. All durable timestamps in one transition come from one captured `clock_timestamp()` value.
+3. All durable timestamps in one transition come from one `clock_timestamp()` value captured after acquiring the execution lock, never before a blocking wait.
 4. Canonical payloads are `bytea`; SQL never interprets application JSON.
 5. Digests accelerate comparison, but a conflict path compares canonical bytes too.
 6. Pending commands have no dispatch row. Ready, retry-wait, and running commands have exactly one dispatch row. Terminal commands have none.
@@ -109,7 +109,7 @@ CREATE INDEX executions_deadline_idx
 
 `start_fingerprint` covers definition version, canonical input, explicit deadline/fail-fast/metadata options, and driver mode. It deliberately excludes the runtime's accepted `max_commands` default and a direct root command's definition-level retry/timeout/queue defaults: an idempotent repeat returns the already accepted execution under changed deployment defaults. Metadata is duplicated as canonical bytes for identity and `jsonb` for the bounded `ListExecutions` containment filter; keys, values, and total size are validated before insertion.
 
-`status = 'failing'` is the durable form of failure handling in progress. `plan_quiescent` means the latest required evaluation introduced no new command. It is ignored outside plan mode.
+`status = 'failing'` is the durable form of failure handling in progress. `plan_quiescent` means the latest completed evaluation cycle reached a no-new-command pass. A cycle that creates ordinary open work may stop with it false because that work already blocks completion; its later routed terminal transition supplies the next evaluation. The field is ignored outside plan mode.
 
 ### 3.2 Commands
 
@@ -200,7 +200,10 @@ CREATE TABLE flow.commands (
             AND finished_at IS NULL AND terminal_position IS NULL)
     ),
     CONSTRAINT commands_budget_shape_ck CHECK (
-        budget_started_at IS NULL OR next_attempt_at IS NOT NULL
+        (budget_started_at IS NULL) = (next_attempt_at IS NULL)
+    ),
+    CONSTRAINT commands_wait_deadline_shape_ck CHECK (
+        wait_deadline_at IS NULL OR wait_started_at IS NOT NULL
     ),
     CONSTRAINT commands_attempt_counts_ck CHECK (consumed_attempts <= attempt_ordinal)
 );
@@ -217,6 +220,11 @@ CREATE INDEX commands_parent_idx
 CREATE INDEX commands_terminal_idx
     ON flow.commands (execution_id, terminal_position)
     WHERE terminal_position IS NOT NULL;
+
+CREATE INDEX commands_wait_deadline_idx
+    ON flow.commands (wait_deadline_at, command_id)
+    INCLUDE (execution_id)
+    WHERE state = 'pending' AND wait_deadline_at IS NOT NULL;
 ```
 
 `declaration_fingerprint` excludes definition-level operational defaults. For plan nodes it includes whether an explicit retry override was present and its canonical value. The accepted effective policy remains in `retry_policy` for execution and inspection.
@@ -470,6 +478,12 @@ CREATE TABLE flow.journal (
             AND event_id IS NULL AND event_namespace IS NULL
             AND event_name IS NULL AND event_version IS NULL
             AND event_key IS NULL AND event_class IS NULL AND terminal_status IS NULL)
+    ),
+    CONSTRAINT journal_subject_shape_ck CHECK (
+        (entry_kind <> 'command_created' OR command_id IS NOT NULL)
+        AND (entry_kind NOT IN ('attempt_started', 'attempt_concluded') OR attempt_id IS NOT NULL)
+        AND (entry_kind <> 'coordinator_transition' OR coordinator_id IS NOT NULL)
+        AND (event_class IS DISTINCT FROM 'coordinator_terminal' OR coordinator_id IS NOT NULL)
     ),
     CONSTRAINT journal_event_namespace_ck CHECK
         (event_namespace IS NULL OR event_namespace IN ('application', 'command_success', 'runtime')),
@@ -732,19 +746,21 @@ type SemanticTx interface {
 }
 ```
 
-`BeginSemantic` locks the execution and captures `DBNow`. Library-owned and caller-owned semantic paths use blocking mode; claim alone uses skip-locked mode. The transaction-scoped caller client enforces ascending execution-lock requests before the application-write phase. `Apply` validates expected prior states and affected-row counts; it does not accept partially validated engine changes.
+`BeginSemantic` locks the execution and then captures `DBNow`. Library-owned and caller-owned semantic paths use blocking mode; claim alone uses skip-locked mode. Capturing time after the lock prevents time spent waiting for that lock from making deadline or eligibility decisions against a stale timestamp. The transaction-scoped caller client enforces ascending execution-lock requests before the application-write phase. `Apply` validates expected prior states and affected-row counts; it does not accept partially validated engine changes.
+
+The ascending-order check applies only when one caller-owned transaction touches more than one existing execution. Each ordinary one-execution operation uses the same API and requires no batch helper.
 
 ## 6. Core statement algorithms
 
 ### 6.1 Execution lock and position reservation
 
 ```sql
-SELECT clock_timestamp() AS db_now;
-
 SELECT *
 FROM flow.executions
 WHERE execution_id = $1
 FOR UPDATE;                 -- SKIP LOCKED only for the documented claim mode
+
+SELECT clock_timestamp() AS db_now;
 
 UPDATE flow.executions
 SET next_journal_position = next_journal_position + $2,
@@ -841,13 +857,15 @@ The snapshot queries run after the execution lock and after the triggering trans
 
 ### 6.7 Event insertion and idempotency
 
-External `Publish` first looks up `(execution_id, namespace, name, key)` before rejecting a terminal execution. Equivalent canonical bytes and version return success; disagreement returns `ErrConflict`. A genuinely new event then requires a running execution and the execution lock.
+External `Publish` first looks up `(execution_id, namespace, name, key)` before rejecting a terminal execution. Equivalent canonical bytes and version return success; disagreement returns `ErrConflict`. A genuinely new event then requires a running execution and the execution lock. The transaction rechecks idempotency after acquiring that lock, so two concurrent first publications cannot turn a unique-index race into an ambiguous semantic error.
+
+After the lock, the store loads matching unresolved wait rows and the current `plan_reads_event_route_idx` entry. Wait satisfaction and readiness are generic topology changes. A wait with `Within` is updated only when the event transaction's captured `DBNow` is no later than `wait_deadline_at`; a later event is journaled but leaves the wait for expiry maintenance. Exact plan code is requested from the runtime only when the event also matches a current `fact`/`facts` plan read; if that capability is absent, the transaction rolls back before inserting the event. An `Await`-only publication therefore needs no plan registration, including for a late fact.
 
 Worker `Emit` uses the same event-key constraint. Derived command and execution terminal events use their dedicated partial unique indexes, not caller event idempotency. Publishing a derived `Command.Done` descriptor through the public `Publish` path is rejected by descriptor validation.
 
 ### 6.8 Coordinator selection and claim
 
-When an active coordinator is idle, selection first chooses `start` if pending. Otherwise it queries the lowest journal event above `inbox_position` matching any immutable registered `On` or `OnOutcome` selector. The runtime passes the selector set as rows; the journal event index supplies the scan.
+When an active coordinator is idle, selection first chooses `start` if pending. Otherwise it queries the lowest journal event above `inbox_position` matching any immutable registered selector. Ordinary `On` selectors use journal event namespace/name/version. `OnOutcome` selectors scan command-terminal rows in execution-position order and join `journal.command_id` to the immutable command name/version projection. Both paths return candidate positions, and the lowest wins. This keeps one terminal journal row per command instead of adding a second outcome stream or denormalizing more routing columns into the journal.
 
 Selection is persisted as one delivery key before or during the skip-locked claim transaction. Retry leaves it selected. On success, a guarded update requires matching coordinator ID, delivery key, attempt, token, and lease; advances inbox to the event position, clears delivery fields, resets delivery counters, and updates state/revision. Start success clears `start_pending` without moving inbox.
 
@@ -903,7 +921,7 @@ ALTER TABLE flow.journal SET (fillfactor = 100);
 
 The exact values are benchmark outputs, not dogma. The migration records chosen values only after HOT-update, WAL, and dead-tuple measurements.
 
-Partitioning is deferred. M1 retains terminal executions indefinitely and supports modest per-execution topology, so premature partitions complicate unique constraints and migrations. Journal archival is the first likely reason to partition later, by time or hash while preserving execution-local reads.
+Partitioning is deferred. M1 retains terminal executions indefinitely and supports modest per-execution topology, so premature partitions complicate unique constraints and migrations. Journal archival is the first operational follow-on and the first likely reason to partition later, by time or hash while preserving execution-local reads.
 
 ## 9. Migrations and compatibility
 
@@ -964,12 +982,14 @@ Every named check, foreign key, unique index, partial unique index, and terminal
 
 - allocation is contiguous; rollback reuses the abandoned range;
 - concurrent appenders produce position order equal to commit order;
+- a transaction blocked on the execution lock captures `DBNow` only after acquiring it, so elapsed deadlines cannot use pre-wait time;
 - command creation batches increment count once and roll back wholly at the ceiling;
 - candidate probes may be stale but claims never double-own work;
 - command and coordinator claims append start history before returning;
 - stale tokens cannot conclude or renew;
 - retry changes next run only; interruption moves neither budget anchor nor consumed count;
 - event idempotency is checked before terminal rejection;
+- concurrent first publication rechecks idempotency under the execution lock, `Await`-only publication needs no plan capability, and facts on opposite sides of a persisted wait deadline resolve deterministically regardless of sweep timing;
 - plan snapshots observe in-transaction trigger state;
 - every maintenance runner is bounded and duplicate-safe;
 - replay from journal equals settled projections after randomized operations.
@@ -981,11 +1001,12 @@ Run `EXPLAIN (ANALYZE, BUFFERS, WAL)` at 10K, 1M, and 10M aggregate commands/jou
 1. claim with 90% of the oldest lane backlog unregistered locally;
 2. claim bursts from one 1,000-command execution and from many executions;
 3. whole-plan snapshot at 10, 100, and 1,000 commands with 100 dependencies per node at the adversarial edge;
-4. coordinator next-match lookup with sparse subscriptions and long unmatched prefixes;
-5. history paging and full 1,000-command trace;
-6. lease renewal at 500 active attempts;
-7. journal insert/WAL growth at 1 KiB, 64 KiB, and maximum payload sizes;
-8. HOT update and autovacuum behavior for dispatch/coordinator rows.
+4. coordinator next-match lookup across mixed `On`/`OnOutcome` selectors with sparse subscriptions and long unmatched prefixes;
+5. expired-wait maintenance with a large mostly-unexpired pending set;
+6. history paging and full 1,000-command trace;
+7. lease renewal at 500 active attempts;
+8. journal insert/WAL growth at 1 KiB, 64 KiB, and maximum payload sizes;
+9. HOT update and autovacuum behavior for dispatch/coordinator rows.
 
 ## 13. Acceptance conditions
 
