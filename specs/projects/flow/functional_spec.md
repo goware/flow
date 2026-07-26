@@ -6,7 +6,7 @@ status: draft
 
 ## 1. Purpose
 
-`flow` is a PostgreSQL-backed Go library for durable, event-driven execution.
+`flow` is a PostgreSQL-backed Go library for event-driven, durable, distributed work execution.
 
 Its core loop is:
 
@@ -16,6 +16,8 @@ command  →  worker  →  event
 ```
 
 A command is a durable instruction to perform work. A worker handles the command and performs that work. Events record facts about what happened. Plans, when used, react to recorded events and coordinate the overall execution. Workers may spawn child commands when their work reveals more work.
+
+Execution is distributed by default. Calling `.Execute` durably enqueues work in PostgreSQL and does not assign it to the caller. Any compatible replica running `Runtime.Run` may claim the command; events and child commands committed by that worker may wake and be handled by other replicas. No execution requires one process to remain alive or retain in-memory state.
 
 There is one event concept. Conceptually, workers emit events. In the API, returning `(result, nil)` automatically records an immutable event carrying the command's typed result; workers call `flow.Emit` only for additional application facts. Failure, cancellation, expiry, and skipping are also recorded as ordinary events. Every command that ends therefore produces exactly one final fact, so progress is observable and "wait for this work" and "wait for this fact" use the same durable mechanism. A retryable error records attempt history but no final event because the command has not finished.
 
@@ -68,6 +70,7 @@ This is a product feature: application writes, command completion, plan reconcil
 - recurring schedules;
 - archival and configurable terminal-history retention;
 - cross-execution subscriptions and event export to Kafka or analytics systems;
+- optional soft local affinity with bounded preference for the replica that starts an execution and automatic takeover by another replica;
 - backend implementations other than PostgreSQL;
 - multi-region execution.
 
@@ -79,6 +82,7 @@ This is a product feature: application writes, command completion, plan reconcil
 - exactly-once external side effects;
 - distributed ACID transactions with external services;
 - executable pinning to a deployed build;
+- hard replica pinning or correctness that depends on instance-local memory;
 - a visual workflow designer in the core package.
 
 ## 3. Core terminology
@@ -1000,13 +1004,15 @@ Terminal executions and their history are retained indefinitely in Milestone 1. 
 
 ### 16.1 Replica model
 
-Every replica runs the same loop against the same database: wake on notification or poll, then claim eligible work with row-level locking that skips rows another replica is claiming. There is no leader election, partition assignment, consistent hashing, sticky routing, or rebalancing. Scaling out is starting a process; scaling in is stopping one.
+Every replica runs the same loop against the same database: wake on notification or poll, then claim eligible work with row-level locking that skips rows another replica is claiming. Milestone 1 has no leader election, partition assignment, consistent hashing, sticky routing, or rebalancing. Scaling out is starting a process; scaling in is stopping one.
 
 ### 16.2 Placement and takeover
 
 Commands are not pinned to replicas; successive commands of one execution may run anywhere, and a retried command may run somewhere new.
 
 Every running attempt holds a lease its worker renews. A replica that crashes, is killed, is partitioned, or is descheduled stops renewing; its leases expire and any other replica claims the work. Recovery is anonymous — no operator action, no control plane, and no return of the failed process — and fencing (§12.3) makes it safe against a merely slow replica.
+
+A later optional **local affinity** mode may prefer the replica that starts an execution for its root command and causally related plan, coordinator, and child-command work. Affinity is soft placement metadata, not ownership: the preferred replica receives only a short, configurable opportunity to claim eligible work before every compatible replica may claim it. The default remains placement-neutral, affinity adds no correctness guarantee, and no handler may depend on local cache contents or process memory. Once another replica claims work, the ordinary lease and fencing rules apply. This bounds failover delay and preserves progress if the preferred replica is unavailable, incompatible, overloaded, or terminated. Large fan-outs may deliberately omit or override the preference so locality does not defeat parallelism.
 
 ### 16.3 Roles
 

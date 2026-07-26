@@ -6,7 +6,7 @@ status: draft
 
 ## Summary
 
-`flow` is a Go library for durable, event-driven execution backed entirely by PostgreSQL.
+`flow` is a Go library for event-driven, durable, distributed work execution backed by PostgreSQL.
 
 Its core loop is deliberately small:
 
@@ -28,6 +28,8 @@ There is one event concept. When a worker returns successfully, `flow` automatic
 Plans are optional. The simplest use starts one command directly as durable background work; its worker may spawn bounded child commands, and the execution finishes after the root and all required descendants finish. When progression needs dependencies, joins, waits, or branches across commands, the application adds a **plan**: a small pure function that declares commands by durable key. The plan does not receive one event callback. It is re-evaluated over all relevant events and command results recorded so far; it never sleeps in memory. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
 
 The intended experience is closer to using an in-process Go library than operating Kafka or a separate workflow platform: a small type-safe API, ordinary Go handlers, PostgreSQL transactions, and one operational backend.
+
+`flow` is distributed by design. Calling `.Execute` durably queues work in PostgreSQL rather than assigning it to the calling process. Any compatible application replica running `Runtime.Run` may claim that command, record its event, and enqueue the next commands; successive parts of one execution may therefore run on different replicas. Leases, retries, and fencing provide automatic takeover when a process disappears, while PostgreSQL remains the durable authority for the complete execution.
 
 ## Motivation
 
@@ -265,6 +267,7 @@ Handlers are ordinary Go and may call normal application services. Business data
 - Exactly-once external side effects.
 - Distributed ACID transactions across PostgreSQL and external services.
 - Multi-region active-active execution in the initial milestones.
+- Hard replica pinning or correctness that depends on instance-local memory.
 - A visual workflow designer in the core library.
 
 ## Future direction
@@ -273,5 +276,6 @@ Handlers are ordinary Go and may call normal application services. Business data
 - OpenTelemetry, metrics, and structured-logging adapters;
 - administrative retry, fork, repair, and compensation tools;
 - child coordinators for decomposing very large executions;
+- optional local affinity that makes a bounded best effort to keep causally related work on the replica that started it, while always allowing another replica to take over;
 - archival and configurable history retention;
 - optional event export to Kafka or other analytics systems, without making them runtime dependencies.
