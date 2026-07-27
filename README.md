@@ -141,7 +141,7 @@ One binary may serve requests and call `Run`, but the roles may also be split:
 - Plan-reconciliation pools register exact plan versions. Command workers and publishers do not need plan code.
 - Coordinator pools register coordinator definitions. Command settlement does not need coordinator code; terminal events wait durably for a compatible coordinator replica.
 
-All roles point at one PostgreSQL database. Schedulers use bounded process-local capacity, `FOR UPDATE SKIP LOCKED` claims, poll-first correctness, and optional notification hints. Transaction-pooling proxies may use poll-only operation. Adding replicas adds capacity; no leader, partition map, or sticky ownership protocol is required.
+All roles point at one PostgreSQL database. Schedulers use bounded process-local capacity, `FOR UPDATE SKIP LOCKED` claims, poll-first correctness, and transactional notification hints. Notifications are enabled by default and use one dedicated session connection per running runtime; `flow.WithNotifications(false)` selects fully correct poll-only operation for transaction-pooling proxies or connection-constrained deployments. Adding replicas adds capacity; no leader, partition map, or sticky ownership protocol is required.
 
 ## Guarantees and boundaries
 
@@ -160,3 +160,5 @@ All roles point at one PostgreSQL database. Schedulers use bounded process-local
 - [PostgreSQL storage and journal](specs/projects/flow/components/schema.md)
 - [Definitions and execution engine](specs/projects/flow/components/engine.md)
 - [Distributed runtime and operations](specs/projects/flow/components/runtime.md)
+- [Milestone 1 acceptance matrix](specs/projects/flow/acceptance_evidence.md)
+- [Release benchmark and example evidence](specs/projects/flow/benchmark_evidence/phase_9_release.md)

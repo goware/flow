@@ -15,7 +15,20 @@ import (
 func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 	t.Parallel()
 
-	for _, point := range []fault.Point{fault.ClaimBeforeCommit, fault.SettleBeforeCommit, fault.SettleCommitAmbiguous} {
+	for _, point := range []fault.Point{
+		fault.ClaimExecutionLock,
+		fault.ClaimBeforeJournal,
+		fault.ClaimBeforeCommit,
+		fault.ClaimCommitAmbiguous,
+		fault.SettleAfterFence,
+		fault.SettleAfterAttempt,
+		fault.SettleAfterChildren,
+		fault.SettleAfterEvents,
+		fault.SettleBeforeCommitFunction,
+		fault.SettleAfterCommitFunction,
+		fault.SettleBeforeCommit,
+		fault.SettleCommitAmbiguous,
+	} {
 		point := point
 		t.Run(string(point), func(t *testing.T) {
 			t.Parallel()
@@ -23,6 +36,10 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 			ctx := context.Background()
 			if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 				t.Fatalf("Migrate() error = %v", err)
+			}
+			if _, err := database.DB.Conn.Exec(ctx, `CREATE TABLE `+pgschema.Table(database.Schema, "fault_commit")+`
+				(command_id text PRIMARY KEY)`); err != nil {
+				t.Fatalf("create commit table: %v", err)
 			}
 			command := DefineCommand[runtimeArgs, runtimeResult]("fault.command."+string(point), 1)
 			var calls atomic.Int32
@@ -34,7 +51,10 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 			if err := runtime.Register(Handle(command, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
 				calls.Add(1)
 				return runtimeResult{Value: "ok"}, nil
-			})); err != nil {
+			}, WithCommit(func(ctx context.Context, tx Tx, commit Commit[runtimeArgs, runtimeResult]) error {
+				_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "fault_commit")+` (command_id) VALUES ($1)`, commit.Info.CommandID)
+				return err
+			}))); err != nil {
 				t.Fatalf("Register() error = %v", err)
 			}
 			var hookMu sync.Mutex
@@ -69,6 +89,11 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 			}
 			if starts != 1 || conclusions != 1 || terminalEvents != 1 {
 				t.Fatalf("history starts=%d conclusions=%d terminal=%d", starts, conclusions, terminalEvents)
+			}
+			var commitRows int
+			if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "fault_commit")+`
+				WHERE command_id=$1`, handle.RootCommandID).Scan(&commitRows); err != nil || commitRows != 1 {
+				t.Fatalf("commit rows=%d error=%v", commitRows, err)
 			}
 		})
 	}

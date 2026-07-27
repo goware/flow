@@ -62,6 +62,7 @@ The functional defaults remain normative:
 | execution deadline | 30 days |
 | commands per execution | 1,000; `0` disables |
 | idle poll | 1 second |
+| notification hints | enabled; one dedicated session per running runtime; `WithNotifications(false)` is poll-only |
 | shutdown grace | 30 seconds |
 | command args/result | 256 KiB each; automatic command-success events use the result limit |
 | application event | 64 KiB for `Emit`/`Publish` |
@@ -239,7 +240,7 @@ The manager never reacquires, resurrects, or extends an already expired token. R
 
 ### 9.1 Selecting deliveries
 
-One loop probes active coordinator instances whose exact definition is registered locally. If an instance is idle, the store/engine selects start activation first or the lowest matching retained event above its inbox and persists a stable delivery key. Ordinary event selectors use indexed journal selector columns; `OnOutcome` selectors join a terminal row's `command_id` to the immutable command name/version projection. If ready/retry-wait and due, claim follows the same execution-first skip-locked pattern as commands and appends `AttemptStarted`.
+One loop probes active coordinator instances whose exact definition is registered locally. If an instance is idle and its journal has grown beyond its disposable scan cursor, the store/engine selects start activation first or the lowest matching retained event above that cursor and persists a stable delivery key. A no-match scan advances only the cursor; semantic inbox advances only after handler success. Ordinary event selectors use indexed journal selector columns; `OnOutcome` selectors join a terminal row's `command_id` to the immutable command name/version projection. If ready/retry-wait and due, claim follows the same execution-first skip-locked pattern as commands and appends `AttemptStarted`.
 
 The local selector set includes ordinary `On` event selectors and terminal command selectors for `OnOutcome`. The journal query can jump over unmatched entries. Early events are retained and therefore match after start/instance creation.
 
@@ -263,17 +264,15 @@ Every loop can operate with polling only. Notification payloads never carry work
 
 ### 10.2 Channel and payload
 
-The channel is `flow_` plus a fixed-length lowercase hex digest of normalized schema and database identity. The notifier obtains one session-capable `pgx.Conn`; when the application uses a transaction-pooling proxy it may provide a separate listener connector. Without one, the runtime is intentionally poll-only.
+The channel is `flow_` plus a fixed-length lowercase hex digest of normalized schema and database identity. A notify-enabled runtime obtains one session-capable `pgx.Conn` from a copy of the application adapter's connection configuration, outside the application pool, and owns that session until shutdown. This preserves one application database adapter and avoids consuming a small pool slot. `WithNotifications(false)` is the explicit poll-only mode required for transaction-pooling proxies and useful when the extra server session is undesirable.
 
 Payloads are small versioned hints:
 
 ```json
-{"v":1,"kind":"queue","key":"default"}
-{"v":1,"kind":"plan","key":"<opaque-plan-pair>"}
 {"v":1,"kind":"execution","key":"<opaque-id>"}
 ```
 
-Queue and execution hints are deduplicated within the semantic transaction, with at most one of each affected key. Unknown payload versions trigger a broad local wake rather than failure.
+Every durable semantic transition is execution-scoped, so one execution hint is sufficient to wake all local scheduler kinds. Identical hints are naturally coalesced by PostgreSQL within one transaction. Unknown or malformed payloads trigger a broad local wake rather than failure and are never interpreted as work.
 
 ### 10.3 Listener lifecycle
 
@@ -284,11 +283,11 @@ On initial connect and every reconnect:
 3. receive until error/cancellation;
 4. close and reconnect with capped jittered backoff.
 
-Catch-up after `LISTEN` closes the connection-gap race. The generation-counted wake hub uses capacity-one channels, coalesces duplicates, and never blocks a transaction observer or listener.
+Catch-up after `LISTEN` closes the connection-gap race. The generation-counted wake hub closes and replaces one generation channel on each signal, broadcasting to every current scheduler waiter without blocking a transaction observer or listener. Repeated generations coalesce into the next probe; no local work payload is queued.
 
 ### 10.4 Transactional NOTIFY cost
 
-PostgreSQL serializes portions of transactional notification commit processing. The implementation benchmarks notify-enabled and poll-only throughput before enabling hints by default for production guidance. Because polling is complete, operators can disable notifications without feature loss. A future decoupled best-effort hint flusher is compatible, but is not required in M1.
+PostgreSQL serializes portions of transactional notification commit processing. M1 enables hints by default for distributed latency and records notify-enabled versus poll-only commit evidence. Because polling is complete, operators can disable notifications without feature loss. A future decoupled best-effort hint flusher is compatible, but is not required in M1.
 
 ## 11. Maintenance
 
@@ -445,10 +444,13 @@ renew_before_result
 maintenance_after_probe
 notify_connect
 notify_before_wait
-migration_each_unit
+ingress_before_journal
+ingress_before_commit
+ingress_commit_ambiguous
+claim_commit_ambiguous
 ```
 
-Fault tests assert durable invariants after runtime restart, not exact goroutine schedules. Hooks are absent from release builds unless an internal test build tag is enabled.
+Fault tests assert durable invariants after runtime restart, not exact goroutine schedules. Hooks are internal, unreachable through the public runtime options, and no-op by default.
 
 ## 20. Test plan
 

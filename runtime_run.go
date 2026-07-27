@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/store"
+	"github.com/jackc/pgx/v5"
 )
 
 type runtimeLifecycle uint8
@@ -29,7 +30,7 @@ type wakeHub struct {
 	ready      chan struct{}
 }
 
-func newWakeHub() *wakeHub { return &wakeHub{ready: make(chan struct{}, 1)} }
+func newWakeHub() *wakeHub { return &wakeHub{ready: make(chan struct{})} }
 
 func (hub *wakeHub) signal() {
 	if hub == nil {
@@ -37,11 +38,9 @@ func (hub *wakeHub) signal() {
 	}
 	hub.mu.Lock()
 	hub.generation++
+	close(hub.ready)
+	hub.ready = make(chan struct{})
 	hub.mu.Unlock()
-	select {
-	case hub.ready <- struct{}{}:
-	default:
-	}
 }
 
 func (hub *wakeHub) snapshot() uint64 {
@@ -53,6 +52,7 @@ func (hub *wakeHub) snapshot() uint64 {
 func (hub *wakeHub) wait(ctx context.Context, seen uint64, interval time.Duration) {
 	hub.mu.Lock()
 	changed := hub.generation != seen
+	ready := hub.ready
 	hub.mu.Unlock()
 	if changed {
 		return
@@ -61,7 +61,7 @@ func (hub *wakeHub) wait(ctx context.Context, seen uint64, interval time.Duratio
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-	case <-hub.ready:
+	case <-ready:
 	case <-timer.C:
 	}
 }
@@ -117,10 +117,10 @@ func (a *activeCoordinators) snapshot() []activeCoordinator {
 	}
 	return result
 }
-func (a *activeCoordinators) renewed(id uuid.UUID, expires time.Time) {
+func (a *activeCoordinators) renewed(id, attemptID uuid.UUID, expires time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if value, ok := a.values[id]; ok {
+	if value, ok := a.values[id]; ok && value.attemptID == attemptID {
 		value.localExpiry = expires
 		a.values[id] = value
 	}
@@ -135,10 +135,14 @@ func (a *activeCoordinators) cancelExpired() {
 		}
 	}
 }
-func (a *activeCoordinators) cancelUnrenewed(renewed map[uuid.UUID]struct{}) {
+func (a *activeCoordinators) cancelUnrenewed(attempted map[uuid.UUID]uuid.UUID, renewed map[uuid.UUID]struct{}) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for id, value := range a.values {
+		attemptID, wasAttempted := attempted[id]
+		if !wasAttempted || value.attemptID != attemptID {
+			continue
+		}
 		if _, ok := renewed[id]; !ok {
 			value.cancel(ErrLeaseLost)
 		}
@@ -181,10 +185,10 @@ func (active *activeCommands) snapshot() []activeCommand {
 	return result
 }
 
-func (active *activeCommands) renewed(commandID uuid.UUID, expiresAt time.Time) {
+func (active *activeCommands) renewed(commandID, attemptID uuid.UUID, expiresAt time.Time) {
 	active.mu.Lock()
 	command, exists := active.values[commandID]
-	if exists {
+	if exists && command.attemptID == attemptID {
 		command.localExpiry = expiresAt
 		active.values[commandID] = command
 	}
@@ -202,10 +206,14 @@ func (active *activeCommands) cancelExpired() {
 	}
 }
 
-func (active *activeCommands) cancelUnrenewed(renewed map[uuid.UUID]struct{}) {
+func (active *activeCommands) cancelUnrenewed(attempted map[uuid.UUID]uuid.UUID, renewed map[uuid.UUID]struct{}) {
 	active.mu.Lock()
 	defer active.mu.Unlock()
 	for id, command := range active.values {
+		attemptID, wasAttempted := attempted[id]
+		if !wasAttempted || command.attemptID != attemptID {
+			continue
+		}
 		if _, ok := renewed[id]; !ok {
 			command.cancel(ErrLeaseLost)
 		}
@@ -262,7 +270,11 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	serviceCtx, stopServices := context.WithCancel(context.Background())
 	var services sync.WaitGroup
-	services.Add(2 + r.planConcurrency + r.coordinatorConcurrency)
+	serviceCount := 2 + r.planConcurrency + r.coordinatorConcurrency
+	if r.notifications {
+		serviceCount++
+	}
+	services.Add(serviceCount)
 	go func() {
 		defer services.Done()
 		r.runLeaseManager(serviceCtx)
@@ -271,6 +283,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 		defer services.Done()
 		r.runMaintenance(serviceCtx)
 	}()
+	if r.notifications {
+		go func() {
+			defer services.Done()
+			r.runNotificationListener(serviceCtx)
+		}()
+	}
 	for range r.planConcurrency {
 		go func() {
 			defer services.Done()
@@ -318,6 +336,91 @@ func (r *Runtime) Run(ctx context.Context) error {
 	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: "run", Outcome: "stopped", Worker: r.replicaName()})
 	r.observations.close()
 	return nil
+}
+
+// runNotificationListener owns exactly one session-capable connection outside
+// the application pool. Hints only reduce latency: every connect performs a
+// broad catch-up wake, and every scheduler retains its correctness poll.
+func (r *Runtime) runNotificationListener(ctx context.Context) {
+	const (
+		initialBackoff = 50 * time.Millisecond
+		maxBackoff     = time.Second
+	)
+	backoff := initialBackoff
+	channel := r.store.NotificationChannel()
+	listenSQL := "LISTEN " + pgx.Identifier{channel}.Sanitize()
+	for ctx.Err() == nil {
+		if err := r.faults.Hit(ctx, fault.NotifyConnect); err != nil {
+			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "connect_error"})
+			if !waitContext(ctx, backoff) {
+				return
+			}
+			backoff = min(maxBackoff, backoff*2)
+			continue
+		}
+		config := r.db.Conn.Config().ConnConfig.Copy()
+		if config.RuntimeParams == nil {
+			config.RuntimeParams = make(map[string]string)
+		}
+		config.RuntimeParams["application_name"] = "flow-listener-" + r.instanceID.String()
+		conn, err := pgx.ConnectConfig(ctx, config)
+		if err == nil {
+			_, err = conn.Exec(ctx, listenSQL)
+		}
+		if err != nil {
+			if conn != nil {
+				_ = conn.Close(context.WithoutCancel(ctx))
+			}
+			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "connect_error"})
+			if !waitContext(ctx, backoff) {
+				return
+			}
+			backoff = min(maxBackoff, backoff*2)
+			continue
+		}
+
+		backoff = initialBackoff
+		// LISTEN begins only after its statement commits. Wake immediately to
+		// close the commit-before-LISTEN and reconnect windows.
+		r.wake.signal()
+		r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "listening"})
+		for ctx.Err() == nil {
+			if err := r.faults.Hit(ctx, fault.NotifyBeforeWait); err != nil {
+				break
+			}
+			notification, waitErr := conn.WaitForNotification(ctx)
+			if waitErr != nil {
+				break
+			}
+			r.wake.signal()
+			if _, valid := store.ParseNotificationHint(notification.Payload); valid {
+				r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_hint", Outcome: "received"})
+			} else {
+				// Unknown versions and malformed hints are never interpreted as
+				// work. A bounded broad wake is forward-compatible and safe.
+				r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_hint", Outcome: "broad_wake"})
+			}
+		}
+		_ = conn.Close(context.WithoutCancel(ctx))
+		if ctx.Err() == nil {
+			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "reconnecting"})
+			if !waitContext(ctx, backoff) {
+				return
+			}
+			backoff = min(maxBackoff, backoff*2)
+		}
+	}
+}
+
+func waitContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (r *Runtime) Stop(ctx context.Context) error {
@@ -368,8 +471,10 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 			continue
 		}
 		renewals := make([]store.LeaseRenewal, len(current))
+		attemptedCommands := make(map[uuid.UUID]uuid.UUID, len(current))
 		for index, command := range current {
 			renewals[index] = store.LeaseRenewal{CommandID: command.commandID, AttemptID: command.attemptID, Token: command.token}
+			attemptedCommands[command.commandID] = command.attemptID
 		}
 		if err := r.faults.Hit(ctx, fault.RenewBeforeResult); err != nil {
 			r.active.cancelExpired()
@@ -384,13 +489,15 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 			renewedSet := make(map[uuid.UUID]struct{}, len(renewed))
 			for _, lease := range renewed {
 				renewedSet[lease.CommandID] = struct{}{}
-				r.active.renewed(lease.CommandID, time.Now().Add(r.commandLease))
+				r.active.renewed(lease.CommandID, attemptedCommands[lease.CommandID], time.Now().Add(r.commandLease))
 			}
-			r.active.cancelUnrenewed(renewedSet)
+			r.active.cancelUnrenewed(attemptedCommands, renewedSet)
 		}
 		coordinatorRenewals := make([]store.CoordinatorLeaseRenewal, len(coordinators))
+		attemptedCoordinators := make(map[uuid.UUID]uuid.UUID, len(coordinators))
 		for index, value := range coordinators {
 			coordinatorRenewals[index] = store.CoordinatorLeaseRenewal{CoordinatorID: value.coordinatorID, AttemptID: value.attemptID, Token: value.token}
+			attemptedCoordinators[value.coordinatorID] = value.attemptID
 		}
 		coordinatorRenewed, coordinatorErr := r.store.RenewCoordinatorLeases(ctx, r.replicaName(), r.commandLease, coordinatorRenewals)
 		if coordinatorErr != nil {
@@ -399,9 +506,9 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 			coordinatorSet := make(map[uuid.UUID]struct{}, len(coordinatorRenewed))
 			for id := range coordinatorRenewed {
 				coordinatorSet[id] = struct{}{}
-				r.activeCoordinators.renewed(id, time.Now().Add(r.commandLease))
+				r.activeCoordinators.renewed(id, attemptedCoordinators[id], time.Now().Add(r.commandLease))
 			}
-			r.activeCoordinators.cancelUnrenewed(coordinatorSet)
+			r.activeCoordinators.cancelUnrenewed(attemptedCoordinators, coordinatorSet)
 		}
 		r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: "ok", Count: int64(len(renewed))})
 	}
@@ -418,7 +525,11 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 		}
 		progress := false
 		if ids, err := r.store.ProbeExpiredExecutions(ctx, 64); err == nil {
-			_ = r.faults.Hit(ctx, fault.MaintenanceAfterProbe)
+			if len(ids) > 0 {
+				if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
+					continue
+				}
+			}
 			for _, id := range ids {
 				changed, expireErr := r.store.ExpireExecution(ctx, id, "execution deadline reached")
 				if expireErr == nil && changed {
@@ -427,7 +538,11 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 			}
 		}
 		if waits, err := r.store.ProbeExpiredCommandWaits(ctx, 128); err == nil {
-			_ = r.faults.Hit(ctx, fault.MaintenanceAfterProbe)
+			if len(waits) > 0 {
+				if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
+					continue
+				}
+			}
 			for _, candidate := range waits {
 				changed, expireErr := r.store.ExpireCommandWait(ctx, candidate)
 				if expireErr == nil && changed {
@@ -436,7 +551,11 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 			}
 		}
 		if leases, err := r.store.ProbeExpiredCommandLeases(ctx, 128); err == nil {
-			_ = r.faults.Hit(ctx, fault.MaintenanceAfterProbe)
+			if len(leases) > 0 {
+				if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
+					continue
+				}
+			}
 			for _, candidate := range leases {
 				changed, recoverErr := r.store.RecoverExpiredCommandLease(ctx, candidate)
 				if recoverErr == nil && changed {
@@ -445,7 +564,11 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 			}
 		}
 		if leases, err := r.store.ProbeExpiredCoordinatorLeases(ctx, 128); err == nil {
-			_ = r.faults.Hit(ctx, fault.MaintenanceAfterProbe)
+			if len(leases) > 0 {
+				if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
+					continue
+				}
+			}
 			for _, candidate := range leases {
 				changed, recoverErr := r.store.RecoverExpiredCoordinatorLease(ctx, candidate)
 				if recoverErr == nil && changed {

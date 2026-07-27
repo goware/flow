@@ -580,6 +580,7 @@ CREATE TABLE public.flow_coordinators (
 
     start_pending         boolean NOT NULL DEFAULT true,
     inbox_position        bigint NOT NULL DEFAULT 0 CHECK (inbox_position >= 0),
+    scan_position         bigint NOT NULL DEFAULT 0 CHECK (scan_position >= inbox_position),
     delivery_key          text,
     delivery_position     bigint,
     delivery_state        text NOT NULL DEFAULT 'idle',
@@ -625,6 +626,11 @@ CREATE INDEX flow_coordinators_claim_idx
     INCLUDE (execution_id, delivery_key, delivery_position)
     WHERE status = 'active' AND delivery_state IN ('ready', 'retry_wait');
 
+CREATE INDEX flow_coordinators_idle_idx
+    ON public.flow_coordinators (name, version, coordinator_id)
+    INCLUDE (execution_id, scan_position)
+    WHERE status = 'active' AND delivery_state = 'idle';
+
 CREATE INDEX flow_coordinators_lease_idx
     ON public.flow_coordinators (lease_expires_at, coordinator_id)
     WHERE status = 'active' AND delivery_state = 'running';
@@ -635,7 +641,7 @@ ALTER TABLE public.flow_executions
     DEFERRABLE INITIALLY DEFERRED;
 ```
 
-A coordinator inbox event is selected into `delivery_key = 'event/<position>'` before claim. Retry keeps that identity. Success advances `inbox_position`, clears delivery fields, and resets delivery retry counters. Start uses `delivery_key = 'start'` and clears `start_pending` on success.
+A coordinator inbox event is selected into `delivery_key = 'event/<position>'` before claim. Retry keeps that identity. Success advances semantic `inbox_position`, clears delivery fields, and resets delivery retry counters. Start uses `delivery_key = 'start'` and clears `start_pending` on success. `scan_position` is a disposable routing cursor: when an idle scan finds no match, it advances to the locked execution's journal head. The probe revisits that coordinator only after the journal grows. It never advances past a selected delivery, never replaces `inbox_position`, is not exposed as semantic history, and may be rebuilt conservatively from the inbox.
 
 ### 3.8 Migration metadata
 
@@ -851,9 +857,9 @@ Worker/coordinator `Emit` requires the same non-empty stable event key and uses 
 
 ### 6.9 Coordinator selection and claim
 
-When an active coordinator is idle, selection first chooses `start` if pending. Otherwise it queries the lowest journal event above `inbox_position` matching any immutable registered selector. Ordinary `On` selectors use journal event namespace/name/version. `OnOutcome` selectors scan command-terminal rows in execution-position order and join `flow_journal.command_id` to the immutable command name/version projection. Both paths return candidate positions, and the lowest wins. This keeps one terminal journal row per command instead of adding a second outcome stream or denormalizing more routing columns into the journal.
+When an active coordinator is idle, selection first chooses `start` if pending. Otherwise it queries the lowest journal event above disposable `scan_position` matching any immutable registered selector. Semantic `inbox_position` advances only after a handler commits. If there is no match, the scan cursor advances to the journal head under the execution lock; `flow_coordinators_idle_idx` and the execution high-water mark then keep the coordinator out of further idle probes until new history exists. Ordinary `On` selectors use journal event namespace/name/version. `OnOutcome` selectors scan command-terminal rows in execution-position order and join `flow_journal.command_id` to the immutable command name/version projection. Both paths return candidate positions, and the lowest wins. This keeps one terminal journal row per command instead of adding a second outcome stream or denormalizing more routing columns into the journal.
 
-M1 does not preemptively add another command-terminal index. The sparse-`OnOutcome` query-plan benchmark determines whether repeated unmatched prefixes justify a partial `(execution_id, name, version, terminal_position)` index on terminal commands. Adding it is a physical optimization with measurable write cost, not a semantic requirement.
+M1 does not preemptively add another command-terminal index. The sparse-`OnOutcome` benchmark covers the one-time unmatched-prefix scan; durable `scan_position` prevents repeating it while the journal is unchanged. A future partial terminal-command index remains a physical optimization if one newly appended sparse burst itself becomes expensive.
 
 Selection is persisted as one delivery key before or during the skip-locked claim transaction. Retry leaves it selected. On success, a guarded update requires matching coordinator ID, delivery key, attempt, token, and lease; advances inbox to the event position, clears delivery fields, resets delivery counters, and updates state/revision. Start success clears `start_pending` without moving inbox.
 

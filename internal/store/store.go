@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -31,18 +33,59 @@ const (
 )
 
 type Store struct {
-	db     *pgkit.DB
-	schema string
+	db                  *pgkit.DB
+	schema              string
+	notifications       bool
+	notificationChannel string
 }
 
-func New(db *pgkit.DB, schema string) (*Store, error) {
+// New constructs the PostgreSQL store. Notifications controls transactional
+// wake hints; correctness never depends on it.
+func New(db *pgkit.DB, schema string, notifications bool) (*Store, error) {
 	if db == nil || db.Conn == nil {
 		return nil, fmt.Errorf("%w: database is nil", flowerr.ErrInvalid)
 	}
 	if err := pgschema.Validate(schema); err != nil {
 		return nil, fmt.Errorf("%w: schema: %s", flowerr.ErrInvalid, err)
 	}
-	return &Store{db: db, schema: schema}, nil
+	database := db.Conn.Config().ConnConfig.Database
+	return &Store{
+		db: db, schema: schema, notifications: notifications,
+		notificationChannel: NotificationChannel(schema, database),
+	}, nil
+}
+
+// NotificationChannel returns the database-local channel used for bounded
+// wake hints. PostgreSQL already isolates channels by database; including the
+// database and schema identities in the digest also makes the name stable and
+// collision-resistant for diagnostics and tests.
+func NotificationChannel(schema, database string) string {
+	digest := sha256.Sum256([]byte(schema + "\x00" + database))
+	return "flow_" + hex.EncodeToString(digest[:12])
+}
+
+// NotificationChannel returns this store's stable LISTEN/NOTIFY channel.
+func (s *Store) NotificationChannel() string {
+	if s == nil {
+		return ""
+	}
+	return s.notificationChannel
+}
+
+// ParseNotificationHint validates the deliberately tiny, versioned payload.
+// A hint is never durable work and is safe to discard; polling remains the
+// correctness mechanism for malformed or future versions.
+func ParseNotificationHint(payload string) (uuid.UUID, bool) {
+	var hint struct {
+		V    int    `json:"v"`
+		Kind string `json:"kind"`
+		Key  string `json:"key"`
+	}
+	if err := json.Unmarshal([]byte(payload), &hint); err != nil || hint.V != 1 || hint.Kind != "execution" {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(hint.Key)
+	return id, err == nil
 }
 
 type SemanticTx struct {
@@ -230,6 +273,13 @@ func (tx *SemanticTx) Apply(ctx context.Context, changes PersistedChangeSet) (Ap
 	if count != int64(len(copyRows)) {
 		tx.failed = true
 		return ApplyResult{}, fmt.Errorf("%w: journal batch inserted %d of %d rows", flowerr.ErrInvalidState, count, len(copyRows))
+	}
+	if tx.store.notifications {
+		payload := `{"v":1,"kind":"execution","key":"` + tx.executionID.String() + `"}`
+		if _, err := tx.tx.Exec(ctx, `SELECT pg_notify($1, $2)`, tx.store.notificationChannel, payload); err != nil {
+			tx.failed = true
+			return ApplyResult{}, MapError("emit notification hint", err)
+		}
 	}
 	tx.applied = true
 	return ApplyResult{Journal: cloneJournalRows(rows)}, nil

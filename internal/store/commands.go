@@ -779,6 +779,9 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 			return SettleResult{}, err
 		}
 	}
+	if err := hook.Hit(ctx, fault.SettleAfterChildren); err != nil {
+		return SettleResult{}, err
+	}
 	if err := s.applyGraphResolution(ctx, semantic, resolution, journal, skippedOffset); err != nil {
 		return SettleResult{}, err
 	}

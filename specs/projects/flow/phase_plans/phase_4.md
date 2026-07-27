@@ -37,5 +37,5 @@ Deliver the first complete vertical slice: a direct command is durably created, 
 - The direct command example is runnable and is shared with a real-PostgreSQL end-to-end test.
 - Real-PostgreSQL tests cover exact-version rolling deployment, bounded global and queue-lane concurrency, fair lane selection, batched same-execution claims, renewal, takeover, active cancellation, shutdown interruption, settlement outage, commit-function atomicity, and ambiguous commit recovery.
 - The 10K, 1M, and 10M adversarial claim plans and the reusable claim benchmarks are recorded in `benchmark_evidence/phase_4_claim.md`.
-- Polling is the complete correctness path. PostgreSQL notifications remain an optional later latency optimization.
+- Polling is the complete correctness path. Transactional PostgreSQL notification hints are deliberately deferred to the Phase 9 hardening pass, where they remain disableable without changing correctness.
 - `go test ./...`, `go test -race ./...`, `go vet ./...`, and the direct example end-to-end test pass; public-package statement coverage is 83.1% at phase completion.

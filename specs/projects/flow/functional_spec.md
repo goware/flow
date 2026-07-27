@@ -1419,7 +1419,7 @@ A coordinator is durable typed state that reacts to events. Direct-child records
 
 ### 11.1 Definition, start activation, and instance
 
-A definition has a stable name, positive version, typed state schema, an optional start handler declared with `OnStart`, exact typed event subscriptions declared with `On`, and typed command-terminal subscriptions declared with `OnOutcome`. Its instance holds typed canonical state, a durable inbox position, and a lifecycle of `active → completed | failed | cancelled`.
+A definition has a stable name, positive version, typed state schema, an optional start handler declared with `OnStart`, exact typed event subscriptions declared with `On`, and typed command-terminal subscriptions declared with `OnOutcome`. Its instance holds typed canonical state, a durable inbox position, one disposable unmatched-history scan cursor, and a lifecycle of `active → completed | failed | cancelled`. The scan cursor is a physical routing optimization rather than semantic history: it advances only over immutable entries that cannot match the fixed coordinator version's subscriptions, keeps an unchanged idle coordinator out of repeated probes, and may be conservatively rebuilt from the semantic inbox position.
 
 `Coordinator.Execute` durably creates the instance and enqueues one initial activation in the same transaction. It never invokes coordinator code inline. A runtime registering the exact coordinator name and version later claims the activation and invokes `OnStart`, when present; without `OnStart`, the activation is acknowledged as a no-op and the coordinator waits for events. Events, command creation, and orchestration-state changes staged by `OnStart` follow the same atomic processing and retry rules as an event handler.
 
@@ -1572,7 +1572,7 @@ Command-worker pools, plan-reconciliation pools, API processes, and external mon
 
 Concurrency is configured per process and optionally per queue lane. The runtime claims only work it can begin immediately and never builds a local backlog whose leases could expire while queued.
 
-Wake-up uses PostgreSQL notifications when a session-capable connection is available, always with polling fallback. Poll-only operation is fully correct and is the supported mode behind transaction-pooling proxies.
+Wake-up uses PostgreSQL notifications by default, with exactly one dedicated session connection per running runtime and an unconditional polling fallback. `WithNotifications(false)` selects fully correct poll-only operation and is the supported mode behind transaction-pooling proxies or where the extra session is undesirable. Notification payloads are bounded versioned execution-identity hints, never durable work.
 
 ### 16.5 Graceful shutdown
 
@@ -1621,6 +1621,7 @@ The runtime supplies the accepted database values to a worker through `CommandIn
 | dependencies per plan-declared command | 100 |
 | concurrent plan reconciliations | 1 per runtime; configurable |
 | idle poll interval | 1 second |
+| PostgreSQL notification hints | enabled; one dedicated session per running runtime; disable with `WithNotifications(false)` |
 | terminal execution retention | indefinite in v1 |
 | shutdown grace period | 30 seconds |
 

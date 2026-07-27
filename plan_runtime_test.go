@@ -42,7 +42,8 @@ func TestPlanDynamicFanOutJoinEndToEnd(t *testing.T) {
 		Do(p, "generate", generate, generateArgs{Keys: children}).After(children...)
 	})
 	var prepareCalls, analysisCalls, generateCalls atomic.Int32
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithWorkerConcurrency(8))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond),
+		WithWorkerConcurrency(8), WithNotifications(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,6 +207,10 @@ func TestPlanFailureBranchAndWorkerOutcome(t *testing.T) {
 	compensate := DefineCommand[None, value]("plan.compensate", 1)
 	plan := DefinePlan[None]("plan.failure_branch", 1, func(p *Plan, _ None) {
 		Do(p, "failing", failing, None{})
+		// This happy-path read begins temporarily unavailable and becomes
+		// permanently unavailable when failing ends. It may block success, but
+		// must never prevent the explicit failure branch from settling.
+		_, _ = Result(p, "failing", failing)
 		Do(p, "should-skip", shouldSkip, None{}).After("failing")
 		Do(p, "compensate", compensate, None{}).AfterFailed("failing")
 	})
@@ -257,6 +262,117 @@ func TestPlanFailureBranchAndWorkerOutcome(t *testing.T) {
 	result, err := ResultOf(trace, "compensate", compensate)
 	if err != nil || result.Value != "failed" {
 		t.Fatalf("compensation result = %#v, %v", result, err)
+	}
+}
+
+func TestWithinLateFactRemainsHistoryWithoutResurrectingWait(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	fact := DefineEvent[None]("within.deadline.fact", 1)
+	command := DefineCommand[None, None]("within.deadline.command", 1)
+	plan := DefinePlan[None]("within.deadline.plan", 1, func(p *Plan, _ None) {
+		Do(p, "wait", command, None{}).Await(fact).Within(80 * time.Millisecond)
+	})
+	var calls atomic.Int32
+	// Maintenance runs well after the fact is accepted, proving the publish
+	// path does not satisfy an already-expired wait and later maintenance can
+	// terminalize it without losing the retained fact.
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(500*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(plan, Handle(command, func(context.Context, *Work[None]) (None, error) {
+		calls.Add(1)
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	cancelRun, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancelRun, runResult)
+	handle, err := plan.With(runtime).Execute(ctx, "within/late", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waitDeadline time.Time
+	var deadlinePassed bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		err = database.DB.Conn.QueryRow(ctx, `SELECT wait_deadline_at,clock_timestamp()>=wait_deadline_at FROM `+
+			pgschema.Table(database.Schema, "flow_commands")+` WHERE execution_id=$1 AND command_key='wait'`, handle.ID).
+			Scan(&waitDeadline, &deadlinePassed)
+		if err == nil && !waitDeadline.IsZero() && deadlinePassed {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if waitDeadline.IsZero() || !deadlinePassed {
+		t.Fatalf("wait deadline was not observed as passed: deadline=%s passed=%t error=%v", waitDeadline, deadlinePassed, err)
+	}
+	if err := Publish(ctx, runtime, handle.ID, fact, "late", None{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 2*time.Second)
+	trace, err := Trace(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 || len(trace.Commands) != 1 || trace.Commands[0].State != "expired" {
+		t.Fatalf("late fact resurrected wait: calls=%d commands=%#v", calls.Load(), trace.Commands)
+	}
+	var facts, satisfied int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
+		 WHERE execution_id=$1 AND event_namespace='application' AND event_name=$2),
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_event_waits")+`
+		 WHERE execution_id=$1 AND satisfied_position IS NOT NULL)`, handle.ID, fact.Name()).Scan(&facts, &satisfied); err != nil {
+		t.Fatal(err)
+	}
+	if facts != 1 || satisfied != 0 {
+		t.Fatalf("late fact rows=%d satisfied waits=%d", facts, satisfied)
+	}
+}
+
+func TestPlanMissingFactWaitsUntilExecutionDeadline(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	fact := DefineEvent[None]("missing.fact", 1)
+	command := DefineCommand[None, None]("missing.fact.command", 1)
+	plan := DefinePlan[None]("missing.fact.plan", 1, func(p *Plan, _ None) {
+		if _, exists := Fact(p, fact); exists {
+			Do(p, "work", command, None{})
+		}
+	})
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(plan, Handle(command, func(context.Context, *Work[None]) (None, error) {
+		t.Fatal("worker ran without its deciding fact")
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	cancelRun, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancelRun, runResult)
+	handle, err := plan.With(runtime).Execute(ctx, "missing/fact", None{}, WithExecutionDeadline(80*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "expired", 2*time.Second)
+	trace, err := Trace(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.Execution.CommandCount != 0 || trace.Execution.Status != "expired" {
+		t.Fatalf("missing fact completed incorrectly: %#v", trace.Execution)
 	}
 }
 
@@ -543,9 +659,16 @@ func TestPlanReconcilerRollbackLeavesDirtyForTakeover(t *testing.T) {
 		t.Fatal(err)
 	}
 	var injected atomic.Int32
+	planFaults := []fault.Point{fault.PlanAfterClaim, fault.PlanAfterEvaluate, fault.PlanBeforeCommit}
 	first.faults = fault.Func(func(_ context.Context, point fault.Point) error {
-		if point == fault.PlanBeforeCommit {
+		index := int(injected.Load())
+		if index < len(planFaults) && point == planFaults[index] {
 			injected.Add(1)
+			return fault.Injected(point)
+		}
+		// Hold the final commit closed until this runtime stops so the durable
+		// dirty-state assertion cannot race a fourth reconciliation.
+		if index >= len(planFaults) && point == fault.PlanBeforeCommit {
 			return fault.Injected(point)
 		}
 		return nil
@@ -555,7 +678,7 @@ func TestPlanReconcilerRollbackLeavesDirtyForTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForCount(t, &injected, 1, 3*time.Second)
+	waitForCount(t, &injected, int32(len(planFaults)), 3*time.Second)
 	var dirty bool
 	var commands int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT plan_dirty,command_count FROM `+pgschema.Table(database.Schema, "flow_executions")+`

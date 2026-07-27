@@ -489,7 +489,7 @@ func TestRuntimeReleasesDatabaseConnectionBeforeWorker(t *testing.T) {
 	}
 	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.connection_release", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(100*time.Millisecond), WithCommandLease(time.Second))
+		WithPollInterval(100*time.Millisecond), WithCommandLease(time.Second), WithNotifications(false))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

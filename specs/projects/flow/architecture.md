@@ -72,7 +72,7 @@ The implementation must preserve these invariants even if physical tables or int
 
 Initial direct dependencies are `github.com/goware/pgkit/v2`, `github.com/jackc/pgx/v5`, and `github.com/google/uuid`; canonical JSON is implemented in `internal/canonical` against RFC 8785 test vectors rather than exposing another library's types. There is no ORM, broker client, distributed-lock service, or mandatory telemetry SDK. New dependencies require a concrete reduction in implementation or verification risk.
 
-`New` and `Migrate` receive the application's existing `*pgkit.DB`; Flow does not create or own a second pool. All ordinary runtime, application, and commit-function work can therefore use one PostgreSQL adapter. An optional dedicated session connection for `LISTEN` may be borrowed from that pool or supplied through a listener connector when required by a proxy, but it is only a wake-up optimization and not another durable backend.
+`New` and `Migrate` receive the application's existing `*pgkit.DB`; Flow does not create or own a second pool. All ordinary runtime, application, and commit-function work therefore use one PostgreSQL adapter. A notify-enabled running runtime opens exactly one dedicated session connection from a copy of that adapter's `pgx` connection configuration, outside the capacity of the application pool, and closes it during shutdown. This avoids starving a small application pool while making the extra database session explicit. `WithNotifications(false)` avoids that session entirely. The listener is only a wake-up optimization and not another durable backend.
 
 There is one public package plus `flowtest`; internal packages exist for dependency direction, not as user-facing layers.
 
@@ -434,7 +434,7 @@ After start activation, the coordinator scheduler finds the lowest matching even
 
 The selected event position becomes the durable delivery identity until acknowledged. One handler runs without a database transaction, stages state mutation/events/spawns/completion, and then settles under the execution and coordinator fences. Success appends `CoordinatorTransition`, commits the new state, advances the inbox to the handled position, applies outputs, and clears delivery retry state atomically. Error leaves the inbox unchanged and schedules the same delivery. Exhaustion appends `CoordinatorFailed`, fails the execution, and cancels work.
 
-Unmatched journal entries need not be delivered one by one. The indexed query jumps to the next matching event and safely advances past unmatched positions because the coordinator definition/version and subscriptions are immutable for that execution.
+Unmatched journal entries need not be delivered one by one. A disposable coordinator `scan_position` jumps to the next matching event and advances to the locked journal head when none matches, because the coordinator definition/version and subscriptions are immutable for that execution. The semantic `inbox_position` still advances only with a committed handler transition and remains reconstructible from history. The idle-probe index compares the scan cursor with the execution high-water position, so an unchanged idle coordinator is not repeatedly locked and rescanned.
 
 For an adaptive agent, the execution is the episode, coordinator state is bounded orchestration memory, model/tool/sub-agent activities are commands, and terminal outcomes are ordered observations. `StartAfter` creates the next durable turn without sleeping. External user input is an idempotent published event. Large transcripts and artifacts remain application data referenced from state. A recursively adaptive sub-agent will use a future child execution rather than nesting another coordinator authority inside the parent execution.
 
@@ -444,7 +444,7 @@ Every replica is anonymous. It may register a subset of command, plan, and coord
 
 The command queue uses a narrow materialization containing immutable name/version and lane columns, so a rolling-deployment worker does not repeatedly probe an unhandled head-of-lane backlog. Dirty plans use a partial index on execution definition and are claimed directly under the execution row lock. The exact indexes and adversarial benchmarks are specified in the schema component.
 
-Notifications are transactional hints containing only schema-safe queue/execution identifiers. On initial listener connection and reconnect the runtime performs a catch-up poll before sleeping. A generation-counted local wake hub closes the check-then-sleep race. Poll-only operation is fully supported.
+Notifications are transactional hints containing only a version and execution identifier. The fixed channel is derived from normalized schema and database identity. On initial listener connection and reconnect the runtime broadcasts a catch-up generation before sleeping. A generation-counted local broadcast hub closes the check-then-sleep race across command, plan, coordinator, and maintenance schedulers. Unknown or malformed payloads cause only a broad wake. Poll-only operation is fully supported.
 
 Recovery tasks are bounded and leaderless:
 
@@ -535,7 +535,7 @@ Observer calls happen after commit or known rollback and outside locks. Bare cal
 
 ### 22.3 Fault injection and properties
 
-Crash points surround claim commit, handler return, every settlement phase, commit-function invocation, notification, ambiguous commit, lease recovery, coordinator inbox advance, and migration units. Properties include monotonic journal position, monotonic plan growth, nonnegative counters, one terminal event per terminal command, immutable closed child membership, and equality between `command_count` and accepted logical commands.
+Crash points surround claim commit, handler return, every settlement phase, commit-function invocation, notification, ambiguous commit, lease recovery, and coordinator inbox advance. Migration safety is exercised independently through transactional application, concurrent migration, checksum, and compatibility tests. Properties include monotonic journal position, monotonic plan growth, nonnegative counters, one terminal event per terminal command, immutable closed child membership, and equality between `command_count` and accepted logical commands.
 
 ### 22.4 Benchmarks
 
@@ -558,7 +558,7 @@ Crash points surround claim commit, handler return, every settlement phase, comm
 - Removing persistent plan-read routing deliberately permits over-evaluation: an application event may dirty a plan that does not use it. The trigger adds no row and updates an execution row already locked for journal append; repeated triggers coalesce behind one bit. This favors a simple no-missed-input proof over subscription bookkeeping. Benchmarks must include irrelevant-event floods, and any future skip index may be only a disposable hint—never a correctness dependency.
 - The initial journal duplicates some immutable bytes also present in projections. Simplicity and standalone history win in M1; content addressing is a compatible storage optimization.
 - Coordinator processing is deliberately single-threaded per execution. Parallel work belongs in spawned commands; the coordinator remains the short durable decision point.
-- Transactional notifications can impose a database-wide commit cost. They are optional hints, measured before default enablement, and can be disabled without changing correctness.
+- Transactional notifications add one bounded `pg_notify` call to semantic transactions and one session per running runtime. They are enabled by default for low-latency distributed wake-up, benchmarked against poll-only commits, and can be disabled without changing correctness.
 - Child executions, administrative fork/retry, recurring schedules, local affinity, cross-execution export, UI, and telemetry adapters are additive boundaries. Retention is the first operational follow-on but does not change M1 semantics. None may weaken per-execution ordering or introduce a second orchestration authority into one execution.
 
 ## 24. Component responsibility matrix

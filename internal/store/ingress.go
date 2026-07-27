@@ -405,9 +405,9 @@ func (s *Store) insertCoordinator(ctx context.Context, tx pgx.Tx, request StartR
 	coordinator := request.Coordinator
 	_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_coordinators")+` (
 		coordinator_id,execution_id,name,version,status,state,state_hash,state_position,
-		start_pending,inbox_position,delivery_key,delivery_state,retry_policy,retry_policy_hash,
+		start_pending,inbox_position,scan_position,delivery_key,delivery_state,retry_policy,retry_policy_hash,
 		budget_started_at,next_attempt_at,created_at,updated_at
-	) VALUES ($1,$2,$3,$4,'active',$5,$6,$7,true,0,'start','ready',$8::jsonb,$9,$10,$10,$10,$10)`,
+	) VALUES ($1,$2,$3,$4,'active',$5,$6,$7,true,0,0,'start','ready',$8::jsonb,$9,$10,$10,$10,$10)`,
 		coordinator.ID, request.ID, request.DefinitionName, request.DefinitionVersion,
 		coordinator.State.Bytes, coordinator.State.Digest[:], statePosition,
 		string(coordinator.RetryPolicy.Bytes), coordinator.RetryPolicy.Digest[:], dbNow)

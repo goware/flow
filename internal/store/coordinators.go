@@ -58,7 +58,7 @@ func (s *Store) ProbeCoordinators(ctx context.Context, kinds []CoordinatorKind, 
 			JOIN `+pgschema.Table(s.schema, "flow_executions")+` e USING (execution_id)
 			WHERE c.name=h.name AND c.version=h.version AND c.status='active'
 			  AND e.status IN ('running','failing')
-			  AND (c.delivery_state='idle' OR
+			  AND ((c.delivery_state='idle' AND c.scan_position < e.next_journal_position-1) OR
 			      (c.delivery_state IN ('ready','retry_wait') AND c.next_attempt_at<=clock_timestamp()))
 			ORDER BY c.next_attempt_at NULLS FIRST,c.coordinator_id LIMIT $3
 		) candidate ORDER BY candidate.coordinator_id LIMIT $3`, names, versions, limit)
@@ -181,11 +181,17 @@ func (s *Store) ClaimCoordinator(ctx context.Context, candidate CoordinatorCandi
 		return CoordinatorClaimResult{Progressed: true}, nil
 	}
 	if deliveryState == "idle" {
-		selected, err := s.selectCoordinatorDeliveryLocked(ctx, semantic, selectors)
+		selected, advanced, err := s.selectCoordinatorDeliveryLocked(ctx, semantic, selectors)
 		if err != nil {
 			return CoordinatorClaimResult{}, err
 		}
 		if selected == nil {
+			if advanced {
+				if err := semantic.Commit(ctx); err != nil {
+					return CoordinatorClaimResult{}, err
+				}
+				return CoordinatorClaimResult{Progressed: true}, nil
+			}
 			return CoordinatorClaimResult{}, nil
 		}
 		deliveryKey, deliveryPosition = &selected.Key, selected.Position
@@ -252,21 +258,21 @@ func (s *Store) ClaimCoordinator(ctx context.Context, candidate CoordinatorCandi
 	return CoordinatorClaimResult{Coordinator: claim, Progressed: true}, nil
 }
 
-func (s *Store) selectCoordinatorDeliveryLocked(ctx context.Context, semantic *SemanticTx, selectors []CoordinatorSelector) (*CoordinatorDelivery, error) {
+func (s *Store) selectCoordinatorDeliveryLocked(ctx context.Context, semantic *SemanticTx, selectors []CoordinatorSelector) (*CoordinatorDelivery, bool, error) {
 	var startPending bool
-	var inbox int64
-	if err := semantic.PGX().QueryRow(ctx, `SELECT start_pending,inbox_position FROM `+
-		pgschema.Table(s.schema, "flow_coordinators")+` WHERE execution_id=$1`, semantic.ExecutionID()).Scan(&startPending, &inbox); err != nil {
-		return nil, MapError("load coordinator inbox", err)
+	var scan int64
+	if err := semantic.PGX().QueryRow(ctx, `SELECT start_pending,scan_position FROM `+
+		pgschema.Table(s.schema, "flow_coordinators")+` WHERE execution_id=$1`, semantic.ExecutionID()).Scan(&startPending, &scan); err != nil {
+		return nil, false, MapError("load coordinator scan cursor", err)
 	}
 	if startPending {
-		return &CoordinatorDelivery{Start: true, Key: "start"}, nil
+		return &CoordinatorDelivery{Start: true, Key: "start"}, false, nil
 	}
 	var eventNamespaces, eventNames, outcomeNames []string
 	var eventVersions, outcomeVersions []int32
 	for _, selector := range selectors {
 		if selector.Name == "" || selector.Version <= 0 {
-			return nil, fmt.Errorf("%w: invalid coordinator selector", flowerr.ErrInvalid)
+			return nil, false, fmt.Errorf("%w: invalid coordinator selector", flowerr.ErrInvalid)
 		}
 		if selector.Outcome {
 			outcomeNames = append(outcomeNames, selector.Name)
@@ -286,16 +292,29 @@ func (s *Store) selectCoordinatorDeliveryLocked(ctx context.Context, semantic *S
 		      SELECT 1 FROM `+pgschema.Table(s.schema, "flow_commands")+` c,
 		          unnest($6::text[],$7::integer[]) s(name,version)
 		      WHERE c.command_id=j.command_id AND c.name=s.name AND c.version=s.version)))
-		ORDER BY j.position LIMIT 1`, semantic.ExecutionID(), inbox, eventNamespaces, eventNames, eventVersions,
+		ORDER BY j.position LIMIT 1`, semantic.ExecutionID(), scan, eventNamespaces, eventNames, eventVersions,
 		outcomeNames, outcomeVersions).Scan(&position)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
+		var head int64
+		if err := semantic.PGX().QueryRow(ctx, `SELECT next_journal_position-1 FROM `+
+			pgschema.Table(s.schema, "flow_executions")+` WHERE execution_id=$1`, semantic.ExecutionID()).Scan(&head); err != nil {
+			return nil, false, MapError("load coordinator journal head", err)
+		}
+		if head <= scan {
+			return nil, false, nil
+		}
+		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_coordinators")+`
+			SET scan_position=$2,updated_at=$3 WHERE execution_id=$1 AND scan_position<$2`,
+			semantic.ExecutionID(), head, semantic.DBNow()); err != nil {
+			return nil, false, MapError("advance coordinator scan cursor", err)
+		}
+		return nil, true, nil
 	}
 	if err != nil {
-		return nil, MapError("select coordinator event", err)
+		return nil, false, MapError("select coordinator event", err)
 	}
 	key := fmt.Sprintf("event/%d", position)
-	return &CoordinatorDelivery{Position: &position, Key: key}, nil
+	return &CoordinatorDelivery{Position: &position, Key: key}, false, nil
 }
 
 func (s *Store) loadCoordinatorDeliveryLocked(ctx context.Context, semantic *SemanticTx, key string, position *int64) (CoordinatorDelivery, error) {
@@ -513,7 +532,8 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 		_, err = semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_coordinators")+`
 			SET state=$2,state_hash=$3,state_revision=state_revision+1,state_position=$4,
 			    start_pending=CASE WHEN $5 THEN false ELSE start_pending END,
-			    inbox_position=GREATEST(inbox_position,$6),delivery_key=NULL,delivery_position=NULL,delivery_state='idle',
+			    inbox_position=GREATEST(inbox_position,$6),scan_position=GREATEST(scan_position,$6),
+			    delivery_key=NULL,delivery_position=NULL,delivery_state='idle',
 			    budget_started_at=NULL,next_attempt_at=NULL,consumed_attempts=0,active_attempt_id=NULL,lease_token=NULL,
 			    lease_owner=NULL,lease_started_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=$7
 			WHERE coordinator_id=$1`, request.Claim.CoordinatorID, request.State.Bytes, request.State.Digest[:],
@@ -548,7 +568,7 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_coordinators")+`
 			SET status=$2,state=$3,state_hash=$4,state_revision=state_revision+1,state_position=$5,start_pending=false,
-			    inbox_position=GREATEST(inbox_position,$6),
+			    inbox_position=GREATEST(inbox_position,$6),scan_position=GREATEST(scan_position,$6),
 			    delivery_key=NULL,delivery_position=NULL,delivery_state='idle',active_attempt_id=NULL,lease_token=NULL,
 			    lease_owner=NULL,lease_started_at=NULL,lease_expires_at=NULL,finished_at=$7,updated_at=$7
 			WHERE coordinator_id=$1`, request.Claim.CoordinatorID, coordinatorStatus, request.State.Bytes,

@@ -187,10 +187,10 @@ func TestStoreValidation(t *testing.T) {
 	db, schema, repository := setupStore(t)
 	id := seedExecution(t, db, schema, "validation")
 	ctx := context.Background()
-	if _, err := store.New(nil, schema); !errors.Is(err, flow.ErrInvalid) {
+	if _, err := store.New(nil, schema, false); !errors.Is(err, flow.ErrInvalid) {
 		t.Fatalf("New(nil) error = %v", err)
 	}
-	if _, err := store.New(db, "bad-schema"); !errors.Is(err, flow.ErrInvalid) {
+	if _, err := store.New(db, "bad-schema", false); !errors.Is(err, flow.ErrInvalid) {
 		t.Fatalf("New(bad schema) error = %v", err)
 	}
 	if _, err := repository.BeginSemantic(ctx, uuid.Nil, store.LockBlocking); !errors.Is(err, flow.ErrInvalid) {
@@ -279,6 +279,26 @@ func TestStoreValidation(t *testing.T) {
 	}
 }
 
+func TestNotificationChannelAndPayload(t *testing.T) {
+	t.Parallel()
+	lower := store.NotificationChannel("tenant", "database")
+	upper := store.NotificationChannel("Tenant", "database")
+	if lower == upper || len(lower) != 29 || lower[:5] != "flow_" {
+		t.Fatalf("notification channels lower=%q upper=%q", lower, upper)
+	}
+	id := uuid.New()
+	parsed, ok := store.ParseNotificationHint(`{"v":1,"kind":"execution","key":"` + id.String() + `"}`)
+	if !ok || parsed != id {
+		t.Fatalf("parsed notification=%s/%t want %s", parsed, ok, id)
+	}
+	for _, invalid := range []string{"", `{}`, `{"v":2,"kind":"execution","key":"` + id.String() + `"}`,
+		`{"v":1,"kind":"work","key":"` + id.String() + `"}`} {
+		if _, ok := store.ParseNotificationHint(invalid); ok {
+			t.Fatalf("accepted invalid notification %q", invalid)
+		}
+	}
+}
+
 func TestSchemaConstraints(t *testing.T) {
 	t.Parallel()
 
@@ -346,7 +366,7 @@ func setupStore(t *testing.T) (*pgkit.DB, string, *store.Store) {
 	if err := flow.Migrate(context.Background(), database.DB, flow.WithSchema(database.Schema)); err != nil {
 		t.Fatalf("Migrate() error = %v", err)
 	}
-	repository, err := store.New(database.DB, database.Schema)
+	repository, err := store.New(database.DB, database.Schema, false)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}

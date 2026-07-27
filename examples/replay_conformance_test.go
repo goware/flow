@@ -24,7 +24,7 @@ func assertReplayMatchesLive(t *testing.T, db *pgkit.DB, schema string, id flow.
 	if err != nil {
 		t.Fatalf("GetExecution() for replay conformance error = %v", err)
 	}
-	repository, err := store.New(db, schema)
+	repository, err := store.New(db, schema, false)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}

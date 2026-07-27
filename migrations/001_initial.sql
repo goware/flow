@@ -330,6 +330,7 @@ CREATE TABLE {{schema}}.flow_coordinators (
 
     start_pending         boolean NOT NULL DEFAULT true,
     inbox_position        bigint NOT NULL DEFAULT 0 CHECK (inbox_position >= 0),
+    scan_position         bigint NOT NULL DEFAULT 0 CHECK (scan_position >= inbox_position),
     delivery_key          text,
     delivery_position     bigint,
     delivery_state        text NOT NULL DEFAULT 'idle',
@@ -374,6 +375,11 @@ CREATE INDEX flow_coordinators_claim_idx
     ON {{schema}}.flow_coordinators (name, version, next_attempt_at, coordinator_id)
     INCLUDE (execution_id, delivery_key, delivery_position)
     WHERE status = 'active' AND delivery_state IN ('ready', 'retry_wait');
+
+CREATE INDEX flow_coordinators_idle_idx
+    ON {{schema}}.flow_coordinators (name, version, coordinator_id)
+    INCLUDE (execution_id, scan_position)
+    WHERE status = 'active' AND delivery_state = 'idle';
 
 CREATE INDEX flow_coordinators_lease_idx
     ON {{schema}}.flow_coordinators (lease_expires_at, coordinator_id)

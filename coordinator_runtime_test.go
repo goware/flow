@@ -9,6 +9,7 @@ import (
 
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/pgschema"
+	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
 )
 
@@ -89,7 +90,7 @@ func TestCoordinatorPermanentFailureFailsExecution(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 	coordinator := DefineCoordinator[int]("coordinator.permanent", 1, OnStart(func(context.Context, *Coordination[int]) error { return Permanent(errors.New("bad decision")) }))
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +116,68 @@ func TestCoordinatorPermanentFailureFailsExecution(t *testing.T) {
 	}
 	if coordinatorStatus != "failed" || executionStatus != "failed" || terminalEvents != 1 {
 		t.Fatalf("coordinator=%s execution=%s events=%d", coordinatorStatus, executionStatus, terminalEvents)
+	}
+}
+
+func TestCoordinatorScanCursorAvoidsRepeatedIdleHistoryScans(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := DefineCoordinator[None]("coordinator.scan_cursor", 1,
+		OnStart(func(context.Context, *Coordination[None]) error { return nil }))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := coordinator.With(runtime).Execute(ctx, "scan-cursor", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, result := startRuntime(t, runtime)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var scan, head int64
+		var startPending bool
+		if err := database.DB.Conn.QueryRow(ctx, `SELECT c.scan_position,e.next_journal_position-1,c.start_pending
+			FROM `+pgschema.Table(database.Schema, "flow_coordinators")+` c
+			JOIN `+pgschema.Table(database.Schema, "flow_executions")+` e USING(execution_id)
+			WHERE c.execution_id=$1`, handle.ID).Scan(&scan, &head, &startPending); err == nil && !startPending && scan == head {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stopRuntime(t, cancel, result)
+
+	api, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := []store.CoordinatorKind{{Name: coordinator.Name(), Version: coordinator.Version()}}
+	candidates, err := api.store.ProbeCoordinators(ctx, kinds, 10)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("unchanged idle probe = %#v, %v", candidates, err)
+	}
+	unrelated := DefineEvent[None]("coordinator.scan_cursor.unrelated", 1)
+	if err := Publish(ctx, api, handle.ID, unrelated, "new-history", None{}); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err = api.store.ProbeCoordinators(ctx, kinds, 10)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("grown journal probe = %#v, %v", candidates, err)
+	}
+	advanced, err := api.store.ClaimCoordinator(ctx, candidates[0], nil, time.Minute, "test", nil)
+	if err != nil || !advanced.Progressed || advanced.Coordinator != nil {
+		t.Fatalf("unmatched cursor advance = %#v, %v", advanced, err)
+	}
+	candidates, err = api.store.ProbeCoordinators(ctx, kinds, 10)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("advanced idle probe = %#v, %v", candidates, err)
 	}
 }
 
@@ -177,6 +240,13 @@ func TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion(t *testing.T) {
 	})); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
+	var inboxFault atomic.Bool
+	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
+		if point == fault.CoordinatorBeforeInboxAdvance && inboxFault.CompareAndSwap(false, true) {
+			return fault.Injected(point)
+		}
+		return nil
+	})
 	handle, err := coordinator.With(runtime).Execute(ctx, "coordinator-case", coordinatorTestState{})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -189,6 +259,9 @@ func TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion(t *testing.T) {
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 8*time.Second)
 	if starts.Load() != 2 {
 		t.Fatalf("start calls=%d", starts.Load())
+	}
+	if !inboxFault.Load() {
+		t.Fatal("coordinator inbox fault was not exercised")
 	}
 	var state []byte
 	var revision, inbox int64

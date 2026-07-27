@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/replay"
@@ -224,7 +225,8 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	command := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1, WithQueue("original"))
+	command := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1,
+		WithQueue("original"), WithMaxAttempts(3), WithTimeout(111*time.Millisecond))
 	const callers = 16
 	handles := make([]ExecutionHandle, callers)
 	errs := make([]error, callers)
@@ -258,20 +260,24 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(changed defaults) error = %v", err)
 	}
-	changedCommand := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1, WithQueue("changed"), WithMaxAttempts(9))
+	changedCommand := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1,
+		WithQueue("changed"), WithMaxAttempts(9), WithTimeout(999*time.Millisecond))
 	repeated, err := changedCommand.With(changedRuntime).Execute(ctx, "same", ingressArgs{Value: "stable"})
 	if err != nil || repeated.Created || repeated.ID != handles[0].ID {
 		t.Fatalf("start under changed defaults = %#v, %v", repeated, err)
 	}
-	var maxCommands int
+	var maxCommands, acceptedAttempts int
 	var queue string
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT e.max_commands,c.queue FROM `+
+	var timeoutMS int64
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT e.max_commands,c.queue,
+		(c.retry_policy->>'max_attempts')::integer,c.attempt_timeout_ms FROM `+
 		pgschema.Table(database.Schema, "flow_executions")+` e JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c USING (execution_id)
-		WHERE e.execution_id=$1`, handles[0].ID).Scan(&maxCommands, &queue); err != nil {
+		WHERE e.execution_id=$1`, handles[0].ID).Scan(&maxCommands, &queue, &acceptedAttempts, &timeoutMS); err != nil {
 		t.Fatalf("read accepted defaults: %v", err)
 	}
-	if maxCommands != 1 || queue != "original" {
-		t.Fatalf("accepted defaults = max %d queue %s", maxCommands, queue)
+	if maxCommands != 1 || queue != "original" || acceptedAttempts != 3 || timeoutMS != 111 {
+		t.Fatalf("accepted defaults = max %d queue %s attempts %d timeout %dms",
+			maxCommands, queue, acceptedAttempts, timeoutMS)
 	}
 
 	plan := DefinePlan[ingressArgs]("ceiling.plan", 1, func(*Plan, ingressArgs) {})
@@ -397,6 +403,15 @@ func TestRuntimeAndIngressValidation(t *testing.T) {
 	}
 	if err := Publish(ctx, runtime, ExecutionID("bad"), DefineEvent[ingressArgs]("event", 1), "key", ingressArgs{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Publish(invalid ID) error = %v", err)
+	}
+	plan := DefinePlan[ingressArgs]("validation.plan", 1, func(*Plan, ingressArgs) {})
+	handle, err := plan.With(runtime).Execute(ctx, "validation/event-size", ingressArgs{})
+	if err != nil {
+		t.Fatalf("Plan.Execute(event size) error = %v", err)
+	}
+	largeEvent := DefineEvent[ingressArgs]("validation.large_event", 1)
+	if err := Publish(ctx, runtime, handle.ID, largeEvent, "large", ingressArgs{Value: strings.Repeat("x", maxApplicationEventBytes)}); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("Publish(large payload) error = %v", err)
 	}
 	if err := CancelExecution(ctx, runtime, ExecutionID("bad"), "reason"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("CancelExecution(invalid ID) error = %v", err)

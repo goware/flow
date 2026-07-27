@@ -33,6 +33,7 @@ type runtimeOptions struct {
 	pollInterval           time.Duration
 	shutdownGrace          time.Duration
 	planVerification       bool
+	notifications          bool
 	observer               Observer
 	faults                 fault.Hook
 	errs                   []error
@@ -148,6 +149,14 @@ func WithPollInterval(interval time.Duration) Option {
 	})
 }
 
+// WithNotifications enables or disables transactional PostgreSQL wake hints.
+// It defaults to enabled. Polling always remains active and is the correctness
+// path, so disabling notifications is suitable for transaction-pooling
+// proxies and deliberately poll-only deployments.
+func WithNotifications(enabled bool) Option {
+	return runtimeOptionFunc(func(options *runtimeOptions) { options.notifications = enabled })
+}
+
 // WithShutdownGrace configures how long Run waits before interrupting handlers.
 func WithShutdownGrace(grace time.Duration) Option {
 	return runtimeOptionFunc(func(options *runtimeOptions) {
@@ -182,6 +191,7 @@ type Runtime struct {
 	pollInterval           time.Duration
 	shutdownGrace          time.Duration
 	planVerification       bool
+	notifications          bool
 	instanceID             uuid.UUID
 	observer               Observer
 	observations           *observerAdapter
@@ -209,7 +219,8 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 		planConcurrency:        1,
 		coordinatorConcurrency: 1,
 		pollInterval:           time.Second, shutdownGrace: 30 * time.Second,
-		observer: NopObserver{}, faults: fault.None{},
+		notifications: true,
+		observer:      NopObserver{}, faults: fault.None{},
 	}
 	for _, option := range opts {
 		if option == nil {
@@ -224,7 +235,7 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	if _, err := CheckSchema(context.Background(), db, WithSchema(options.schema)); err != nil {
 		return nil, err
 	}
-	repository, err := store.New(db, options.schema)
+	repository, err := store.New(db, options.schema, options.notifications)
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +247,7 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 		queueConcurrency:       cloneIntMap(options.queueConcurrency),
 		pollInterval:           options.pollInterval, shutdownGrace: options.shutdownGrace,
 		planVerification: options.planVerification,
+		notifications:    options.notifications,
 		instanceID:       uuid.New(),
 		observer:         options.observer, observations: newObserverAdapter(options.observer),
 		faults: options.faults, lifecycle: runtimeCreated,

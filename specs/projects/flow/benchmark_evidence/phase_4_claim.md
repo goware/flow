@@ -40,34 +40,14 @@ development machine:
 
 | Benchmark | Result |
 |---|---:|
-| handled-kind probe through the store with a 10K adversarial backlog | about 0.7 ms |
-| 1,000 batched claims from one execution | about 1.0 s |
+| handled-kind probe through the store with a 10K adversarial backlog | 1.082 ms |
+| 1,000 batched claims from one execution | 885.632 ms |
 
 The burst result includes all 1,000 durable `AttemptStarted` entries. The
 scheduler groups immediately runnable siblings into capacity-sized commits, so
 they share the execution lock without weakening the execution-local journal
 order. This is intentionally not presented as a global throughput limit:
 unrelated executions lock and claim concurrently.
-
-```text
-go test -run '^$' -bench 'Benchmark(ClaimProbeUnhandledHead10K|SameExecutionClaimBurst1000)$' -benchtime=1x -count=1 .
-```
-
-## Store-level benchmark baseline
-
-The phase also ships two explicit `-benchtime=1x` benchmarks. On the same
-development machine:
-
-| Benchmark | Result |
-|---|---:|
-| handled-kind probe through the store with a 10K adversarial backlog | 1.054 ms |
-| 1,000 concurrently requested claims from one execution | 4.072 s |
-
-The burst result includes all 1,000 execution-serialized claim transactions and
-their durable `AttemptStarted` entries. It is intentionally not presented as a
-global throughput limit: unrelated executions can lock and claim concurrently.
-It is the baseline for the architecture's explicit wide-fan-out contention
-trade-off.
 
 ```text
 go test -run '^$' -bench 'Benchmark(ClaimProbeUnhandledHead10K|SameExecutionClaimBurst1000)$' -benchtime=1x -count=1 .

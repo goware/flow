@@ -43,6 +43,13 @@ func RunMonitor(ctx context.Context, db *pgkit.DB, schema string, output io.Writ
 	if err != nil {
 		return MonitorResult{}, err
 	}
+	// The monitor has only the lightweight client surface. It deliberately
+	// registers neither the plan nor its worker, proving publishers and plan
+	// processors can be deployed independently.
+	publisher, err := flow.New(db, flow.WithSchema(schema))
+	if err != nil {
+		return MonitorResult{}, err
+	}
 	if err := runtime.Register(
 		BridgePlan,
 		flow.Handle(ConfirmBridge, func(_ context.Context, _ *flow.Work[flow.None]) (ConfirmBridgeResult, error) {
@@ -67,7 +74,7 @@ func RunMonitor(ctx context.Context, db *pgkit.DB, schema string, output io.Writ
 		case <-time.After(50 * time.Millisecond):
 		}
 		fmt.Fprintln(output, "external monitor observed bridge delivery")
-		monitorResult <- flow.Publish(ctx, runtime, handle.ID, BridgeDelivered, "delivery/example", BridgeDelivery{
+		monitorResult <- flow.Publish(ctx, publisher, handle.ID, BridgeDelivered, "delivery/example", BridgeDelivery{
 			TransactionHash: "0xexample",
 		})
 	}()
