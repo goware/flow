@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/pgschema"
@@ -24,6 +25,10 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	// Run owns this adapter in production. This ingress-only test starts it
+	// explicitly while still proving that New itself starts no goroutine.
+	runtime.observations.run()
+	defer runtime.observations.close()
 	command := DefineCommand[ingressArgs, ingressResult]("fault.work", 1)
 
 	for _, point := range []fault.Point{fault.IngressBeforeJournal, fault.IngressBeforeCommit} {
@@ -51,7 +56,7 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute(observed) error = %v", err)
 	}
-	observations := observer.snapshot()
+	observations := waitForObservations(t, observer, 1)
 	if len(observations) != 1 || observations[0].ExecutionID != handle.ID || observations[0].Operation != "start" {
 		t.Fatalf("observations = %#v", observations)
 	}
@@ -75,6 +80,18 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 	if err := CancelExecution(ctx, runtime, handle.ID, "safe observer panic"); err != nil {
 		t.Fatalf("CancelExecution() with panicking observer error = %v", err)
 	}
+}
+
+func waitForObservations(t *testing.T, observer *recordingObserver, count int) []Observation {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if values := observer.snapshot(); len(values) >= count {
+			return values
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return observer.snapshot()
 }
 
 type recordingObserver struct {

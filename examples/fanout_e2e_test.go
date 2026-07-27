@@ -48,4 +48,5 @@ func TestFanOutExampleEndToEnd(t *testing.T) {
 	if queueRows != 0 || createdRows != 5 || terminalRows != 5 {
 		t.Fatalf("database rows queue=%d created=%d terminal=%d", queueRows, createdRows, terminalRows)
 	}
+	assertReplayMatchesLive(t, database.DB, database.Schema, result.Handle.ID)
 }

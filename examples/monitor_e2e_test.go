@@ -52,4 +52,5 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 	if factRows != 1 || satisfiedWaits != 1 || queueRows != 0 {
 		t.Fatalf("database rows facts=%d satisfied_waits=%d queue=%d", factRows, satisfiedWaits, queueRows)
 	}
+	assertReplayMatchesLive(t, database.DB, database.Schema, result.Handle.ID)
 }

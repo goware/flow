@@ -184,6 +184,7 @@ type Runtime struct {
 	planVerification       bool
 	instanceID             uuid.UUID
 	observer               Observer
+	observations           *observerAdapter
 	faults                 fault.Hook
 
 	mu                 sync.RWMutex
@@ -236,7 +237,8 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 		pollInterval:           options.pollInterval, shutdownGrace: options.shutdownGrace,
 		planVerification: options.planVerification,
 		instanceID:       uuid.New(),
-		observer:         options.observer, faults: options.faults, lifecycle: runtimeCreated,
+		observer:         options.observer, observations: newObserverAdapter(options.observer),
+		faults: options.faults, lifecycle: runtimeCreated,
 		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(), activeCoordinators: newActiveCoordinators(),
 	}, nil
 }
@@ -347,8 +349,11 @@ func (c resolvedClient) semantic(ctx context.Context, id uuid.UUID, operation fu
 }
 
 func (r *Runtime) observe(ctx context.Context, observation Observation) {
-	defer func() { _ = recover() }()
-	r.observer.Observe(ctx, observation)
+	_ = ctx
+	if r == nil {
+		return
+	}
+	r.observations.emit(observation)
 }
 
 func parseExecutionID(id ExecutionID) (uuid.UUID, error) {

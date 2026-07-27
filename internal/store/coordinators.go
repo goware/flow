@@ -504,12 +504,12 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 	if err := s.applyGraphResolution(ctx, semantic, resolution, journal, skippedOffset); err != nil {
 		return SettleResult{}, err
 	}
+	startPending := request.Claim.Delivery.Start
+	inbox := int64(0)
+	if request.Claim.Delivery.Position != nil {
+		inbox = *request.Claim.Delivery.Position
+	}
 	if request.Terminal == "" {
-		startPending := request.Claim.Delivery.Start
-		inbox := int64(0)
-		if request.Claim.Delivery.Position != nil {
-			inbox = *request.Claim.Delivery.Position
-		}
 		_, err = semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_coordinators")+`
 			SET state=$2,state_hash=$3,state_revision=state_revision+1,state_position=$4,
 			    start_pending=CASE WHEN $5 THEN false ELSE start_pending END,
@@ -548,16 +548,18 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_coordinators")+`
 			SET status=$2,state=$3,state_hash=$4,state_revision=state_revision+1,state_position=$5,start_pending=false,
+			    inbox_position=GREATEST(inbox_position,$6),
 			    delivery_key=NULL,delivery_position=NULL,delivery_state='idle',active_attempt_id=NULL,lease_token=NULL,
-			    lease_owner=NULL,lease_started_at=NULL,lease_expires_at=NULL,finished_at=$6,updated_at=$6
+			    lease_owner=NULL,lease_started_at=NULL,lease_expires_at=NULL,finished_at=$7,updated_at=$7
 			WHERE coordinator_id=$1`, request.Claim.CoordinatorID, coordinatorStatus, request.State.Bytes,
-			request.State.Digest[:], journal.Journal[transitionIndex].Position, semantic.DBNow()); err != nil {
+			request.State.Digest[:], journal.Journal[transitionIndex].Position, inbox, semantic.DBNow()); err != nil {
 			return SettleResult{}, MapError("complete coordinator", err)
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
 			SET status=$2,open_commands=0,failure=CASE WHEN $2='failed' THEN $3::jsonb ELSE failure END,
+			    outcome_ref=CASE WHEN $2='succeeded' THEN NULLIF($5,'') ELSE outcome_ref END,
 			    finished_at=$4,updated_at=$4,status_at=$4 WHERE execution_id=$1`, semantic.ExecutionID(),
-			request.Terminal, jsonString(failure), semantic.DBNow()); err != nil {
+			request.Terminal, jsonString(failure), semantic.DBNow(), request.ResultRef); err != nil {
 			return SettleResult{}, MapError("complete coordinator execution", err)
 		}
 	}

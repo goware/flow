@@ -249,6 +249,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(context.Background())
 	r.runCancel = cancel
 	r.mu.Unlock()
+	r.observations.run()
 
 	watcherDone := make(chan struct{})
 	go func() {
@@ -315,6 +316,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	close(r.runDone)
 	r.mu.Unlock()
 	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: "run", Outcome: "stopped", Worker: r.replicaName()})
+	r.observations.close()
 	return nil
 }
 

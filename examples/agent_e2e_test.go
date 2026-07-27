@@ -27,7 +27,10 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 	if !strings.Contains(output.String(), "agent thinking on turn 2") || !strings.Contains(output.String(), "running tool broken") {
 		t.Fatalf("output=%q", output.String())
 	}
-	if result.Trace.Execution.Status != "succeeded" || len(result.Trace.Commands) != 4 {
+	if result.Trace.Execution.Status != "succeeded" || result.Trace.Execution.OutcomeRef != "result/final-report" ||
+		len(result.Trace.Commands) != 4 || result.Trace.Coordinator == nil || result.Trace.Coordinator.Status != "completed" ||
+		result.Trace.Coordinator.StateRevision != 6 || len(result.Trace.Coordinator.Attempts) != 6 ||
+		result.Trace.Coordinator.InboxPosition == 0 {
 		t.Fatalf("trace=%+v", result.Trace)
 	}
 	statuses := map[string]string{}
@@ -48,4 +51,5 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 	if transitions != 6 || outcomes != 4 || queueRows != 0 {
 		t.Fatalf("transitions=%d outcomes=%d queue=%d", transitions, outcomes, queueRows)
 	}
+	assertReplayMatchesLive(t, database.DB, database.Schema, result.Handle.ID)
 }

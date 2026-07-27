@@ -33,6 +33,13 @@ type Execution struct {
 	PlanWaitingCount  int
 	RootCommandID     *uuid.UUID
 	LastPosition      int64
+	OutcomeRef        string
+	FailureCode       string
+	FailureMessage    string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	StatusAt          time.Time
+	FinishedAt        *time.Time
 	Input             []byte
 	Metadata          []byte
 	DeadlineAt        *time.Time
@@ -160,6 +167,8 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.DefinitionVersion = body.DefinitionVersion
 		state.ExecutionKey = body.ExecutionKey
 		state.Status = "running"
+		state.CreatedAt = row.RecordedAt
+		state.StatusAt = row.RecordedAt
 		state.FailFast = body.FailFast
 		state.MaxCommands = body.MaxCommands
 		state.PlanDirty = state.DriverMode == store.DriverPlan
@@ -345,6 +354,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 
 	case store.ExecutionFailing:
 		state.Status = "failing"
+		state.StatusAt = row.RecordedAt
 
 	case store.PlanReconciled:
 		body, err := journalcodec.Decode[journalcodec.PlanReconciledBody](row.Body)
@@ -376,6 +386,9 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Coordinator.StartPending = false
 		state.Coordinator.DeliveryState = "idle"
 		state.Coordinator.DeliveryKey = ""
+		if body.TerminalDecision == "succeeded" {
+			state.OutcomeRef = body.ResultRef
+		}
 		if body.HandledPosition != nil {
 			state.Coordinator.InboxPosition = *body.HandledPosition
 		}
@@ -445,7 +458,20 @@ func (state *Execution) Apply(row store.JournalRow) error {
 				return errors.New("execution terminal event has no status")
 			}
 			state.Status = *row.TerminalStatus
+			state.StatusAt = row.RecordedAt
+			state.FinishedAt = pointer(row.RecordedAt)
 			state.PlanDirty = false
+			if *row.TerminalStatus != "succeeded" {
+				body, err := journalcodec.Decode[journalcodec.TerminalEventBody](row.Body)
+				if err != nil {
+					return err
+				}
+				state.FailureCode = body.Code
+				if state.FailureCode == "" {
+					state.FailureCode = *row.TerminalStatus
+				}
+				state.FailureMessage = body.Reason
+			}
 			if state.Coordinator != nil {
 				switch *row.TerminalStatus {
 				case "succeeded":
@@ -461,6 +487,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			}
 		}
 	}
+	state.UpdatedAt = row.RecordedAt
 	state.LastPosition = row.Position
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/goware/flow/internal/replay"
 	"github.com/goware/flow/internal/store"
+	"github.com/jackc/pgx/v5"
 )
 
 type Execution struct {
@@ -26,9 +27,15 @@ type Execution struct {
 	PlanQuiescent    bool
 	PlanRevision     PlanRevision
 	PlanWaitingCount int
+	PlanWaitingOn    []string
 	DeadlineAt       *time.Time
+	OutcomeRef       string
+	FailureCode      string
+	FailureMessage   string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+	StatusAt         time.Time
+	FinishedAt       *time.Time
 	Metadata         json.RawMessage
 }
 
@@ -70,6 +77,22 @@ type TraceCommand struct {
 	TerminalPosition      *JournalPosition
 	FailureCode           string
 	FailureMessage        string
+	LastErrorCode         string
+	LastErrorMessage      string
+	UnsatisfiedGroups     int
+	UnsatisfiedWaits      int
+	AttemptOrdinal        int
+	ConsumedAttempts      int
+	WaitStartedAt         *time.Time
+	WaitDeadlineAt        *time.Time
+	DeliveryState         string
+	LeaseOwner            string
+	LeaseStartedAt        *time.Time
+	LeaseExpiresAt        *time.Time
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+	StatusAt              time.Time
+	FinishedAt            *time.Time
 	Attempts              []TraceAttempt
 }
 
@@ -85,11 +108,53 @@ type TraceEventWait struct {
 	Version   int
 }
 
+type TraceEvent struct {
+	ID                EventID
+	Position          JournalPosition
+	Namespace         string
+	Name              string
+	Version           int
+	Key               string
+	Class             string
+	TerminalStatus    string
+	CommandID         CommandID
+	CoordinatorID     CoordinatorID
+	RecordedAt        time.Time
+	CausationPosition *JournalPosition
+	Body              json.RawMessage
+}
+
+type TraceCoordinator struct {
+	ID               CoordinatorID
+	Name             string
+	Version          int
+	Status           string
+	State            json.RawMessage
+	StatePosition    JournalPosition
+	StateRevision    uint64
+	StartPending     bool
+	DeliveryState    string
+	DeliveryKey      string
+	InboxPosition    JournalPosition
+	DeliveryPosition *JournalPosition
+	AttemptOrdinal   int
+	ConsumedAttempts int
+	LeaseOwner       string
+	LeaseStartedAt   *time.Time
+	LeaseExpiresAt   *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	FinishedAt       *time.Time
+	Attempts         []TraceAttempt
+}
+
 type ExecutionTrace struct {
-	Execution Execution
-	Commands  []TraceCommand
-	History   []HistoryEntry
-	results   resultSourceState
+	Execution   Execution
+	Commands    []TraceCommand
+	Events      []TraceEvent
+	Coordinator *TraceCoordinator
+	History     []HistoryEntry
+	results     resultSourceState
 }
 
 func (trace ExecutionTrace) flowResultSource() *resultSourceState { return &trace.results }
@@ -122,6 +187,15 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 	if err := errors.Join(options.errs...); err != nil {
 		return ExecutionTrace{}, newError(ErrInvalid, "trace", "options", "", err.Error())
 	}
+	var ownedTx pgx.Tx
+	if client.tx == nil {
+		ownedTx, err = client.runtime.db.Conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			return ExecutionTrace{}, store.MapError("begin trace snapshot", err)
+		}
+		defer ownedTx.Rollback(context.WithoutCancel(ctx))
+		client.tx = ownedTx
+	}
 	rows := make([]store.JournalRow, 0, 64)
 	var after uint64
 	for len(rows) < maxTraceEntries {
@@ -145,15 +219,20 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 	if err != nil {
 		return ExecutionTrace{}, newError(ErrInvalidState, "trace", "execution", string(id), "retained history cannot be replayed")
 	}
-	result := ExecutionTrace{Execution: Execution{
-		ID: id, Mode: string(state.DriverMode), Type: state.DefinitionName, Version: state.DefinitionVersion,
-		Key: state.ExecutionKey, Status: state.Status, FailFast: state.FailFast, MaxCommands: state.MaxCommands,
-		CommandCount: state.CommandCount, OpenCommands: state.OpenCommands, DeadlineAt: cloneTimePointer(state.DeadlineAt),
-		PlanDirty: state.PlanDirty, PlanQuiescent: state.PlanQuiescent,
-		PlanRevision: PlanRevision(state.PlanRevision), PlanWaitingCount: state.PlanWaitingCount,
-		CreatedAt: rows[0].RecordedAt, UpdatedAt: rows[len(rows)-1].RecordedAt,
-		Metadata: json.RawMessage(append([]byte(nil), state.Metadata...)),
-	}, History: historyEntries(rows), results: resultSourceState{values: make(map[string]resultSourceValue)}}
+	live, err := client.runtime.store.GetExecutionInTx(ctx, client.tx, executionID)
+	if err != nil {
+		return ExecutionTrace{}, err
+	}
+	result := ExecutionTrace{Execution: executionFromStore(live), History: historyEntries(rows),
+		results: resultSourceState{values: make(map[string]resultSourceValue)}}
+	operational, err := client.runtime.store.TraceOperationalInTx(ctx, client.tx, executionID)
+	if err != nil {
+		return ExecutionTrace{}, err
+	}
+	operationalCommands := make(map[string]store.TraceCommandRow, len(operational.Commands))
+	for _, command := range operational.Commands {
+		operationalCommands[command.ID.String()] = command
+	}
 	result.Commands = make([]TraceCommand, 0, len(state.Commands))
 	for _, command := range state.Commands {
 		item := TraceCommand{
@@ -186,6 +265,19 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 			position := JournalPosition(*command.TerminalPosition)
 			item.TerminalPosition = &position
 		}
+		if current, ok := operationalCommands[command.ID.String()]; ok {
+			item.State = current.State
+			item.BudgetStartedAt = cloneTimePointer(current.BudgetStartedAt)
+			item.NextAttemptAt = cloneTimePointer(current.NextAttemptAt)
+			item.LastErrorCode, item.LastErrorMessage = current.LastErrorCode, current.LastErrorMessage
+			item.UnsatisfiedGroups, item.UnsatisfiedWaits = current.UnsatisfiedGroups, current.UnsatisfiedWaits
+			item.AttemptOrdinal, item.ConsumedAttempts = current.AttemptOrdinal, current.ConsumedAttempts
+			item.WaitStartedAt, item.WaitDeadlineAt = cloneTimePointer(current.WaitStartedAt), cloneTimePointer(current.WaitDeadlineAt)
+			item.DeliveryState, item.LeaseOwner = current.DeliveryState, current.LeaseOwner
+			item.LeaseStartedAt, item.LeaseExpiresAt = cloneTimePointer(current.LeaseStartedAt), cloneTimePointer(current.LeaseExpiresAt)
+			item.CreatedAt, item.UpdatedAt, item.StatusAt = current.CreatedAt, current.UpdatedAt, current.StatusAt
+			item.FinishedAt = cloneTimePointer(current.FinishedAt)
+		}
 		item.Attempts = make([]TraceAttempt, len(command.Attempts))
 		for index, attempt := range command.Attempts {
 			item.Attempts[index] = TraceAttempt{
@@ -209,7 +301,86 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		result.results.values[command.Key] = value
 	}
 	sort.Slice(result.Commands, func(i, j int) bool { return result.Commands[i].Key < result.Commands[j].Key })
+	result.Events = make([]TraceEvent, 0, len(state.Events))
+	historyByPosition := make(map[JournalPosition]HistoryEntry, len(result.History))
+	for _, entry := range result.History {
+		historyByPosition[entry.Position] = entry
+	}
+	for _, event := range state.Events {
+		entry := historyByPosition[JournalPosition(event.Position)]
+		item := TraceEvent{
+			ID: EventID(event.ID.String()), Position: JournalPosition(event.Position), Namespace: event.Namespace,
+			Name: event.Name, Version: event.Version, Key: event.Key, Class: event.Class,
+			TerminalStatus: event.TerminalStatus, RecordedAt: entry.RecordedAt,
+			CausationPosition: cloneJournalPosition(entry.CausationPosition),
+			Body:              json.RawMessage(append([]byte(nil), event.Body...)),
+		}
+		if event.CommandID != nil {
+			item.CommandID = CommandID(event.CommandID.String())
+		}
+		if entry.CoordinatorID != "" {
+			item.CoordinatorID = entry.CoordinatorID
+		}
+		result.Events = append(result.Events, item)
+	}
+	if state.Coordinator != nil {
+		coordinator := state.Coordinator
+		result.Coordinator = &TraceCoordinator{
+			ID: CoordinatorID(coordinator.ID.String()), Name: coordinator.Name, Version: coordinator.Version,
+			Status: coordinator.Status, State: json.RawMessage(append([]byte(nil), coordinator.State...)),
+			StatePosition: JournalPosition(coordinator.StatePosition), StateRevision: uint64(coordinator.StateRevision),
+			StartPending: coordinator.StartPending, DeliveryState: coordinator.DeliveryState,
+			DeliveryKey: coordinator.DeliveryKey, InboxPosition: JournalPosition(coordinator.InboxPosition),
+			Attempts: traceAttempts(coordinator.Attempts),
+		}
+		if current := operational.Coordinator; current != nil {
+			result.Coordinator.Status = current.Status
+			result.Coordinator.State = json.RawMessage(append([]byte(nil), current.State...))
+			result.Coordinator.StatePosition = JournalPosition(current.StatePosition)
+			result.Coordinator.StateRevision = uint64(current.StateRevision)
+			result.Coordinator.StartPending = current.StartPending
+			result.Coordinator.InboxPosition = JournalPosition(current.InboxPosition)
+			result.Coordinator.DeliveryState, result.Coordinator.DeliveryKey = current.DeliveryState, current.DeliveryKey
+			if current.DeliveryPosition != nil {
+				position := JournalPosition(*current.DeliveryPosition)
+				result.Coordinator.DeliveryPosition = &position
+			}
+			result.Coordinator.AttemptOrdinal, result.Coordinator.ConsumedAttempts = current.AttemptOrdinal, current.ConsumedAttempts
+			result.Coordinator.LeaseOwner = current.LeaseOwner
+			result.Coordinator.LeaseStartedAt = cloneTimePointer(current.LeaseStartedAt)
+			result.Coordinator.LeaseExpiresAt = cloneTimePointer(current.LeaseExpiresAt)
+			result.Coordinator.CreatedAt, result.Coordinator.UpdatedAt = current.CreatedAt, current.UpdatedAt
+			result.Coordinator.FinishedAt = cloneTimePointer(current.FinishedAt)
+		}
+	}
+	if ownedTx != nil {
+		if err := ownedTx.Commit(ctx); err != nil {
+			return ExecutionTrace{}, store.MapError("commit trace snapshot", err)
+		}
+	}
 	return result, nil
+}
+
+func traceAttempts(attempts []replay.Attempt) []TraceAttempt {
+	result := make([]TraceAttempt, len(attempts))
+	for index, attempt := range attempts {
+		result[index] = TraceAttempt{
+			ID: AttemptID(attempt.ID.String()), Attempt: attempt.Ordinal, StartedAt: attempt.StartedAt,
+			FinishedAt: cloneTimePointer(attempt.FinishedAt), Worker: attempt.Worker,
+			Classification: attempt.Classification, ConsumedBudget: attempt.ConsumedBudget,
+			ConsumedAttempts: attempt.ConsumedAttempts, NextAttemptAt: cloneTimePointer(attempt.NextAttemptAt),
+			ErrorCode: attempt.ErrorCode, ErrorMessage: attempt.ErrorMessage,
+		}
+	}
+	return result
+}
+
+func cloneJournalPosition(value *JournalPosition) *JournalPosition {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func cloneIntPointer(value *int) *int {

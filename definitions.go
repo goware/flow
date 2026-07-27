@@ -191,6 +191,48 @@ func (e Event[T]) flowEventName() eventReference {
 	return eventReference{namespace: e.def.Namespace, name: e.def.Name, version: e.def.Version}
 }
 
+func (e Event[T]) Name() string {
+	if e.def == nil {
+		return ""
+	}
+	return e.def.Name
+}
+
+func (e Event[T]) Version() int {
+	if e.def == nil {
+		return 0
+	}
+	return e.def.Version
+}
+
+func (p PlanDef[A]) Name() string {
+	if p.def == nil {
+		return ""
+	}
+	return p.def.Name
+}
+
+func (p PlanDef[A]) Version() int {
+	if p.def == nil {
+		return 0
+	}
+	return p.def.Version
+}
+
+func (c Coordinator[S]) Name() string {
+	if c.def == nil {
+		return ""
+	}
+	return c.def.Name
+}
+
+func (c Coordinator[S]) Version() int {
+	if c.def == nil {
+		return 0
+	}
+	return c.def.Version
+}
+
 func (p PlanDef[A]) With(client Client) PlanDef[A] {
 	copy := p
 	copy.client = client

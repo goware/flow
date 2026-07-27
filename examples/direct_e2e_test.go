@@ -44,4 +44,5 @@ func TestDirectExampleEndToEnd(t *testing.T) {
 	if queueRows != 0 || journalRows != 6 || len(result.Trace.History) != journalRows {
 		t.Fatalf("database rows queue=%d journal=%d trace=%d", queueRows, journalRows, len(result.Trace.History))
 	}
+	assertReplayMatchesLive(t, database.DB, database.Schema, result.Handle.ID)
 }
