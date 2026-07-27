@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: PostgreSQL storage and journal
