@@ -1,24 +1,24 @@
 package flow
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/goware/flow/internal/failure"
+	"github.com/goware/flow/internal/flowerr"
 )
 
 var (
-	ErrNotFound        = errors.New("flow: not found")
-	ErrConflict        = errors.New("flow: conflict")
-	ErrInvalid         = errors.New("flow: invalid")
-	ErrInvalidState    = errors.New("flow: invalid state")
-	ErrTerminal        = errors.New("flow: terminal")
-	ErrLeaseLost       = errors.New("flow: lease lost")
-	ErrPayloadTooLarge = errors.New("flow: payload too large")
-	ErrClosed          = errors.New("flow: closed")
-	ErrSchema          = errors.New("flow: incompatible schema")
+	ErrNotFound        = flowerr.ErrNotFound
+	ErrConflict        = flowerr.ErrConflict
+	ErrInvalid         = flowerr.ErrInvalid
+	ErrInvalidState    = flowerr.ErrInvalidState
+	ErrTerminal        = flowerr.ErrTerminal
+	ErrLeaseLost       = flowerr.ErrLeaseLost
+	ErrPayloadTooLarge = flowerr.ErrPayloadTooLarge
+	ErrClosed          = flowerr.ErrClosed
+	ErrSchema          = flowerr.ErrSchema
 )
 
 // Error adds safe structured context to a sentinel category. Its fields must
