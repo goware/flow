@@ -107,6 +107,8 @@ type AttemptStartedBody struct {
 	LeaseDurationMS  int64     `json:"lease_duration_ms"`
 	ConsumedAttempts int       `json:"consumed_attempts"`
 	BudgetStartedAt  time.Time `json:"budget_started_at"`
+	CoordinatorID    string    `json:"coordinator_id,omitempty"`
+	DeliveryKey      string    `json:"delivery_key,omitempty"`
 }
 
 type AttemptConcludedBody struct {
@@ -122,6 +124,20 @@ type AttemptConcludedBody struct {
 	NextAttemptAt    *time.Time `json:"next_attempt_at,omitempty"`
 	ErrorCode        string     `json:"error_code,omitempty"`
 	ErrorMessage     string     `json:"error_message,omitempty"`
+	CoordinatorID    string     `json:"coordinator_id,omitempty"`
+	DeliveryKey      string     `json:"delivery_key,omitempty"`
+}
+
+type CoordinatorTransitionBody struct {
+	V                  int             `json:"v"`
+	CoordinatorID      string          `json:"coordinator_id"`
+	DeliveryKey        string          `json:"delivery_key"`
+	HandledPosition    *int64          `json:"handled_position,omitempty"`
+	PriorStateRevision int64           `json:"prior_state_revision"`
+	StateRevision      int64           `json:"state_revision"`
+	State              json.RawMessage `json:"state"`
+	TerminalDecision   string          `json:"terminal_decision,omitempty"`
+	ResultRef          string          `json:"result_ref,omitempty"`
 }
 
 type CommandSucceededBody struct {

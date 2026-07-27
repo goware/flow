@@ -23,18 +23,19 @@ type Option interface {
 }
 
 type runtimeOptions struct {
-	schema            string
-	maxCommands       int
-	workerConcurrency int
-	planConcurrency   int
-	queueConcurrency  map[string]int
-	commandLease      time.Duration
-	pollInterval      time.Duration
-	shutdownGrace     time.Duration
-	planVerification  bool
-	observer          Observer
-	faults            fault.Hook
-	errs              []error
+	schema                 string
+	maxCommands            int
+	workerConcurrency      int
+	planConcurrency        int
+	coordinatorConcurrency int
+	queueConcurrency       map[string]int
+	commandLease           time.Duration
+	pollInterval           time.Duration
+	shutdownGrace          time.Duration
+	planVerification       bool
+	observer               Observer
+	faults                 fault.Hook
+	errs                   []error
 }
 
 type runtimeOptionFunc func(*runtimeOptions)
@@ -87,6 +88,18 @@ func WithPlanConcurrency(concurrency int) Option {
 			return
 		}
 		options.planConcurrency = concurrency
+	})
+}
+
+// WithCoordinatorConcurrency bounds short coordinator decisions in this
+// process independently from command workers.
+func WithCoordinatorConcurrency(concurrency int) Option {
+	return runtimeOptionFunc(func(options *runtimeOptions) {
+		if concurrency <= 0 {
+			options.errs = append(options.errs, errors.New("coordinator concurrency must be positive"))
+			return
+		}
+		options.coordinatorConcurrency = concurrency
 	})
 }
 
@@ -157,30 +170,33 @@ func WithPlanVerification(enabled bool) Option {
 // goroutines; execution operations are usable before background processing is
 // started.
 type Runtime struct {
-	db                *pgkit.DB
-	store             *store.Store
-	schema            string
-	maxCommands       int
-	workerConcurrency int
-	planConcurrency   int
-	queueConcurrency  map[string]int
-	commandLease      time.Duration
-	pollInterval      time.Duration
-	shutdownGrace     time.Duration
-	planVerification  bool
-	instanceID        uuid.UUID
-	observer          Observer
-	faults            fault.Hook
+	db                     *pgkit.DB
+	store                  *store.Store
+	schema                 string
+	maxCommands            int
+	workerConcurrency      int
+	planConcurrency        int
+	coordinatorConcurrency int
+	queueConcurrency       map[string]int
+	commandLease           time.Duration
+	pollInterval           time.Duration
+	shutdownGrace          time.Duration
+	planVerification       bool
+	instanceID             uuid.UUID
+	observer               Observer
+	faults                 fault.Hook
 
-	mu          sync.RWMutex
-	closed      bool
-	lifecycle   runtimeLifecycle
-	registry    *runtimeRegistry
-	runCancel   context.CancelFunc
-	runDone     chan struct{}
-	wake        *wakeHub
-	active      *activeCommands
-	workerGroup sync.WaitGroup
+	mu                 sync.RWMutex
+	closed             bool
+	lifecycle          runtimeLifecycle
+	registry           *runtimeRegistry
+	runCancel          context.CancelFunc
+	runDone            chan struct{}
+	wake               *wakeHub
+	active             *activeCommands
+	activeCoordinators *activeCoordinators
+	workerGroup        sync.WaitGroup
+	coordinatorGroup   sync.WaitGroup
 }
 
 // New validates configuration and schema compatibility without migrating or
@@ -189,8 +205,9 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	options := runtimeOptions{
 		schema: defaultSchema, maxCommands: defaultMaxCommandsPerExecution,
 		workerConcurrency: max(1, runtime.GOMAXPROCS(0)), commandLease: 60 * time.Second,
-		planConcurrency: 1,
-		pollInterval:    time.Second, shutdownGrace: 30 * time.Second,
+		planConcurrency:        1,
+		coordinatorConcurrency: 1,
+		pollInterval:           time.Second, shutdownGrace: 30 * time.Second,
 		observer: NopObserver{}, faults: fault.None{},
 	}
 	for _, option := range opts {
@@ -213,13 +230,14 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	return &Runtime{
 		db: db, store: repository, schema: options.schema, maxCommands: options.maxCommands,
 		workerConcurrency: options.workerConcurrency, commandLease: options.commandLease,
-		planConcurrency:  options.planConcurrency,
-		queueConcurrency: cloneIntMap(options.queueConcurrency),
-		pollInterval:     options.pollInterval, shutdownGrace: options.shutdownGrace,
+		planConcurrency:        options.planConcurrency,
+		coordinatorConcurrency: options.coordinatorConcurrency,
+		queueConcurrency:       cloneIntMap(options.queueConcurrency),
+		pollInterval:           options.pollInterval, shutdownGrace: options.shutdownGrace,
 		planVerification: options.planVerification,
 		instanceID:       uuid.New(),
 		observer:         options.observer, faults: options.faults, lifecycle: runtimeCreated,
-		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(),
+		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(), activeCoordinators: newActiveCoordinators(),
 	}, nil
 }
 

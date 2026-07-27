@@ -2,8 +2,13 @@ package flow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
+
+	"github.com/goware/flow/internal/definition"
+	"github.com/goware/flow/internal/store/journalcodec"
 )
 
 type Coordination[S any] struct {
@@ -52,6 +57,7 @@ func (s coordinatorSelector) nameVersion() string {
 
 type coordinatorHandler[S any] struct {
 	selector coordinatorSelector
+	decode   func(coordinatorReceivedData) (any, error)
 	invoke   func(context.Context, *Coordination[S], any) error
 	err      error
 }
@@ -89,6 +95,31 @@ func On[S, T any](event Event[T], handler func(context.Context, *Coordination[S]
 		}
 		return handler(ctx, coordination, typed)
 	}
+	value.decode = func(data coordinatorReceivedData) (any, error) {
+		var payloadBytes []byte
+		if ref.namespace == "command_success" {
+			body, err := journalcodec.Decode[journalcodec.CommandSucceededBody](data.body)
+			if err != nil {
+				return nil, newError(ErrInvalidState, "decode", "event", ref.name, "invalid command success body")
+			}
+			payloadBytes = body.Result
+		} else {
+			body, err := journalcodec.Decode[journalcodec.ApplicationEventBody](data.body)
+			if err != nil {
+				return nil, newError(ErrInvalidState, "decode", "event", ref.name, "invalid journal event body")
+			}
+			payloadBytes = body.Payload
+		}
+		decoded, err := event.def.Payload.Decode(payloadBytes)
+		if err != nil {
+			return nil, newError(ErrInvalidState, "decode", "event", ref.name, "event payload does not match definition")
+		}
+		typedPayload, ok := decoded.(T)
+		if !ok {
+			return nil, newError(ErrInvalidState, "decode", "event", ref.name, "event payload type mismatch")
+		}
+		return Received[T]{EventID: data.eventID, Key: data.key, Position: data.position, RecordedAt: data.recordedAt, Payload: typedPayload}, nil
+	}
 	return value
 }
 
@@ -114,19 +145,57 @@ func OnOutcome[S, A, R any](
 		}
 		return handler(ctx, coordination, typed)
 	}
+	value.decode = func(data coordinatorReceivedData) (any, error) {
+		outcome := CommandOutcome[R]{Status: data.status}
+		if data.status == StatusSucceeded {
+			decoded, err := command.def.Result.Decode(data.result)
+			if err != nil {
+				return nil, newError(ErrInvalidState, "decode", "command", name, "command result does not match definition")
+			}
+			result, ok := decoded.(R)
+			if !ok {
+				return nil, newError(ErrInvalidState, "decode", "command", name, "command result type mismatch")
+			}
+			outcome.Result = result
+		} else {
+			var failure CommandFailure
+			if len(data.failure) > 0 && string(data.failure) != "null" {
+				if err := json.Unmarshal(data.failure, &failure); err != nil {
+					return nil, newError(ErrInvalidState, "decode", "command", name, "invalid command failure")
+				}
+			}
+			if failure.Code == "" {
+				failure = CommandFailure{Code: string(data.status), Message: "command ended " + string(data.status)}
+			}
+			outcome.Failure = &failure
+		}
+		return Received[CommandOutcome[R]]{EventID: data.eventID, Key: data.key, Position: data.position, RecordedAt: data.recordedAt, Payload: outcome}, nil
+	}
 	return value
 }
 
 type erasedCoordinator struct {
 	name     string
 	version  int
-	stateDef any
+	stateDef *definition.Coordinator
 	handlers map[string]erasedCoordinatorHandler
 }
 
 type erasedCoordinatorHandler struct {
 	selector coordinatorSelector
+	decode   func(coordinatorReceivedData) (any, error)
 	invoke   func(context.Context, *coordinatorScope, any) error
+}
+
+type coordinatorReceivedData struct {
+	eventID    EventID
+	key        string
+	position   JournalPosition
+	recordedAt time.Time
+	body       []byte
+	status     CommandStatus
+	result     []byte
+	failure    []byte
 }
 
 type coordinatorScope struct {
@@ -147,6 +216,7 @@ func (c Coordinator[S]) flowRegistration() registrationData {
 		h := handler
 		erased.handlers[h.selector.key()] = erasedCoordinatorHandler{
 			selector: h.selector,
+			decode:   h.decode,
 			invoke: func(ctx context.Context, scope *coordinatorScope, payload any) error {
 				state, ok := scope.state.(S)
 				if !ok {

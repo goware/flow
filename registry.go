@@ -145,6 +145,25 @@ func (registry *runtimeRegistry) planKeys() []definitionKey {
 	return result
 }
 
+func (registry *runtimeRegistry) coordinator(name string, version int) (erasedCoordinator, bool) {
+	value, ok := registry.coordinators[definitionKey{name: name, version: version}]
+	return value, ok
+}
+
+func (registry *runtimeRegistry) coordinatorKeys() []definitionKey {
+	result := make([]definitionKey, 0, len(registry.coordinators))
+	for key := range registry.coordinators {
+		result = append(result, key)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].name == result[j].name {
+			return result[i].version < result[j].version
+		}
+		return result[i].name < result[j].name
+	})
+	return result
+}
+
 func cloneMap[K comparable, V any](source map[K]V) map[K]V {
 	result := make(map[K]V, len(source))
 	for key, value := range source {

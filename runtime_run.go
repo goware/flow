@@ -79,6 +79,79 @@ type activeCommands struct {
 	values map[uuid.UUID]activeCommand
 }
 
+type activeCoordinator struct {
+	coordinatorID uuid.UUID
+	attemptID     uuid.UUID
+	token         uuid.UUID
+	localExpiry   time.Time
+	cancel        context.CancelCauseFunc
+}
+
+type activeCoordinators struct {
+	mu     sync.Mutex
+	values map[uuid.UUID]activeCoordinator
+}
+
+func newActiveCoordinators() *activeCoordinators {
+	return &activeCoordinators{values: make(map[uuid.UUID]activeCoordinator)}
+}
+
+func (a *activeCoordinators) register(value activeCoordinator) {
+	a.mu.Lock()
+	a.values[value.coordinatorID] = value
+	a.mu.Unlock()
+}
+func (a *activeCoordinators) unregister(id, attempt uuid.UUID) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if value, ok := a.values[id]; ok && value.attemptID == attempt {
+		delete(a.values, id)
+	}
+}
+func (a *activeCoordinators) snapshot() []activeCoordinator {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	result := make([]activeCoordinator, 0, len(a.values))
+	for _, value := range a.values {
+		result = append(result, value)
+	}
+	return result
+}
+func (a *activeCoordinators) renewed(id uuid.UUID, expires time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if value, ok := a.values[id]; ok {
+		value.localExpiry = expires
+		a.values[id] = value
+	}
+}
+func (a *activeCoordinators) cancelExpired() {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, value := range a.values {
+		if !now.Before(value.localExpiry) {
+			value.cancel(ErrLeaseLost)
+		}
+	}
+}
+func (a *activeCoordinators) cancelUnrenewed(renewed map[uuid.UUID]struct{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for id, value := range a.values {
+		if _, ok := renewed[id]; !ok {
+			value.cancel(ErrLeaseLost)
+		}
+	}
+}
+func (a *activeCoordinators) cancelAll(cause error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, value := range a.values {
+		value.cancel(cause)
+	}
+}
+
 func newActiveCommands() *activeCommands {
 	return &activeCommands{values: make(map[uuid.UUID]activeCommand)}
 }
@@ -188,7 +261,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	serviceCtx, stopServices := context.WithCancel(context.Background())
 	var services sync.WaitGroup
-	services.Add(2 + r.planConcurrency)
+	services.Add(2 + r.planConcurrency + r.coordinatorConcurrency)
 	go func() {
 		defer services.Done()
 		r.runLeaseManager(serviceCtx)
@@ -203,6 +276,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 			r.runPlanScheduler(serviceCtx)
 		}()
 	}
+	for range r.coordinatorConcurrency {
+		go func() {
+			defer services.Done()
+			r.runCoordinatorScheduler(runCtx)
+		}()
+	}
 
 	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: "run", Outcome: "started", Worker: r.replicaName()})
 	r.runCommandScheduler(runCtx)
@@ -213,12 +292,16 @@ func (r *Runtime) Run(ctx context.Context) error {
 	}
 	r.mu.Unlock()
 	graceCtx, cancelGrace := context.WithTimeout(context.Background(), r.shutdownGrace)
-	graceful := waitGroupContext(graceCtx, &r.workerGroup)
+	gracefulCommands := waitGroupContext(graceCtx, &r.workerGroup)
+	gracefulCoordinators := waitGroupContext(graceCtx, &r.coordinatorGroup)
+	graceful := gracefulCommands && gracefulCoordinators
 	cancelGrace()
 	if !graceful {
 		r.active.cancelAll(errRuntimeShutdown)
+		r.activeCoordinators.cancelAll(errRuntimeShutdown)
 		settleCtx, cancelSettle := context.WithTimeout(context.Background(), min(2*time.Second, max(100*time.Millisecond, r.commandLease/2)))
 		_ = waitGroupContext(settleCtx, &r.workerGroup)
+		_ = waitGroupContext(settleCtx, &r.coordinatorGroup)
 		cancelSettle()
 	}
 	stopServices()
@@ -278,7 +361,8 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 		case <-ticker.C:
 		}
 		current := r.active.snapshot()
-		if len(current) == 0 {
+		coordinators := r.activeCoordinators.snapshot()
+		if len(current) == 0 && len(coordinators) == 0 {
 			continue
 		}
 		renewals := make([]store.LeaseRenewal, len(current))
@@ -287,20 +371,36 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 		}
 		if err := r.faults.Hit(ctx, fault.RenewBeforeResult); err != nil {
 			r.active.cancelExpired()
+			r.activeCoordinators.cancelExpired()
 			continue
 		}
 		renewed, err := r.store.RenewCommandLeases(ctx, renewals, r.commandLease)
 		if err != nil {
 			r.active.cancelExpired()
 			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: "error", Count: int64(len(current))})
-			continue
+		} else {
+			renewedSet := make(map[uuid.UUID]struct{}, len(renewed))
+			for _, lease := range renewed {
+				renewedSet[lease.CommandID] = struct{}{}
+				r.active.renewed(lease.CommandID, time.Now().Add(r.commandLease))
+			}
+			r.active.cancelUnrenewed(renewedSet)
 		}
-		renewedSet := make(map[uuid.UUID]struct{}, len(renewed))
-		for _, lease := range renewed {
-			renewedSet[lease.CommandID] = struct{}{}
-			r.active.renewed(lease.CommandID, time.Now().Add(r.commandLease))
+		coordinatorRenewals := make([]store.CoordinatorLeaseRenewal, len(coordinators))
+		for index, value := range coordinators {
+			coordinatorRenewals[index] = store.CoordinatorLeaseRenewal{CoordinatorID: value.coordinatorID, AttemptID: value.attemptID, Token: value.token}
 		}
-		r.active.cancelUnrenewed(renewedSet)
+		coordinatorRenewed, coordinatorErr := r.store.RenewCoordinatorLeases(ctx, r.replicaName(), r.commandLease, coordinatorRenewals)
+		if coordinatorErr != nil {
+			r.activeCoordinators.cancelExpired()
+		} else {
+			coordinatorSet := make(map[uuid.UUID]struct{}, len(coordinatorRenewed))
+			for id := range coordinatorRenewed {
+				coordinatorSet[id] = struct{}{}
+				r.activeCoordinators.renewed(id, time.Now().Add(r.commandLease))
+			}
+			r.activeCoordinators.cancelUnrenewed(coordinatorSet)
+		}
 		r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: "ok", Count: int64(len(renewed))})
 	}
 }
@@ -337,6 +437,15 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 			_ = r.faults.Hit(ctx, fault.MaintenanceAfterProbe)
 			for _, candidate := range leases {
 				changed, recoverErr := r.store.RecoverExpiredCommandLease(ctx, candidate)
+				if recoverErr == nil && changed {
+					progress = true
+				}
+			}
+		}
+		if leases, err := r.store.ProbeExpiredCoordinatorLeases(ctx, 128); err == nil {
+			_ = r.faults.Hit(ctx, fault.MaintenanceAfterProbe)
+			for _, candidate := range leases {
+				changed, recoverErr := r.store.RecoverExpiredCoordinatorLease(ctx, candidate)
 				if recoverErr == nil && changed {
 					progress = true
 				}
