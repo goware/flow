@@ -188,7 +188,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	serviceCtx, stopServices := context.WithCancel(context.Background())
 	var services sync.WaitGroup
-	services.Add(3)
+	services.Add(2 + r.planConcurrency)
 	go func() {
 		defer services.Done()
 		r.runLeaseManager(serviceCtx)
@@ -197,10 +197,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 		defer services.Done()
 		r.runMaintenance(serviceCtx)
 	}()
-	go func() {
-		defer services.Done()
-		r.runPlanScheduler(serviceCtx)
-	}()
+	for range r.planConcurrency {
+		go func() {
+			defer services.Done()
+			r.runPlanScheduler(serviceCtx)
+		}()
+	}
 
 	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: "run", Outcome: "started", Worker: r.replicaName()})
 	r.runCommandScheduler(runCtx)

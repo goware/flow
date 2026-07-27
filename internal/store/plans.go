@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,11 +37,19 @@ type PlanCommandSnapshot struct {
 	State                  string
 	Args                   []byte
 	Result                 []byte
+	ResultLoaded           bool
+	FailureScope           bool
 	FailureCode            string
 	FailureMessage         string
 	ChildMembershipClosed  bool
 	Children               []string
 	DeclarationFingerprint []byte
+}
+
+type PlanEventSelector struct {
+	Namespace string
+	Name      string
+	Version   int
 }
 
 type PlanEventSnapshot struct {
@@ -53,24 +62,29 @@ type PlanEventSnapshot struct {
 }
 
 type PlanSnapshot struct {
-	ExecutionID    uuid.UUID
-	Status         string
-	Input          []byte
-	DeadlineAt     *time.Time
-	MaxCommands    int
-	CommandCount   int
-	OpenCommands   int
-	Revision       int64
-	JournalThrough int64
-	Commands       []PlanCommandSnapshot
-	Events         []PlanEventSnapshot
+	ExecutionID     uuid.UUID
+	DecisionAt      time.Time
+	Status          string
+	Input           []byte
+	DeadlineAt      *time.Time
+	MaxCommands     int
+	CommandCount    int
+	OpenCommands    int
+	Revision        int64
+	JournalThrough  int64
+	Commands        []PlanCommandSnapshot
+	Events          []PlanEventSnapshot
+	LoadedSelectors []PlanEventSelector
 }
 
 type PlanReconciliation struct {
 	ExpectedRevision int64
 	ConsumedThrough  int64
 	WaitingReads     int
+	WaitingOn        []string
+	Quiescent        bool
 	Commands         []CommandCreate
+	ImmediateExpired []uuid.UUID
 }
 
 type PlanReconcileResult struct {
@@ -93,11 +107,15 @@ func (s *Store) ProbeDirtyPlans(ctx context.Context, kinds []PlanKind, limit int
 		names[index], versions[index] = kind.Name, int32(kind.Version)
 	}
 	rows, err := s.db.Conn.Query(ctx, `WITH handled(name,version) AS (SELECT * FROM unnest($1::text[],$2::integer[]))
-		SELECT e.execution_id,e.definition_name,e.definition_version,e.plan_dirty_since
-		FROM `+pgschema.Table(s.schema, "flow_executions")+` e JOIN handled h
-		ON h.name=e.definition_name AND h.version=e.definition_version
-		WHERE e.driver_mode='plan' AND e.status IN ('running','failing') AND e.plan_dirty
-		ORDER BY e.plan_dirty_since,e.execution_id LIMIT $3`, names, versions, limit)
+		SELECT candidate.execution_id,candidate.definition_name,candidate.definition_version,candidate.plan_dirty_since
+		FROM handled h CROSS JOIN LATERAL (
+			SELECT e.execution_id,e.definition_name,e.definition_version,e.plan_dirty_since
+			FROM `+pgschema.Table(s.schema, "flow_executions")+` e
+			WHERE e.definition_name=h.name AND e.definition_version=h.version
+			  AND e.driver_mode='plan' AND e.status IN ('running','failing') AND e.plan_dirty
+			ORDER BY e.plan_dirty_since,e.execution_id LIMIT $3
+		) candidate
+		ORDER BY candidate.plan_dirty_since,candidate.execution_id LIMIT $3`, names, versions, limit)
 	if err != nil {
 		return nil, MapError("probe dirty plans", err)
 	}
@@ -119,6 +137,7 @@ func (s *Store) ProbeDirtyPlans(ctx context.Context, kinds []PlanKind, limit int
 func (s *Store) LoadPlanSnapshot(ctx context.Context, semantic *SemanticTx) (PlanSnapshot, error) {
 	var result PlanSnapshot
 	result.ExecutionID = semantic.ExecutionID()
+	result.DecisionAt = semantic.DBNow()
 	err := semantic.PGX().QueryRow(ctx, `SELECT status,input,deadline_at,max_commands,command_count,open_commands,
 		plan_revision,next_journal_position-1 FROM `+pgschema.Table(s.schema, "flow_executions")+`
 		WHERE execution_id=$1 AND driver_mode='plan' AND plan_dirty`, semantic.ExecutionID()).
@@ -127,8 +146,8 @@ func (s *Store) LoadPlanSnapshot(ctx context.Context, semantic *SemanticTx) (Pla
 	if err != nil {
 		return PlanSnapshot{}, MapError("load dirty plan execution", err)
 	}
-	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,name,version,origin,state,args,result,
-		terminal_failure,child_membership_closed,declaration_fingerprint
+	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,name,version,origin,state,args,
+		terminal_failure,child_membership_closed,declaration_fingerprint,failure_scope
 		FROM `+pgschema.Table(s.schema, "flow_commands")+` WHERE execution_id=$1 ORDER BY command_key`, semantic.ExecutionID())
 	if err != nil {
 		return PlanSnapshot{}, MapError("load plan commands", err)
@@ -137,8 +156,8 @@ func (s *Store) LoadPlanSnapshot(ctx context.Context, semantic *SemanticTx) (Pla
 		var command PlanCommandSnapshot
 		var failureBytes []byte
 		if err := rows.Scan(&command.ID, &command.Key, &command.Name, &command.Version, &command.Origin,
-			&command.State, &command.Args, &command.Result, &failureBytes, &command.ChildMembershipClosed,
-			&command.DeclarationFingerprint); err != nil {
+			&command.State, &command.Args, &failureBytes, &command.ChildMembershipClosed,
+			&command.DeclarationFingerprint, &command.FailureScope); err != nil {
 			rows.Close()
 			return PlanSnapshot{}, MapError("scan plan command", err)
 		}
@@ -183,44 +202,120 @@ func (s *Store) LoadPlanSnapshot(ctx context.Context, semantic *SemanticTx) (Pla
 	}
 	rows.Close()
 
-	rows, err = semantic.PGX().Query(ctx, `SELECT position,event_namespace,event_name,event_version,COALESCE(event_key,''),body
-		FROM `+pgschema.Table(s.schema, "flow_journal")+`
-		WHERE execution_id=$1 AND entry_kind='event_recorded'
-		AND event_namespace IN ('application','command_success') ORDER BY position`, semantic.ExecutionID())
-	if err != nil {
-		return PlanSnapshot{}, MapError("load plan events", err)
+	result.Input = slices.Clone(result.Input)
+	return result, nil
+}
+
+func (s *Store) LoadPlanEventsLocked(
+	ctx context.Context,
+	semantic *SemanticTx,
+	through int64,
+	selectors []PlanEventSelector,
+) ([]PlanEventSnapshot, error) {
+	if len(selectors) == 0 {
+		return nil, nil
 	}
+	const maxSelectorsPerQuery = 1_000
+	var result []PlanEventSnapshot
+	for start := 0; start < len(selectors); start += maxSelectorsPerQuery {
+		end := min(start+maxSelectorsPerQuery, len(selectors))
+		loaded, err := s.loadPlanEventSelectorsLocked(ctx, semantic, through, selectors[start:end])
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, loaded...)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Position < result[j].Position })
+	return result, nil
+}
+
+func (s *Store) loadPlanEventSelectorsLocked(
+	ctx context.Context,
+	semantic *SemanticTx,
+	through int64,
+	selectors []PlanEventSelector,
+) ([]PlanEventSnapshot, error) {
+	args := make([]any, 0, 2+len(selectors)*3)
+	args = append(args, semantic.ExecutionID(), through)
+	var predicates strings.Builder
+	for index, selector := range selectors {
+		if selector.Namespace == "" || selector.Name == "" || selector.Version <= 0 {
+			return nil, fmt.Errorf("%w: invalid plan event selector", flowerr.ErrInvalid)
+		}
+		if index > 0 {
+			predicates.WriteString(" OR ")
+		}
+		first := 3 + index*3
+		fmt.Fprintf(&predicates, "(event_namespace=$%d AND event_name=$%d AND event_version=$%d)", first, first+1, first+2)
+		args = append(args, selector.Namespace, selector.Name, int32(selector.Version))
+	}
+	query := `SELECT position,event_namespace,event_name,event_version,COALESCE(event_key,''),body
+		FROM ` + pgschema.Table(s.schema, "flow_journal") + `
+		WHERE execution_id=$1 AND position<=$2 AND entry_kind='event_recorded' AND (` + predicates.String() + `)
+		ORDER BY position`
+	rows, err := semantic.PGX().Query(ctx, query, args...)
+	if err != nil {
+		return nil, MapError("load selected plan events", err)
+	}
+	defer rows.Close()
+	var result []PlanEventSnapshot
 	for rows.Next() {
 		var event PlanEventSnapshot
 		var body []byte
 		if err := rows.Scan(&event.Position, &event.Namespace, &event.Name, &event.Version, &event.Key, &body); err != nil {
-			rows.Close()
-			return PlanSnapshot{}, MapError("scan plan event", err)
+			return nil, MapError("scan selected plan event", err)
 		}
 		switch event.Namespace {
 		case "application":
 			decoded, err := journalcodec.Decode[journalcodec.ApplicationEventBody](body)
 			if err != nil {
-				rows.Close()
-				return PlanSnapshot{}, err
+				return nil, err
 			}
 			event.Payload = slices.Clone(decoded.Payload)
 		case "command_success":
 			decoded, err := journalcodec.Decode[journalcodec.CommandSucceededBody](body)
 			if err != nil {
-				rows.Close()
-				return PlanSnapshot{}, err
+				return nil, err
 			}
 			event.Payload = slices.Clone(decoded.Result)
+		default:
+			return nil, fmt.Errorf("%w: unsupported plan event namespace", flowerr.ErrInvalidState)
 		}
-		result.Events = append(result.Events, event)
+		result = append(result, event)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
-		return PlanSnapshot{}, MapError("read plan events", err)
+		return nil, MapError("read selected plan events", err)
 	}
-	rows.Close()
-	result.Input = slices.Clone(result.Input)
+	return result, nil
+}
+
+func (s *Store) LoadPlanCommandResultsLocked(
+	ctx context.Context,
+	semantic *SemanticTx,
+	commandIDs []uuid.UUID,
+) (map[uuid.UUID][]byte, error) {
+	if len(commandIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,result FROM `+pgschema.Table(s.schema, "flow_commands")+`
+		WHERE execution_id=$1 AND command_id=ANY($2) AND state='succeeded' ORDER BY command_id`,
+		semantic.ExecutionID(), commandIDs)
+	if err != nil {
+		return nil, MapError("load selected plan results", err)
+	}
+	defer rows.Close()
+	result := make(map[uuid.UUID][]byte, len(commandIDs))
+	for rows.Next() {
+		var id uuid.UUID
+		var value []byte
+		if err := rows.Scan(&id, &value); err != nil {
+			return nil, MapError("scan selected plan result", err)
+		}
+		result[id] = slices.Clone(value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, MapError("read selected plan results", err)
+	}
 	return result, nil
 }
 
@@ -250,9 +345,29 @@ func (s *Store) ReconcilePlanLocked(
 	}
 	commands := append([]CommandCreate(nil), request.Commands...)
 	sort.Slice(commands, func(i, j int) bool { return commands[i].Key < commands[j].Key })
+	commandByID := make(map[uuid.UUID]CommandCreate, len(commands))
+	for _, command := range commands {
+		commandByID[command.ID] = command
+	}
+	expiredSet := make(map[uuid.UUID]string, len(request.ImmediateExpired))
+	expiredCommands := make([]CommandCreate, 0, len(request.ImmediateExpired))
+	requiredExpired := false
+	for _, id := range request.ImmediateExpired {
+		command, exists := commandByID[id]
+		if !exists {
+			return PlanReconcileResult{}, fmt.Errorf("%w: immediate expiry references a command outside the plan delta", flowerr.ErrInvalidState)
+		}
+		if _, duplicate := expiredSet[id]; duplicate {
+			continue
+		}
+		expiredSet[id] = "expired"
+		expiredCommands = append(expiredCommands, command)
+		requiredExpired = requiredExpired || command.Required
+	}
+	sort.Slice(expiredCommands, func(i, j int) bool { return expiredCommands[i].Key < expiredCommands[j].Key })
 	decisionBody := journalcodec.PlanReconciledBody{
 		V: 1, Revision: revision + 1, ConsumedThrough: request.ConsumedThrough,
-		WaitingReads: request.WaitingReads, Quiescent: len(commands) == 0,
+		WaitingReads: request.WaitingReads, Quiescent: request.Quiescent,
 	}
 	for _, command := range commands {
 		decisionBody.Declarations = append(decisionBody.Declarations, journalcodec.PlanReconciledDeclaration{
@@ -288,28 +403,58 @@ func (s *Store) ReconcilePlanLocked(
 			return PlanReconcileResult{}, err
 		}
 	}
-	resolution, err := s.resolveGraphLocked(ctx, semantic, nil, nil)
+	resolution := graphResolution{}
+	failureEffects := failureResolution{}
+	if requiredExpired {
+		failureEffects, err = s.resolveRequiredFailuresLocked(ctx, semantic, expiredSet, head.FailFast)
+		resolution = failureEffects.graphResolution
+	} else {
+		resolution, err = s.resolveGraphLocked(ctx, semantic, expiredSet, nil)
+	}
 	if err != nil {
 		return PlanReconcileResult{}, err
 	}
-	result := PlanReconcileResult{Created: len(commands), Skipped: len(resolution.skipped)}
+	result := PlanReconcileResult{Created: len(commands), Skipped: len(expiredCommands) + len(resolution.skipped) + len(failureEffects.cancelled)}
 	continuation := semantic.continueBatch()
-	continuationEntries, err := resolution.skippedEntries(0)
+	continuationEntries := make([]JournalEntry, 0, result.Skipped+2)
+	for _, command := range expiredCommands {
+		expired, err := terminalEventWithCode(command.ID, command.Key, "expired", "initial_schedule_expired",
+			"first eligible time is not before the execution deadline", "flow.command_expired", "command_terminal")
+		if err != nil {
+			return PlanReconcileResult{}, err
+		}
+		continuationEntries = append(continuationEntries, expired)
+	}
+	skippedOffset := len(continuationEntries)
+	skippedEntries, err := resolution.skippedEntries(0)
 	if err != nil {
 		return PlanReconcileResult{}, err
 	}
+	continuationEntries = append(continuationEntries, skippedEntries...)
+	if requiredExpired && head.Status == "running" {
+		failing, err := NewJournalEntry(ExecutionFailing, map[string]any{
+			"v": 1, "status": "failing", "reason": "initial command schedule exceeds execution deadline",
+			"fail_fast": head.FailFast,
+		})
+		if err != nil {
+			return PlanReconcileResult{}, err
+		}
+		continuationEntries = append(continuationEntries, failing)
+	}
+	cancelledOffset := len(continuationEntries)
+	cancelledEntries, err := failureEffects.cancellationEntries(0, "cancelled by fail-fast after required command expiry")
+	if err != nil {
+		return PlanReconcileResult{}, err
+	}
+	continuationEntries = append(continuationEntries, cancelledEntries...)
 	for index := range continuationEntries {
 		continuationEntries[index].CausationBatchIndex = nil
 		continuationEntries[index].CausationPosition = clonePointer(&journal.Journal[0].Position)
 	}
-	// Immediate terminal declarations require another dirty pass so the pure
-	// plan can observe them before completion. Ordinary open declarations wait
-	// for their own terminal trigger; an empty delta is quiescent.
-	remainDirty := len(resolution.skipped) > 0
-	effectiveOpen := head.OpenCommands + len(commands) - len(resolution.skipped)
+	effectiveOpen := head.OpenCommands + len(commands) - len(expiredCommands) - len(resolution.skipped) - len(failureEffects.cancelled)
 	terminalStatus := ""
-	if !remainDirty && len(commands) == 0 && effectiveOpen == 0 {
-		if head.Status == "failing" {
+	if request.Quiescent && effectiveOpen == 0 {
+		if head.Status == "failing" || requiredExpired {
 			terminalStatus = "failed"
 		} else if request.WaitingReads == 0 {
 			terminalStatus = "succeeded"
@@ -333,14 +478,41 @@ func (s *Store) ReconcilePlanLocked(
 		if err != nil {
 			return PlanReconcileResult{}, err
 		}
-		if err := s.applyGraphResolution(ctx, continuation, resolution, continuationJournal, 0); err != nil {
+	}
+	failure := terminalFailure{Code: "initial_schedule_expired", Message: "first eligible time is not before the execution deadline"}
+	for index, command := range expiredCommands {
+		position := continuationJournal.Journal[index].Position
+		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
+			SET state='expired',terminal_failure=$2::jsonb,terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
+			WHERE command_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired','skipped')`,
+			command.ID, jsonString(failure), position, semantic.DBNow()); err != nil {
+			return PlanReconcileResult{}, MapError("expire initial plan schedule", err)
+		}
+		if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, command.ID); err != nil {
+			return PlanReconcileResult{}, MapError("remove expired initial plan schedule", err)
+		}
+	}
+	if requiredExpired {
+		if err := s.applyFailureResolution(ctx, continuation, failureEffects, continuationJournal, skippedOffset,
+			cancelledOffset, "cancelled by fail-fast after required command expiry"); err != nil {
 			return PlanReconcileResult{}, err
 		}
-	} else if err := s.applyGraphResolution(ctx, continuation, resolution, ApplyResult{}, 0); err != nil {
+	} else if err := s.applyGraphResolution(ctx, continuation, resolution, continuationJournal, skippedOffset); err != nil {
 		return PlanReconcileResult{}, err
 	}
-	waitingOn := "[]"
+	waitingOn := request.WaitingOn
+	if waitingOn == nil {
+		waitingOn = []string{}
+	}
+	waitingOnBytes, err := json.Marshal(waitingOn)
+	if err != nil {
+		return PlanReconcileResult{}, fmt.Errorf("%w: encode plan waiting diagnostics", flowerr.ErrInvalidState)
+	}
+	waitingOnJSON := string(waitingOnBytes)
 	status := head.Status
+	if requiredExpired {
+		status = "failing"
+	}
 	finishedAt := (*time.Time)(nil)
 	if terminalStatus != "" {
 		status = terminalStatus
@@ -351,9 +523,12 @@ func (s *Store) ReconcilePlanLocked(
 		SET command_count=command_count+$2,open_commands=open_commands+$2-$3,
 		plan_revision=$4,plan_dirty=$5,plan_dirty_since=CASE WHEN $5 THEN COALESCE(plan_dirty_since,$6) ELSE NULL END,
 		plan_quiescent=$7,plan_waiting_count=$8,plan_waiting_on=$9::jsonb,
-		status=$10,finished_at=$11,updated_at=$6,status_at=CASE WHEN status<>$10 THEN $6 ELSE status_at END
-		WHERE execution_id=$1`, semantic.ExecutionID(), len(commands), len(resolution.skipped), revision+1,
-		remainDirty, semantic.DBNow(), len(commands) == 0, request.WaitingReads, waitingOn, status, finishedAt)
+		status=$10,failure=CASE WHEN $12 THEN $13::jsonb ELSE failure END,
+		finished_at=$11,updated_at=$6,status_at=CASE WHEN status<>$10 THEN $6 ELSE status_at END
+		WHERE execution_id=$1`, semantic.ExecutionID(), len(commands),
+		len(expiredCommands)+len(resolution.skipped)+len(failureEffects.cancelled), revision+1,
+		false, semantic.DBNow(), request.Quiescent, request.WaitingReads, waitingOnJSON, status, finishedAt,
+		requiredExpired, jsonString(failure))
 	if err != nil {
 		return PlanReconcileResult{}, MapError("materialize plan reconciliation", err)
 	}

@@ -122,9 +122,29 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 		t.Fatalf("retry worker calls = %d", retryCalls.Load())
 	}
 	retryTrace, err := Trace(ctx, runtime, retryHandle.ID)
-	if err != nil || len(retryTrace.Commands[0].Attempts) != 3 ||
-		retryTrace.Commands[0].Attempts[0].Classification != "retryable" ||
-		retryTrace.Commands[0].Attempts[2].Classification != "succeeded" {
+	if err != nil {
+		t.Fatalf("retry Trace error = %v", err)
+	}
+	retryableAttempts, succeededAttempts := 0, 0
+	validAttempts := len(retryTrace.Commands) == 1 && len(retryTrace.Commands[0].Attempts) >= 3
+	if validAttempts {
+		for _, attempt := range retryTrace.Commands[0].Attempts {
+			switch attempt.Classification {
+			case "retryable":
+				retryableAttempts++
+			case "succeeded":
+				succeededAttempts++
+			case "interrupted":
+				validAttempts = validAttempts && !attempt.ConsumedBudget
+			default:
+				validAttempts = false
+			}
+		}
+		last := retryTrace.Commands[0].Attempts[len(retryTrace.Commands[0].Attempts)-1]
+		validAttempts = validAttempts && retryableAttempts == 2 && succeededAttempts == 1 &&
+			last.Classification == "succeeded" && last.ConsumedAttempts == 2
+	}
+	if !validAttempts {
 		t.Fatalf("retry Trace = %#v, %v", retryTrace, err)
 	}
 	permanentTrace, _ := Trace(ctx, runtime, permanentHandle.ID)

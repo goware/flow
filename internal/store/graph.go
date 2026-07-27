@@ -86,7 +86,15 @@ func (s *Store) resolveRequiredFailureLocked(
 	terminalState string,
 	failFast bool,
 ) (failureResolution, error) {
-	baseOverrides := map[uuid.UUID]string{commandID: terminalState}
+	return s.resolveRequiredFailuresLocked(ctx, semantic, map[uuid.UUID]string{commandID: terminalState}, failFast)
+}
+
+func (s *Store) resolveRequiredFailuresLocked(
+	ctx context.Context,
+	semantic *SemanticTx,
+	baseOverrides map[uuid.UUID]string,
+	failFast bool,
+) (failureResolution, error) {
 	resolution, err := s.resolveGraphLocked(ctx, semantic, baseOverrides, nil)
 	if err != nil {
 		return failureResolution{}, err
@@ -117,14 +125,19 @@ func (s *Store) resolveRequiredFailureLocked(
 	for _, command := range append(append([]graphCommand(nil), resolution.ready...), resolution.waiting...) {
 		scope[command.id] = true
 	}
-	for _, dependent := range adjacency[commandID] {
-		scope[dependent] = true
+	for commandID := range baseOverrides {
+		for _, dependent := range adjacency[commandID] {
+			scope[dependent] = true
+		}
 	}
 	closeFailureScope(scope, adjacency)
 
 	for {
-		cancelled := failureCancellations(commands, commandID, scope)
-		overrides := map[uuid.UUID]string{commandID: terminalState}
+		cancelled := failureCancellations(commands, baseOverrides, scope)
+		overrides := make(map[uuid.UUID]string, len(baseOverrides)+len(cancelled))
+		for commandID, terminalState := range baseOverrides {
+			overrides[commandID] = terminalState
+		}
 		for _, command := range cancelled {
 			overrides[command.id] = "cancelled"
 		}
@@ -140,7 +153,8 @@ func (s *Store) resolveRequiredFailureLocked(
 		if len(scope) == before {
 			survivors := make([]graphCommand, 0, len(scope))
 			for id := range scope {
-				if command, ok := byID[id]; ok && !isCommandTerminal(command.state) && id != commandID {
+				_, failed := baseOverrides[id]
+				if command, ok := byID[id]; ok && !isCommandTerminal(command.state) && !failed {
 					survivors = append(survivors, command)
 				}
 			}
@@ -150,10 +164,10 @@ func (s *Store) resolveRequiredFailureLocked(
 	}
 }
 
-func failureCancellations(commands []graphCommand, failedID uuid.UUID, scope map[uuid.UUID]bool) []graphCommand {
+func failureCancellations(commands []graphCommand, failedIDs map[uuid.UUID]string, scope map[uuid.UUID]bool) []graphCommand {
 	result := make([]graphCommand, 0, len(commands))
 	for _, command := range commands {
-		if command.id == failedID || isCommandTerminal(command.state) || scope[command.id] || command.state == "running" {
+		if _, failed := failedIDs[command.id]; failed || isCommandTerminal(command.state) || scope[command.id] || command.state == "running" {
 			continue
 		}
 		result = append(result, command)

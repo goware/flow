@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,12 +17,16 @@ import (
 )
 
 type Plan struct {
-	snapshot     planSnapshot
-	declarations map[string]*planDeclaration
-	order        []string
-	readKeys     map[string]struct{}
-	waitingReads int
-	firstError   error
+	snapshot        planSnapshot
+	declarations    map[string]*planDeclaration
+	order           []string
+	readKeys        map[string]struct{}
+	readSelectors   map[eventReference]struct{}
+	selectorMisses  map[eventReference]struct{}
+	valueMisses     map[uuid.UUID]struct{}
+	waitingReadKeys map[string]struct{}
+	waitingReads    int
+	firstError      error
 }
 
 type Node struct {
@@ -29,8 +35,9 @@ type Node struct {
 }
 
 type planSnapshot struct {
-	commands map[string]store.PlanCommandSnapshot
-	events   map[eventReference][]store.PlanEventSnapshot
+	commands     map[string]store.PlanCommandSnapshot
+	events       map[eventReference][]store.PlanEventSnapshot
+	loadedEvents map[eventReference]bool
 }
 
 type planDeclaration struct {
@@ -60,8 +67,11 @@ type planDependency struct {
 
 func newPlan(snapshot store.PlanSnapshot) *Plan {
 	plan := &Plan{
-		declarations: make(map[string]*planDeclaration), readKeys: make(map[string]struct{}),
-		snapshot: planSnapshot{commands: make(map[string]store.PlanCommandSnapshot), events: make(map[eventReference][]store.PlanEventSnapshot)},
+		declarations: make(map[string]*planDeclaration), readKeys: make(map[string]struct{}), readSelectors: make(map[eventReference]struct{}),
+		selectorMisses: make(map[eventReference]struct{}), valueMisses: make(map[uuid.UUID]struct{}),
+		waitingReadKeys: make(map[string]struct{}),
+		snapshot: planSnapshot{commands: make(map[string]store.PlanCommandSnapshot),
+			events: make(map[eventReference][]store.PlanEventSnapshot), loadedEvents: make(map[eventReference]bool)},
 	}
 	for _, command := range snapshot.Commands {
 		plan.snapshot.commands[command.Key] = command
@@ -69,6 +79,9 @@ func newPlan(snapshot store.PlanSnapshot) *Plan {
 	for _, event := range snapshot.Events {
 		selector := eventReference{namespace: event.Namespace, name: event.Name, version: event.Version}
 		plan.snapshot.events[selector] = append(plan.snapshot.events[selector], event)
+	}
+	for _, selector := range snapshot.LoadedSelectors {
+		plan.snapshot.loadedEvents[eventReference{namespace: selector.Namespace, name: selector.Name, version: selector.Version}] = true
 	}
 	return plan
 }
@@ -148,9 +161,14 @@ func factValues[T any](plan *Plan, event Event[T]) []store.PlanEventSnapshot {
 		return nil
 	}
 	selector := eventReference{namespace: event.def.Namespace, name: event.def.Name, version: event.def.Version}
+	plan.readSelectors[selector] = struct{}{}
+	if !plan.snapshot.loadedEvents[selector] {
+		plan.selectorMisses[selector] = struct{}{}
+		return nil
+	}
 	values := plan.snapshot.events[selector]
 	if len(values) == 0 {
-		plan.waitingReads++
+		plan.markWaiting("event:" + selector.namespace + ":" + selector.name + ":" + strconv.Itoa(selector.version))
 	}
 	return values
 }
@@ -164,7 +182,7 @@ func Children(plan *Plan, parentKey string) ([]string, bool) {
 		return append([]string(nil), command.Children...), true
 	}
 	if !isPublicTerminal(command.State) {
-		plan.waitingReads++
+		plan.markWaiting("command:" + parentKey)
 	}
 	return nil, false
 }
@@ -177,8 +195,12 @@ func Result[A, R any](plan *Plan, key string, cmd Command[A, R]) (R, bool) {
 	}
 	if command.State != "succeeded" {
 		if !isPublicTerminal(command.State) {
-			plan.waitingReads++
+			plan.markWaiting("command:" + key)
 		}
+		return zero, false
+	}
+	if !command.ResultLoaded {
+		plan.valueMisses[command.ID] = struct{}{}
 		return zero, false
 	}
 	decoded, err := cmd.def.Result.Decode(command.Result)
@@ -196,11 +218,15 @@ func Outcome[A, R any](plan *Plan, key string, cmd Command[A, R]) (CommandOutcom
 		return result, false
 	}
 	if !isPublicTerminal(command.State) {
-		plan.waitingReads++
+		plan.markWaiting("command:" + key)
 		return result, false
 	}
 	result.Status = CommandStatus(command.State)
 	if result.Status == StatusSucceeded {
+		if !command.ResultLoaded {
+			plan.valueMisses[command.ID] = struct{}{}
+			return CommandOutcome[R]{}, false
+		}
 		decoded, err := cmd.def.Result.Decode(command.Result)
 		if err != nil {
 			plan.poison(newError(ErrInvalidState, "plan", "command", key, "retained result cannot be decoded"))
@@ -384,6 +410,57 @@ func (plan *Plan) poison(err error) {
 	}
 }
 
+func (plan *Plan) markWaiting(key string) {
+	if plan == nil {
+		return
+	}
+	if _, exists := plan.waitingReadKeys[key]; exists {
+		return
+	}
+	plan.waitingReadKeys[key] = struct{}{}
+	plan.waitingReads++
+}
+
+func (plan *Plan) waitingDiagnostics() []string {
+	result := make([]string, 0, min(32, len(plan.waitingReadKeys)))
+	for key := range plan.waitingReadKeys {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	if len(result) > 32 {
+		result = result[:32]
+	}
+	return result
+}
+
+func (plan *Plan) missingSelectors() []store.PlanEventSelector {
+	result := make([]store.PlanEventSelector, 0, len(plan.selectorMisses))
+	for selector := range plan.selectorMisses {
+		result = append(result, store.PlanEventSelector{Namespace: selector.namespace, Name: selector.name, Version: selector.version})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Namespace != result[j].Namespace {
+			return result[i].Namespace < result[j].Namespace
+		}
+		if result[i].Name != result[j].Name {
+			return result[i].Name < result[j].Name
+		}
+		return result[i].Version < result[j].Version
+	})
+	return result
+}
+
+func (plan *Plan) missingValues() []uuid.UUID {
+	result := make([]uuid.UUID, 0, len(plan.valueMisses))
+	for id := range plan.valueMisses {
+		result = append(result, id)
+	}
+	sort.Slice(result, func(i, j int) bool { return bytes.Compare(result[i][:], result[j][:]) < 0 })
+	return result
+}
+
+func (plan *Plan) complete() bool { return len(plan.selectorMisses) == 0 && len(plan.valueMisses) == 0 }
+
 func equivalentCommandDefaults(a, b commandDefaults) bool {
 	if a.queue != b.queue || a.attemptTimeout != b.attemptTimeout {
 		return false
@@ -507,7 +584,8 @@ func buildPlanReconciliation(snapshot store.PlanSnapshot, plan *Plan) (store.Pla
 		}
 	}
 	request := store.PlanReconciliation{
-		ExpectedRevision: snapshot.Revision, ConsumedThrough: snapshot.JournalThrough, WaitingReads: plan.waitingReads,
+		ExpectedRevision: snapshot.Revision, ConsumedThrough: snapshot.JournalThrough,
+		WaitingReads: plan.waitingReads, WaitingOn: plan.waitingDiagnostics(),
 	}
 	for _, key := range plan.order {
 		decl := plan.declarations[key]
@@ -537,7 +615,11 @@ func buildPlanReconciliation(snapshot store.PlanSnapshot, plan *Plan) (store.Pla
 		}
 		command.DeclarationFingerprint = fingerprint
 		command.Required = decl.required
-		command.FailureScope = snapshot.Status == "failing" && declarationHandlesFailure(decl)
+		// Once an execution is failing, every genuinely new plan declaration is
+		// part of the newly selected recovery decision. Existing unrelated work
+		// was already handled by fail-fast; treating the new delta as one scope
+		// avoids trying to infer Go control-flow provenance from payloads.
+		command.FailureScope = snapshot.Status == "failing"
 		if decl.delay > 0 {
 			command.ScheduleKind, command.InitialDelay = "plan_delay", decl.delay
 		}
@@ -623,13 +705,63 @@ func planDeclarationFingerprint(decl *planDeclaration) ([32]byte, error) {
 	return encoded.Digest, nil
 }
 
-func declarationHandlesFailure(decl *planDeclaration) bool {
-	for _, group := range decl.groups {
-		if group.kind == "all_failed" || group.kind == "all_settled" {
-			return true
-		}
+func planEvaluationFingerprint(plan *Plan) (canonical.Value, error) {
+	if err := plan.validate(); err != nil {
+		return canonical.Value{}, err
 	}
-	return false
+	type declaration struct {
+		Key         string `json:"key"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	type read struct {
+		Kind         string `json:"kind"`
+		Identity     string `json:"identity"`
+		Availability string `json:"availability"`
+	}
+	value := struct {
+		V            int           `json:"v"`
+		Declarations []declaration `json:"declarations"`
+		Reads        []read        `json:"reads"`
+		Waiting      int           `json:"waiting"`
+	}{V: 1, Waiting: plan.waitingReads}
+	keys := append([]string(nil), plan.order...)
+	sort.Strings(keys)
+	for _, key := range keys {
+		fingerprint, err := planDeclarationFingerprint(plan.declarations[key])
+		if err != nil {
+			return canonical.Value{}, err
+		}
+		value.Declarations = append(value.Declarations, declaration{Key: key, Fingerprint: fmt.Sprintf("%x", fingerprint)})
+	}
+	for key := range plan.readKeys {
+		availability := "temporary"
+		if command, exists := plan.snapshot.commands[key]; exists {
+			switch {
+			case command.State == "succeeded":
+				availability = "available"
+			case isPublicTerminal(command.State):
+				availability = "permanent"
+			}
+		}
+		value.Reads = append(value.Reads, read{Kind: "command", Identity: key, Availability: availability})
+	}
+	for selector := range plan.readSelectors {
+		availability := "temporary"
+		if len(plan.snapshot.events[selector]) > 0 {
+			availability = "available"
+		}
+		value.Reads = append(value.Reads, read{
+			Kind: "event", Identity: selector.namespace + ":" + selector.name + ":" + strconv.Itoa(selector.version),
+			Availability: availability,
+		})
+	}
+	sort.Slice(value.Reads, func(i, j int) bool {
+		if value.Reads[i].Kind != value.Reads[j].Kind {
+			return value.Reads[i].Kind < value.Reads[j].Kind
+		}
+		return value.Reads[i].Identity < value.Reads[j].Identity
+	})
+	return canonical.Marshal(value, 0)
 }
 
 type erasedPlan struct {
