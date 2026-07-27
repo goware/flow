@@ -370,6 +370,8 @@ func (w *Work[A]) Info() CommandInfo
 
 `Work.Args` is the typed argument value supplied when the command was created. The API uses **arguments** for what a worker receives, **result** for what it returns, **payload** for serialized command or event data, and **state** for coordinator memory.
 
+The `key` passed to `Emit` is mandatory and non-empty. It is the application event's stable execution-scoped idempotency key and follows the same identity/conflict rules as `Publish` (§9.3).
+
 `CommandInfo` exposes identity plus durable database timing for the current logical command and attempt. `CreatedAt` is immutable command creation time. `BudgetStartedAt` is set once to the command's first claim-eligible time after dependencies, waits, and an initial plan `Delay` or spawn `StartAfter`; it never moves on retry, claim, interruption, lease recovery, or replica takeover. `Attempt` is the one-based durable invocation ordinal; it may be greater than the number of retry-budget-consuming attempts because an interrupted invocation still has operational identity. `AttemptStartedAt` is the PostgreSQL time at which this invocation began. Every field is fixed before the handler starts. Mutable update time and the moving next-attempt schedule are deliberately not exposed through `CommandInfo`: update time is maintenance data, while retry timing belongs to policy and inspection. `Commit.Info` carries the same accepted values.
 
 `Received[T]` is the coordinator's typed view of one event. Position, key, and recorded time are retained metadata. For `On`, `Key` is the event's idempotency key and `Payload` is its canonical typed value. For `OnOutcome`, `Key` is the command key and `Payload` is the lossless typed `CommandOutcome[R]` view of that terminal event. `RecordedAt` is PostgreSQL acceptance time. Application-domain occurrence time belongs in `T` in Milestone 1; no separate caller-supplied occurrence-time option is implied. Coordinators use `Position` for ordering.
@@ -1145,6 +1147,8 @@ Retry policy is for failures while attempting work. A successful external query 
 
 Shutdown interruption, lease loss, and unregistered-version deferral never consume retry budget and never make a command terminal. They are retained as operational history and observations, not as domain progression.
 
+This deliberate rule means an attempt-count-only policy may keep retrying when every invocation is interrupted before it can finish, bounded only by an elapsed policy when configured or the execution deadline when present. Explicitly removing both bounds opts out of that guarantee and can permit indefinite interruption/retry. `Trace` exposes invocation ordinal, consumed-attempt count, and interruption classifications. Telemetry adapters should alert on repeated or high-ratio non-consuming interruptions grouped by command name/version; the core does not create another event, retry counter, or high-cardinality command-ID metric for this operational condition.
+
 ### 8.4 Terminal failure
 
 A command that exhausts its attempt count or elapsed retry duration, or returns a permanent error, becomes `failed` and records `CommandFailed`, with its full attempt history preserved.
@@ -1198,7 +1202,7 @@ Plan-side `Outcome` remains appropriate when a terminal result changes which com
 
 Every journal entry has an `ExecutionID`, immutable per-execution position, recorded time, entry kind, and causation. Entry kinds cover the durable semantic and operational history needed to explain topology, progress, attempts, and outcome: execution lifecycle, command creation, attempt start and conclusion, event recording, successful plan reconciliation, coordinator processing, and execution transitions. A command's final transition is represented by its required terminal event rather than a duplicate operational entry. High-frequency maintenance such as lease-renewal heartbeats, polling, and notifications is deliberately excluded.
 
-Every event entry additionally has an `EventID`, name and version, optional key, canonical typed payload, and where applicable the originating command and attempt. Application-domain occurrence time belongs in the typed payload in Milestone 1; the event metadata's `RecordedAt` is authoritative PostgreSQL acceptance time.
+Every event entry additionally has an `EventID`, name and version, canonical typed payload, and where applicable the originating command and attempt. Application events always have their required non-empty idempotency key; runtime-owned terminal events use their subject identity and expose a command key where the typed coordinator view requires one. Application-domain occurrence time belongs in the typed payload in Milestone 1; the event metadata's `RecordedAt` is authoritative PostgreSQL acceptance time.
 
 The journal is append-only and never destructively consumed. Events are one kind of journal entry and the only kind exposed through the typed `Event[T]`, `Fact`, `Facts`, and coordinator-subscription APIs; `OnOutcome` is a typed view over a command's terminal event, not exposure of an operational entry. Unlike a command, which one worker handles, an event is observed independently by the plan and by any coordinator subscribing to it. `CommandCreated`, `AttemptStarted`, `PlanReconciled`, and other operational entries appear in `History` and `Trace` but do not create additional event abstractions and cannot be awaited as application facts.
 
@@ -1218,7 +1222,7 @@ The runtime deliberately does not append a `CommandStarted` event. `Trace` deriv
 
 ### 9.3 Idempotency
 
-`Publish` requires a non-empty event key. Identity is `(ExecutionID, event_name, EventKey)`, scoped across versions so a publisher retrying the same natural fact after a deployment cannot create duplicate progression under a newer schema.
+Every application event recorded through `Emit` or `Publish` requires a non-empty stable event key. Both paths share identity `(ExecutionID, event_name, EventKey)`, scoped across versions so retrying the same natural fact after a deployment cannot create duplicate progression under a newer schema. Repeating the same key with equivalent canonical payload and material metadata coalesces; disagreement poisons a staged handler decision or returns `ErrConflict` from ingress. Runtime-owned command and execution terminal events use their subject identities and dedicated uniqueness rules rather than application event keys.
 
 | Repeated key | Result |
 |---|---|
@@ -1226,6 +1230,8 @@ The runtime deliberately does not append a `CommandStarted` event. `Trace` deriv
 | different payload, version, or material metadata | `ErrConflict`; nothing written |
 
 Idempotency is checked before terminal-execution rejection: retrying an existing equivalent event succeeds even after the execution becomes terminal, while a genuinely new event is rejected with `ErrTerminal`.
+
+Because identity deliberately omits event version while `Await`, `Fact`, `Facts`, and coordinator selectors match an exact version, one natural `(event name, key)` cannot change versions within an execution. A rolling deployment must continue publishing the version expected by each in-flight execution until it finishes or is deliberately replaced by a new execution. Publishing a different version under an already accepted key conflicts; publishing only the new version for an old exact-version wait can leave that wait to expire. Version selection is therefore an execution-lifetime compatibility decision, not an idempotent retry mechanism.
 
 ### 9.4 Ordering
 
@@ -1243,7 +1249,7 @@ Small durable results may be carried in payloads. Large or sensitive outputs bel
 
 ### 9.6 Replay and recovery boundary
 
-`flow` is journal-first for its orchestration control plane without event-sourcing application state. `CommandCreated` entries record requested work and topology; event entries record how commands ended and additional facts; attempt entries record transient execution mechanics; `PlanReconciled` records which durable prefix a successful pure decision consumed and whether it became quiescent or remained waiting; materialized command and execution state makes claiming and current-state inspection efficient. The retained journal is the logical source for the causal graph and settled orchestration projections. Architecture may normalize or share immutable payload storage rather than physically duplicating large canonical bytes, provided `History` preserves the same complete logical record.
+`flow` is journal-first for its orchestration control plane without event-sourcing application state. `CommandCreated` entries record requested work and topology; event entries record how commands ended and additional facts; attempt entries record transient execution mechanics; `PlanReconciled` records which durable prefix a successful pure decision consumed, whether it became quiescent or remained waiting, and the keys/identities of newly accepted declarations. It does not repeat their arguments, topology, or other payloads because the same batch's `CommandCreated` entries are the complete command records. Materialized command and execution state makes claiming and current-state inspection efficient. The retained journal is the logical source for the causal graph and settled orchestration projections. Architecture may normalize or share immutable payload storage rather than physically duplicating large canonical bytes, provided `History` preserves the same complete logical record.
 
 Plans may be re-evaluated by folding the retained journal: command creation establishes declarations, dependencies, and closed membership; events establish results and facts; attempts explain operational execution without becoming plan inputs. Accurate historical plan simulation additionally requires the exact plan version that produced the historical declarations. Recovery and simulation never replay arbitrary Go handlers or declared commit functions, repeat historical external side effects, or rebuild application tables. Application-owned tables remain authoritative for business state; the journal records the durable inputs and accepted outcome of a commit function, not a promise that arbitrary domain state is a projection of events.
 
@@ -1320,6 +1326,8 @@ The success gate is automatic and cannot be forgotten, because it derives from t
 Starting a plan-driven execution, appending an application event, or recording a terminal command outcome sets `plan_dirty = true` in the same transaction as that durable transition. The clean-to-dirty transition also captures PostgreSQL `plan_dirty_since`; later triggers leave that timestamp unchanged until reconciliation, preventing a busy execution from continually losing its queue position. Claim, lease renewal, `running`, and `retry_wait` transitions do not mark it because no plan API can observe them. Stored dependency and `Await` resolution still occurs immediately in the triggering transaction; the dirty marker represents only the pure Go plan work that remains.
 
 A runtime registering the execution's exact plan name and version claims dirty executions with PostgreSQL row locking and evaluates the plan in its own short transaction. It logically sees the complete committed snapshot through the journal position captured after locking, including every event, terminal result, and closed child membership accepted before that point. Implementations may discover `Fact`/`Facts` selectors in provisional pure passes and batch-load only those indexed journal slices; they need not scan unrelated events or persist the selectors. Several triggers may therefore coalesce into one evaluation. Publishers and command workers do not need the plan definition, and a process crash cannot lose the work because the dirty marker is cleared only when reconciliation commits.
+
+Initial plan evaluation is deferred for the same reason as every later pass: there is one reconciliation, defect, capacity, and recovery path; caller-facing `Execute` and caller-owned `InTx` transactions never run application plan CPU while holding their transaction; and an initial plan defect is isolated as durable asynchronous execution failure. Consequently, an immediate `Trace` after `PlanDef.Execute` may show a dirty execution with no commands until a compatible plan runtime reconciles it.
 
 | Declared key | Action |
 |---|---|
@@ -1598,8 +1606,8 @@ The runtime supplies the accepted database values to a worker through `CommandIn
 | retry delays | 1s, 5s, 30s, 2m, jittered |
 | per-attempt timeout | none unless configured |
 | execution deadline | 30 days; removable per execution |
-| command payload / result size | 256 KiB |
-| event payload size | 64 KiB |
+| command arguments / result size | 256 KiB each; the automatic `Command.Done()` terminal event carrying `R` uses the result limit |
+| application event payload size | 64 KiB for `Emit` and `Publish` |
 | coordinator state size | 256 KiB |
 | commands per execution | 1,000 across every driver mode; configurable, `0` disables |
 | dependencies per plan-declared command | 100 |
@@ -1609,6 +1617,8 @@ The runtime supplies the accepted database values to a worker through `CommandIn
 | shutdown grace period | 30 seconds |
 
 Configuration uses typed options; environment parsing is the application's concern. Invalid combinations fail at configuration or request validation time.
+
+Runtime-owned terminal event bodies use their bounded internal schemas. They are not subject to the 64 KiB application-event limit, while a successful command result remains subject to the 256 KiB result limit even though it is exposed as `Command.Done()`.
 
 ## 19. Errors and safety
 
@@ -1657,6 +1667,7 @@ Milestone 1 is complete when:
 - each execution enforces its stored command ceiling regardless of the defaults configured on processing replicas, and an idempotent repeated start under a changed runtime default returns the existing execution without rewriting or conflicting with that ceiling;
 - `Command.Execute` durably queues one typed root command and returns immediately without requiring a plan or coordinator;
 - `PlanDef.Execute` durably creates the execution, sets `plan_dirty`, and returns without invoking the plan; a compatible plan runtime later atomically creates the initial declaration batch;
+- an immediate trace after `PlanDef.Execute` may contain no commands until reconciliation, and an initial plan defect is reported asynchronously on that durable execution rather than returned by `Execute`;
 - `Coordinator.Execute` durably creates the instance and queues its start activation without invoking `OnStart` inline;
 - `WithMaxCommandsPerExecution` applies one accepted-logical-command ceiling to direct, plan, and coordinator executions; `0` disables it, and the ceiling never limits other executions, total database backlog, or runtime concurrency;
 - the command ceiling counts each accepted root, `Do`, `Spawn`, and `Issue` command once while excluding attempts, retries, equivalent reconciliation, duplicate-equivalent staged output, events, and coordinator activations;
@@ -1666,11 +1677,13 @@ Milestone 1 is complete when:
 - the worked examples in §5 compile and run against PostgreSQL;
 - a mistyped command or event reference, or a wrong payload, result, or event payload type, fails to compile;
 - every command that ends records exactly one event describing how it ended, with success carrying its typed result and transient attempt failures excluded;
+- command arguments and results enforce their 256 KiB limits; the automatic success event carrying a result uses that result limit, while explicit application events from `Emit` and `Publish` enforce 64 KiB;
 - every accepted root, `Do`, worker- or coordinator-spawned, or `Issue` command records exactly one ordered `CommandCreated` journal entry with canonical payload, origin, parent where applicable, classification, dependencies, accepted initial schedule, policy, and causation; equivalent reconciliation appends no duplicate;
 - changing a command definition's retry, per-attempt-timeout, or queue default requires no command-version bump, leaves every existing command and its accepted journaled settings unchanged, does not fail plan reconciliation, and affects only commands created afterward;
 - a material plan declaration/read change or coordinator state/subscription/decision change uses a new definition version; rolling replicas never intentionally run divergent orchestration logic under one name/version pair;
 - adding, removing, or changing an explicit plan-node retry override for an existing key is a plan defect, while duplicate declarations within one evaluation must agree on their effective operational settings;
 - every claimed attempt records ordered start and conclusion entries, including retry scheduling or interruption where applicable, without exposing transient attempt mechanics through `Event[T]`;
+- repeated shutdown interruption or lease loss consumes no attempt budget, remains bounded by any elapsed policy or execution deadline still present, and is diagnosable from invocation ordinal, consumed-attempt count, and classified attempt history;
 - `CommandInfo` supplies immutable PostgreSQL creation, budget-start, current-attempt number, and attempt-start values; retry scheduling, claim renewal, recovery, and takeover never move the budget start, and mutable update or next-attempt timestamps are not exposed to handlers;
 - a declarative `RetryPolicy` can bound retries by attempts, elapsed PostgreSQL time, or both; `RetryFor` remains bounded across process restarts regardless of attempt count, permanent errors cannot be made retryable, and the chosen next-attempt time is persisted rather than recomputed;
 - a running handler's context is bounded by the earliest applicable per-attempt timeout, elapsed retry-budget deadline, and execution deadline;
@@ -1696,6 +1709,7 @@ Milestone 1 is complete when:
 - command workers and publishers can commit plan-triggering transitions without registering the plan, and each such transition sets the execution's dirty marker in the same transaction;
 - dirty plan executions are claimed only by replicas registering the exact plan version, using bounded concurrency and skip-locked execution rows; a reconciler crash rolls back its declarations and leaves the execution dirty for takeover;
 - several events and terminal command outcomes committed before reconciliation coalesce into one dirty execution, and the next plan snapshot contains all of them;
+- each successful plan revision records one compact `PlanReconciled` identity delta containing counts and ordered new-command keys, IDs, and declaration fingerprints, while the corresponding `CommandCreated` entries alone carry full arguments and topology;
 - re-evaluating a plan many times creates each declared command exactly once;
 - a plan branch appears only once the fact deciding it exists, and never withdraws work already declared;
 - every command made runnable by one plan evaluation is created in a single transaction;
@@ -1728,6 +1742,9 @@ Milestone 1 is complete when:
 - event positions are total only within one execution, and no API or projection implies a total order across executions;
 - all retained journal entries share that execution-local position order; `History` can reconstruct command existence, arguments, topology, attempts, events, causation, and settled outcomes without reconciling a separately ordered command source, while lease heartbeats remain excluded maintenance;
 - an idempotent republish of a stored event succeeds after the execution becomes terminal, while a genuinely new event is rejected;
+- every application event from `Emit` or `Publish` requires a non-empty stable key and shares one cross-version `(ExecutionID, event name, key)` identity; equivalent repetition coalesces and disagreement fails atomically;
+- runtime-owned terminal events use subject-based uniqueness rather than application keys;
+- an exact-version wait or subscription is satisfied only by that event version; rolling deployments retain compatible publishers until in-flight executions finish or are deliberately replaced, and cannot change a stored natural fact's version under the same key;
 - crash at any commit boundary leaves the execution recoverable and internally consistent;
 - workers registering different `(name, version)` sets share a database without failing each other's work;
 - `Trace` returns both what happened and what the execution is waiting for, including parent-child edges, every final command state, current running state, and attempt start history in one call, without a `CommandStarted` application event;

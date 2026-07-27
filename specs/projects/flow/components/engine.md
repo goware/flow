@@ -193,7 +193,7 @@ type stagedDecision struct {
 
 ### 6.2 Emit and Spawn
 
-`Emit` validates the event descriptor, non-empty stable key where required, canonical payload, and size before appending in call order. Repeated same event identity/content coalesces; disagreement poisons the decision with `ErrConflict`.
+`Emit` always requires a non-empty stable key for an application event. It validates the descriptor, canonical payload, and 64 KiB application-event limit before appending in call order. The `(event name, key)` reservation spans versions under the same identity rule as `Publish`: repetition with the same version and equivalent content coalesces, while a version, payload, or material-metadata disagreement poisons the complete decision with `ErrConflict`. Runtime-created terminal events are not staged through `Emit` and use subject identities instead.
 
 `Spawn` validates and canonicalizes before staging. Its options are sealed:
 
@@ -341,7 +341,7 @@ The engine evaluates the pure plan again in the same transaction only if applyin
 
 Every continuation accepts at least one genuinely new terminal command. A positive stored command ceiling therefore bounds the fixed-point cycle. Independently, a fixed technical guard of 10,000 total plan invocations per semantic transaction—including lazy selector/value loading and fixed-point passes—protects the execution lock. Exceeding it is a plan defect. The guard does not limit the number of commands one pass may declare and is exposed through plan diagnostics.
 
-The final complete pass yields an exact in-memory temporary-read count and at most 32 safe `plan_waiting_on` diagnostic summaries. The engine emits one `PlanReconciled` record, increments the revision, and clears dirty state only in the same change set as the accepted declaration batch. It persists no reactive subscription set.
+The final complete pass yields an exact in-memory temporary-read count and at most 32 safe `plan_waiting_on` diagnostic summaries. The engine emits one `PlanReconciled` record containing counts and ordered `(command key, command ID, declaration fingerprint)` tuples for genuinely new declarations, increments the revision, and clears dirty state only in the same change set as the accepted declaration batch. Full arguments, topology, and accepted settings exist only in the corresponding `CommandCreated` records and are not duplicated in the decision body. The engine persists no reactive subscription set.
 
 ### 8.5 Purity verification
 
@@ -418,7 +418,7 @@ Worker/coordinator `StartAfter` commands have no dependency phase; creation comp
 
 ### 10.1 Success
 
-Given a fenced running attempt and successful canonical result:
+Given a fenced running attempt and successful canonical result, the engine first enforces the 256 KiB command-result limit. The automatic success event is another representation of that result and does not reapply the smaller application-event limit.
 
 1. validate staged decision and complete child batch;
 2. append attempt conclusion success;
@@ -590,14 +590,14 @@ Test worlds provide synthetic canonical facts, command states/results/outcomes, 
 
 - every retry-policy builder/invalid combination, bound precedence, deterministic jitter, interruption, and deadline cap;
 - canonical equality and definition-default exclusion from reconciliation;
-- Spawn/Emit duplicate equivalence, poisoning, Optional, and StartAfter validation;
+- Spawn/Emit duplicate equivalence, mandatory non-empty event keys, cross-version conflict, payload-limit selection, poisoning, Optional, and StartAfter validation;
 - all dependency matrices and monotonic group transitions;
 - early/late waits, `Within`, Delay, deadline, and immutable budget anchor;
 - plan read availability, lazy value passes, forward references, ownership, cycles, growth, fragments, deterministic/coalescing assertions, and immediate-terminal fixed points without redundant normal passes;
 - fail-fast branch declaration after failure, survivor inheritance, multiple failures, and skip cascades;
 - direct/plan/coordinator completion and plan temporary-read failure exception;
 - coordinator start, event matching, `OnOutcome`, retry, state discard, mixed fan-in, and explicit terminal decisions;
-- journal deterministic order/causation and replay equivalence.
+- compact `PlanReconciled` identity deltas, journal deterministic order/causation, and replay equivalence.
 
 Property generators assert that accepted commands never disappear, terminal states never reopen, closed child sets never change, counters never become negative, and equivalent replay is idempotent.
 

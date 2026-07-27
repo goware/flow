@@ -401,6 +401,8 @@ CREATE INDEX flow_command_event_waits_reverse_idx
 
 The once-only `wait_started_at` and `wait_deadline_at` live on the command because one `Within` bounds the node's complete `Await` set.
 
+Wait selectors match an exact event version, while application event idempotency reserves `(execution, event name, key)` across versions. An in-flight execution must therefore keep publishers capable of producing the version its waits declare; accepting another version under that natural key cannot satisfy the old wait and prevents a later conflicting republish.
+
 ### 3.6 Journal
 
 ```sql
@@ -459,6 +461,8 @@ CREATE TABLE public.flow_journal (
                 AND attempt_id IS NULL)
         )
         AND (entry_kind <> 'coordinator_transition' OR coordinator_id IS NOT NULL)
+        AND (entry_kind <> 'plan_reconciled'
+             OR (command_id IS NULL AND coordinator_id IS NULL))
         AND (event_class IS DISTINCT FROM 'coordinator_terminal' OR coordinator_id IS NOT NULL)
     ),
     CONSTRAINT flow_journal_plan_revision_shape_ck CHECK (
@@ -471,6 +475,10 @@ CREATE TABLE public.flow_journal (
         (event_class IS NULL OR event_class IN
             ('application', 'command_terminal', 'execution_terminal',
              'plan_terminal', 'coordinator_terminal')),
+    CONSTRAINT flow_journal_application_event_key_ck CHECK (
+        event_class IS DISTINCT FROM 'application'
+        OR (event_key IS NOT NULL AND event_key <> '')
+    ),
     CONSTRAINT flow_journal_command_terminal_shape_ck CHECK (
         event_class <> 'command_terminal'
         OR (command_id IS NOT NULL AND terminal_status IS NOT NULL)
@@ -657,8 +665,8 @@ Internal journal bodies are versioned separately from application definitions. T
 | `CommandCreated` | body schema version, ID/key/name/version, canonical args, origin/parent, required and failure-scope classification, normalized dependency and wait selectors, explicit schedule declaration, accepted absolute first schedule, accepted retry/timeout/queue, causation. |
 | `AttemptStarted` | subject identity, delivery key if coordinator, invocation ordinal, database start, worker/process, lease duration but not reusable lease token. |
 | `AttemptConcluded` | subject, classification, consumed-budget flag, database finish, safe error, and persisted next-attempt time when any. |
-| `EventRecorded` | canonical typed event payload; indexed columns hold its durable selector metadata. |
-| `PlanReconciled` | plan revision, highest prior journal position consumed, quiescence, waiting count and bounded summary, and the accepted declaration delta. |
+| `EventRecorded` | canonical typed event payload; indexed columns hold its durable selector metadata. Explicit `Emit`/`Publish` events use the application-event size limit; command-success events use the command-result limit. |
+| `PlanReconciled` | plan revision, highest prior journal position consumed, quiescence, waiting count and bounded summary, counts, and ordered new-command `(key, ID, declaration fingerprint)` tuples; no command payloads or topology. |
 | `ExecutionBecameFailing` | triggering required command/event, fail-fast setting, and the survivor-set decision needed to explain cancellations. |
 | `CoordinatorTransition` | handled activation/position, previous and new state revision, canonical resulting state, decision kind, and causation. |
 
@@ -834,11 +842,13 @@ External `Publish` first looks up `(execution_id, namespace, name, key)` before 
 
 After the lock, the store loads matching unresolved wait rows. Wait satisfaction and readiness are generic topology changes. A wait with `Within` is updated only when the event transaction's captured `DBNow` is no later than `wait_deadline_at`; a later event is journaled but leaves the wait for expiry maintenance. Every newly accepted application event sets `plan_dirty = true` for a live plan-driven execution in the same transaction, regardless of what its last evaluation happened to read. No plan code or read-routing lookup is required.
 
-Worker `Emit` uses the same event-key constraint. Derived command and execution terminal events use their dedicated partial unique indexes, not caller event idempotency. Publishing a derived `Command.Done` descriptor through the public `Publish` path is rejected by descriptor validation.
+Worker/coordinator `Emit` requires the same non-empty stable event key and uses the same cross-version uniqueness constraint as `Publish`. Equivalent repeated keys coalesce; disagreement rejects the whole staged decision. Derived command and execution terminal events use their dedicated partial unique indexes, not caller event idempotency. Publishing a derived `Command.Done` descriptor through the public `Publish` path is rejected by descriptor validation.
 
 ### 6.9 Coordinator selection and claim
 
 When an active coordinator is idle, selection first chooses `start` if pending. Otherwise it queries the lowest journal event above `inbox_position` matching any immutable registered selector. Ordinary `On` selectors use journal event namespace/name/version. `OnOutcome` selectors scan command-terminal rows in execution-position order and join `flow_journal.command_id` to the immutable command name/version projection. Both paths return candidate positions, and the lowest wins. This keeps one terminal journal row per command instead of adding a second outcome stream or denormalizing more routing columns into the journal.
+
+M1 does not preemptively add another command-terminal index. The sparse-`OnOutcome` query-plan benchmark determines whether repeated unmatched prefixes justify a partial `(execution_id, name, version, terminal_position)` index on terminal commands. Adding it is a physical optimization with measurable write cost, not a semantic requirement.
 
 Selection is persisted as one delivery key before or during the skip-locked claim transaction. Retry leaves it selected. On success, a guarded update requires matching coordinator ID, delivery key, attempt, token, and lease; advances inbox to the event position, clears delivery fields, resets delivery counters, and updates state/revision. Start success clears `start_pending` without moving inbox.
 
@@ -965,8 +975,11 @@ Every named check, foreign key, unique index, partial unique index, and terminal
 - stale tokens cannot conclude or renew;
 - retry changes next run only; interruption moves neither budget anchor nor consumed count;
 - event idempotency is checked before terminal rejection;
+- application `Emit`/`Publish` keys are non-empty, equivalent content coalesces across retries, and a version or content change under the same natural key conflicts;
+- exact-version waits are not satisfied by another version, including during rolling deployment;
 - concurrent first publication rechecks idempotency under the execution lock, every plan-mode publication works without plan capability and sets dirty, and facts on opposite sides of a persisted wait deadline resolve deterministically regardless of sweep timing;
 - concurrent plan triggers coalesce behind `plan_dirty`, a claimed reconciliation sees their complete committed snapshot, and rollback leaves the execution dirty;
+- every `PlanReconciled` row has no command/coordinator subject and carries only the compact declaration-identity delta represented in full by same-batch `CommandCreated` entries;
 - every maintenance runner is bounded and duplicate-safe;
 - replay from journal equals settled projections after randomized operations.
 
@@ -977,7 +990,7 @@ Run `EXPLAIN (ANALYZE, BUFFERS, WAL)` at 10K, 1M, and 10M aggregate commands/jou
 1. claim with 90% of the oldest lane backlog unregistered locally;
 2. claim bursts from one 1,000-command execution and from many executions;
 3. dirty-plan probe with many registered plan versions, coalescing under relevant and irrelevant event floods, plus whole-plan snapshot at 10, 100, and 1,000 commands with 100 dependencies per node at the adversarial edge;
-4. coordinator next-match lookup across mixed `On`/`OnOutcome` selectors with sparse subscriptions and long unmatched prefixes;
+4. repeated coordinator next-match lookup across mixed `On`/`OnOutcome` selectors with sparse subscriptions and long unmatched prefixes, comparing the base indexes with the candidate terminal-kind index from §6.9;
 5. expired-wait maintenance with a large mostly-unexpired pending set;
 6. history paging and full 1,000-command trace;
 7. lease renewal at 500 active attempts;

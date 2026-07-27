@@ -191,7 +191,7 @@ The engine emits a stable batch order so traces do not depend on map iteration:
 7. `ExecutionBecameFailing` and fail-fast cancellation events when applicable;
 8. coordinator or execution terminal events.
 
-Some transactions omit steps. A `PlanReconciled` record is caused by `ExecutionStarted` or the latest journal position included in the coalesced dirty snapshot; its body records the full consumed-through position and plan revision, and plan-created commands are caused by that decision record. Worker outputs are caused by the attempt conclusion; coordinator outputs are caused by the handled activation or event and recorded transition. Exact positions are assigned only after the full batch validates.
+Some transactions omit steps. A `PlanReconciled` record is caused by `ExecutionStarted` or the latest journal position included in the coalesced dirty snapshot; its body records the full consumed-through position, plan revision, counts, and the ordered `(command key, command ID, declaration fingerprint)` identity of each newly accepted command. It never repeats arguments, results, dependencies, waits, or other declaration payloads already recorded by the same batch's `CommandCreated` entries. Plan-created commands are caused by that decision record. Worker outputs are caused by the attempt conclusion; coordinator outputs are caused by the handled activation or event and recorded transition. Exact positions are assigned only after the full batch validates.
 
 ## 8. Transaction and lock discipline
 
@@ -265,7 +265,11 @@ Each typed descriptor contains an internal erased descriptor with:
 
 Definitions do not mutate global state. `Registration` values populate a runtime-local registry, frozen by `Run`. Registration rejects duplicate workers, conflicting codecs for a durable pair, duplicate coordinator handlers, multiple commit functions, and overlapping success-only `On(cmd.Done())` with `OnOutcome(cmd)`.
 
-The registry is also the rolling-deployment capability map. A dispatcher claims only exact command or coordinator definition versions that process can execute. A registered command pair is executable on any stored queue; `WithQueue` is a creation-time scheduling default, not a second handler identity, so changing it cannot strand existing work on its previously accepted queue. Unknown work remains durable and consumes no retry budget.
+Every application event accepted through `Emit` or `Publish` has a non-empty key and shares one execution-scoped uniqueness rule across event versions. Exact-version waits and subscriptions therefore require publishers to retain the version expected by each in-flight execution during a rollout; a different version under an existing natural key conflicts rather than creating duplicate progression. Runtime-owned terminal events use subject-based unique indexes instead of application keys.
+
+Payload validation distinguishes representation from abstraction. Explicit application events from `Emit` and `Publish` use the 64 KiB limit. The automatic `Command.Done()` terminal event is the journal representation of the command result and uses the 256 KiB result limit. Other runtime-owned terminal bodies use bounded internal schemas.
+
+The registry is also the rolling-deployment capability map. A scheduler claims only exact command, plan, or coordinator definition versions that process can execute. A registered command pair is executable on any stored queue; `WithQueue` is a creation-time scheduling default, not a second handler identity, so changing it cannot strand existing work on its previously accepted queue. Unknown work remains durable and consumes no retry budget.
 
 ## 10. Command creation and identity
 
@@ -548,7 +552,9 @@ Crash points surround claim commit, handler return, every settlement phase, comm
 ## 23. Known trade-offs and extension boundaries
 
 - The execution row lock serializes short semantic commits and coordinator decisions within one execution. This buys simple ordering and atomic progression; very large independent adaptive branches should become child executions later.
-- Plan evaluation occurs inside its own short execution-lock transaction. The 1,000-command default, bounded plan concurrency, trigger coalescing, and plan metrics make the cost explicit; direct and coordinator modes avoid repeated whole-graph evaluation.
+- Plan evaluation occurs inside its own short execution-lock transaction. The 1,000-command default, bounded plan concurrency, trigger coalescing, and plan metrics make the cost explicit; direct and coordinator modes avoid repeated whole-graph evaluation. Reconciliation defaults to one concurrent execution per runtime and scales across different executions by configuration or additional replicas.
+- Dirty-plan progression adds one scheduler hop after a plan-visible trigger. Notification hints normally reduce it to milliseconds; poll-only operation may add up to the configured poll interval for each sequential plan-dependent stage. Already-materialized dependency and `Await` release still happens in the triggering transaction, so a declared chain does not need a plan pass merely to make its next eligible command ready.
+- Initial evaluation deliberately uses that same deferred path even though the caller holds a `PlanDef`: one path owns capacity, reconciliation, crash recovery, and plan defects; plan CPU never runs inside caller-facing or caller-owned transactions. The visible consequence is that `Execute` may return before initial commands exist and an initial defect appears asynchronously on the execution.
 - Removing persistent plan-read routing deliberately permits over-evaluation: an application event may dirty a plan that does not use it. The trigger adds no row and updates an execution row already locked for journal append; repeated triggers coalesce behind one bit. This favors a simple no-missed-input proof over subscription bookkeeping. Benchmarks must include irrelevant-event floods, and any future skip index may be only a disposable hint—never a correctness dependency.
 - The initial journal duplicates some immutable bytes also present in projections. Simplicity and standalone history win in M1; content addressing is a compatible storage optimization.
 - Coordinator processing is deliberately single-threaded per execution. Parallel work belongs in spawned commands; the coordinator remains the short durable decision point.

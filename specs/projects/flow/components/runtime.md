@@ -63,8 +63,8 @@ The functional defaults remain normative:
 | commands per execution | 1,000; `0` disables |
 | idle poll | 1 second |
 | shutdown grace | 30 seconds |
-| command args/result | 256 KiB each |
-| event | 64 KiB |
+| command args/result | 256 KiB each; automatic command-success events use the result limit |
+| application event | 64 KiB for `Emit`/`Publish` |
 | coordinator state | 256 KiB |
 | dependencies per plan command | 100 |
 | plan reconciliation concurrency | 1; configurable independently of command workers |
@@ -110,6 +110,8 @@ Direct execution needs only the command worker. Coordinator command workers like
 Claim filters are built from the immutable registry. Old replicas never claim new command versions; a plan scheduler never claims an unknown plan version; and a coordinator replica never claims an unknown coordinator or event/command subscription version. Unknown work remains pending or dirty with no retry consumption.
 
 Rolling deployment assumes that one durable name/version has one orchestration meaning. The registry can diagnose codec and selector conflicts inside one process but cannot compare Go function bodies across replicas. Material plan or coordinator behavior changes therefore deploy under a new version; intentionally mixing divergent code under the same version is unsupported.
+
+Application event keys are reserved across versions while `Await`, plan facts, and coordinator subscriptions match exact versions. A rolling publisher therefore retains the event version required by each in-flight execution until it finishes or is deliberately replaced by a new execution. Publishing a newer version under the same natural key is a conflict, not an upgrade of stored history.
 
 Unclaimable observations distinguish missing command worker, dirty execution missing a plan definition, missing coordinator definition, and no matching coordinator handler. These are deployment gaps, not attempts, and consume no retry budget.
 
@@ -369,7 +371,7 @@ func MigrationFS(...MigrateOption) (fs.FS, error)
 - `AwaitExecution` repeatedly reads terminal state, optionally listens for execution hints, and always polls; it consumes no worker slot or durable lease.
 - `ResultOf(ExecutionTrace, ...)` performs typed decode against the trace and definition pair without another query.
 
-Trace labels delayed work as derived `scheduled`, exposes accepted/current command count, plan dirty/revision/quiescence and bounded waiting diagnostics, missing registrant reasons, current lease age without token, dependency and wait reasons, child closure, attempts reconstructed from journal history plus current delivery state, coordinator inbox, and causation graph. It never invents a `CommandStarted` event.
+Trace labels delayed work as derived `scheduled`, exposes accepted/current command count, plan dirty/revision/quiescence and bounded waiting diagnostics, missing registrant reasons, current lease age without token, dependency and wait reasons, child closure, invocation ordinal and consumed-attempt count, attempts reconstructed from journal history plus current delivery state, coordinator inbox, and causation graph. It never invents a `CommandStarted` event.
 
 ## 16. Observations
 
@@ -388,7 +390,7 @@ Required measurements include:
 - start/idempotent/conflict and execution outcomes;
 - command creation, schedule kind, command-limit use/rejection;
 - probes, claims, empty claims, free capacity, handler/commit duration;
-- attempt classification, persisted retry time, elapsed/attempt budget use;
+- attempt classification, invocation and consumed-attempt counts, persisted retry time, elapsed/attempt budget use;
 - lease renewal/loss/recovery and long-running attempts;
 - dirty-plan probes, coalesced trigger count, evaluation/fixed-point passes, loaded values, nodes, waiting count, declaration delta, and duration;
 - dependency resolution, wait start/expiry, skip cascade, failure closure;
@@ -398,6 +400,8 @@ Required measurements include:
 - execution-lock wait and journal batch size.
 
 Payloads, results, coordinator state, raw errors, SQL, connection data, and lease tokens are forbidden dimensions.
+
+Attempt-conclusion observations already contain enough information for adapters to count consecutive interruptions and compute interruption-to-consumed-attempt ratios by command name/version. That derived alert belongs in telemetry adapters; the runtime does not emit another event or recommend command-ID metric labels merely because non-consuming interruptions repeat.
 
 ## 17. Error and panic handling
 
@@ -455,7 +459,8 @@ Fault tests assert durable invariants after runtime restart, not exact goroutine
 - duplicate worker/plan/coordinator and subscription conflicts;
 - API-only operations without Run;
 - plan-independent worker settlement and publication, dirty-plan takeover, and delayed deployment of the exact `PlanDef`;
-- rolling replicas with divergent command, plan, coordinator, and event versions.
+- rolling replicas with divergent command, plan, coordinator, and event versions;
+- event-version rollouts retain exact-version compatibility for in-flight waits and reject a different version under an accepted natural key;
 
 ### 20.2 Queue and leases
 
@@ -465,6 +470,7 @@ Fault tests assert durable invariants after runtime restart, not exact goroutine
 - same-execution multi-claim serializes only claim commits;
 - renewals batch and one missing lease cancels only its handler;
 - lease loss, cancellation, shutdown, and ambiguous settlement races;
+- repeated non-consuming interruption remains bounded by elapsed/execution deadlines and is diagnosable from attempt observations and Trace counters;
 - handler deadline precedence and database revalidation.
 
 ### 20.3 Plan, coordinator, and agents
