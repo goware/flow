@@ -194,3 +194,23 @@ func TestDecideValidation(t *testing.T) {
 		t.Fatal("ClonePublic() changed the policy")
 	}
 }
+
+func TestPublicPolicyCanonicalRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	want := NewPublicFor(3*time.Hour).Attempts(11).Backoff(time.Second, 7*time.Second).Jitter(0.1)
+	encoded, err := CanonicalPublic(want)
+	if err != nil {
+		t.Fatalf("CanonicalPublic() error = %v", err)
+	}
+	got, err := PublicFromCanonical(encoded.Bytes)
+	if err != nil {
+		t.Fatalf("PublicFromCanonical() error = %v", err)
+	}
+	if !ValueOf(got).Equal(ValueOf(want)) {
+		t.Fatalf("round trip = %#v, want %#v", ValueOf(got), ValueOf(want))
+	}
+	if _, err := PublicFromCanonical([]byte(`{"max_attempts":0,"backoff":[],"jitter":0}`)); err == nil {
+		t.Fatal("PublicFromCanonical() accepted invalid policy")
+	}
+}

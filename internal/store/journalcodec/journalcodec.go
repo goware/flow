@@ -6,9 +6,64 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/goware/flow/internal/canonical"
 )
+
+// ExecutionStartedBody is the versioned logical start record retained by the
+// journal. Raw JSON fields already contain canonical application values.
+type ExecutionStartedBody struct {
+	V                 int             `json:"v"`
+	ExecutionID       string          `json:"execution_id"`
+	DriverMode        string          `json:"driver_mode"`
+	DefinitionName    string          `json:"definition_name"`
+	DefinitionVersion int             `json:"definition_version"`
+	ExecutionKey      string          `json:"execution_key"`
+	Input             json.RawMessage `json:"input"`
+	FailFast          bool            `json:"fail_fast"`
+	DeadlineMode      string          `json:"deadline_mode"`
+	DeadlineDuration  int64           `json:"deadline_duration_ms,omitempty"`
+	DeadlineAt        *time.Time      `json:"deadline_at,omitempty"`
+	MaxCommands       int             `json:"max_commands"`
+	Metadata          json.RawMessage `json:"metadata"`
+	CoordinatorID     string          `json:"coordinator_id,omitempty"`
+	CoordinatorPolicy json.RawMessage `json:"coordinator_retry_policy,omitempty"`
+}
+
+type CommandCreatedBody struct {
+	V                      int             `json:"v"`
+	CommandID              string          `json:"command_id"`
+	CommandKey             string          `json:"command_key"`
+	Name                   string          `json:"name"`
+	Version                int             `json:"version"`
+	Args                   json.RawMessage `json:"args"`
+	Origin                 string          `json:"origin"`
+	ParentCommandID        string          `json:"parent_command_id,omitempty"`
+	Required               bool            `json:"required"`
+	FailureScope           bool            `json:"failure_scope"`
+	InitialState           string          `json:"initial_state"`
+	Queue                  string          `json:"queue"`
+	AttemptTimeoutMS       *int64          `json:"attempt_timeout_ms,omitempty"`
+	RetryPolicy            json.RawMessage `json:"retry_policy"`
+	ScheduleKind           string          `json:"schedule_kind"`
+	InitialDelayMS         *int64          `json:"initial_delay_ms,omitempty"`
+	BudgetStartedAt        *time.Time      `json:"budget_started_at,omitempty"`
+	NextAttemptAt          *time.Time      `json:"next_attempt_at,omitempty"`
+	DeclarationFingerprint string          `json:"declaration_fingerprint"`
+}
+
+type ApplicationEventBody struct {
+	V       int             `json:"v"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+type TerminalEventBody struct {
+	V          int    `json:"v"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+	CommandKey string `json:"command_key,omitempty"`
+}
 
 var ErrVersion = errors.New("journal body requires a positive integer v")
 

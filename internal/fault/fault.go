@@ -35,6 +35,9 @@ const (
 	NotifyConnect                 Point = "notify_connect"
 	NotifyBeforeWait              Point = "notify_before_wait"
 	MigrationEachUnit             Point = "migration_each_unit"
+	IngressBeforeJournal          Point = "ingress_before_journal"
+	IngressBeforeCommit           Point = "ingress_before_commit"
+	IngressCommitAmbiguous        Point = "ingress_commit_ambiguous"
 )
 
 var ErrInjected = errors.New("flow: injected fault")

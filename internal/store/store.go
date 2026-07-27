@@ -66,13 +66,34 @@ func (s *Store) BeginSemantic(ctx context.Context, id uuid.UUID, mode LockMode) 
 	if err != nil {
 		return nil, MapError("begin semantic transaction", err)
 	}
+	semantic, err := s.AttachSemantic(ctx, tx, id, mode)
+	if err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, err
+	}
+	return semantic, nil
+}
+
+// AttachSemantic acquires an execution-first semantic lock inside a
+// caller-owned transaction. The returned value never takes ownership of the
+// transaction; callers that use this entry point remain responsible for its
+// final commit or rollback.
+func (s *Store) AttachSemantic(ctx context.Context, tx pgx.Tx, id uuid.UUID, mode LockMode) (*SemanticTx, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("%w: transaction is nil", flowerr.ErrInvalid)
+	}
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
+	}
+	if mode != LockBlocking && mode != LockSkipLocked {
+		return nil, fmt.Errorf("%w: unknown lock mode", flowerr.ErrInvalid)
+	}
 	lockSQL := `SELECT execution_id FROM ` + pgschema.Table(s.schema, "flow_executions") + ` WHERE execution_id=$1 FOR UPDATE`
 	if mode == LockSkipLocked {
 		lockSQL += ` SKIP LOCKED`
 	}
 	var locked uuid.UUID
 	if err := tx.QueryRow(ctx, lockSQL, id).Scan(&locked); err != nil {
-		_ = tx.Rollback(context.WithoutCancel(ctx))
 		if mode == LockSkipLocked && errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrLockUnavailable
 		}
@@ -80,10 +101,26 @@ func (s *Store) BeginSemantic(ctx context.Context, id uuid.UUID, mode LockMode) 
 	}
 	var dbNow time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
-		_ = tx.Rollback(context.WithoutCancel(ctx))
 		return nil, MapError("capture database time", err)
 	}
 	return &SemanticTx{store: s, tx: tx, executionID: locked, dbNow: dbNow}, nil
+}
+
+// AdoptSemantic wraps a newly inserted execution row that the supplied
+// transaction already owns. It is used only by the start path after the insert
+// has established row ownership and database time has been captured.
+func (s *Store) AdoptSemantic(tx pgx.Tx, id uuid.UUID, dbNow time.Time) (*SemanticTx, error) {
+	if tx == nil || id == uuid.Nil || dbNow.IsZero() {
+		return nil, fmt.Errorf("%w: incomplete adopted semantic transaction", flowerr.ErrInvalid)
+	}
+	return &SemanticTx{store: s, tx: tx, executionID: id, dbNow: dbNow}, nil
+}
+
+func (tx *SemanticTx) PGX() pgx.Tx {
+	if tx == nil {
+		return nil
+	}
+	return tx.tx
 }
 
 func (tx *SemanticTx) DBNow() time.Time {
@@ -307,16 +344,29 @@ func (row JournalRow) copyValues() []any {
 }
 
 func (s *Store) History(ctx context.Context, id uuid.UUID, after uint64, limit int) ([]JournalRow, error) {
+	return s.HistoryInTx(ctx, nil, id, after, limit)
+}
+
+// HistoryInTx reads history through tx when supplied so transaction-scoped
+// inspection can observe its own uncommitted Flow writes.
+func (s *Store) HistoryInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, after uint64, limit int) ([]JournalRow, error) {
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
 	}
 	if after > math.MaxInt64 || limit <= 0 || limit > MaxHistoryLimit {
 		return nil, fmt.Errorf("%w: history bounds are invalid", flowerr.ErrInvalid)
 	}
-	rows, err := s.db.Conn.Query(ctx, `SELECT `+joinIdentifiers(journalColumns)+`
-		FROM `+pgschema.Table(s.schema, "flow_journal")+`
+	query := `SELECT ` + joinIdentifiers(journalColumns) + `
+		FROM ` + pgschema.Table(s.schema, "flow_journal") + `
 		WHERE execution_id=$1 AND position>$2
-		ORDER BY position LIMIT $3`, id, int64(after), limit)
+		ORDER BY position LIMIT $3`
+	var rows pgx.Rows
+	var err error
+	if tx != nil {
+		rows, err = tx.Query(ctx, query, id, int64(after), limit)
+	} else {
+		rows, err = s.db.Conn.Query(ctx, query, id, int64(after), limit)
+	}
 	if err != nil {
 		return nil, MapError("read history", err)
 	}

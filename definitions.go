@@ -235,8 +235,8 @@ func WithTimeout(timeout time.Duration) CommandOption {
 			return
 		}
 		state.timeoutSet = true
-		if timeout <= 0 {
-			state.errs = append(state.errs, errors.New("attempt timeout must be positive"))
+		if timeout < time.Millisecond {
+			state.errs = append(state.errs, errors.New("attempt timeout must be at least one millisecond"))
 			return
 		}
 		state.defaults.attemptTimeout = timeout

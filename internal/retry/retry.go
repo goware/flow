@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/goware/flow/internal/canonical"
 )
 
 const DefaultJitter = 0.20
@@ -83,6 +85,39 @@ func DecidePublic(p PublicPolicy, input Input) (Decision, error) {
 		return Decision{}, err
 	}
 	return Decide(p.value, input)
+}
+
+type DurablePolicy struct {
+	MaxAttempts *int            `json:"max_attempts,omitempty"`
+	MaxElapsed  *time.Duration  `json:"max_elapsed,omitempty"`
+	Backoff     []time.Duration `json:"backoff"`
+	Jitter      float64         `json:"jitter"`
+}
+
+func CanonicalPublic(p PublicPolicy) (canonical.Value, error) {
+	if err := ValidatePublic(p); err != nil {
+		return canonical.Value{}, err
+	}
+	value := ValueOf(p)
+	return canonical.Marshal(DurablePolicy{
+		MaxAttempts: value.MaxAttempts, MaxElapsed: value.MaxElapsed,
+		Backoff: value.Backoff, Jitter: value.Jitter,
+	}, 16<<10)
+}
+
+func PublicFromCanonical(data []byte) (PublicPolicy, error) {
+	var durable DurablePolicy
+	if err := canonical.Decode(data, &durable); err != nil {
+		return PublicPolicy{}, err
+	}
+	value := Policy{
+		MaxAttempts: durable.MaxAttempts, MaxElapsed: durable.MaxElapsed,
+		Backoff: slices.Clone(durable.Backoff), Jitter: durable.Jitter,
+	}
+	if err := value.Validate(); err != nil {
+		return PublicPolicy{}, err
+	}
+	return PublicPolicy{value: value}, nil
 }
 
 type Policy struct {

@@ -8,8 +8,10 @@ type ExecutionID string
 type CommandID string
 type EventID string
 type AttemptID string
+type CoordinatorID string
 type JournalEntryID string
 type JournalPosition uint64
+type PlanRevision uint64
 
 type CommandStatus string
 
