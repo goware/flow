@@ -209,6 +209,7 @@ func executeStart(ctx context.Context, client resolvedClient, request store.Star
 		handle.RootCommandID = CommandID(result.RootCommandID.String())
 	}
 	if client.tx == nil && result.Created {
+		client.runtime.wakeCommands()
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationExecution, Operation: "start", Outcome: "created",
 			ExecutionID: handle.ID, Name: request.DefinitionName, Version: request.DefinitionVersion,
@@ -258,6 +259,7 @@ func Issue[A, R any](ctx context.Context, c Client, id ExecutionID, key string, 
 	}
 	commandID := CommandID(result.CommandID.String())
 	if client.tx == nil && result.Created {
+		client.runtime.wakeCommands()
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationCommand, Operation: "issue", Outcome: "created", ExecutionID: id,
 			CommandID: commandID, CommandKey: key, Name: cmd.Name(), Version: cmd.Version(), Queue: command.Queue,

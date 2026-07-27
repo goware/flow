@@ -61,8 +61,44 @@ type ApplicationEventBody struct {
 type TerminalEventBody struct {
 	V          int    `json:"v"`
 	Status     string `json:"status"`
+	Code       string `json:"code,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 	CommandKey string `json:"command_key,omitempty"`
+}
+
+type AttemptStartedBody struct {
+	V                int       `json:"v"`
+	AttemptID        string    `json:"attempt_id"`
+	CommandID        string    `json:"command_id"`
+	CommandKey       string    `json:"command_key"`
+	Attempt          int       `json:"attempt"`
+	StartedAt        time.Time `json:"started_at"`
+	Worker           string    `json:"worker"`
+	LeaseDurationMS  int64     `json:"lease_duration_ms"`
+	ConsumedAttempts int       `json:"consumed_attempts"`
+	BudgetStartedAt  time.Time `json:"budget_started_at"`
+}
+
+type AttemptConcludedBody struct {
+	V                int        `json:"v"`
+	AttemptID        string     `json:"attempt_id"`
+	CommandID        string     `json:"command_id"`
+	CommandKey       string     `json:"command_key"`
+	Attempt          int        `json:"attempt"`
+	Classification   string     `json:"classification"`
+	ConsumedBudget   bool       `json:"consumed_budget"`
+	ConsumedAttempts int        `json:"consumed_attempts"`
+	FinishedAt       time.Time  `json:"finished_at"`
+	NextAttemptAt    *time.Time `json:"next_attempt_at,omitempty"`
+	ErrorCode        string     `json:"error_code,omitempty"`
+	ErrorMessage     string     `json:"error_message,omitempty"`
+}
+
+type CommandSucceededBody struct {
+	V             int             `json:"v"`
+	CommandKey    string          `json:"command_key"`
+	Result        json.RawMessage `json:"result"`
+	CommitApplied bool            `json:"commit_applied"`
 }
 
 var ErrVersion = errors.New("journal body requires a positive integer v")

@@ -465,6 +465,58 @@ type terminalFailure struct {
 	Message string `json:"message"`
 }
 
+type activeCommandAttempt struct {
+	ID               uuid.UUID
+	StartedPosition  int64
+	Ordinal          int
+	ConsumedAttempts int
+}
+
+func (s *Store) lockActiveCommandAttempt(
+	ctx context.Context,
+	semantic *SemanticTx,
+	commandID uuid.UUID,
+	state string,
+) (*activeCommandAttempt, error) {
+	if state != "running" {
+		return nil, nil
+	}
+	var attempt activeCommandAttempt
+	err := semantic.PGX().QueryRow(ctx, `SELECT q.active_attempt_id,c.attempt_ordinal,c.consumed_attempts,
+		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
+		 WHERE execution_id=c.execution_id AND attempt_id=q.active_attempt_id AND entry_kind='attempt_started')
+		FROM `+pgschema.Table(s.schema, "flow_command_queue")+` q
+		JOIN `+pgschema.Table(s.schema, "flow_commands")+` c ON c.command_id=q.command_id
+		WHERE q.command_id=$1 AND q.execution_id=$2 FOR UPDATE OF q`, commandID, semantic.ExecutionID()).
+		Scan(&attempt.ID, &attempt.Ordinal, &attempt.ConsumedAttempts, &attempt.StartedPosition)
+	if err != nil {
+		return nil, MapError("lock active command attempt", err)
+	}
+	return &attempt, nil
+}
+
+func cancelledAttemptEvent(
+	commandID uuid.UUID,
+	key string,
+	attempt activeCommandAttempt,
+	code string,
+	reason string,
+	dbNow time.Time,
+) (JournalEntry, error) {
+	entry, err := NewJournalEntry(AttemptConcluded, journalcodec.AttemptConcludedBody{
+		V: 1, AttemptID: attempt.ID.String(), CommandID: commandID.String(), CommandKey: key,
+		Attempt: attempt.Ordinal, Classification: "cancelled", ConsumedBudget: false,
+		ConsumedAttempts: attempt.ConsumedAttempts, FinishedAt: dbNow, ErrorCode: code, ErrorMessage: reason,
+	})
+	if err != nil {
+		return JournalEntry{}, err
+	}
+	entry.CommandID = clonePointer(&commandID)
+	entry.AttemptID = clonePointer(&attempt.ID)
+	entry.CausationPosition = clonePointer(&attempt.StartedPosition)
+	return entry, nil
+}
+
 func (s *Store) LookupCommandExecution(ctx context.Context, tx pgx.Tx, commandID uuid.UUID) (uuid.UUID, error) {
 	query := `SELECT execution_id FROM ` + pgschema.Table(s.schema, "flow_commands") + ` WHERE command_id=$1`
 	var row pgx.Row
@@ -507,20 +559,34 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	if head.Status != "running" && head.Status != "failing" {
 		return CancelResult{}, fmt.Errorf("%w: execution is terminal", flowerr.ErrTerminal)
 	}
+	activeAttempt, err := s.lockActiveCommandAttempt(ctx, semantic, commandID, state)
+	if err != nil {
+		return CancelResult{}, err
+	}
 
 	commandEvent, err := terminalEvent(commandID, key, "cancelled", reason, "flow.command_cancelled", "command_terminal")
 	if err != nil {
 		return CancelResult{}, err
 	}
-	entries := []JournalEntry{commandEvent}
+	entries := make([]JournalEntry, 0, 4)
+	if activeAttempt != nil {
+		concluded, err := cancelledAttemptEvent(commandID, key, *activeAttempt, "cancelled", reason, semantic.DBNow())
+		if err != nil {
+			return CancelResult{}, err
+		}
+		entries = append(entries, concluded)
+		zero := 0
+		commandEvent.CausationBatchIndex = &zero
+	}
+	terminalIndex := len(entries)
+	entries = append(entries, commandEvent)
 	becameFailing := required && head.Status == "running"
 	if becameFailing {
 		failing, err := NewJournalEntry(ExecutionFailing, journalcodec.TerminalEventBody{V: 1, Status: "failing", Reason: reason, CommandKey: key})
 		if err != nil {
 			return CancelResult{}, err
 		}
-		zero := 0
-		failing.CausationBatchIndex = &zero
+		failing.CausationBatchIndex = clonePointer(&terminalIndex)
 		entries = append(entries, failing)
 	}
 	terminalExecution := required && head.OpenCommands == 1 && head.Mode != DriverPlan
@@ -529,8 +595,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		if err != nil {
 			return CancelResult{}, err
 		}
-		zero := 0
-		executionEvent.CausationBatchIndex = &zero
+		executionEvent.CausationBatchIndex = clonePointer(&terminalIndex)
 		entries = append(entries, executionEvent)
 	}
 	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: entries})
@@ -540,7 +605,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	failure := terminalFailure{Code: "cancelled", Message: reason}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
 		SET state='cancelled',terminal_failure=$2::jsonb,terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
-		WHERE command_id=$1`, commandID, jsonString(failure), journal.Journal[0].Position, semantic.DBNow()); err != nil {
+		WHERE command_id=$1`, commandID, jsonString(failure), journal.Journal[terminalIndex].Position, semantic.DBNow()); err != nil {
 		return CancelResult{}, MapError("cancel command", err)
 	}
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, commandID); err != nil {
@@ -597,7 +662,7 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		return CancelResult{}, fmt.Errorf("%w: execution is terminal", flowerr.ErrTerminal)
 	}
 
-	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key FROM `+
+	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,state FROM `+
 		pgschema.Table(s.schema, "flow_commands")+`
 		WHERE execution_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired','skipped')
 		ORDER BY command_id FOR UPDATE`, head.ID)
@@ -605,13 +670,15 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		return CancelResult{}, MapError("lock execution commands for cancellation", err)
 	}
 	type command struct {
-		id  uuid.UUID
-		key string
+		id      uuid.UUID
+		key     string
+		state   string
+		attempt *activeCommandAttempt
 	}
 	commands := make([]command, 0, head.OpenCommands)
 	for rows.Next() {
 		var item command
-		if err := rows.Scan(&item.id, &item.key); err != nil {
+		if err := rows.Scan(&item.id, &item.key, &item.state); err != nil {
 			rows.Close()
 			return CancelResult{}, MapError("scan execution commands for cancellation", err)
 		}
@@ -634,18 +701,43 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		}
 		return bytes.Compare(a.id[:], b.id[:])
 	})
+	for index := range commands {
+		attempt, err := s.lockActiveCommandAttempt(ctx, semantic, commands[index].id, commands[index].state)
+		if err != nil {
+			return CancelResult{}, err
+		}
+		commands[index].attempt = attempt
+	}
 
-	entries := make([]JournalEntry, 0, len(commands)+1)
+	entries := make([]JournalEntry, 0, len(commands)*2+1)
+	terminalBatchIndex := make(map[uuid.UUID]int, len(commands))
 	for _, command := range commands {
+		if command.attempt != nil {
+			concluded, err := cancelledAttemptEvent(command.id, command.key, *command.attempt,
+				"execution_cancelled", reason, semantic.DBNow())
+			if err != nil {
+				return CancelResult{}, err
+			}
+			entries = append(entries, concluded)
+		}
 		entry, err := terminalEvent(command.id, command.key, "cancelled", reason, "flow.command_cancelled", "command_terminal")
 		if err != nil {
 			return CancelResult{}, err
 		}
+		if command.attempt != nil {
+			index := len(entries) - 1
+			entry.CausationBatchIndex = &index
+		}
+		terminalBatchIndex[command.id] = len(entries)
 		entries = append(entries, entry)
 	}
 	executionEvent, err := executionTerminalEvent("cancelled", reason, "flow.execution_cancelled")
 	if err != nil {
 		return CancelResult{}, err
+	}
+	if len(entries) > 0 {
+		index := len(entries) - 1
+		executionEvent.CausationBatchIndex = &index
 	}
 	entries = append(entries, executionEvent)
 	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: entries})
@@ -653,10 +745,10 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		return CancelResult{}, err
 	}
 	failure := jsonString(terminalFailure{Code: "cancelled", Message: reason})
-	for index, command := range commands {
+	for _, command := range commands {
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
 			SET state='cancelled',terminal_failure=$2::jsonb,terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
-			WHERE command_id=$1`, command.id, failure, journal.Journal[index].Position, semantic.DBNow()); err != nil {
+			WHERE command_id=$1`, command.id, failure, journal.Journal[terminalBatchIndex[command.id]].Position, semantic.DBNow()); err != nil {
 			return CancelResult{}, MapError("cancel execution command", err)
 		}
 	}
@@ -679,7 +771,13 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 }
 
 func terminalEvent(commandID uuid.UUID, key, status, reason, name, class string) (JournalEntry, error) {
-	body, err := NewJournalEntry(EventRecorded, journalcodec.TerminalEventBody{V: 1, Status: status, Reason: reason, CommandKey: key})
+	return terminalEventWithCode(commandID, key, status, status, reason, name, class)
+}
+
+func terminalEventWithCode(commandID uuid.UUID, key, status, code, reason, name, class string) (JournalEntry, error) {
+	body, err := NewJournalEntry(EventRecorded, journalcodec.TerminalEventBody{
+		V: 1, Status: status, Code: code, Reason: reason, CommandKey: key,
+	})
 	if err != nil {
 		return JournalEntry{}, err
 	}

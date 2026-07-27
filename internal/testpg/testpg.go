@@ -23,7 +23,17 @@ type Database struct {
 }
 
 func Open(t testing.TB) Database {
+	return OpenWithMaxConns(t, 12)
+}
+
+// OpenWithMaxConns creates an isolated real-PostgreSQL test database whose
+// application pool has the requested capacity. Small pools are useful for
+// proving that Flow releases its connection before invoking application code.
+func OpenWithMaxConns(t testing.TB, maxConns int32) Database {
 	t.Helper()
+	if maxConns <= 0 {
+		t.Fatalf("max PostgreSQL connections must be positive")
+	}
 	url := os.Getenv("FLOW_TEST_DATABASE_URL")
 	if url == "" {
 		url = defaultURL
@@ -35,7 +45,7 @@ func Open(t testing.TB) Database {
 	if password := os.Getenv("FLOW_TEST_DATABASE_PASSWORD"); password != "" {
 		config.ConnConfig.Password = password
 	}
-	config.MaxConns = 12
+	config.MaxConns = maxConns
 	db, err := pgkit.ConnectWithPGX("flow-test", config)
 	if err != nil {
 		t.Fatalf("connect PostgreSQL: %v", err)

@@ -38,6 +38,7 @@ const (
 	IngressBeforeJournal          Point = "ingress_before_journal"
 	IngressBeforeCommit           Point = "ingress_before_commit"
 	IngressCommitAmbiguous        Point = "ingress_commit_ambiguous"
+	ClaimCommitAmbiguous          Point = "claim_commit_ambiguous"
 )
 
 var ErrInjected = errors.New("flow: injected fault")

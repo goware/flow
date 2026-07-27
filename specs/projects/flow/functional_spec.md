@@ -131,11 +131,19 @@ func (r *Runtime) Stop(ctx context.Context) error
 func (r *Runtime) InTx(tx pgx.Tx) Client
 
 func WithMaxCommandsPerExecution(int) Option // default 1,000; 0 disables
+func WithWorkerConcurrency(int) Option       // process-wide handler capacity
+func WithQueueConcurrency(string, int) Option // optional smaller lane capacity
+func WithCommandLease(time.Duration) Option
+func WithPollInterval(time.Duration) Option
+func WithShutdownGrace(time.Duration) Option
+func WithObserver(Observer) Option
 ```
 
 `New` validates configuration and schema compatibility, starts no goroutines, and never migrates implicitly. `*Runtime` implements `Client`, so it can be passed directly to every operation whether or not `Run` is called. Registrations are accepted only before `Run`, which may be called once.
 
 `WithMaxCommandsPerExecution` configures the default ceiling accepted by executions started through that runtime. The chosen value is copied onto the execution and recorded in `ExecutionStarted`; every replica subsequently enforces the stored value rather than its own runtime default. Changing the runtime option affects only newly created executions. An existing execution, including one returned by an idempotent repeated `.Execute`, keeps its accepted ceiling.
+
+Worker concurrency is process-local and globally bounded. An optional queue-lane limit may only make one lane's local bound smaller; all lanes continue to share the global capacity, and neither setting limits the durable backlog. Lease, poll, and shutdown options are operational runtime settings, never execution or command identity. Invalid, duplicate, or non-positive values fail `New`.
 
 `Client` is a small sealed capability implemented by `*Runtime` and the transaction-scoped value returned by `InTx`. Application code does not construct one. API processes create a runtime and simply do not call `Run`; mixed processes and specialized worker pools may use the same type against one database.
 

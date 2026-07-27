@@ -3,9 +3,12 @@ package flow
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/definition"
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/pgkit/v2"
@@ -20,11 +23,16 @@ type Option interface {
 }
 
 type runtimeOptions struct {
-	schema      string
-	maxCommands int
-	observer    Observer
-	faults      fault.Hook
-	errs        []error
+	schema            string
+	maxCommands       int
+	workerConcurrency int
+	queueConcurrency  map[string]int
+	commandLease      time.Duration
+	pollInterval      time.Duration
+	shutdownGrace     time.Duration
+	observer          Observer
+	faults            fault.Hook
+	errs              []error
 }
 
 type runtimeOptionFunc func(*runtimeOptions)
@@ -56,19 +64,99 @@ func WithObserver(observer Observer) Option {
 	})
 }
 
+// WithWorkerConcurrency bounds command handlers running in this process.
+func WithWorkerConcurrency(concurrency int) Option {
+	return runtimeOptionFunc(func(options *runtimeOptions) {
+		if concurrency <= 0 {
+			options.errs = append(options.errs, errors.New("worker concurrency must be positive"))
+			return
+		}
+		options.workerConcurrency = concurrency
+	})
+}
+
+// WithQueueConcurrency optionally gives one queue lane a smaller process-local
+// handler limit. The lane still shares the runtime's global worker capacity.
+func WithQueueConcurrency(queue string, concurrency int) Option {
+	return runtimeOptionFunc(func(options *runtimeOptions) {
+		if err := definition.ValidateName(queue); err != nil {
+			options.errs = append(options.errs, errors.New("queue concurrency requires a valid queue name"))
+			return
+		}
+		if concurrency <= 0 {
+			options.errs = append(options.errs, errors.New("queue concurrency must be positive"))
+			return
+		}
+		if options.queueConcurrency == nil {
+			options.queueConcurrency = make(map[string]int)
+		}
+		if _, exists := options.queueConcurrency[queue]; exists {
+			options.errs = append(options.errs, errors.New("queue concurrency configured more than once"))
+			return
+		}
+		options.queueConcurrency[queue] = concurrency
+	})
+}
+
+// WithCommandLease configures the renewable ownership lease for command attempts.
+func WithCommandLease(lease time.Duration) Option {
+	return runtimeOptionFunc(func(options *runtimeOptions) {
+		if lease < 30*time.Millisecond {
+			options.errs = append(options.errs, errors.New("command lease must be at least 30 milliseconds"))
+			return
+		}
+		options.commandLease = lease
+	})
+}
+
+// WithPollInterval configures the fallback scheduler and maintenance poll.
+func WithPollInterval(interval time.Duration) Option {
+	return runtimeOptionFunc(func(options *runtimeOptions) {
+		if interval <= 0 {
+			options.errs = append(options.errs, errors.New("poll interval must be positive"))
+			return
+		}
+		options.pollInterval = interval
+	})
+}
+
+// WithShutdownGrace configures how long Run waits before interrupting handlers.
+func WithShutdownGrace(grace time.Duration) Option {
+	return runtimeOptionFunc(func(options *runtimeOptions) {
+		if grace < 0 {
+			options.errs = append(options.errs, errors.New("shutdown grace must not be negative"))
+			return
+		}
+		options.shutdownGrace = grace
+	})
+}
+
 // Runtime is a configured PostgreSQL-backed Flow client. New starts no
 // goroutines; execution operations are usable before background processing is
 // started.
 type Runtime struct {
-	db          *pgkit.DB
-	store       *store.Store
-	schema      string
-	maxCommands int
-	observer    Observer
-	faults      fault.Hook
+	db                *pgkit.DB
+	store             *store.Store
+	schema            string
+	maxCommands       int
+	workerConcurrency int
+	queueConcurrency  map[string]int
+	commandLease      time.Duration
+	pollInterval      time.Duration
+	shutdownGrace     time.Duration
+	instanceID        uuid.UUID
+	observer          Observer
+	faults            fault.Hook
 
-	mu     sync.RWMutex
-	closed bool
+	mu          sync.RWMutex
+	closed      bool
+	lifecycle   runtimeLifecycle
+	registry    *runtimeRegistry
+	runCancel   context.CancelFunc
+	runDone     chan struct{}
+	wake        *wakeHub
+	active      *activeCommands
+	workerGroup sync.WaitGroup
 }
 
 // New validates configuration and schema compatibility without migrating or
@@ -76,6 +164,8 @@ type Runtime struct {
 func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	options := runtimeOptions{
 		schema: defaultSchema, maxCommands: defaultMaxCommandsPerExecution,
+		workerConcurrency: max(1, runtime.GOMAXPROCS(0)), commandLease: 60 * time.Second,
+		pollInterval: time.Second, shutdownGrace: 30 * time.Second,
 		observer: NopObserver{}, faults: fault.None{},
 	}
 	for _, option := range opts {
@@ -97,8 +187,24 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	}
 	return &Runtime{
 		db: db, store: repository, schema: options.schema, maxCommands: options.maxCommands,
-		observer: options.observer, faults: options.faults,
+		workerConcurrency: options.workerConcurrency, commandLease: options.commandLease,
+		queueConcurrency: cloneIntMap(options.queueConcurrency),
+		pollInterval:     options.pollInterval, shutdownGrace: options.shutdownGrace,
+		instanceID: uuid.New(),
+		observer:   options.observer, faults: options.faults, lifecycle: runtimeCreated,
+		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(),
 	}, nil
+}
+
+func cloneIntMap(source map[string]int) map[string]int {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[string]int, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func (*Runtime) flowClient() {}

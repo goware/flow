@@ -102,6 +102,10 @@ func History(ctx context.Context, c Client, id ExecutionID, opts ...HistoryOptio
 		// a missing execution from an empty page without another query.
 		return nil, newError(ErrNotFound, "history", "execution", string(id), "execution does not exist")
 	}
+	return historyEntries(rows), nil
+}
+
+func historyEntries(rows []store.JournalRow) []HistoryEntry {
 	result := make([]HistoryEntry, len(rows))
 	for index, row := range rows {
 		entry := HistoryEntry{
@@ -148,5 +152,5 @@ func History(ctx context.Context, c Client, id ExecutionID, opts ...HistoryOptio
 		}
 		result[index] = entry
 	}
-	return result, nil
+	return result
 }

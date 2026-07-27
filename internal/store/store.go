@@ -185,6 +185,9 @@ type ApplyResult struct {
 	Journal []JournalRow
 }
 
+// Apply appends exactly one deterministically ordered semantic batch through a
+// SemanticTx value. Internal batch operations may derive another value over
+// the same owned PostgreSQL transaction and DBNow after the first application.
 func (tx *SemanticTx) Apply(ctx context.Context, changes PersistedChangeSet) (ApplyResult, error) {
 	if err := tx.ensureOpen("apply"); err != nil {
 		return ApplyResult{}, err
@@ -230,6 +233,12 @@ func (tx *SemanticTx) Apply(ctx context.Context, changes PersistedChangeSet) (Ap
 	}
 	tx.applied = true
 	return ApplyResult{Journal: cloneJournalRows(rows)}, nil
+}
+
+func (tx *SemanticTx) continueBatch() *SemanticTx {
+	return &SemanticTx{
+		store: tx.store, tx: tx.tx, executionID: tx.executionID, dbNow: tx.dbNow,
+	}
 }
 
 func (tx *SemanticTx) nextJournalPosition(ctx context.Context) (int64, error) {
