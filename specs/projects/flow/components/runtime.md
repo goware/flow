@@ -6,7 +6,7 @@ status: draft
 
 ## 1. Purpose and scope
 
-The runtime is disposable process machinery around the durable store and deterministic engine. It owns registration, process lifecycle, command/coordinator dispatch, handler invocation, lease renewal, polling and optional notifications, maintenance, shutdown, transaction-bound clients, inspection entry points, observations, and fault injection.
+The runtime is disposable process machinery around the durable store and deterministic engine. It owns registration, process lifecycle, command/coordinator scheduling, dirty-plan reconciliation, handler invocation, lease renewal, polling and optional notifications, maintenance, shutdown, transaction-bound clients, inspection entry points, observations, and fault injection.
 
 Correctness cannot depend on any runtime field surviving a crash. A new compatible replica reconstructs work solely from PostgreSQL.
 
@@ -28,6 +28,7 @@ type Runtime struct {
     group     runGroup
 
     workers   *commandScheduler
+    plans     *planScheduler
     coords    *coordinatorScheduler
     leases    *leaseManager
     wake      *wakeHub
@@ -66,9 +67,10 @@ The functional defaults remain normative:
 | event | 64 KiB |
 | coordinator state | 256 KiB |
 | dependencies per plan command | 100 |
+| plan reconciliation concurrency | 1; configurable independently of command workers |
 | PostgreSQL schema | `public`; every Flow table retains its fixed `flow_` prefix |
 
-Process concurrency defaults to `max(1, GOMAXPROCS)` and is configurable globally and per queue. A claim batch is capped by immediately free slots and a small operational maximum; it is not a durable or public queue limit. Invalid lease/renewal relationships, negative concurrency, empty queue names, unsafe schema names, invalid sizes, or negative command ceilings fail `New`.
+Command-worker concurrency defaults to `max(1, GOMAXPROCS)` and is configurable globally and per queue. Plan reconciliation uses its separate default above so one runtime holds at most one connection for plan code unless the application opts in to more. A command claim batch is capped by immediately free slots and a small operational maximum; it is not a durable or public queue limit. Invalid lease/renewal relationships, negative concurrency, empty queue names, unsafe schema names, invalid sizes, or negative command ceilings fail `New`.
 
 Environment-variable parsing belongs to the application. Runtime options are typed and immutable after `New`.
 
@@ -95,28 +97,21 @@ type registry struct {
 
 It is built under a mutex while created, deeply copied/frozen by `Run`, and read lock-free afterward. Duplicate and codec/handler conflicts are rejected before any work starts.
 
-### 4.2 Plan compatibility at the committing replica
+### 4.2 Plan reconciliation capability
 
-A plan is evaluated in the same transaction as a relevant fact or command terminal event. Therefore any runtime that performs such a transition must possess the execution's exact plan name/version:
+Application events and terminal command outcomes never execute plan code on the committing replica. They commit their own durable transition, resolve persisted dependencies and `Await` rows, and set `flow_executions.plan_dirty = true`. Consequently, API processes, monitors, and specialized command pools do not need to register the plan whose execution they advance.
 
-- command dispatch in a plan-driven execution requires both the command worker and plan registration;
-- `Publish` and command cancellation against a plan execution require that plan on the calling runtime only when durable routing metadata says they trigger evaluation;
-- wait-expiry maintenance for a plan execution runs only on a replica with that plan;
-- plan start can use the receiver's definition directly, but future processing still requires deployment registration.
+A plan scheduler may reconcile a dirty execution only when its registry contains the execution's exact plan name/version. Missing plan code leaves the execution durably dirty and unclaimed; inspection reports `missing_plan_definition`. A compatible replica added later can take over without republishing an event or repeating a worker effect.
 
-`Issue` creation is not a plan input and does not evaluate the plan. Likewise, publishing an event used only by persisted `Await` rows performs generic wait/readiness resolution and needs no plan registration. If the same event is present in the latest `Fact`/`Facts` read set, the exact plan is required so its declarations commit with the fact.
-
-If a required capability is absent, the operation writes nothing and returns structured `ErrInvalidState`, or the dispatcher leaves the work unclaimed. Inspection reports `missing_plan_definition`. This preserves atomic plan semantics instead of splitting a transition and its declarations across transactions.
-
-Direct execution needs only the command worker. Coordinator command workers do not need the coordinator definition to settle; their terminal events remain in the journal until a compatible coordinator runtime consumes them. Coordinator delivery itself requires the exact coordinator version and matching registered subscription.
+Direct execution needs only the command worker. Coordinator command workers likewise do not need the coordinator definition to settle; their terminal events remain in the journal until a compatible coordinator runtime consumes them. Coordinator delivery itself requires the exact coordinator version and matching registered subscription.
 
 ### 4.3 Rolling deployment
 
-Claim filters are built from the immutable registry. Old replicas never claim new command versions; a coordinator replica never claims an unknown coordinator or event/command subscription version; plan commands never settle on a replica with the wrong plan version. Unknown work remains pending with no retry consumption.
+Claim filters are built from the immutable registry. Old replicas never claim new command versions; a plan scheduler never claims an unknown plan version; and a coordinator replica never claims an unknown coordinator or event/command subscription version. Unknown work remains pending or dirty with no retry consumption.
 
 Rolling deployment assumes that one durable name/version has one orchestration meaning. The registry can diagnose codec and selector conflicts inside one process but cannot compare Go function bodies across replicas. Material plan or coordinator behavior changes therefore deploy under a new version; intentionally mixing divergent code under the same version is unsupported.
 
-Unclaimable observations distinguish missing command worker, missing plan definition, missing coordinator definition, and no matching coordinator handler. These are deployment gaps, not attempts, and consume no retry budget.
+Unclaimable observations distinguish missing command worker, dirty execution missing a plan definition, missing coordinator definition, and no matching coordinator handler. These are deployment gaps, not attempts, and consume no retry budget.
 
 ## 5. Command scheduler
 
@@ -150,17 +145,17 @@ The scheduler uses deficit round-robin across nonempty queues so a busy default 
 
 ### 5.2 Probe and no-wait claim
 
-Probe uses the denormalized dispatch index and the exact local command pairs across their stored queues. It additionally filters plan-driven candidates by exact registered plan pair using immutable plan columns denormalized into dispatch. The probe returns queue names; the scheduler applies global/per-queue capacity and fairness before claim.
+Probe uses the denormalized queue index and the exact local command pairs across their stored queues. The probe returns queue names; the scheduler applies global/per-queue capacity and fairness before claim. Command ownership does not depend on plan registration.
 
 Candidates are hints. The scheduler groups by execution, opens a skip-locked semantic transaction, locks the execution first and candidate commands second, and revalidates:
 
 - execution remains running/failing in a state that permits this command;
-- definition and plan capability are still locally present;
-- command/dispatch state and schedule agree;
+- the command definition is still locally present;
+- command/queue state and schedule agree;
 - database time has reached `next_run_at`;
 - execution, retry budget, and wait deadlines have not already ended it.
 
-It may claim several commands from the same execution in one short commit, bounded by free slots. Expired budgets/deadlines are settled terminally in that transaction instead of invoking the handler. Successful claim stores the current attempt ID and lease on each dispatch row and appends its `AttemptStarted` journal entry; it creates no separate attempt row. Handler goroutines start only after commit success.
+It may claim several commands from the same execution in one short commit, bounded by free slots. Expired budgets/deadlines are settled terminally in that transaction instead of invoking the handler. Successful claim stores the current attempt ID and lease on each queue row and appends its `AttemptStarted` journal entry; it creates no separate attempt row. Handler goroutines start only after commit success.
 
 No claim waits for another execution or work row. A skipped/busy/stale candidate returns its reserved capacity and the loop probes again or sleeps.
 
@@ -175,9 +170,19 @@ After an empty claim, the lane waits for the earliest of:
 
 The wake generation is sampled before the probe and passed to the wait, closing the hint-between-check-and-sleep race. Timers are local latency aids only; claim revalidates database time.
 
-## 6. Worker invocation
+## 6. Plan reconciliation scheduler
 
-### 6.1 Preparing work
+Plan reconciliation has its own small, configurable concurrency limit and never consumes a command-worker slot. The scheduler probes the partial dirty-plan index using the exact plan pairs in its frozen registry, ordered by the first unconsumed trigger's `plan_dirty_since`, then claims execution rows with `FOR UPDATE SKIP LOCKED`. Coalesced triggers do not move that timestamp. It holds no leased local backlog: one claimed execution is evaluated and committed in that same short transaction.
+
+For each claim the runtime loads the durable plan snapshot, evaluates the pure plan to the engine's bounded fixed point, appends the complete reconciliation batch including `PlanReconciled`, advances plan revision and inspection diagnostics, and clears `plan_dirty`. Several facts or command outcomes committed before the claim intentionally coalesce into one evaluation against the complete snapshot. A transaction rollback leaves the dirty bit set, so another compatible replica can retry safely.
+
+Plan code must be CPU-bounded and perform no I/O. The command ceiling bounds monotonic declaration growth; separate plan concurrency protects the connection pool. A missing definition, busy execution lock, or stale probe is skipped without waiting. A deterministic plan defect is recorded and terminalizes the execution in the reconciliation transaction; it cannot roll back application work that committed earlier.
+
+After an empty probe the scheduler waits for a generation-counted plan hint, the fallback poll interval, or shutdown. Hints are optional and carry only that plan work may exist.
+
+## 7. Worker invocation
+
+### 7.1 Preparing work
 
 The claim result contains canonical arguments, accepted policy/timing, command metadata, and active attempt fence. Before user code, the runtime:
 
@@ -190,23 +195,23 @@ The claim result contains canonical arguments, accepted policy/timing, command m
 
 Decode/type incompatibility for a registered durable version is a permanent safe failure and an operational alert; it is never retried indefinitely as infrastructure noise.
 
-### 6.2 Running
+### 7.2 Running
 
 No pool connection or transaction is held while the worker runs. Panic recovery captures a bounded redacted stack fingerprint, not arbitrary arguments or locals. A context uses cancellation causes to distinguish shutdown, lost lease, command/execution cancellation, and timeouts.
 
 The runtime unregisters the active lease only after settlement has either committed, established loss of ownership, or delegated recovery to lease expiry. It does not assume that a locally returned handler still owns the command.
 
-### 6.3 Settling
+### 7.3 Settling
 
 Success invokes the engine/store settlement from the architecture. The runtime retries only the short database transaction with the already canonical decision buffer. If the registered commit function is present, the store exposes the current `pgx.Tx` through the narrow `flow.Tx` adapter only after all Flow locks/writes are acquired.
 
-On commit-function failure the success transaction rolls back. This includes any plan defect discovered while evaluating that candidate success: neither the success nor `PlanFailed` existed outside the rolled-back transaction. The runtime classifies the commit-function error and starts a fresh fenced conclusion transaction, which either schedules retry or fails the command. The application function may run again after a deadlock/rollback and must be deterministic/idempotent from its durable inputs.
+On commit-function failure the success transaction rolls back. The runtime classifies the commit-function error and starts a fresh fenced conclusion transaction, which either schedules retry or fails the command. Plan evaluation is not part of either worker transaction. The application function may run again after a deadlock/rollback and must be deterministic/idempotent from its durable inputs.
 
 If commit outcome is ambiguous, the runtime does not blindly run a second success settlement. It queries the stable attempt/command identity: terminal success means done; still-running same fence permits retrying the settlement; changed fence means lost ownership.
 
 External effects performed by the worker before settlement may repeat after crash or lease takeover. Documentation and observations expose `CommandID` as the preferred external idempotency key.
 
-## 7. Lease manager
+## 8. Lease manager
 
 The lease manager owns only active attempts in this process:
 
@@ -228,33 +233,33 @@ Renewal is scheduled near one third of lease duration with bounded deterministic
 
 The manager never reacquires, resurrects, or extends an already expired token. Renewals append no journal entry and do not move status, budget, schedule, or attempt-start timestamps.
 
-## 8. Coordinator scheduler
+## 9. Coordinator scheduler
 
-### 8.1 Selecting deliveries
+### 9.1 Selecting deliveries
 
-One loop probes active coordinator instances whose exact definition is registered locally. If an instance is idle, the store/engine selects start activation first or the lowest matching retained event above its inbox and persists a stable delivery key. Ordinary event selectors use journal routing columns; `OnOutcome` selectors join a terminal row's `command_id` to the immutable command name/version projection. If ready/retry-wait and due, claim follows the same execution-first skip-locked pattern as commands and appends `AttemptStarted`.
+One loop probes active coordinator instances whose exact definition is registered locally. If an instance is idle, the store/engine selects start activation first or the lowest matching retained event above its inbox and persists a stable delivery key. Ordinary event selectors use indexed journal selector columns; `OnOutcome` selectors join a terminal row's `command_id` to the immutable command name/version projection. If ready/retry-wait and due, claim follows the same execution-first skip-locked pattern as commands and appends `AttemptStarted`.
 
 The local selector set includes ordinary `On` event selectors and terminal command selectors for `OnOutcome`. The journal query can jump over unmatched entries. Early events are retained and therefore match after start/instance creation.
 
-### 8.2 Capacity and serialization
+### 9.2 Capacity and serialization
 
 Coordinator decisions use a separate configurable semaphore because they should be short and must not be starved by long workers. There is at most one selected/running delivery per instance, while different coordinators and command workers run concurrently.
 
 No database connection is held during the handler. The runtime decodes current state and received payload, invokes the exact frozen handler, and stages changes. A lease manager fences it like a worker.
 
-### 8.3 Settlement and retry
+### 9.3 Settlement and retry
 
 Nil handler return settles state revision, inbox/start acknowledgment, `CoordinatorTransition`, events, commands, and explicit completion atomically. The command ceiling is checked before any output. Handler error discards all mutated state/output and applies coordinator delivery retry policy to the same key; later events cannot overtake it.
 
 Permanent/exhausted error or deterministic output defect appends `CoordinatorFailed`, fails the execution, and cancels work. A process crash after handler code but before commit simply redelivers the same start/event after lease recovery.
 
-## 9. Notifications and polling
+## 10. Notifications and polling
 
-### 9.1 Correctness boundary
+### 10.1 Correctness boundary
 
 Every loop can operate with polling only. Notification payloads never carry work, state, payloads, results, errors, positions that act as checkpoints, or ownership. A missed, duplicated, malformed, or reordered notification changes latency only.
 
-### 9.2 Channel and payload
+### 10.2 Channel and payload
 
 The channel is `flow_` plus a fixed-length lowercase hex digest of normalized schema and database identity. The notifier obtains one session-capable `pgx.Conn`; when the application uses a transaction-pooling proxy it may provide a separate listener connector. Without one, the runtime is intentionally poll-only.
 
@@ -262,27 +267,28 @@ Payloads are small versioned hints:
 
 ```json
 {"v":1,"kind":"queue","key":"default"}
+{"v":1,"kind":"plan","key":"<opaque-plan-pair>"}
 {"v":1,"kind":"execution","key":"<opaque-id>"}
 ```
 
 Queue and execution hints are deduplicated within the semantic transaction, with at most one of each affected key. Unknown payload versions trigger a broad local wake rather than failure.
 
-### 9.3 Listener lifecycle
+### 10.3 Listener lifecycle
 
 On initial connect and every reconnect:
 
 1. establish session and `LISTEN`;
-2. publish a catch-up generation for every registered queue and coordinator loop;
+2. publish a catch-up generation for every registered queue, plan, and coordinator loop;
 3. receive until error/cancellation;
 4. close and reconnect with capped jittered backoff.
 
 Catch-up after `LISTEN` closes the connection-gap race. The generation-counted wake hub uses capacity-one channels, coalesces duplicates, and never blocks a transaction observer or listener.
 
-### 9.4 Transactional NOTIFY cost
+### 10.4 Transactional NOTIFY cost
 
 PostgreSQL serializes portions of transactional notification commit processing. The implementation benchmarks notify-enabled and poll-only throughput before enabling hints by default for production guidance. Because polling is complete, operators can disable notifications without feature loss. A future decoupled best-effort hint flusher is compatible, but is not required in M1.
 
-## 10. Maintenance
+## 11. Maintenance
 
 Maintenance has no elected leader. Each task performs a bounded stale probe, then enters the ordinary semantic transaction with state/fence revalidation.
 
@@ -290,16 +296,16 @@ Maintenance has no elected leader. Each task performs a bounded stale probe, the
 |---|---|---|
 | command lease expiry | none | conclude lost attempt and restore persisted schedule without budget use |
 | coordinator lease expiry | exact coordinator version | redeliver same stable delivery |
-| `Within` expiry | exact plan for plan-driven execution | expire command from its persisted deadline, ignoring any fact recorded later; resolve dependencies and re-evaluate plan |
+| `Within` expiry | none | expire command from its persisted deadline, ignoring any fact recorded later; resolve dependencies and mark a plan execution dirty |
 | execution deadline | none | expire execution, cancel commands/coordinator, no failure branches |
 | unclaimable scan | none | emit safe counts/reasons only |
-| consistency audit | none | detect impossible projection/dispatch/counter shapes; never silently rewrite semantic history |
+| consistency audit | none | detect impossible projection/queue/counter shapes; never silently rewrite semantic history |
 
 There is no due-retry or due-delay mover. Time eligibility is a claim predicate. Full maintenance batches self-wake to drain backlog rather than waiting a complete interval.
 
-A consistency audit may repair a purely derived missing wake or delete a provably orphaned nonsemantic dispatch row only through a named, journal-neutral reconciliation rule. Any repair that changes settled command/execution meaning is an administrative future capability, not automatic maintenance.
+A consistency audit may repair a purely derived missing wake or delete a provably orphaned nonsemantic queue row only through a named, journal-neutral reconciliation rule. Any repair that changes settled command/execution meaning is an administrative future capability, not automatic maintenance.
 
-## 11. Graceful shutdown
+## 12. Graceful shutdown
 
 `Stop` and parent context cancellation execute:
 
@@ -315,15 +321,15 @@ A consistency audit may repair a purely derived missing wake or delete a provabl
 
 A shutdown release never acknowledges work. `Stop` context expiry may return while database leases remain; fencing and expiry still guarantee recovery. There is no unsafe force-complete API.
 
-## 12. Runtime as Client and transaction composition
+## 13. Runtime as Client and transaction composition
 
-### 12.1 Ordinary client
+### 13.1 Ordinary client
 
 Execution methods, `Issue`, `Publish`, cancellation, and inspection borrow short connections from `pgkit.DB`. They use the same engine/store operations as background runtime paths. They never invoke a worker or coordinator inline.
 
 Bound definitions hold the `Client` interface, not `*Runtime`, so API-only and transaction-scoped use share the same surface.
 
-### 12.2 Transaction-scoped client
+### 13.2 Transaction-scoped client
 
 `InTx(pgx.Tx)` wraps the supplied transaction:
 
@@ -334,17 +340,15 @@ Bound definitions hold the `Client` interface, not `*Runtime`, so API-only and t
 - maps `pgx.ErrTxClosed` to `ErrClosed`;
 - emits no commit-dependent observation because pgx exposes no general post-commit hook.
 
-A typed plan-defect error may accompany a terminal failure change set staged inside the caller's transaction. Returning that error from a `pgx.BeginFunc` callback rolls the change set back; handling it and allowing the caller transaction to commit retains the terminal history. The runtime does neither implicitly and reports no post-commit observation in either case.
-
 The narrow `flow.Tx` passed to commit functions is a different sealed capability: it permits application SQL but not Flow operations or transaction control.
 
-### 12.3 Plan-aware ingress
+### 13.3 Plan-independent ingress
 
-An ingress operation locks the execution and loads its current plan-routing metadata before writing. If the mutation changes an input the plan reads, the runtime resolves the exact plan from its registry and evaluates it in that transaction. If the capability is absent, the operation rolls back and returns `ErrInvalidState`.
+Ingress locks the execution, appends its durable mutation, applies generic persisted dependency/`Await` resolution, and marks the execution dirty when the mutation is a plan-visible fact or terminal command outcome. It never resolves or calls Go plan code and therefore never fails because a plan definition is absent. `Issue` creates a command but is not itself a plan input.
 
-`Issue` and `Await`-only publication need no plan lookup: command creation is not a plan input, and stored wait resolution belongs to the engine. A monitor therefore registers the relevant `PlanDef` only when it publishes an event the plan currently reads through `Fact` or `Facts`; it does not become a worker and need not call `Run`. This routing decision is made under the execution lock, so it cannot race a concurrent plan evaluation that changes the read set.
+The dirty marker and transition commit together. A later plan reconciliation either observes that transition or a still-later snapshot containing it, so monitors need only the event definition and client. This is the same rule for ordinary and transaction-scoped clients.
 
-## 13. Migrations and startup compatibility
+## 14. Migrations and startup compatibility
 
 Public entry points delegate to the store migration component:
 
@@ -356,7 +360,7 @@ func MigrationFS(...MigrateOption) (fs.FS, error)
 
 `New` calls `CheckSchema`; missing/incompatible schema is `ErrSchema`. It does not opportunistically migrate, even in development. Migration roles and runtime roles may be different database users; runtime SQL requires only DML/sequence-free permissions on the `flow_` tables in the configured schema and application permissions used by declared commit functions. The default is the application's `public` schema; choosing another schema changes only qualification, never the fixed table prefix.
 
-## 14. Inspection operations
+## 15. Inspection operations
 
 - `GetExecution` and `LookupExecution` return bounded current summaries. `LookupExecution(typ, key)` treats `typ` as the receiver definition name and searches all driver modes; if the same non-empty key/name exists in more than one mode it returns `ErrConflict` rather than choosing one silently. Stable `ExecutionID` remains unambiguous.
 - `Trace` uses the store's repeatable-read fixed query set and engine projection types.
@@ -365,9 +369,9 @@ func MigrationFS(...MigrateOption) (fs.FS, error)
 - `AwaitExecution` repeatedly reads terminal state, optionally listens for execution hints, and always polls; it consumes no worker slot or durable lease.
 - `ResultOf(ExecutionTrace, ...)` performs typed decode against the trace and definition pair without another query.
 
-Trace labels delayed work as derived `scheduled`, exposes accepted/current command count, missing registrant reasons, current lease age without token, dependency and wait reasons, child closure, attempts reconstructed from journal history plus current delivery state, coordinator inbox, and causation graph. It never invents a `CommandStarted` event.
+Trace labels delayed work as derived `scheduled`, exposes accepted/current command count, plan dirty/revision/quiescence and bounded waiting diagnostics, missing registrant reasons, current lease age without token, dependency and wait reasons, child closure, attempts reconstructed from journal history plus current delivery state, coordinator inbox, and causation graph. It never invents a `CommandStarted` event.
 
-## 15. Observations
+## 16. Observations
 
 The core interface is intentionally small:
 
@@ -386,7 +390,7 @@ Required measurements include:
 - probes, claims, empty claims, free capacity, handler/commit duration;
 - attempt classification, persisted retry time, elapsed/attempt budget use;
 - lease renewal/loss/recovery and long-running attempts;
-- plan evaluation passes, loaded values, nodes, reads, routing skips/assertions, duration;
+- dirty-plan probes, coalesced trigger count, evaluation/fixed-point passes, loaded values, nodes, waiting count, declaration delta, and duration;
 - dependency resolution, wait start/expiry, skip cascade, failure closure;
 - coordinator delivery lag, retry, state size, inbox position, outcome fan-in;
 - notification/poll wake source, reconnect, and latency;
@@ -395,13 +399,13 @@ Required measurements include:
 
 Payloads, results, coordinator state, raw errors, SQL, connection data, and lease tokens are forbidden dimensions.
 
-## 16. Error and panic handling
+## 17. Error and panic handling
 
 Runtime database errors delegate to the schema component's SQLSTATE/constraint mapper. Handler errors delegate to engine classification. Fatal process errors are limited to corrupt registry/internal invariants, incompatible schema discovered after startup, and unrecoverable component startup; ordinary database outages cause backoff and continued polling until context cancellation.
 
 Backoff uses capped full jitter and resets after success. Loops log/observe aggregate repeated errors rather than one record per failed poll. Panics in user worker/coordinator code become attempt outcomes; panics in observer adapters are isolated; panics in internal invariant code stop `Run` after best-effort graceful release because continuing may corrupt meaning.
 
-## 17. `flowtest` package integration
+## 18. `flowtest` package integration
 
 `flowtest` wraps the same definition codecs and engine used in production. It supplies constructors for synthetic `CommandInfo`, PostgreSQL time, facts, outcomes, dependencies, children, command ceilings, and coordinator deliveries. It never imports `internal/store` or requires PostgreSQL.
 
@@ -409,7 +413,7 @@ Worker results expose returned result/error, staged events, child declarations, 
 
 SQL behavior, lock/fence guarantees, actual canonical `bytea` persistence, and application commit SQL remain integration tests against real PostgreSQL.
 
-## 18. Fault injection
+## 19. Fault injection
 
 Test-only named fault points surround:
 
@@ -424,13 +428,15 @@ settle_after_fence
 settle_after_attempt
 settle_after_events
 settle_after_children
-settle_after_plan
 settle_before_commit_function
 settle_after_commit_function
 settle_before_commit
 settle_commit_ambiguous
 coordinator_after_handler
 coordinator_before_inbox_advance
+plan_after_claim
+plan_after_evaluate
+plan_before_commit
 renew_before_result
 maintenance_after_probe
 notify_connect
@@ -440,18 +446,18 @@ migration_each_unit
 
 Fault tests assert durable invariants after runtime restart, not exact goroutine schedules. Hooks are absent from release builds unless an internal test build tag is enabled.
 
-## 19. Test plan
+## 20. Test plan
 
-### 19.1 Lifecycle and registry
+### 20.1 Lifecycle and registry
 
 - New starts no goroutines and rejects invalid/incompatible configuration;
 - Register/Run/Stop state transitions and concurrent Stop calls;
 - duplicate worker/plan/coordinator and subscription conflicts;
 - API-only operations without Run;
-- plan-aware worker claim, routed-ingress refusal when the exact PlanDef is absent, and plan-free `Await`-only publication;
+- plan-independent worker settlement and publication, dirty-plan takeover, and delayed deployment of the exact `PlanDef`;
 - rolling replicas with divergent command, plan, coordinator, and event versions.
 
-### 19.2 Dispatch and leases
+### 20.2 Queue and leases
 
 - no claim beyond immediately free capacity;
 - no database connection held across handler execution;
@@ -461,7 +467,11 @@ Fault tests assert durable invariants after runtime restart, not exact goroutine
 - lease loss, cancellation, shutdown, and ambiguous settlement races;
 - handler deadline precedence and database revalidation.
 
-### 19.3 Coordinator and agents
+### 20.3 Plan, coordinator, and agents
+
+- concurrent plan triggers coalesce without losing declarations;
+- dirty plan claims use skip-locked execution rows, roll back safely, and are recovered by another compatible replica;
+- a plan defect cannot roll back an already committed worker result, event, or commit-function write;
 
 - start activation, early event, sparse match scan, strict matching-position order;
 - failure redelivery with unchanged state/inbox;
@@ -469,7 +479,7 @@ Fault tests assert durable invariants after runtime restart, not exact goroutine
 - optional tool fan-out, durable wait for user input, delayed next turn, crash during tool and between turns;
 - command ceiling fails coordinator decision atomically.
 
-### 19.4 Polling, notification, maintenance, shutdown
+### 20.4 Polling, notification, maintenance, shutdown
 
 - poll-only processes all work;
 - notification after commit and none after rollback;
@@ -479,31 +489,32 @@ Fault tests assert durable invariants after runtime restart, not exact goroutine
 - graceful release consumes no retry budget; database-outage shutdown recovers by expiry;
 - no goroutine, timer, slot, or connection leak under `go test -race`.
 
-### 19.5 Transactions, errors, and safety
+### 20.5 Transactions, errors, and safety
 
-- `InTx` commits/rolls back with application write, performs Flow first, preserves caller ownership of plan-defect commit versus rollback, and inverse order receives a database error without hidden retry;
+- `InTx` commits/rolls back with application writes, performs Flow first, marks plan work dirty atomically, and inverse order receives a database error without hidden retry;
 - transaction-bound definition use after close returns `ErrClosed`;
 - commit-dependent observations are suppressed for bare caller transactions;
 - every constraint maps by name/SQLSTATE;
 - ambiguous commit is re-derived by identity;
 - no error/observation contains payload, token, SQL, or secret.
 
-### 19.6 Benchmarks
+### 20.6 Benchmarks
 
 - end-to-end claim/execute/settle throughput by queue and replica count;
 - execution-row contention for wide fan-out completion;
 - registry filters with rolling-deploy distributions;
+- dirty-plan probe and coalescing throughput with many plans and replicas;
 - 500 active lease renewals;
 - coordinator high-rate delivery and sparse matching;
 - poll latency/load at multiple intervals;
 - transactional notification versus poll-only commit throughput;
 - shutdown at 10, 100, and 1,000 active handlers.
 
-## 20. Acceptance conditions
+## 21. Acceptance conditions
 
 - Runtime correctness and recovery work with notifications disabled and every prior process gone;
 - registration is frozen for `Run`, and claims cannot drift from executable local definitions;
-- plan transitions are accepted only where the exact plan code is available for the same transaction;
+- worker settlement and event publication never require plan code; dirty plan work remains durable until an exact-plan scheduler reconciles it;
 - claimed handlers start only after `AttemptStarted` commits and never hold a database resource while running;
 - immediately free capacity bounds claims, and stale leases cannot settle;
 - coordinator state/inbox/output is serial, fenced, and redeliverable;

@@ -238,14 +238,15 @@ type Snapshot struct {
     Children     map[string][]string
     Groups       map[CommandID][]DependencyGroup
     Waits        map[CommandID][]EventWait
+    JournalThrough JournalPosition
     EventIndex   map[EventSelector][]EventHeader
-    PlanReads    []PlanRead
+    LoadedSelectors map[EventSelector]bool
     Coordinator  *CoordinatorState
     LoadedValues map[valueLocator]canonicalValue
 }
 ```
 
-Commands are keyed by execution-local key. `Children` values are sorted. Event headers contain position and value locator, not necessarily payload bytes. The runtime/store applies in-transaction trigger changes to the snapshot before asking the engine to resolve or evaluate.
+Commands are keyed by execution-local key. `Children` values are sorted. `JournalThrough` fixes the committed prefix for this reconciliation. Event headers contain position and value locator, not necessarily payload bytes, and only selectors discovered by provisional plan passes are loaded. `LoadedSelectors` distinguishes a queried selector with no matches from one not queried yet. The runtime/store applies in-transaction state to the snapshot before asking the engine to resolve or evaluate.
 
 ### 7.2 Change set
 
@@ -253,11 +254,10 @@ Commands are keyed by execution-local key. `Children` values are sorted. Event h
 type ChangeSet struct {
     Expected       []ExpectedState
     Commands       []CommandMutation
-    Dispatch       []DispatchMutation
+    Queue          []QueueMutation
     Groups         []GroupMutation
     Waits          []WaitMutation
-    Attempts       []AttemptMutation
-    PlanReads      []PlanRead
+    Plan           *PlanMutation
     Coordinator    *CoordinatorMutation
     Execution      ExecutionMutation
     Journal        []JournalRecord
@@ -266,7 +266,7 @@ type ChangeSet struct {
 }
 ```
 
-Every mutation names its expected prior state/revision. The store treats a mismatch or wrong affected-row count as lost ownership/invariant failure and rolls back. The engine sorts commands, groups, cascaded terminal records, and wake queues before returning.
+`PlanMutation` contains the dirty/quiescent transition, revision, temporary-read count, and bounded waiting diagnostics; it never contains a persisted complete read set. The store stamps `plan_dirty_since` with supplied database time only on a clean-to-dirty transition and clears it with dirty state. Every mutation names its expected prior state/revision. The store treats a mismatch or wrong affected-row count as lost ownership/invariant failure and rolls back. The engine sorts commands, groups, cascaded terminal records, and wake queues before returning.
 
 ## 8. Plan evaluation
 
@@ -280,6 +280,7 @@ type Plan struct {
     declarations map[string]*planNode
     order        []string
     reads        map[planReadKey]ReadAvailability
+    selectorMisses map[EventSelector]struct{}
     valueMisses  map[valueLocator]struct{}
     defect       error
 }
@@ -297,11 +298,13 @@ Semantics are stable and monotonic:
 
 The internal availability matrix is exactly the functional specification's available/temporary/permanent model. Only temporary reads count against successful completion.
 
-### 8.2 Resumable value loading
+### 8.2 Resumable selector and value loading
 
-The narrow initial snapshot contains all command states and event headers but may omit large bodies. When a read finds a known available value whose bytes are not loaded, it records a `valueMiss` and returns the public zero/false for that provisional pass. The engine discards that pass's declarations, returns `NeedValues`, and the store loads all requested locators in one query. The pure plan is invoked again.
+The narrow initial snapshot contains command/topology state and the fixed journal high-water position, but no application-event scan. When `Fact` or `Facts` first consults an unloaded selector, it records a `selectorMiss` and returns the public zero/false for that provisional pass. The engine discards that pass's declarations, returns `NeedSelectors`, and the store batch-loads only those exact indexed journal slices through `JournalThrough`; an empty result still marks the selector loaded. The pure plan is then invoked again.
 
-This repeats until one pass has no misses. Each pass discovers at least one new locator, so it terminates for a bounded plan. Value-loading passes count toward the same per-transaction invocation guard as fixed-point continuations. This permits lazy loading without giving the engine SQL or a callback and makes it explicit that a pure plan may be invoked more than once for one durable transition.
+When a read finds a known available value whose bytes are not loaded, it similarly records a `valueMiss`, discards the provisional declarations, and asks the store to batch-load the requested locators. Selector discovery and body loading may share one round trip when possible but remain distinct engine states.
+
+This repeats until one pass has no misses. Each provisional pass discovers at least one new selector or locator, so it terminates for a bounded plan. Loading passes count toward the same per-transaction invocation guard as fixed-point continuations. This avoids whole-journal scans and permits lazy loading without giving the engine SQL or a callback; it also makes explicit that a pure plan may be invoked more than once for one durable transition.
 
 Debug determinism compares only complete passes. A plan with side effects already violates its contract; repeated internal evaluation is another reason that such code is unsupported.
 
@@ -326,21 +329,21 @@ Previously accepted commands absent from this pass remain untouched. The plan on
 
 For each genuinely new declaration, the engine evaluates groups/waits against the post-trigger snapshot:
 
-- all prerequisites satisfied -> create with dispatch state `ready` and initial schedule;
-- unresolved prerequisite -> create `pending` with no dispatch;
+- all prerequisites satisfied -> create with command-queue state `ready` and initial schedule;
+- unresolved prerequisite -> create `pending` with no queue row;
 - permanently impossible dependency -> create directly `skipped` plus its terminal event;
 - missing awaited fact after command groups satisfy -> pending, initialize `Within` when configured;
 - early awaited facts -> mark waits satisfied before readiness.
 
-Each declaration delta goes through the execution command ceiling once. Existing equivalent declarations append no history and do not change counters. Applying ordinary `ready` or `pending` declarations ends the current cycle with `plan_quiescent = false`; their open state already prevents completion, and a later routed terminal transition provides the next evaluation.
+Each declaration delta goes through the execution command ceiling once. Existing equivalent declarations append no history and do not change counters. Applying ordinary `ready` or `pending` declarations ends the current cycle with `plan_quiescent = false`; their open state already prevents completion, and a later terminal event sets `plan_dirty` for the next evaluation.
 
-The engine evaluates the pure plan again in the same transaction only if applying the delta also created a plan-observable terminal transition, such as an immediately skipped or expired command. It repeats while each new delta produces another such terminal transition, then stops on either a no-new-command pass (`plan_quiescent = true`) or an ordinary open declaration (`plan_quiescent = false`). This is the fixed point needed to prevent an immediate skip/expiry cascade from waiting for a wake that can no longer arrive, without doubling every normal plan evaluation.
+The engine evaluates the pure plan again in the same transaction only if applying the delta also created an immediate terminal transition, such as an already skipped or expired command. It repeats while each new delta produces another such transition, then stops on either a no-new-command pass (`plan_quiescent = true`) or an ordinary open declaration (`plan_quiescent = false`). This prevents an immediate skip/expiry cascade from waiting for a future dirty trigger that can no longer arrive.
 
-Every continuation accepts at least one genuinely new terminal command. A positive stored command ceiling therefore bounds the fixed-point cycle. Independently, a fixed technical guard of 10,000 total plan invocations per semantic transaction—including lazy value-loading and fixed-point passes—protects the execution lock. Exceeding it is a plan defect. The guard does not limit the number of commands one pass may declare and is exposed through plan diagnostics.
+Every continuation accepts at least one genuinely new terminal command. A positive stored command ceiling therefore bounds the fixed-point cycle. Independently, a fixed technical guard of 10,000 total plan invocations per semantic transaction—including lazy selector/value loading and fixed-point passes—protects the execution lock. Exceeding it is a plan defect. The guard does not limit the number of commands one pass may declare and is exposed through plan diagnostics.
 
-The latest accepted read set includes public reads plus the routing-only observations required by the architecture. An event selector present only in a stored `Await` is topology, not a plan read. `plan_quiescent` records whether the latest completed cycle reached a no-new-command pass.
+The final complete pass yields an exact in-memory temporary-read count and at most 32 safe `plan_waiting_on` diagnostic summaries. The engine emits one `PlanReconciled` record, increments the revision, and clears dirty state only in the same change set as the accepted declaration batch. It persists no reactive subscription set.
 
-### 8.5 Purity and routing verification
+### 8.5 Purity verification
 
 `flowtest.AssertPlanDeterministic` and optional runtime debug mode evaluate the same fully loaded snapshot twice and compare:
 
@@ -348,9 +351,10 @@ The latest accepted read set includes public reads plus the routing-only observa
 - normalized dependency/wait topology;
 - declaration order only where it affects diagnostics, never identity;
 - consulted read selectors and availability;
+- provisional selector-miss sequence;
 - provisional value-miss sequence.
 
-Routing assertion mode evaluates a transition the persisted read set says can be skipped. Any change in complete output is an invariant error; verification output never commits.
+The dirty-plan harness may combine several synthetic facts/outcomes before one evaluation and verifies that the complete snapshot produces the same canonical result as sequential over-evaluation. This tests coalescing without making routing depend on read bookkeeping.
 
 ## 9. Dependencies, waits, and readiness
 
@@ -386,10 +390,10 @@ An event selector is satisfied by its earliest retained matching event that is t
 When command groups first become satisfied:
 
 1. recheck all awaited selectors against retained event headers;
-2. if all exist, apply initial `Delay` and create dispatch;
+2. if all exist, apply initial `Delay` and create a command-queue row;
 3. otherwise, set `wait_started_at = DBNow` and, for `Within`, set the capped deadline once.
 
-An expired wait terminates the command as `expired`, appends its terminal event, removes any dispatch, and seeds dependency/plan processing. Expiry uses the persisted deadline even when a matching event was recorded later, so sweep timing cannot change the winner. `Await` without `Within` remains bounded by execution deadline unless the execution explicitly has none.
+An expired wait terminates the command as `expired`, appends its terminal event, removes any queue row, resolves dependencies, and marks plan mode dirty. Expiry uses the persisted deadline even when a matching event was recorded later, so sweep timing cannot change the winner. `Await` without `Within` remains bounded by execution deadline unless the execution explicitly has none.
 
 ### 9.3 Readiness and initial schedule
 
@@ -405,7 +409,7 @@ if execution.Deadline != nil && !eligible.Before(*execution.Deadline) {
 }
 command.BudgetStartedAt = eligible
 command.NextAttemptAt = eligible
-insertDispatch(eligible)
+insertQueue(eligible)
 ```
 
 Worker/coordinator `StartAfter` commands have no dependency phase; creation computes `eligible = accepting DBNow + duration` and uses the same deadline check. The accepted absolute time never changes after commit.
@@ -418,12 +422,12 @@ Given a fenced running attempt and successful canonical result:
 
 1. validate staged decision and complete child batch;
 2. append attempt conclusion success;
-3. set command result/success, remove dispatch, close children, decrement open count;
+3. set command result/success, remove the queue row, close children, decrement open count;
 4. append emitted application events;
 5. create/journal children and increment counts;
 6. append the command success event after emitted events;
 7. resolve affected dependencies/waits and cascaded skips;
-8. evaluate a relevant plan and reconcile its delta;
+8. set plan mode dirty because the transaction appended observable facts/outcomes;
 9. apply required-failure state if a cascaded transition introduced one;
 10. evaluate execution completion;
 11. attach the optional commit invocation and wake queues.
@@ -434,8 +438,8 @@ The journal batch builder places records in architecture §7.3 order and fills c
 
 Staged outputs are discarded. The policy either:
 
-- appends attempt conclusion with `retry_scheduled`, increments consumed attempts, stores the selected absolute next time, clears the lease, and moves command/dispatch to `retry_wait`; or
-- appends attempt conclusion plus terminal `CommandFailed`, removes dispatch, decrements open count, and runs terminal processing.
+- appends attempt conclusion with `retry_scheduled`, increments consumed attempts, stores the selected absolute next time, clears the lease, and moves command/queue to `retry_wait`; or
+- appends attempt conclusion plus terminal `CommandFailed`, removes the queue row, decrements open count, runs terminal processing, and marks plan mode dirty.
 
 The engine never writes an intermediate application event for a retry.
 
@@ -445,7 +449,7 @@ A graceful shutdown release or recovered expired lease appends an attempt conclu
 
 ### 10.4 Cancellation and expiry
 
-Cancellation/expiry verifies nonterminal state, cancels the active local context through the runtime when known, removes dispatch, writes the terminal event, and resolves dependents. A late handler cannot settle because its fence is gone. An already identical cancellation is idempotent; a different terminal state returns `ErrTerminal`.
+Cancellation/expiry verifies nonterminal state, cancels the active local context through the runtime when known, removes the queue row, writes the terminal event, resolves dependents, and marks plan mode dirty. A late handler cannot settle because its fence is gone. An already identical cancellation is idempotent; a different terminal state returns `ErrTerminal`.
 
 ## 11. Failure handling and completion
 
@@ -455,9 +459,9 @@ For a newly unsuccessful required command:
 
 1. terminal state and event already exist in the in-memory transition;
 2. resolve existing dependencies and cascades;
-3. evaluate the plan if relevant, allowing newly declared failure branches to be created against the terminal outcome;
+3. mark plan mode dirty so a later exact-version pass can declare outcome-dependent failure handling;
 4. mark execution `failing`;
-5. if fail-fast, compute the surviving failure scope and cancel everything else;
+5. if fail-fast, preserve existing viable `AfterFailed`/`AfterSettled` work and cancel everything else; later plan reconciliation may add new failure-scope commands while the execution remains non-terminal;
 6. evaluate terminal failure only after survivors finish.
 
 The surviving set begins with commands made runnable/retained by failure conditions and every command already running. It includes their dependency descendants. Commands carry an internal `failure_scope` projection once selected; later children of a surviving running command inherit it, and new plan declarations survive only when their prerequisites are in the scope or they are part of the newly selected failure branch. Multiple failures union scopes.
@@ -483,8 +487,9 @@ func completion(s Snapshot, cs ChangeSet) *ExecutionTerminal {
     case Direct:
         return successUnlessFailing(s, cs)
     case Plan:
+        if effectivePlanDirty(s, cs) { return nil }
         if isFailing(s, cs) { return failed(s, cs) }
-        if cs.TemporaryPlanReads != 0 || !cs.PlanQuiescent { return nil }
+        if cs.Plan.WaitingCount != 0 || !cs.Plan.Quiescent { return nil }
         return succeeded()
     case Coordinator:
         return validateExplicitCoordinatorDecision(s, cs)
@@ -493,21 +498,13 @@ func completion(s Snapshot, cs ChangeSet) *ExecutionTerminal {
 }
 ```
 
-For plan failure, temporary reads are ignored; explicit open failure-handling work remains counted. `SucceedExecution` is invalid while work remains after the same coordinator decision. `FailExecution` cancels outstanding work and completes failed. Every terminal result appends one execution event and closes the coordinator.
+For plan failure, dirty reconciliation still blocks terminality so outcome-dependent failure branches cannot be missed; after reconciliation, temporary reads are ignored and explicit open failure-handling work remains counted. `SucceedExecution` is invalid while work remains after the same coordinator decision. `FailExecution` cancels outstanding work and completes failed. Every terminal result appends one execution event and closes the coordinator.
 
 ## 12. Plan defects
 
 A `DecisionDefect` includes stable code, safe message, and source. Plan panic, nondeterminism, invalid read/reference, cycle, conflicting declaration, changed explicit node override, and plan command-ceiling overflow are terminal plan defects.
 
-The transaction preserves the durable transition that triggered evaluation:
-
-- at plan start, retain `ExecutionStarted` and fail the new execution;
-- after ingress, retain the accepted event/command;
-- after worker success, retain result, emitted events, children, and declared commit-function write.
-
-It discards the invalid plan delta, appends `PlanFailed`, cancels outstanding commands with terminal events, appends `ExecutionFailed`, and proposes that complete change set. If its optional commit invocation also succeeds and the transaction commits, none of that accepted work becomes another worker attempt. If the commit invocation fails, the entire proposed change set—including the plan defect—rolls back and the commit-function error follows the ordinary command retry path; no worker success had yet been accepted.
-
-The public call that triggered an initial/ingress defect returns a typed error containing the affected `ExecutionID`. A library-owned transaction commits the terminal record before returning, so an idempotent repeat finds it rather than evaluating again. Under `InTx`, the change set remains subject to the caller's commit or rollback like every other engine output.
+Plan defects arise only in the dedicated library-owned reconciliation transaction. The engine discards the invalid declaration delta, appends `PlanFailed`, cancels outstanding commands with terminal events, appends `ExecutionFailed`, and clears dirty state atomically. Previously committed events, worker results, children, and application commit-function writes remain history and are never rerun or rolled back by the defect. A crash before commit leaves the execution dirty; a committed defect is terminal and will not be reevaluated.
 
 ## 13. Coordinator engine
 
@@ -541,7 +538,7 @@ A coordinator that needs to interpret failure spawns the command optional and re
 
 ### 14.1 Execute
 
-Direct start creates `root` and its dispatch in the execution-start transaction. Plan start runs initial evaluation and creates the complete initial declaration batch. Coordinator start persists state and a ready start delivery. None invokes user code inline.
+Direct start creates `root` and its command-queue row in the execution-start transaction. Plan start creates the execution with `plan_dirty = true`; it does not invoke the plan inline. Coordinator start persists state and a ready start delivery. None invokes worker or coordinator code inline.
 
 ### 14.2 Issue
 
@@ -549,7 +546,7 @@ Direct start creates `root` and its dispatch in the execution-start transaction.
 
 ### 14.3 Publish
 
-`Publish` validates canonical bytes and checks event-key idempotency before terminal rejection. A new event appends, satisfies stored waits, and becomes available to a coordinator's later indexed scan. In plan mode it invokes the plan in the same transaction only when the durable `Fact`/`Facts` routing set says the event changes a plan input; an event used solely by `Await` is resolved without plan code. Direct mode retains the fact without progression.
+`Publish` validates canonical bytes and checks event-key idempotency before terminal rejection. A new event appends, satisfies stored waits, and becomes available to a coordinator's later indexed scan. In plan mode it always sets `plan_dirty` without invoking plan code; a later reconciler sees the retained fact whether it is used through `Await`, `Fact`, or `Facts`. Direct mode retains the fact without plan progression.
 
 ### 14.4 Cancel
 
@@ -565,9 +562,10 @@ The paired pure reducer consumes journal entries and rebuilds settled projection
 - command identity/topology/result/terminal state;
 - attempts and chosen retry schedules;
 - closed child membership;
+- dirty/reconciled plan revisions and quiescence from trigger records and `PlanReconciled`;
 - coordinator state revision/inbox from transitions.
 
-Current lease expiry/renewal and exact live dispatch ownership are outside replay. A conformance suite applies each committed change set to both reducer and database materializations and compares the settled subset.
+Current lease expiry/renewal and exact live command-queue ownership are outside replay. A conformance suite applies each committed change set to both reducer and database materializations and compares the settled subset.
 
 ## 16. Database-free `flowtest` engine
 
@@ -595,7 +593,7 @@ Test worlds provide synthetic canonical facts, command states/results/outcomes, 
 - Spawn/Emit duplicate equivalence, poisoning, Optional, and StartAfter validation;
 - all dependency matrices and monotonic group transitions;
 - early/late waits, `Within`, Delay, deadline, and immutable budget anchor;
-- plan read availability, lazy value passes, forward references, ownership, cycles, growth, fragments, deterministic/routing assertions, and immediate-terminal fixed points without redundant normal passes;
+- plan read availability, lazy value passes, forward references, ownership, cycles, growth, fragments, deterministic/coalescing assertions, and immediate-terminal fixed points without redundant normal passes;
 - fail-fast branch declaration after failure, survivor inheritance, multiple failures, and skip cascades;
 - direct/plan/coordinator completion and plan temporary-read failure exception;
 - coordinator start, event matching, `OnOutcome`, retry, state discard, mixed fan-in, and explicit terminal decisions;
@@ -605,7 +603,7 @@ Property generators assert that accepted commands never disappear, terminal stat
 
 ### 17.2 PostgreSQL integration contracts
 
-Engine/store integration tests cover all-or-nothing worker/plan/coordinator deltas; trigger visibility inside plan snapshots; commit-function rollback and plan-defect preservation; ceiling source-specific behavior; failure closure under concurrent running work; coordinator inbox fencing; and replay/live projection equality after crash injection.
+Engine/store integration tests cover all-or-nothing worker/plan/coordinator deltas; dirty-trigger coalescing and takeover; complete committed input visibility inside plan snapshots; commit-function rollback independent from later plan defects; ceiling source-specific behavior; failure closure under concurrent running work; coordinator inbox fencing; and replay/live projection equality after crash injection.
 
 ### 17.3 Benchmarks
 
@@ -622,7 +620,7 @@ Engine/store integration tests cover all-or-nothing worker/plan/coordinator delt
 - retry policy is immutable canonical data, and all decisions use supplied PostgreSQL time;
 - every handler output is staged and all-or-nothing, including delayed children and command ceiling;
 - plan evaluation is pure, resumable for values, additive, deterministic-verifiable, and reconciles changed defaults correctly;
-- failure dependency/plan resolution precedes fail-fast cancellation;
+- terminal transitions resolve already-declared dependencies before fail-fast cancellation, mark plan mode dirty, and keep failure nonterminal until exact-version reconciliation can add outcome-dependent handling;
 - coordinator success/failure outcomes are consumed once from the existing terminal event and state/inbox/output commit together;
 - journal order and causation are deterministic and replay reconstructs settled projections;
 - all unit, property, integration, agent, and benchmark suites pass.

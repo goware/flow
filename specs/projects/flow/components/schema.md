@@ -21,7 +21,7 @@ The application passes its existing `*pgkit.DB` to `New` and `Migrate`; this com
 3. All durable timestamps in one transition come from one `clock_timestamp()` value captured after acquiring the execution lock, never before a blocking wait.
 4. Canonical payloads are `bytea`; SQL never interprets application JSON.
 5. Digests accelerate comparison, but a conflict path compares canonical bytes too.
-6. Pending commands have no dispatch row. Ready, retry-wait, and running commands have exactly one dispatch row. Terminal commands have none.
+6. Pending commands have no queue row. Ready, retry-wait, and running commands have exactly one queue row. Terminal commands have none.
 7. Lease renewal touches only hot delivery rows and is intentionally absent from the journal.
 8. Every statement is bounded by an execution, a claim batch, a maintenance batch, or a page limit.
 9. Constraint and index names are stable because error mapping and migrations refer to them.
@@ -31,22 +31,21 @@ The application passes its existing `*pgkit.DB` to `New` and `Migrate`; this com
 
 The DDL is the target shape for the initial migration. Small column-type changes discovered during implementation require an architecture amendment; semantic changes require the functional spec to reopen.
 
-The initial physical inventory is ten tables:
+The initial physical inventory is nine tables:
 
 | Table | Purpose |
 |---|---|
-| `flow_executions` | Execution identity, driver, lifecycle, counters, deadline, and journal-position allocator. |
+| `flow_executions` | Execution identity, driver, lifecycle, counters, plan-reconciliation queue state, deadline, and journal-position allocator. |
 | `flow_commands` | Durable command definitions, current states, accepted policies, results, and timing anchors. |
-| `flow_command_dispatch` | Narrow hot queue and lease rows for runnable commands. |
+| `flow_command_queue` | Narrow hot queue and lease rows for runnable commands. |
 | `flow_command_dependency_groups` | Durable join clauses attached to dependent commands. |
 | `flow_command_dependency_members` | Predecessor membership for each dependency group. |
 | `flow_command_event_waits` | Persisted `Await` selectors and their satisfying journal positions. |
-| `flow_journal` | Immutable execution-local history for commands, attempts, events, outcomes, and coordinator transitions. |
-| `flow_plan_reads` | Latest durable plan-read and routing set. |
+| `flow_journal` | Immutable execution-local history for commands, attempts, events, plan decisions, outcomes, and coordinator transitions. |
 | `flow_coordinators` | Coordinator state, inbox position, selected delivery, retry state, and lease. |
 | `flow_schema_migrations` | Applied migration versions, checksums, library versions, and active reader/writer compatibility. |
 
-There is intentionally no separate queue table, event table, coordinator-inbox table, attempt table, or schema-compatibility table. Queue lanes are immutable columns on command/dispatch rows, events and attempt history live in `flow_journal`, the coordinator inbox cursor and selected delivery live in `flow_coordinators`, and the latest migration row carries the active compatibility range.
+There is intentionally no plan-read subscription table, queue-lane configuration table, event table, coordinator-inbox table, attempt table, or schema-compatibility table. A plan execution exposes one coalescing dirty marker on `flow_executions`; queue lanes are immutable columns on command/queue rows; events and attempt history live in `flow_journal`; the coordinator inbox cursor and selected delivery live in `flow_coordinators`; and the latest migration row carries the active compatibility range.
 
 ### 3.1 Executions
 
@@ -73,9 +72,12 @@ CREATE TABLE public.flow_executions (
     command_count         integer NOT NULL DEFAULT 0 CHECK (command_count >= 0),
     open_commands         integer NOT NULL DEFAULT 0 CHECK (open_commands >= 0),
 
-    temporary_plan_reads  integer NOT NULL DEFAULT 0 CHECK (temporary_plan_reads >= 0),
+    plan_dirty            boolean NOT NULL DEFAULT false,
+    plan_dirty_since      timestamptz,
     plan_quiescent        boolean NOT NULL DEFAULT false,
     plan_revision         bigint NOT NULL DEFAULT 0 CHECK (plan_revision >= 0),
+    plan_waiting_count    integer NOT NULL DEFAULT 0 CHECK (plan_waiting_count >= 0),
+    plan_waiting_on       jsonb NOT NULL DEFAULT '[]'::jsonb,
 
     next_journal_position bigint NOT NULL DEFAULT 1 CHECK (next_journal_position >= 1),
     root_command_id       uuid,
@@ -99,8 +101,15 @@ CREATE TABLE public.flow_executions (
     CONSTRAINT flow_executions_command_limit_ck CHECK
         (max_commands = 0 OR command_count <= max_commands),
     CONSTRAINT flow_executions_plan_fields_ck CHECK (
-        (driver_mode = 'plan') OR
-        (temporary_plan_reads = 0 AND plan_revision = 0 AND plan_quiescent = false)
+        (driver_mode = 'plan' AND jsonb_typeof(plan_waiting_on) = 'array'
+            AND (plan_dirty = (plan_dirty_since IS NOT NULL))) OR
+        (driver_mode <> 'plan' AND plan_dirty = false AND plan_dirty_since IS NULL
+            AND plan_revision = 0
+            AND plan_quiescent = false AND plan_waiting_count = 0
+            AND plan_waiting_on = '[]'::jsonb)
+    ),
+    CONSTRAINT flow_executions_terminal_plan_ck CHECK (
+        status IN ('running', 'failing') OR plan_dirty = false
     )
 );
 
@@ -124,11 +133,18 @@ CREATE INDEX flow_executions_metadata_idx
 CREATE INDEX flow_executions_deadline_idx
     ON public.flow_executions (deadline_at, execution_id)
     WHERE status IN ('running', 'failing') AND deadline_at IS NOT NULL;
+
+CREATE INDEX flow_executions_plan_queue_idx
+    ON public.flow_executions
+       (definition_name, definition_version, plan_dirty_since, execution_id)
+    WHERE driver_mode = 'plan'
+      AND status IN ('running', 'failing')
+      AND plan_dirty;
 ```
 
 `start_fingerprint` covers definition version, canonical input, explicit deadline/fail-fast/metadata options, and driver mode. It deliberately excludes the runtime's accepted `max_commands` default and a direct root command's definition-level retry/timeout/queue defaults: an idempotent repeat returns the already accepted execution under changed deployment defaults. Metadata is duplicated as canonical bytes for identity and `jsonb` for the bounded `ListExecutions` containment filter; keys, values, and total size are validated before insertion.
 
-`status = 'failing'` is the durable form of failure handling in progress. `plan_quiescent` means the latest completed evaluation cycle reached a no-new-command pass. A cycle that creates ordinary open work may stop with it false because that work already blocks completion; its later routed terminal transition supplies the next evaluation. The field is ignored outside plan mode.
+`status = 'failing'` is the durable form of failure handling in progress. `plan_dirty` is the complete durable queue for pending pure-plan work; multiple triggers may coalesce behind it. `plan_dirty_since` is set only on the clean-to-dirty transition and is cleared with the bit, so repeated triggers do not push a hot execution to the back forever. `plan_quiescent` means the latest completed reconciliation reached a no-new-command pass. `plan_waiting_count` is exact; `plan_waiting_on` contains at most 32 safe summaries and may therefore be truncated. Both are inspection aids, not a routing or subscription set. Only dirty state, not those diagnostics, controls scheduling. Explicit execution cancellation or deadline expiry clears dirty work while terminalizing the execution.
 
 ### 3.2 Commands
 
@@ -250,12 +266,12 @@ CREATE INDEX flow_commands_wait_deadline_idx
 
 `budget_started_at` is null while a pending node has not completed prerequisites. It becomes immutable when the initial `next_attempt_at` is established. A retry modifies only `next_attempt_at`.
 
-### 3.3 Command dispatch
+### 3.3 Command queue
 
 The hot queue row is separated from the wider command projection so lease churn and ready scans do not bloat immutable payload and topology pages.
 
 ```sql
-CREATE TABLE public.flow_command_dispatch (
+CREATE TABLE public.flow_command_queue (
     command_id        uuid PRIMARY KEY
         REFERENCES public.flow_commands(command_id) ON DELETE CASCADE,
     execution_id      uuid NOT NULL
@@ -264,8 +280,6 @@ CREATE TABLE public.flow_command_dispatch (
     queue             text NOT NULL,
     name              text NOT NULL,
     version           integer NOT NULL CHECK (version > 0),
-    plan_name         text NOT NULL DEFAULT '',
-    plan_version      integer NOT NULL DEFAULT 0 CHECK (plan_version >= 0),
     state             text NOT NULL,
     next_run_at       timestamptz NOT NULL,
 
@@ -276,12 +290,9 @@ CREATE TABLE public.flow_command_dispatch (
     lease_expires_at  timestamptz,
     updated_at        timestamptz NOT NULL,
 
-    CONSTRAINT flow_command_dispatch_state_ck CHECK
+    CONSTRAINT flow_command_queue_state_ck CHECK
         (state IN ('ready', 'retry_wait', 'running')),
-    CONSTRAINT flow_command_dispatch_plan_shape_ck CHECK
-        ((plan_name = '' AND plan_version = 0)
-         OR (plan_name <> '' AND plan_version > 0)),
-    CONSTRAINT flow_command_dispatch_lease_shape_ck CHECK (
+    CONSTRAINT flow_command_queue_lease_shape_ck CHECK (
         (state = 'running' AND active_attempt_id IS NOT NULL AND lease_token IS NOT NULL
          AND lease_owner IS NOT NULL AND lease_started_at IS NOT NULL AND lease_expires_at IS NOT NULL)
         OR
@@ -290,22 +301,22 @@ CREATE TABLE public.flow_command_dispatch (
     )
 );
 
-CREATE INDEX flow_command_dispatch_claim_idx
-    ON public.flow_command_dispatch
-       (name, version, plan_name, plan_version, next_run_at, queue, command_id)
+CREATE INDEX flow_command_queue_claim_idx
+    ON public.flow_command_queue
+       (name, version, next_run_at, queue, command_id)
     INCLUDE (execution_id)
     WHERE state IN ('ready', 'retry_wait');
 
-CREATE INDEX flow_command_dispatch_lease_idx
-    ON public.flow_command_dispatch (lease_expires_at, command_id)
+CREATE INDEX flow_command_queue_lease_idx
+    ON public.flow_command_queue (lease_expires_at, command_id)
     INCLUDE (execution_id, active_attempt_id, lease_token)
     WHERE state = 'running';
 
-CREATE INDEX flow_command_dispatch_execution_idx
-    ON public.flow_command_dispatch (execution_id, command_id);
+CREATE INDEX flow_command_queue_execution_idx
+    ON public.flow_command_queue (execution_id, command_id);
 ```
 
-Denormalizing immutable `(queue, name, version)` and the plan pair (empty outside plan mode) is deliberate. It prevents a replica that handles a subset of kinds or plan versions from repeatedly scanning an unhandled head of a shared lane. Store tests assert these values equal the owning command and execution at insertion; they never change later.
+Denormalizing immutable `(queue, name, version)` is deliberate. It prevents a replica that handles a subset of command kinds from repeatedly scanning an unhandled head of a shared lane. Plan identity does not belong on the command queue because command workers settle independently of plan code. Store tests assert the denormalized values equal the owning command at insertion; they never change later.
 
 ### 3.4 Dependency groups and members
 
@@ -405,6 +416,7 @@ CREATE TABLE public.flow_journal (
     command_id         uuid,
     attempt_id         uuid,
     coordinator_id     uuid,
+    plan_revision      bigint,
 
     event_id           uuid,
     event_namespace    text,
@@ -424,7 +436,7 @@ CREATE TABLE public.flow_journal (
     CONSTRAINT flow_journal_entry_kind_ck CHECK
         (entry_kind IN ('execution_started', 'execution_failing', 'command_created',
                         'attempt_started', 'attempt_concluded',
-                        'event_recorded', 'coordinator_transition')),
+                        'event_recorded', 'plan_reconciled', 'coordinator_transition')),
     CONSTRAINT flow_journal_event_shape_ck CHECK (
         (entry_kind = 'event_recorded'
             AND event_id IS NOT NULL AND event_namespace IS NOT NULL
@@ -448,6 +460,10 @@ CREATE TABLE public.flow_journal (
         )
         AND (entry_kind <> 'coordinator_transition' OR coordinator_id IS NOT NULL)
         AND (event_class IS DISTINCT FROM 'coordinator_terminal' OR coordinator_id IS NOT NULL)
+    ),
+    CONSTRAINT flow_journal_plan_revision_shape_ck CHECK (
+        (entry_kind = 'plan_reconciled' AND plan_revision IS NOT NULL AND plan_revision > 0)
+        OR (entry_kind <> 'plan_reconciled' AND plan_revision IS NULL)
     ),
     CONSTRAINT flow_journal_event_namespace_ck CHECK
         (event_namespace IS NULL OR event_namespace IN ('application', 'command_success', 'runtime')),
@@ -511,6 +527,10 @@ CREATE UNIQUE INDEX flow_journal_attempt_concluded_uq
     ON public.flow_journal (attempt_id)
     WHERE entry_kind = 'attempt_concluded';
 
+CREATE UNIQUE INDEX flow_journal_plan_reconciled_uq
+    ON public.flow_journal (execution_id, plan_revision)
+    WHERE entry_kind = 'plan_reconciled';
+
 CREATE INDEX flow_journal_event_lookup_idx
     ON public.flow_journal
        (execution_id, event_namespace, event_name, event_version, position)
@@ -523,53 +543,13 @@ CREATE INDEX flow_journal_command_events_idx
 
 `body` is a versioned canonical record. `CommandCreated` includes arguments, declaration topology, accepted schedule/policy, classification, and origin even though current projections repeat those fields. `ExecutionStarted`, attempt entries, coordinator transitions, and runtime events likewise have explicit internal body schemas owned by `internal/store/journalcodec`.
 
-There is no separate attempt table. A running command's current attempt identity, lease, and start time live in `flow_command_dispatch`; a coordinator's equivalent fields live in `flow_coordinators`. `AttemptStarted` and `AttemptConcluded` entries in `flow_journal` are the complete immutable history after an attempt stops being current. Command and coordinator rows hold their monotonic invocation and consumed-budget counters.
+There is no separate attempt table. A running command's current attempt identity, lease, and start time live in `flow_command_queue`; a coordinator's equivalent fields live in `flow_coordinators`. `AttemptStarted` and `AttemptConcluded` entries in `flow_journal` are the complete immutable history after an attempt stops being current. Command and coordinator rows hold their monotonic invocation and consumed-budget counters.
 
 `event_namespace = 'command_success'` is the implementation detail behind `Command.Done`; failure/cancellation/expiry/skip use runtime terminal names and are exposed to a coordinator through `OnOutcome`, not by synthesizing a second event.
 
-### 3.7 Plan reads
+There is deliberately no durable row per plan read. The plan scheduler reads a complete durable snapshot whenever `flow_executions.plan_dirty` is true, while the execution row retains only bounded waiting diagnostics from the latest reconciliation.
 
-```sql
-CREATE TABLE public.flow_plan_reads (
-    execution_id       uuid NOT NULL
-        REFERENCES public.flow_executions(execution_id) ON DELETE CASCADE,
-    read_kind          text NOT NULL,
-    command_key        text NOT NULL DEFAULT '',
-    event_namespace    text NOT NULL DEFAULT '',
-    event_name         text NOT NULL DEFAULT '',
-    event_version      integer NOT NULL DEFAULT 0,
-    availability       text NOT NULL,
-
-    PRIMARY KEY
-        (execution_id, read_kind, command_key,
-         event_namespace, event_name, event_version),
-    CONSTRAINT flow_plan_reads_kind_ck CHECK
-        (read_kind IN ('fact', 'facts', 'children', 'result', 'outcome',
-                       'plan_command', 'dependency')),
-    CONSTRAINT flow_plan_reads_availability_ck CHECK
-        (availability IN ('available', 'temporary', 'permanent', 'routing')),
-    CONSTRAINT flow_plan_reads_selector_ck CHECK (
-        (read_kind IN ('fact', 'facts')
-            AND command_key = '' AND event_name <> '' AND event_version > 0)
-        OR
-        (read_kind NOT IN ('fact', 'facts')
-            AND command_key <> '' AND event_name = '' AND event_version = 0)
-    )
-);
-
-CREATE INDEX flow_plan_reads_event_route_idx
-    ON public.flow_plan_reads
-       (execution_id, event_namespace, event_name, event_version)
-    WHERE read_kind IN ('fact', 'facts');
-
-CREATE INDEX flow_plan_reads_command_route_idx
-    ON public.flow_plan_reads (execution_id, command_key)
-    WHERE read_kind IN ('children', 'result', 'outcome', 'plan_command', 'dependency');
-```
-
-The whole set is replaced after a successful evaluation. `temporary_plan_reads` is the count of public reads with `availability = 'temporary'`; implicit routing rows never affect completion.
-
-### 3.8 Coordinators
+### 3.7 Coordinators
 
 ```sql
 CREATE TABLE public.flow_coordinators (
@@ -644,7 +624,7 @@ ALTER TABLE public.flow_executions
 
 A coordinator inbox event is selected into `delivery_key = 'event/<position>'` before claim. Retry keeps that identity. Success advances `inbox_position`, clears delivery fields, and resets delivery retry counters. Start uses `delivery_key = 'start'` and clears `start_pending` on success.
 
-### 3.9 Migration metadata
+### 3.8 Migration metadata
 
 ```sql
 CREATE TABLE public.flow_schema_migrations (
@@ -677,11 +657,14 @@ Internal journal bodies are versioned separately from application definitions. T
 | `CommandCreated` | body schema version, ID/key/name/version, canonical args, origin/parent, required and failure-scope classification, normalized dependency and wait selectors, explicit schedule declaration, accepted absolute first schedule, accepted retry/timeout/queue, causation. |
 | `AttemptStarted` | subject identity, delivery key if coordinator, invocation ordinal, database start, worker/process, lease duration but not reusable lease token. |
 | `AttemptConcluded` | subject, classification, consumed-budget flag, database finish, safe error, and persisted next-attempt time when any. |
-| `EventRecorded` | canonical typed event payload; indexed columns hold its durable routing metadata. |
+| `EventRecorded` | canonical typed event payload; indexed columns hold its durable selector metadata. |
+| `PlanReconciled` | plan revision, highest prior journal position consumed, quiescence, waiting count and bounded summary, and the accepted declaration delta. |
 | `ExecutionBecameFailing` | triggering required command/event, fail-fast setting, and the survivor-set decision needed to explain cancellations. |
 | `CoordinatorTransition` | handled activation/position, previous and new state revision, canonical resulting state, decision kind, and causation. |
 
 Secrets such as lease tokens are never journaled. Worker/process identity is operational metadata and subject to configured redaction/size bounds.
+
+`PlanReconciled` is the first entry in its reconciliation batch. Its causation points to `ExecutionStarted` or the latest previously committed journal position included in the snapshot, while its `consumed_through_position` body field records the complete prefix. Commands and immediate terminal transitions created by that decision point back to the `PlanReconciled` position. This records a decision once without creating one plan-delivery row per trigger.
 
 ## 5. Store transaction API
 
@@ -691,6 +674,7 @@ The engine and runtime call a narrow store API rather than composing SQL ad hoc:
 type Store interface {
     BeginSemantic(ctx context.Context, id ExecutionID, mode LockMode) (*SemanticTx, error)
     ProbeCommands(ctx context.Context, filter ClaimFilter, limit int) ([]Candidate, error)
+    ProbePlans(ctx context.Context, filter PlanFilter, limit int) ([]PlanCandidate, error)
     ProbeCoordinators(ctx context.Context, filter CoordFilter, limit int) ([]CoordCandidate, error)
     RenewCommandLeases(ctx context.Context, leases []LeaseRenewal) (LeaseRenewalResult, error)
     RenewCoordinatorLeases(ctx context.Context, leases []LeaseRenewal) (LeaseRenewalResult, error)
@@ -739,7 +723,7 @@ Reservation happens after the engine knows the exact journal batch. A rollback r
 
 Start first attempts the natural-key insert. On `flow_executions_idempotency_uq`, it loads the existing row and compares `start_fingerprint` plus canonical bytes before checking terminal status. An equivalent repeat returns it unchanged, including its accepted command ceiling. A conflict writes nothing.
 
-New direct/plan/coordinator start inserts `ExecutionStarted` at position 1 and sets `next_journal_position` after the complete initial batch. Root or initial plan commands use the same batch insertion routine as later creation. Coordinator start stores initial state and `delivery_key = 'start'`/`delivery_state = 'ready'`.
+New direct/plan/coordinator start inserts `ExecutionStarted` at position 1 and sets `next_journal_position` after the complete initial batch. Direct start creates its root command in that batch. Plan start instead sets `plan_dirty = true`; the first plan scheduler claim records revision 1 and any initial declarations. Coordinator start stores initial state and `delivery_key = 'start'`/`delivery_state = 'ready'`.
 
 ### 6.3 Command candidate probe
 
@@ -749,34 +733,59 @@ Candidate discovery takes no lock and may return stale rows:
 WITH t AS MATERIALIZED (
     SELECT clock_timestamp() AS db_now
 ),
-registered(name, version, plan_name, plan_version) AS (
-    SELECT * FROM unnest(
-        $1::text[], $2::integer[], $3::text[], $4::integer[]
-    )
+registered(name, version) AS (
+    SELECT * FROM unnest($1::text[], $2::integer[])
 )
 SELECT d.execution_id, d.command_id, d.queue, d.next_run_at
 FROM registered r
 CROSS JOIN LATERAL (
     SELECT execution_id, command_id, queue, next_run_at
-    FROM public.flow_command_dispatch, t
+    FROM public.flow_command_queue, t
     WHERE name = r.name
       AND version = r.version
-      AND plan_name = r.plan_name
-      AND plan_version = r.plan_version
       AND state IN ('ready', 'retry_wait')
       AND next_run_at <= t.db_now
     ORDER BY next_run_at, queue, command_id
-    LIMIT $5
+    LIMIT $3
 ) d
 ORDER BY d.next_run_at, d.queue, d.command_id
-LIMIT $6;
+LIMIT $4;
 ```
 
 Registering a command pair makes that handler capable of every stored queue. Queue affects scheduling and concurrency, not handler compatibility. This is necessary because changing a command definition's queue default affects only new commands, while existing commands retain and must remain claimable on their accepted queue.
 
-The runtime groups probes by execution. For a chosen execution it begins a skip-locked semantic transaction, then locks proposed commands/dispatch rows in `command_id` order with `FOR UPDATE SKIP LOCKED`, revalidates all predicates, and may claim up to immediately free capacity. It appends one `AttemptStarted` per claim and commits before handlers receive work.
+The runtime groups probes by execution. For a chosen execution it begins a skip-locked semantic transaction, then locks proposed commands/queue rows in `command_id` order with `FOR UPDATE SKIP LOCKED`, revalidates all predicates, and may claim up to immediately free capacity. It appends one `AttemptStarted` per claim and commits before handlers receive work.
 
-### 6.4 Fenced command mutation
+### 6.4 Dirty plan probe and reconciliation claim
+
+Candidate discovery joins the runtime's exact registered plan pairs to the partial dirty index:
+
+```sql
+WITH registered(name, version) AS (
+    SELECT * FROM unnest($1::text[], $2::integer[])
+)
+SELECT e.execution_id, e.definition_name, e.definition_version,
+       e.plan_revision, e.plan_dirty_since
+FROM registered r
+CROSS JOIN LATERAL (
+    SELECT execution_id, definition_name, definition_version,
+           plan_revision, plan_dirty_since
+    FROM public.flow_executions
+    WHERE driver_mode = 'plan'
+      AND definition_name = r.name
+      AND definition_version = r.version
+      AND status IN ('running', 'failing')
+      AND plan_dirty
+    ORDER BY plan_dirty_since, execution_id
+    LIMIT $3
+) e
+ORDER BY e.plan_dirty_since, e.execution_id
+LIMIT $4;
+```
+
+The candidate is stale by design. Reconciliation starts a semantic transaction with `FOR UPDATE SKIP LOCKED` on that execution and rechecks mode, status, plan pair, and `plan_dirty`. The pure plan runs while the row and connection are held; it must be CPU-bounded. The transaction appends `PlanReconciled` first, then any `CommandCreated` and immediate terminal entries caused by that revision, updates the plan fields, and clears dirty. Rollback leaves all prior triggers committed and dirty.
+
+### 6.5 Fenced command mutation
 
 Every running-command conclusion includes:
 
@@ -788,9 +797,9 @@ Every running-command conclusion includes:
       AND d.lease_expires_at > $db_now
 ```
 
-and a matching `flow_commands.state = 'running'` check. Zero rows aborts the transaction. Success or terminal failure deletes dispatch; retry changes it to `retry_wait`, clears lease fields, and writes the already chosen `next_run_at`.
+and a matching `flow_commands.state = 'running'` check. Zero rows aborts the transaction. Success or terminal failure deletes the queue row; retry changes it to `retry_wait`, clears lease fields, and writes the already chosen `next_run_at`. A terminal command transition also sets `plan_dirty = true` when the owning execution is live and plan-driven; retry and lease-only transitions do not.
 
-### 6.5 Command creation batch
+### 6.6 Command creation batch
 
 Under the execution lock:
 
@@ -809,35 +818,35 @@ RETURNING command_count;
 ```
 
 4. require one returned row before inserting any proposal;
-5. bulk insert commands in key order, dependency groups/members, waits, dispatch rows, and `CommandCreated` journal rows.
+5. bulk insert commands in key order, dependency groups/members, waits, queue rows, and `CommandCreated` journal rows.
 
 All statements share the transaction, so a later failure rolls the counter back. Equivalent proposals neither increment nor append.
 
-### 6.6 Plan snapshot
+### 6.7 Plan snapshot
 
-One narrow command query plus normalized dependency/wait/read queries load the full plan state. Event bodies are loaded only for selectors the plan actually reads and memoized during evaluation. Terminal results come from commands; journal positions provide event metadata.
+One narrow command query plus normalized dependency/wait queries load the structural plan state and capture the execution's journal high-water position. Provisional pure passes discover event selectors in memory; the store batch-loads exact matching slices through that fixed position with `flow_journal_event_lookup_idx`, including an explicit empty result for an absent selector. Event bodies are then decoded lazily by locator and memoized. Terminal results come from commands. No query loads or updates a persistent read/subscription set, and no pass scans unrelated event history.
 
-The snapshot queries run after the execution lock and after the triggering transition's in-transaction materializations are applied, so the plan sees the new terminal result, closed children, and emitted facts before commit.
+The snapshot queries run after the dirty execution lock. Therefore the plan sees every event and terminal command outcome committed before that lock, including several triggers that coalesced behind one dirty bit.
 
-### 6.7 Event insertion and idempotency
+### 6.8 Event insertion and idempotency
 
 External `Publish` first looks up `(execution_id, namespace, name, key)` before rejecting a terminal execution. Equivalent canonical bytes and version return success; disagreement returns `ErrConflict`. A genuinely new event then requires a running execution and the execution lock. The transaction rechecks idempotency after acquiring that lock, so two concurrent first publications cannot turn a unique-index race into an ambiguous semantic error.
 
-After the lock, the store loads matching unresolved wait rows and the current `flow_plan_reads_event_route_idx` entry. Wait satisfaction and readiness are generic topology changes. A wait with `Within` is updated only when the event transaction's captured `DBNow` is no later than `wait_deadline_at`; a later event is journaled but leaves the wait for expiry maintenance. Exact plan code is requested from the runtime only when the event also matches a current `fact`/`facts` plan read; if that capability is absent, the transaction rolls back before inserting the event. An `Await`-only publication therefore needs no plan registration, including for a late fact.
+After the lock, the store loads matching unresolved wait rows. Wait satisfaction and readiness are generic topology changes. A wait with `Within` is updated only when the event transaction's captured `DBNow` is no later than `wait_deadline_at`; a later event is journaled but leaves the wait for expiry maintenance. Every newly accepted application event sets `plan_dirty = true` for a live plan-driven execution in the same transaction, regardless of what its last evaluation happened to read. No plan code or read-routing lookup is required.
 
 Worker `Emit` uses the same event-key constraint. Derived command and execution terminal events use their dedicated partial unique indexes, not caller event idempotency. Publishing a derived `Command.Done` descriptor through the public `Publish` path is rejected by descriptor validation.
 
-### 6.8 Coordinator selection and claim
+### 6.9 Coordinator selection and claim
 
 When an active coordinator is idle, selection first chooses `start` if pending. Otherwise it queries the lowest journal event above `inbox_position` matching any immutable registered selector. Ordinary `On` selectors use journal event namespace/name/version. `OnOutcome` selectors scan command-terminal rows in execution-position order and join `flow_journal.command_id` to the immutable command name/version projection. Both paths return candidate positions, and the lowest wins. This keeps one terminal journal row per command instead of adding a second outcome stream or denormalizing more routing columns into the journal.
 
 Selection is persisted as one delivery key before or during the skip-locked claim transaction. Retry leaves it selected. On success, a guarded update requires matching coordinator ID, delivery key, attempt, token, and lease; advances inbox to the event position, clears delivery fields, resets delivery counters, and updates state/revision. Start success clears `start_pending` without moving inbox.
 
-### 6.9 Maintenance
+### 6.10 Maintenance
 
 Every sweep first probes a bounded index and then enters the ordinary execution-first semantic path:
 
-- expired command leases from `flow_command_dispatch_lease_idx`;
+- expired command leases from `flow_command_queue_lease_idx`;
 - expired coordinator leases from `flow_coordinators_lease_idx`;
 - `wait_deadline_at` on pending commands;
 - `deadline_at` on running/failing executions.
@@ -849,12 +858,13 @@ No due-retry or delayed-command state sweep exists: `next_run_at` becomes claima
 The store validates these in code under the execution lock and tests them as invariants:
 
 - command and all dependency members share one execution;
-- command projection and dispatch state agree;
+- command projection and queue state agree;
 - `flow_executions.command_count` equals accepted command rows;
 - `flow_executions.open_commands` equals non-terminal command rows after each transition;
 - every command's `created_position` identifies its `CommandCreated` entry;
 - every terminal command's `terminal_position` identifies its sole terminal event;
-- every running dispatch/coordinator `active_attempt_id` identifies exactly one earlier `AttemptStarted` entry for that same subject;
+- every positive execution `plan_revision` has exactly one matching `PlanReconciled` entry, and revisions are contiguous within that execution;
+- every running queue/coordinator `active_attempt_id` identifies exactly one earlier `AttemptStarted` entry for that same subject;
 - every `AttemptConcluded` entry identifies exactly one earlier `AttemptStarted` in the same execution and for the same command or coordinator, with no other conclusion for that attempt;
 - coordinator state position identifies `ExecutionStarted` or its latest `CoordinatorTransition`;
 - journal causation remains inside the same execution;
@@ -867,7 +877,7 @@ Property and replay tests enforce these after arbitrary operation sequences.
 Initial table settings prioritize the hot delivery rows:
 
 ```sql
-ALTER TABLE public.flow_command_dispatch SET (
+ALTER TABLE public.flow_command_queue SET (
     fillfactor = 75,
     autovacuum_vacuum_scale_factor = 0.01,
     autovacuum_analyze_scale_factor = 0.02,
@@ -899,7 +909,7 @@ Migration units are embedded, monotonically numbered, never rewritten after rele
 5. insert the migration row with its library version, checksum, and compatibility range;
 6. commit.
 
-Suggested initial units: migration ledger; executions; commands/dispatch; topology/waits; coordinators; journal/plan reads; indexes/storage settings. `New` calls compatibility check only. It never migrates implicitly.
+Suggested initial units: migration ledger; executions; commands/queue; topology/waits; coordinators; journal; indexes/storage settings. `New` calls compatibility check only. It never migrates implicitly.
 
 Expand/migrate/contract governs rolling schema changes. The runtime refuses an unknown future writer version or an incompatible minimum reader/writer range with `ErrSchema`.
 
@@ -933,7 +943,7 @@ ORDER BY position
 LIMIT $3;
 ```
 
-`Trace` runs a small fixed query set in one `REPEATABLE READ, READ ONLY` transaction: execution; commands with dispatch; dependencies/waits; the bounded journal range containing attempt history and events; coordinator. It does not execute N queries per command. Current running-attempt detail comes from dispatch/coordinator rows; concluded attempts come from journal entries. Live state may advance immediately after the snapshot, but the returned view is internally consistent.
+`Trace` runs a small fixed query set in one `REPEATABLE READ, READ ONLY` transaction: execution including bounded plan diagnostics; commands with queue rows; dependencies/waits; the bounded journal range containing attempt history, plan revisions, and events; coordinator. It does not execute N queries per command. Current running-attempt detail comes from queue/coordinator rows; concluded attempts come from journal entries. Live state may advance immediately after the snapshot, but the returned view is internally consistent.
 
 `ListExecutions` uses stable `(created_at, execution_id)` cursor pagination and only the indexed filters defined in the functional spec. Metadata filtering is bounded JSON containment over the validated string map and uses `flow_executions_metadata_idx`; arbitrary JSONPath expressions are not exposed.
 
@@ -955,8 +965,8 @@ Every named check, foreign key, unique index, partial unique index, and terminal
 - stale tokens cannot conclude or renew;
 - retry changes next run only; interruption moves neither budget anchor nor consumed count;
 - event idempotency is checked before terminal rejection;
-- concurrent first publication rechecks idempotency under the execution lock, `Await`-only publication needs no plan capability, and facts on opposite sides of a persisted wait deadline resolve deterministically regardless of sweep timing;
-- plan snapshots observe in-transaction trigger state;
+- concurrent first publication rechecks idempotency under the execution lock, every plan-mode publication works without plan capability and sets dirty, and facts on opposite sides of a persisted wait deadline resolve deterministically regardless of sweep timing;
+- concurrent plan triggers coalesce behind `plan_dirty`, a claimed reconciliation sees their complete committed snapshot, and rollback leaves the execution dirty;
 - every maintenance runner is bounded and duplicate-safe;
 - replay from journal equals settled projections after randomized operations.
 
@@ -966,13 +976,13 @@ Run `EXPLAIN (ANALYZE, BUFFERS, WAL)` at 10K, 1M, and 10M aggregate commands/jou
 
 1. claim with 90% of the oldest lane backlog unregistered locally;
 2. claim bursts from one 1,000-command execution and from many executions;
-3. whole-plan snapshot at 10, 100, and 1,000 commands with 100 dependencies per node at the adversarial edge;
+3. dirty-plan probe with many registered plan versions, coalescing under relevant and irrelevant event floods, plus whole-plan snapshot at 10, 100, and 1,000 commands with 100 dependencies per node at the adversarial edge;
 4. coordinator next-match lookup across mixed `On`/`OnOutcome` selectors with sparse subscriptions and long unmatched prefixes;
 5. expired-wait maintenance with a large mostly-unexpired pending set;
 6. history paging and full 1,000-command trace;
 7. lease renewal at 500 active attempts;
 8. journal insert/WAL growth at 1 KiB, 64 KiB, and maximum payload sizes;
-9. HOT update and autovacuum behavior for dispatch/coordinator rows.
+9. HOT update and autovacuum behavior for queue/coordinator rows.
 
 ## 13. Acceptance conditions
 
@@ -982,5 +992,5 @@ Run `EXPLAIN (ANALYZE, BUFFERS, WAL)` at 10K, 1M, and 10M aggregate commands/jou
 - renewal writes no journal entry and changes no durable timing anchor;
 - one complete journal source reconstructs command existence, topology, attempts, events, outcomes, and coordinator transitions;
 - command ceiling and open count are maintained without table scans and verified after randomized transitions;
-- materialization/dispatch invariants and exactly-one terminal constraints hold under concurrency and injected crashes;
+- materialization/queue invariants and exactly-one terminal constraints hold under concurrency and injected crashes;
 - all integration tests and the required query-plan benchmarks pass with recorded evidence.

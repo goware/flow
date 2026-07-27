@@ -1,5 +1,5 @@
 ---
-status: complete
+status: draft
 ---
 
 # flow
@@ -27,7 +27,7 @@ When a worker returns successfully, `flow` automatically records an event carryi
 
 Every execution also has one immutable, ordered **journal**. The journal is broader than the developer-facing event abstraction: it records command creation, attempt lifecycle, events, terminal outcomes, execution transitions, causation, and the graph edges needed to explain why work exists. An `Event[T]` is a plan- and coordinator-visible fact recorded in that journal; operational entries such as `CommandCreated` and `AttemptStarted` are history, not additional kinds of application event. The journal is the complete durable account of the execution decisions and lifecycle transitions accepted by `flow`, not a claim that `flow` can observe every effect in an external system.
 
-Plans are optional. The simplest use starts one command directly as durable background work; its worker may spawn bounded child commands, and the execution finishes after the root and all required descendants finish. When progression needs dependencies, joins, waits, or branches across commands, the application adds a **plan**: a small pure function that declares commands by durable key. The plan does not receive one event callback. It is re-evaluated over all relevant events and command results recorded so far; it never sleeps in memory. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
+Plans are optional. The simplest use starts one command directly as durable background work; its worker may spawn bounded child commands, and the execution finishes after the root and all required descendants finish. When progression needs dependencies, joins, waits, or branches across commands, the application adds a **plan**: a small pure function that declares commands by durable key. The plan does not receive one event callback. Events and terminal command outcomes durably mark the execution as needing reconciliation; a compatible replica then evaluates the plan over everything recorded so far and clears that work only after its declarations commit. Several inputs may coalesce into one evaluation, and the plan never sleeps in memory. For open-ended processes whose membership cannot close with one worker return, a hand-written **coordinator** reacts to events directly.
 
 This also makes `flow` suitable for long-running durable agents without adding an agent-specific framework. One agent run or bounded episode is an execution; its coordinator is the durable control loop; model calls, tools, and bounded sub-agent tasks are commands; and their results and external observations are events. A long-lived execution is composed of bounded worker invocations rather than one worker retaining an agent loop in memory. A coordinator may schedule its next command for later without occupying a worker, and the journal preserves every accepted turn, tool call, failure, retry, and causal decision across replica failure and takeover.
 
@@ -71,7 +71,7 @@ report,  err := ReportPlan.With(rt).Execute(ctx, reportID, reportArgs)
 intent,  err := IntentCoordinator.With(rt).Execute(ctx, intentID, initialState)
 ```
 
-Each call returns after durable scheduling. A command enqueues its root command. A plan evaluates its initial pure declaration and enqueues every command that is ready. A coordinator enqueues its initial activation. No worker or coordinator handler runs inline in the caller.
+Each call returns after durable scheduling. A command enqueues its root command. A plan marks the new execution for reconciliation; a plan-capable runtime later evaluates the initial pure declaration and enqueues every ready command. A coordinator enqueues its initial activation. No plan, worker, or coordinator handler runs inline in the caller.
 
 Frequently used definitions may be bound once to a runtime:
 
@@ -188,7 +188,7 @@ The runtime automatically records an event carrying a successful worker result. 
 
 Long external waits normally remain outside a claimed worker. A webhook or efficient batch monitor observes the external system, then uses `Runtime.InTx` to publish one idempotent fact in the same PostgreSQL transaction as its application-table update. A plan-declared command waiting with `Await` holds no worker, connection, goroutine, or lease; the published fact makes it eligible atomically at commit. Facts retained before the plan reaches that branch are still observed later, so this pattern replaces fragile one-shot release writes without requiring one polling command per execution.
 
-An event used only by a durably stored `Await` condition is resolved by the engine and does not require the publishing monitor to register or execute the Go plan. If the plan itself reads that event through `Fact` or `Facts`, the publishing runtime must have the exact plan version so the fact and any resulting declarations can commit together. This keeps ordinary monitors small without weakening atomic plan decisions.
+Any event publication durably records the fact, resolves matching stored `Await` conditions, and marks a plan-driven execution for reconciliation in the same transaction. The publishing monitor needs only the event definition and client; it never needs to link or register the Go plan. A replica registering the exact plan version later consumes that durable reconciliation work. This keeps monitors and specialized worker pools independent from orchestration code without creating a lost-progress window.
 
 The journal additionally records the creation of every command, including its canonical arguments, origin, parent where applicable, dependencies, required/optional classification, and causation. Together with the exactly-one-terminal-event rule, those entries make the execution graph and its final command states reconstructible from retained history. Attempt starts, retryable failures, interruptions, and retry scheduling remain operational journal entries rather than events because the command has not finished yet. Lease-renewal heartbeats and polling noise are maintenance, not history.
 
@@ -219,7 +219,7 @@ func planIntent(p *flow.Plan, args ExecuteArgs) {
 
 The name is deliberate: the whole durable run is the workflow in ordinary language, represented by an `Execution`. `Plan` names only the optional pure function that plans cross-command progression; calling that function `Workflow` would blur it with the execution it helps coordinate.
 
-The plan is re-evaluated whenever a relevant event is recorded or an observed command reaches a final state, and reconciled by command key: declaring a command that already exists does nothing, and declaring a new one whose prerequisites are met issues it. "React" does not mean that the plan receives a single event callback. Each evaluation is a pure function over the execution arguments and all relevant events and command results recorded so far. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. `Children` reads a worker's authoritative closed child membership; `Result` and `Outcome` remain available for genuine value-dependent branching. A plan only ever grows; it never withdraws work it already asked for.
+Every event or terminal command outcome durably marks a plan-driven execution dirty. Plan-capable replicas claim dirty executions with PostgreSQL row locking, and several transitions may coalesce before one evaluation. Reconciliation remains by command key: declaring a command that already exists does nothing, and declaring a new one whose prerequisites are met issues it. "React" does not mean that the plan receives a single event callback. Each evaluation is a pure function over the execution arguments and all relevant events and command results recorded so far. Dynamic branches need no separate API — the plan simply declares more work once the fact that decides the branch exists. `Children` reads a worker's authoritative closed child membership; `Result` and `Outcome` remain available for genuine value-dependent branching. A plan only ever grows; it never withdraws work it already asked for.
 
 `After` waits for the event recording another command's success. `AfterSettled` waits for the command to reach any final state, and `Outcome` exposes the typed result or structured reason. `Await` waits for any event, including one published from outside the execution. Plan reads internally distinguish an input that may still arrive from one that resolved without a value, so an unsuccessful command can never leave an execution waiting forever for an impossible result. These are plan-reading operations over durable state and events, not additional event categories.
 
@@ -278,7 +278,7 @@ Handlers are ordinary Go and may call normal application services. Business data
 - **Durable adaptive execution:** long-running agents and other open-ended loops progress as bounded commands around durable coordinator decisions, with no process-local loop required for correctness.
 - **Durability:** commands, attempts, events, decisions, and causal relationships survive process and machine failure.
 - **Failure correctness:** bounded retries, backoff, leases, timeouts, cancellation, terminal failure, and explicit operator-visible outcomes.
-- **Atomic progression:** a command result, its declared short application write, emitted events, spawned commands, plan reconciliation, coordinator state, and inbox progress commit under one settlement discipline.
+- **Durable progression:** a command result, its declared short application write, emitted events, and spawned children commit atomically; plan-triggering transitions atomically mark reconciliation work, and plan declarations later commit as their own atomic batch; coordinator state, outputs, and inbox progress commit together.
 - **Traceability:** explain what is running, what is waiting, what failed, what was retried, and why every command exists.
 - **Horizontal operation:** many API processes and workers cooperating on one PostgreSQL database.
 - **Testability:** workers, optional plans, and coordinator-driven agent loops unit-testable without starting a distributed system.
@@ -296,7 +296,7 @@ Handlers are ordinary Go and may call normal application services. Business data
 - Commands and events are versioned durable data whose schemas may outlive the code version that created them.
 - Rolling deployments where processes temporarily recognize different command or event versions.
 - Runtime correctness must never depend on a process retaining in-memory state.
-- A replica settling plan-driven commands must register the execution's exact plan version. Ingress processes need that plan only when their transition changes an input the plan actually reads; satisfying a materialized `Await` alone remains plan-free.
+- Events and terminal command outcomes atomically mark plan-driven executions dirty. Only plan-reconciliation replicas need the exact plan version; publishers and command workers may remain independently deployed.
 - `Runtime` directly satisfies the lightweight client capability, and definitions bind to that capability immutably for concise execution and application wiring.
 - A direct command execution requires neither a plan nor a coordinator and completes from its closed command tree.
 - Every accepted command creation has one immutable ordered journal entry recording its payload, origin, dependencies, classification, and causation; every command that ends has exactly one persisted event recording how it ended.
