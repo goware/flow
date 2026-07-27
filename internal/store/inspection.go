@@ -1,0 +1,190 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/goware/flow/internal/flowerr"
+	"github.com/goware/flow/internal/pgschema"
+	"github.com/jackc/pgx/v5"
+)
+
+// MaxExecutionListLimit includes the one-row look-ahead used to construct a
+// public page cursor. Public pages remain capped at 200 executions.
+const MaxExecutionListLimit = 201
+
+type ExecutionRow struct {
+	ID                uuid.UUID
+	Mode              string
+	DefinitionName    string
+	DefinitionVersion int
+	Key               string
+	Status            string
+	FailFast          bool
+	MaxCommands       int
+	CommandCount      int
+	OpenCommands      int
+	PlanDirty         bool
+	PlanQuiescent     bool
+	PlanRevision      int64
+	PlanWaitingCount  int
+	PlanWaitingOn     []string
+	DeadlineAt        *time.Time
+	OutcomeRef        string
+	FailureCode       string
+	FailureMessage    string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	StatusAt          time.Time
+	FinishedAt        *time.Time
+	Metadata          []byte
+}
+
+type ExecutionListFilter struct {
+	DefinitionName string
+	KeyPrefix      string
+	Statuses       []string
+	CreatedAfter   *time.Time
+	CreatedBefore  *time.Time
+	Metadata       []byte
+	CursorCreated  *time.Time
+	CursorID       *uuid.UUID
+	Limit          int
+}
+
+func (s *Store) GetExecutionInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (ExecutionRow, error) {
+	if id == uuid.Nil {
+		return ExecutionRow{}, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
+	}
+	query := s.executionSelect() + ` WHERE execution_id=$1`
+	if tx != nil {
+		return scanExecution(tx.QueryRow(ctx, query, id))
+	}
+	return scanExecution(s.db.Conn.QueryRow(ctx, query, id))
+}
+
+func (s *Store) LookupExecutionInTx(ctx context.Context, tx pgx.Tx, definitionName, key string) ([]ExecutionRow, error) {
+	if definitionName == "" || key == "" {
+		return nil, fmt.Errorf("%w: lookup type and key are required", flowerr.ErrInvalid)
+	}
+	query := s.executionSelect() + ` WHERE definition_name=$1 AND execution_key=$2 ORDER BY driver_mode LIMIT 2`
+	return s.queryExecutions(ctx, tx, query, definitionName, key)
+}
+
+func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter ExecutionListFilter) ([]ExecutionRow, error) {
+	if filter.Limit <= 0 || filter.Limit > MaxExecutionListLimit {
+		return nil, fmt.Errorf("%w: execution list limit is invalid", flowerr.ErrInvalid)
+	}
+	if (filter.CursorCreated == nil) != (filter.CursorID == nil) {
+		return nil, fmt.Errorf("%w: execution list cursor is incomplete", flowerr.ErrInvalid)
+	}
+	clauses := make([]string, 0, 7)
+	args := make([]any, 0, 8)
+	add := func(sql string, value any) {
+		args = append(args, value)
+		clauses = append(clauses, fmt.Sprintf(sql, len(args)))
+	}
+	if filter.DefinitionName != "" {
+		add(`definition_name=$%d`, filter.DefinitionName)
+	}
+	if filter.KeyPrefix != "" {
+		escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(filter.KeyPrefix)
+		add(`execution_key LIKE $%d || '%%' ESCAPE '!'`, escaped)
+	}
+	if len(filter.Statuses) != 0 {
+		add(`status=ANY($%d::text[])`, filter.Statuses)
+	}
+	if filter.CreatedAfter != nil {
+		add(`created_at >= $%d`, *filter.CreatedAfter)
+	}
+	if filter.CreatedBefore != nil {
+		add(`created_at < $%d`, *filter.CreatedBefore)
+	}
+	if len(filter.Metadata) != 0 {
+		add(`metadata @> $%d::jsonb`, string(filter.Metadata))
+	}
+	if filter.CursorCreated != nil {
+		args = append(args, *filter.CursorCreated, *filter.CursorID)
+		clauses = append(clauses, fmt.Sprintf(`(created_at,execution_id) < ($%d,$%d)`, len(args)-1, len(args)))
+	}
+	args = append(args, filter.Limit)
+	query := s.executionSelect()
+	if len(clauses) != 0 {
+		query += ` WHERE ` + strings.Join(clauses, ` AND `)
+	}
+	query += fmt.Sprintf(` ORDER BY created_at DESC,execution_id DESC LIMIT $%d`, len(args))
+	return s.queryExecutions(ctx, tx, query, args...)
+}
+
+const executionSelectColumns = `SELECT execution_id,driver_mode,definition_name,definition_version,execution_key,status,
+	fail_fast,max_commands,command_count,open_commands,plan_dirty,plan_quiescent,plan_revision,
+	plan_waiting_count,plan_waiting_on,deadline_at,outcome_ref,failure,created_at,updated_at,status_at,
+	finished_at,metadata FROM `
+
+func (s *Store) executionSelect() string {
+	return executionSelectColumns + pgschema.Table(s.schema, "flow_executions")
+}
+
+func (s *Store) queryExecutions(ctx context.Context, tx pgx.Tx, query string, args ...any) ([]ExecutionRow, error) {
+	var rows pgx.Rows
+	var err error
+	if tx != nil {
+		rows, err = tx.Query(ctx, query, args...)
+	} else {
+		rows, err = s.db.Conn.Query(ctx, query, args...)
+	}
+	if err != nil {
+		return nil, MapError("list executions", err)
+	}
+	defer rows.Close()
+	result := make([]ExecutionRow, 0, min(len(args)+8, MaxExecutionListLimit))
+	for rows.Next() {
+		value, err := scanExecution(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, MapError("read execution rows", err)
+	}
+	return result, nil
+}
+
+func scanExecution(row pgx.Row) (ExecutionRow, error) {
+	var value ExecutionRow
+	var waiting, failure, metadata []byte
+	var outcome *string
+	if err := row.Scan(
+		&value.ID, &value.Mode, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
+		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.PlanDirty,
+		&value.PlanQuiescent, &value.PlanRevision, &value.PlanWaitingCount, &waiting, &value.DeadlineAt,
+		&outcome, &failure, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
+	); err != nil {
+		return ExecutionRow{}, MapError("scan execution", err)
+	}
+	if outcome != nil {
+		value.OutcomeRef = *outcome
+	}
+	if len(waiting) != 0 && string(waiting) != "null" {
+		if err := json.Unmarshal(waiting, &value.PlanWaitingOn); err != nil {
+			return ExecutionRow{}, fmt.Errorf("%w: invalid plan waiting projection", flowerr.ErrInvalidState)
+		}
+	}
+	if len(failure) != 0 && string(failure) != "null" {
+		var decoded struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(failure, &decoded); err != nil {
+			return ExecutionRow{}, fmt.Errorf("%w: invalid execution failure projection", flowerr.ErrInvalidState)
+		}
+		value.FailureCode, value.FailureMessage = decoded.Code, decoded.Message
+	}
+	value.Metadata = append([]byte(nil), metadata...)
+	return value, nil
+}
