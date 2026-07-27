@@ -114,6 +114,50 @@ type ClaimBatchResult struct {
 	Progressed bool
 }
 
+type CommandInput struct {
+	Key     string
+	Name    string
+	Version int
+	State   string
+	Result  []byte
+	Failure *terminalFailure
+}
+
+// LoadCommandInputs returns every durable predecessor explicitly named by a
+// dependency edge of commandID. The query is batched once before invocation;
+// terminal predecessor values are immutable thereafter.
+func (s *Store) LoadCommandInputs(ctx context.Context, commandID uuid.UUID) ([]CommandInput, error) {
+	rows, err := s.db.Conn.Query(ctx, `SELECT DISTINCT p.command_key,p.name,p.version,p.state,p.result,p.terminal_failure
+		FROM `+pgschema.Table(s.schema, "flow_command_dependency_groups")+` g
+		JOIN `+pgschema.Table(s.schema, "flow_command_dependency_members")+` m ON m.group_id=g.group_id
+		JOIN `+pgschema.Table(s.schema, "flow_commands")+` p ON p.command_id=m.predecessor_command_id
+		WHERE g.dependent_command_id=$1 ORDER BY p.command_key`, commandID)
+	if err != nil {
+		return nil, MapError("load command dependency inputs", err)
+	}
+	defer rows.Close()
+	var result []CommandInput
+	for rows.Next() {
+		var item CommandInput
+		var failureBytes []byte
+		if err := rows.Scan(&item.Key, &item.Name, &item.Version, &item.State, &item.Result, &failureBytes); err != nil {
+			return nil, MapError("scan command dependency input", err)
+		}
+		if len(failureBytes) > 0 {
+			var failure terminalFailure
+			if err := json.Unmarshal(failureBytes, &failure); err != nil {
+				return nil, fmt.Errorf("%w: invalid stored terminal failure", flowerr.ErrInvalidState)
+			}
+			item.Failure = &failure
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, MapError("read command dependency inputs", err)
+	}
+	return result, nil
+}
+
 func (s *Store) ClaimCommand(
 	ctx context.Context,
 	candidate CommandCandidate,
@@ -233,16 +277,16 @@ func (s *Store) claimCommandLocked(
 	var timeoutMS *int64
 	var createdAt, budgetStartedAt, nextRunAt time.Time
 	var createdPosition int64
-	var failureScope bool
+	var failureScope, required bool
 	err := semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.args,c.queue,c.attempt_timeout_ms,
 		c.retry_policy::text::bytea,c.created_at,c.budget_started_at,c.attempt_ordinal,c.consumed_attempts,
-		c.created_position,c.failure_scope,c.state,q.state,q.next_run_at
+		c.created_position,c.failure_scope,c.required,c.state,q.state,q.next_run_at
 		FROM `+pgschema.Table(s.schema, "flow_command_queue")+` q
 		JOIN `+pgschema.Table(s.schema, "flow_commands")+` c ON c.command_id=q.command_id
 		WHERE q.command_id=$1 AND q.execution_id=$2
 		FOR UPDATE OF q,c SKIP LOCKED`, candidate.CommandID, semantic.ExecutionID()).
 		Scan(&key, &name, &version, &args, &queue, &timeoutMS, &policyBytes, &createdAt,
-			&budgetStartedAt, &ordinal, &consumed, &createdPosition, &failureScope, &commandState, &queueState, &nextRunAt)
+			&budgetStartedAt, &ordinal, &consumed, &createdPosition, &failureScope, &required, &commandState, &queueState, &nextRunAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, true, nil
 	}
@@ -251,7 +295,7 @@ func (s *Store) claimCommandLocked(
 	}
 	if name != candidate.Name || version != candidate.Version || queue != candidate.Queue ||
 		(commandState != "ready" && commandState != "retry_wait") || commandState != queueState ||
-		semantic.DBNow().Before(nextRunAt) || executionStatus == "failing" && !failureScope {
+		semantic.DBNow().Before(nextRunAt) {
 		return nil, true, nil
 	}
 	policy, err := retrypolicy.PublicFromCanonical(policyBytes)
@@ -260,7 +304,7 @@ func (s *Store) claimCommandLocked(
 	}
 	policyValue := retrypolicy.ValueOf(policy)
 	if policyValue.MaxElapsed != nil && !semantic.DBNow().Before(budgetStartedAt.Add(*policyValue.MaxElapsed)) {
-		if err := s.failBeforeClaimLocked(ctx, semantic, candidate.CommandID, key, executionStatus,
+		if err := s.failBeforeClaimLocked(ctx, semantic, candidate.CommandID, key, required,
 			"retry_elapsed", "retry elapsed budget expired", createdPosition); err != nil {
 			return nil, false, err
 		}
@@ -316,17 +360,47 @@ func (s *Store) failBeforeClaimLocked(
 	ctx context.Context,
 	semantic *SemanticTx,
 	commandID uuid.UUID,
-	key, executionStatus, code, message string,
+	key string,
+	required bool,
+	code, message string,
 	causation int64,
 ) error {
+	head, err := s.LoadExecutionHead(ctx, semantic)
+	if err != nil {
+		return err
+	}
+	resolution := graphResolution{}
+	failureEffects := failureResolution{}
+	if required {
+		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, commandID, "failed", head.FailFast)
+		resolution = failureEffects.graphResolution
+	} else {
+		resolution, err = s.resolveGraphLocked(ctx, semantic, map[uuid.UUID]string{commandID: "failed"}, nil)
+	}
+	if err != nil {
+		return err
+	}
 	commandEvent, err := terminalEventWithCode(commandID, key, "failed", code, message, "flow.command_failed", "command_terminal")
 	if err != nil {
 		return err
 	}
 	commandEvent.CausationPosition = clonePointer(&causation)
 	entries := []JournalEntry{commandEvent}
-	if executionStatus == "running" {
-		failing, err := NewJournalEntry(ExecutionFailing, journalcodec.TerminalEventBody{V: 1, Status: "failing", Reason: message, CommandKey: key})
+	skippedOffset := len(entries)
+	skippedEntries, err := resolution.skippedEntries(0)
+	if err != nil {
+		return err
+	}
+	entries = append(entries, skippedEntries...)
+	if required && head.Status == "running" {
+		survivors := make([]string, len(failureEffects.survivors))
+		for index, command := range failureEffects.survivors {
+			survivors[index] = command.key
+		}
+		failing, err := NewJournalEntry(ExecutionFailing, map[string]any{
+			"v": 1, "status": "failing", "reason": message, "command_key": key,
+			"fail_fast": head.FailFast, "survivors": survivors,
+		})
 		if err != nil {
 			return err
 		}
@@ -334,13 +408,21 @@ func (s *Store) failBeforeClaimLocked(
 		failing.CausationBatchIndex = &zero
 		entries = append(entries, failing)
 	}
-	head, err := s.LoadExecutionHead(ctx, semantic)
+	cancelledOffset := len(entries)
+	cancelledEntries, err := failureEffects.cancellationEntries(0, "cancelled by fail-fast after required command failure")
 	if err != nil {
 		return err
 	}
-	terminalExecution := head.Mode == DriverDirect && head.OpenCommands == 1
+	entries = append(entries, cancelledEntries...)
+	executionFailed := required || head.Status == "failing"
+	effectiveOpen := head.OpenCommands - 1 - len(resolution.skipped) - len(failureEffects.cancelled)
+	terminalExecution := head.Mode == DriverDirect && effectiveOpen == 0
 	if terminalExecution {
-		terminal, err := executionTerminalEvent("failed", message, "flow.execution_failed")
+		status, eventName, reason := "succeeded", "flow.execution_succeeded", ""
+		if executionFailed {
+			status, eventName, reason = "failed", "flow.execution_failed", message
+		}
+		terminal, err := executionTerminalEvent(status, reason, eventName)
 		if err != nil {
 			return err
 		}
@@ -362,18 +444,33 @@ func (s *Store) failBeforeClaimLocked(
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, commandID); err != nil {
 		return MapError("remove failed command queue row", err)
 	}
-	status := "failing"
+	if required {
+		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, skippedOffset, cancelledOffset,
+			"cancelled by fail-fast after required command failure"); err != nil {
+			return err
+		}
+	} else if err := s.applyGraphResolution(ctx, semantic, resolution, journal, skippedOffset); err != nil {
+		return err
+	}
+	status := head.Status
+	if required {
+		status = "failing"
+	}
 	if terminalExecution {
-		status = "failed"
+		status = "succeeded"
+		if executionFailed {
+			status = "failed"
+		}
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-		SET status=$2,open_commands=open_commands-1,failure=$3::jsonb,
-		    finished_at=CASE WHEN $2='failed' THEN $4 ELSE finished_at END,
+		SET status=$2,open_commands=open_commands-1-$5,failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
+		    finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 		    plan_dirty=CASE WHEN driver_mode='plan' THEN true ELSE plan_dirty END,
 		    plan_dirty_since=CASE WHEN driver_mode='plan' THEN COALESCE(plan_dirty_since,$4) ELSE plan_dirty_since END,
 		    plan_quiescent=CASE WHEN driver_mode='plan' THEN false ELSE plan_quiescent END,
 		    updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END
-		WHERE execution_id=$1`, semantic.ExecutionID(), status, jsonString(failure), semantic.DBNow()); err != nil {
+		WHERE execution_id=$1`, semantic.ExecutionID(), status, jsonString(failure), semantic.DBNow(),
+		len(resolution.skipped)+len(failureEffects.cancelled), executionFailed); err != nil {
 		return MapError("update execution after pre-claim failure", err)
 	}
 	return nil
@@ -482,9 +579,11 @@ func rawJSON(value []byte) json.RawMessage { return json.RawMessage(slices.Clone
 func canonicalBody(value any) (canonical.Value, error) { return canonical.Marshal(value, 0) }
 
 type CommandSuccess struct {
-	Claim  ClaimedCommand
-	Result canonical.Value
-	Commit func(pgx.Tx) error
+	Claim    ClaimedCommand
+	Result   canonical.Value
+	Events   []ApplicationEvent
+	Children []CommandCreate
+	Commit   func(pgx.Tx) error
 }
 
 type CommandConclusion struct {
@@ -527,6 +626,7 @@ type commandFence struct {
 	State                  string
 	QueueState             string
 	FailureScope           bool
+	Required               bool
 	Attempt                int
 	ConsumedAttempts       int
 	BudgetStartedAt        time.Time
@@ -565,6 +665,19 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		}
 		return SettleResult{Terminal: true, Status: "expired"}, nil
 	}
+	for index := range request.Children {
+		// A child created by a survivor belongs to the same failure-handling
+		// closure. This is accepted in the settle transaction, never inferred
+		// later from application payloads.
+		request.Children[index].FailureScope = fence.FailureScope
+	}
+	if err := s.validateSuccessfulDecision(ctx, semantic, fence, request); err != nil {
+		return SettleResult{}, err
+	}
+	resolution, err := s.resolveGraphLocked(ctx, semantic, map[uuid.UUID]string{request.Claim.CommandID: "succeeded"}, nil)
+	if err != nil {
+		return SettleResult{}, err
+	}
 
 	concluded, err := NewJournalEntry(AttemptConcluded, journalcodec.AttemptConcludedBody{
 		V: 1, AttemptID: request.Claim.AttemptID.String(), CommandID: request.Claim.CommandID.String(),
@@ -578,6 +691,29 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	concluded.AttemptID = clonePointer(&request.Claim.AttemptID)
 	concluded.CausationPosition = clonePointer(&fence.AttemptStartedPosition)
 
+	entries := []JournalEntry{concluded}
+	for _, event := range request.Events {
+		entry := JournalEntry{
+			EntryID: uuid.New(), Kind: EventRecorded, EventID: clonePointer(&event.ID),
+			EventNamespace: stringPointer("application"), EventName: clonePointer(&event.Name),
+			EventVersion: clonePointer(&event.Version), EventKey: clonePointer(&event.Key),
+			EventClass: stringPointer("application"), Body: event.Body,
+		}
+		entry.CommandID = clonePointer(&request.Claim.CommandID)
+		zero := 0
+		entry.CausationBatchIndex = &zero
+		entries = append(entries, entry)
+	}
+	for _, child := range request.Children {
+		next := semantic.DBNow().Add(child.InitialDelay)
+		created, createErr := commandCreatedEntry(child, next, next)
+		if createErr != nil {
+			return SettleResult{}, createErr
+		}
+		zero := 0
+		created.CausationBatchIndex = &zero
+		entries = append(entries, created)
+	}
 	succeeded, err := NewJournalEntry(EventRecorded, journalcodec.CommandSucceededBody{
 		V: 1, CommandKey: fence.Key, Result: rawJSON(request.Result.Bytes), CommitApplied: request.Commit != nil,
 	})
@@ -595,15 +731,28 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	succeeded.TerminalStatus = stringPointer("succeeded")
 	zero := 0
 	succeeded.CausationBatchIndex = &zero
-	entries := []JournalEntry{concluded, succeeded}
-	terminalExecution := fence.Head.Mode == DriverDirect && fence.Head.OpenCommands == 1
+	entries = append(entries, succeeded)
+	parentTerminalIndex := len(entries) - 1
+	skippedOffset := len(entries)
+	skippedEntries, err := resolution.skippedEntries(parentTerminalIndex)
+	if err != nil {
+		return SettleResult{}, err
+	}
+	entries = append(entries, skippedEntries...)
+	effectiveOpen := fence.Head.OpenCommands - 1 + len(request.Children) - len(resolution.skipped)
+	terminalExecution := fence.Head.Mode == DriverDirect && effectiveOpen == 0
+	terminalStatus := "succeeded"
+	terminalName := "flow.execution_succeeded"
+	if fence.Head.Status == "failing" {
+		terminalStatus = "failed"
+		terminalName = "flow.execution_failed"
+	}
 	if terminalExecution {
-		terminal, err := executionTerminalEvent("succeeded", "", "flow.execution_succeeded")
+		terminal, err := executionTerminalEvent(terminalStatus, "", terminalName)
 		if err != nil {
 			return SettleResult{}, err
 		}
-		one := 1
-		terminal.CausationBatchIndex = &one
+		terminal.CausationBatchIndex = &zero
 		entries = append(entries, terminal)
 	}
 	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: entries})
@@ -617,25 +766,35 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		SET state='succeeded',result=$2,result_hash=$3,last_error=NULL,terminal_failure=NULL,
 		    terminal_position=$4,child_membership_closed=true,finished_at=$5,updated_at=$5,status_at=$5
 		WHERE command_id=$1`, request.Claim.CommandID, request.Result.Bytes, request.Result.Digest[:],
-		journal.Journal[1].Position, semantic.DBNow()); err != nil {
+		journal.Journal[parentTerminalIndex].Position, semantic.DBNow()); err != nil {
 		return SettleResult{}, MapError("settle successful command", err)
 	}
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, request.Claim.CommandID); err != nil {
 		return SettleResult{}, MapError("remove successful command queue row", err)
 	}
+	for index, child := range request.Children {
+		next := semantic.DBNow().Add(child.InitialDelay)
+		if err := s.insertCommand(ctx, semantic.PGX(), semantic.ExecutionID(), child,
+			journal.Journal[1+len(request.Events)+index].Position, next, next); err != nil {
+			return SettleResult{}, err
+		}
+	}
+	if err := s.applyGraphResolution(ctx, semantic, resolution, journal, skippedOffset); err != nil {
+		return SettleResult{}, err
+	}
 	if terminalExecution {
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET status='succeeded',open_commands=0,finished_at=$2,updated_at=$2,status_at=$2
-			WHERE execution_id=$1`, semantic.ExecutionID(), semantic.DBNow()); err != nil {
+			SET status=$3,open_commands=0,finished_at=$2,updated_at=$2,status_at=$2
+			WHERE execution_id=$1`, semantic.ExecutionID(), semantic.DBNow(), terminalStatus); err != nil {
 			return SettleResult{}, MapError("complete direct execution", err)
 		}
 	} else {
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET open_commands=open_commands-1,
+			SET open_commands=open_commands-1+$3-$4,command_count=command_count+$3,
 			    plan_dirty=CASE WHEN driver_mode='plan' THEN true ELSE plan_dirty END,
 			    plan_dirty_since=CASE WHEN driver_mode='plan' THEN COALESCE(plan_dirty_since,$2) ELSE plan_dirty_since END,
 			    plan_quiescent=CASE WHEN driver_mode='plan' THEN false ELSE plan_quiescent END,
-			    updated_at=$2 WHERE execution_id=$1`, semantic.ExecutionID(), semantic.DBNow()); err != nil {
+			    updated_at=$2 WHERE execution_id=$1`, semantic.ExecutionID(), semantic.DBNow(), len(request.Children), len(resolution.skipped)); err != nil {
 			return SettleResult{}, MapError("update execution after command success", err)
 		}
 	}
@@ -663,6 +822,42 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		return SettleResult{}, err
 	}
 	return SettleResult{Terminal: true, Status: "succeeded"}, nil
+}
+
+func (s *Store) validateSuccessfulDecision(ctx context.Context, semantic *SemanticTx, fence commandFence, request CommandSuccess) error {
+	if len(request.Children) > 0 {
+		if fence.Head.MaxCommands > 0 && fence.Head.CommandCount+len(request.Children) > fence.Head.MaxCommands {
+			return fmt.Errorf("%w: execution command ceiling exceeded", flowerr.ErrInvalidState)
+		}
+		keys := make([]string, len(request.Children))
+		for index, child := range request.Children {
+			if child.ParentCommandID == nil || *child.ParentCommandID != request.Claim.CommandID || child.Origin != "worker_spawn" {
+				return fmt.Errorf("%w: invalid worker-spawned child", flowerr.ErrInvalid)
+			}
+			keys[index] = child.Key
+		}
+		var conflicts int
+		if err := semantic.PGX().QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(s.schema, "flow_commands")+`
+			WHERE execution_id=$1 AND command_key=ANY($2)`, semantic.ExecutionID(), keys).Scan(&conflicts); err != nil {
+			return MapError("validate spawned child keys", err)
+		}
+		if conflicts != 0 {
+			return fmt.Errorf("%w: spawned command key already exists", flowerr.ErrConflict)
+		}
+	}
+	for _, event := range request.Events {
+		existing, err := s.LookupApplicationEvent(ctx, semantic.PGX(), semantic.ExecutionID(), event.Name, event.Key)
+		if err != nil {
+			return err
+		}
+		if existing.Found {
+			if existing.Version != event.Version || !bytes.Equal(existing.Body, event.Body.Bytes) {
+				return fmt.Errorf("%w: emitted event identity differs", flowerr.ErrConflict)
+			}
+			return fmt.Errorf("%w: emitted event identity already exists", flowerr.ErrConflict)
+		}
+	}
+	return nil
 }
 
 func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConclusion, hook fault.Hook) (SettleResult, error) {
@@ -724,7 +919,22 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 	concluded.AttemptID = clonePointer(&request.Claim.AttemptID)
 	concluded.CausationPosition = clonePointer(&fence.AttemptStartedPosition)
 	entries := []JournalEntry{concluded}
+	resolution := graphResolution{}
+	failureEffects := failureResolution{}
+	skippedOffset := 0
+	cancelledOffset := 0
+	terminalExecution := false
+	executionFailed := false
 	if !decision.Retry {
+		if fence.Required {
+			failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, request.Claim.CommandID, "failed", fence.Head.FailFast)
+			resolution = failureEffects.graphResolution
+		} else {
+			resolution, err = s.resolveGraphLocked(ctx, semantic, map[uuid.UUID]string{request.Claim.CommandID: "failed"}, nil)
+		}
+		if err != nil {
+			return SettleResult{}, err
+		}
 		failed, err := terminalEventWithCode(request.Claim.CommandID, fence.Key, "failed", failure.Code, failure.Message, "flow.command_failed", "command_terminal")
 		if err != nil {
 			return SettleResult{}, err
@@ -732,24 +942,47 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		zero := 0
 		failed.CausationBatchIndex = &zero
 		entries = append(entries, failed)
-		if fence.Head.Status == "running" {
-			failing, err := NewJournalEntry(ExecutionFailing, journalcodec.TerminalEventBody{
-				V: 1, Status: "failing", Reason: failure.Message, CommandKey: fence.Key,
+		failedIndex := len(entries) - 1
+		skippedOffset = len(entries)
+		skippedEntries, err := resolution.skippedEntries(failedIndex)
+		if err != nil {
+			return SettleResult{}, err
+		}
+		entries = append(entries, skippedEntries...)
+		executionFailed = fence.Required || fence.Head.Status == "failing"
+		if fence.Required && fence.Head.Status == "running" {
+			survivors := make([]string, len(failureEffects.survivors))
+			for index, command := range failureEffects.survivors {
+				survivors[index] = command.key
+			}
+			failing, err := NewJournalEntry(ExecutionFailing, map[string]any{
+				"v": 1, "status": "failing", "reason": failure.Message, "command_key": fence.Key,
+				"fail_fast": fence.Head.FailFast, "survivors": survivors,
 			})
 			if err != nil {
 				return SettleResult{}, err
 			}
-			one := 1
-			failing.CausationBatchIndex = &one
+			failing.CausationBatchIndex = &failedIndex
 			entries = append(entries, failing)
 		}
-		if fence.Head.Mode == DriverDirect && fence.Head.OpenCommands == 1 {
-			terminal, err := executionTerminalEvent("failed", failure.Message, "flow.execution_failed")
+		cancelledOffset = len(entries)
+		cancelledEntries, err := failureEffects.cancellationEntries(failedIndex, "cancelled by fail-fast after required command failure")
+		if err != nil {
+			return SettleResult{}, err
+		}
+		entries = append(entries, cancelledEntries...)
+		effectiveOpen := fence.Head.OpenCommands - 1 - len(resolution.skipped) - len(failureEffects.cancelled)
+		terminalExecution = fence.Head.Mode == DriverDirect && effectiveOpen == 0
+		if terminalExecution {
+			status, eventName, reason := "succeeded", "flow.execution_succeeded", ""
+			if executionFailed {
+				status, eventName, reason = "failed", "flow.execution_failed", failure.Message
+			}
+			terminal, err := executionTerminalEvent(status, reason, eventName)
 			if err != nil {
 				return SettleResult{}, err
 			}
-			one := 1
-			terminal.CausationBatchIndex = &one
+			terminal.CausationBatchIndex = &failedIndex
 			entries = append(entries, terminal)
 		}
 	}
@@ -784,19 +1017,34 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, request.Claim.CommandID); err != nil {
 			return SettleResult{}, MapError("remove failed command queue row", err)
 		}
-		terminalExecution := fence.Head.Mode == DriverDirect && fence.Head.OpenCommands == 1
-		status := "failing"
+		if fence.Required {
+			if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, skippedOffset, cancelledOffset,
+				"cancelled by fail-fast after required command failure"); err != nil {
+				return SettleResult{}, err
+			}
+		} else if err := s.applyGraphResolution(ctx, semantic, resolution, journal, skippedOffset); err != nil {
+			return SettleResult{}, err
+		}
+		status := fence.Head.Status
+		if fence.Required {
+			status = "failing"
+		}
 		if terminalExecution {
-			status = "failed"
+			status = "succeeded"
+			if executionFailed {
+				status = "failed"
+			}
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET status=$2,open_commands=open_commands-1,failure=$3::jsonb,
-			    finished_at=CASE WHEN $2='failed' THEN $4 ELSE finished_at END,
+			SET status=$2,open_commands=open_commands-1-$5,
+			    failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
+			    finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 			    plan_dirty=CASE WHEN driver_mode='plan' THEN true ELSE plan_dirty END,
 			    plan_dirty_since=CASE WHEN driver_mode='plan' THEN COALESCE(plan_dirty_since,$4) ELSE plan_dirty_since END,
 			    plan_quiescent=CASE WHEN driver_mode='plan' THEN false ELSE plan_quiescent END,
 			    updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END
-			WHERE execution_id=$1`, semantic.ExecutionID(), status, jsonString(failure), semantic.DBNow()); err != nil {
+			WHERE execution_id=$1`, semantic.ExecutionID(), status, jsonString(failure), semantic.DBNow(),
+			len(resolution.skipped)+len(failureEffects.cancelled), executionFailed); err != nil {
 			return SettleResult{}, MapError("update execution after command failure", err)
 		}
 	}
@@ -834,7 +1082,7 @@ func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, clai
 		return commandFence{}, MapError("load execution deadline", err)
 	}
 	var activeAttempt, token *uuid.UUID
-	err = semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.state,c.failure_scope,c.attempt_ordinal,
+	err = semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.state,c.failure_scope,c.required,c.attempt_ordinal,
 		c.consumed_attempts,c.budget_started_at,c.retry_policy::text::bytea,
 		q.state,q.active_attempt_id,q.lease_token,q.lease_expires_at,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
@@ -843,7 +1091,7 @@ func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, clai
 		JOIN `+pgschema.Table(s.schema, "flow_command_queue")+` q ON q.command_id=c.command_id
 		WHERE c.command_id=$1 AND c.execution_id=$3
 		FOR UPDATE OF c,q`, claim.CommandID, claim.AttemptID, semantic.ExecutionID()).
-		Scan(&result.Key, &result.Name, &result.Version, &result.State, &result.FailureScope,
+		Scan(&result.Key, &result.Name, &result.Version, &result.State, &result.FailureScope, &result.Required,
 			&result.Attempt, &result.ConsumedAttempts, &result.BudgetStartedAt, &result.RetryPolicy,
 			&result.QueueState, &activeAttempt, &token, &result.LeaseExpiresAt, &result.AttemptStartedPosition)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -855,9 +1103,6 @@ func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, clai
 	if result.State != "running" || result.QueueState != "running" || activeAttempt == nil || token == nil ||
 		*activeAttempt != claim.AttemptID || *token != claim.LeaseToken || !semantic.DBNow().Before(result.LeaseExpiresAt) {
 		return commandFence{}, fmt.Errorf("%w: command attempt no longer owns its lease", flowerr.ErrLeaseLost)
-	}
-	if head.Status == "failing" && !result.FailureScope {
-		return commandFence{}, fmt.Errorf("%w: command is outside failure scope", flowerr.ErrTerminal)
 	}
 	return result, nil
 }

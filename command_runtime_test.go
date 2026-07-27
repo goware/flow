@@ -166,6 +166,180 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 	}
 }
 
+func TestRuntimeStagesEventsAndDelayedChildrenAtomically(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	type childArgs struct{ Value string }
+	type childResult struct{ Value string }
+	type rootResult struct{ Children int }
+	type fact struct{ Value string }
+	child := DefineCommand[childArgs, childResult]("graph.child", 1)
+	root := DefineCommand[None, rootResult]("graph.root", 1,
+		WithRetryPolicy(RetryFor(time.Second).Attempts(2).Backoff(10*time.Millisecond).Jitter(0)))
+	observed := DefineEvent[fact]("graph.observed", 1)
+	var childStartedAt atomic.Int64
+	var rootCalls atomic.Int32
+
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(root, func(_ context.Context, work *Work[None]) (rootResult, error) {
+			if err := Emit(work, observed, "observed/1", fact{Value: "root"}); err != nil {
+				return rootResult{}, err
+			}
+			if err := Spawn(work, "child/required", child, childArgs{Value: "required"}); err != nil {
+				return rootResult{}, err
+			}
+			if err := Spawn(work, "child/delayed", child, childArgs{Value: "delayed"}, Optional(), StartAfter(80*time.Millisecond)); err != nil {
+				return rootResult{}, err
+			}
+			if rootCalls.Add(1) == 1 {
+				return rootResult{}, errors.New("retry after staging")
+			}
+			return rootResult{Children: 2}, nil
+		}),
+		Handle(child, func(_ context.Context, work *Work[childArgs]) (childResult, error) {
+			if work.Args.Value == "delayed" {
+				childStartedAt.Store(time.Now().UnixNano())
+			}
+			return childResult{Value: work.Args.Value}, nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancelRun, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancelRun, runResult)
+	started := time.Now()
+	handle, err := root.With(runtime).Execute(ctx, "graph-tree", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
+	if got := time.Unix(0, childStartedAt.Load()).Sub(started); got < 60*time.Millisecond {
+		t.Fatalf("delayed child started after %s", got)
+	}
+	trace, err := Trace(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Commands) != 3 || trace.Execution.CommandCount != 3 || trace.Execution.OpenCommands != 0 {
+		t.Fatalf("Trace topology = commands %d, count %d, open %d", len(trace.Commands), trace.Execution.CommandCount, trace.Execution.OpenCommands)
+	}
+	var applicationEvents int
+	for _, entry := range trace.History {
+		if entry.EventNamespace == "application" && entry.EventName == observed.def.Name {
+			applicationEvents++
+		}
+	}
+	if applicationEvents != 1 {
+		t.Fatalf("application events = %d, want 1", applicationEvents)
+	}
+	if rootCalls.Load() != 2 {
+		t.Fatalf("root calls = %d, want 2", rootCalls.Load())
+	}
+	var parentID string
+	for _, command := range trace.Commands {
+		if command.Key == "root" {
+			parentID = string(command.ID)
+		}
+	}
+	if parentID == "" {
+		t.Fatal("root command missing")
+	}
+	var linked int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
+		WHERE execution_id=$1 AND parent_command_id=$2`, handle.ID, parentID).Scan(&linked); err != nil {
+		t.Fatal(err)
+	}
+	if linked != 2 {
+		t.Fatalf("linked children = %d, want 2", linked)
+	}
+	assertReplayMatches(t, runtime, handle.ID)
+}
+
+func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name        string
+		failFast    bool
+		wantSibling string
+	}{
+		{name: "enabled", failFast: true, wantSibling: string(StatusCancelled)},
+		{name: "disabled", failFast: false, wantSibling: string(StatusSucceeded)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database := testpg.Open(t)
+			ctx := context.Background()
+			if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+				t.Fatal(err)
+			}
+			type args struct{ Kind string }
+			child := DefineCommand[args, None]("failfast.child."+test.name, 1, WithMaxAttempts(1))
+			root := DefineCommand[None, None]("failfast.root."+test.name, 1)
+			var siblingCalls atomic.Int32
+			runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+				WithPollInterval(5*time.Millisecond))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.Register(
+				Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
+					if err := Spawn(work, "a-failure", child, args{Kind: "fail"}); err != nil {
+						return None{}, err
+					}
+					if err := Spawn(work, "z-sibling", child, args{Kind: "sibling"}, StartAfter(60*time.Millisecond)); err != nil {
+						return None{}, err
+					}
+					return None{}, nil
+				}),
+				Handle(child, func(_ context.Context, work *Work[args]) (None, error) {
+					if work.Args.Kind == "fail" {
+						return None{}, Permanent(errors.New("expected failure"))
+					}
+					siblingCalls.Add(1)
+					return None{}, nil
+				}),
+			); err != nil {
+				t.Fatal(err)
+			}
+			cancelRun, runResult := startRuntime(t, runtime)
+			defer stopRuntime(t, cancelRun, runResult)
+			handle, err := root.With(runtime).Execute(ctx, "failfast/"+test.name, None{}, WithFailFast(test.failFast))
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 5*time.Second)
+			trace, err := Trace(ctx, runtime, handle.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var siblingStatus string
+			for _, command := range trace.Commands {
+				if command.Key == "z-sibling" {
+					siblingStatus = command.State
+				}
+			}
+			if siblingStatus != test.wantSibling {
+				t.Fatalf("sibling status = %q, want %q", siblingStatus, test.wantSibling)
+			}
+			wantCalls := int32(0)
+			if !test.failFast {
+				wantCalls = 1
+			}
+			if siblingCalls.Load() != wantCalls {
+				t.Fatalf("sibling calls = %d, want %d", siblingCalls.Load(), wantCalls)
+			}
+			assertReplayMatches(t, runtime, handle.ID)
+		})
+	}
+}
+
 func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	t.Parallel()
 
@@ -761,13 +935,17 @@ func TestRuntimeExecutesDirectCommand(t *testing.T) {
 func waitForExecutionStatus(t *testing.T, schema string, db queryRower, id ExecutionID, want string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
+	last := "<unreadable>"
 	for time.Now().Before(deadline) {
 		var status string
 		if err := db.QueryRow(context.Background(), `SELECT status FROM `+pgschema.Table(schema, "flow_executions")+`
-			WHERE execution_id=$1`, id).Scan(&status); err == nil && status == want {
-			return
+			WHERE execution_id=$1`, id).Scan(&status); err == nil {
+			last = status
+			if status == want {
+				return
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("execution %s did not reach %s", id, want)
+	t.Fatalf("execution %s did not reach %s (last status %s)", id, want, last)
 }

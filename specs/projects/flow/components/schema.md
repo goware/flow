@@ -182,6 +182,7 @@ CREATE TABLE public.flow_commands (
     next_attempt_at         timestamptz,
     wait_started_at         timestamptz,
     wait_deadline_at        timestamptz,
+    wait_timeout_ms         bigint CHECK (wait_timeout_ms IS NULL OR wait_timeout_ms > 0),
 
     attempt_ordinal         integer NOT NULL DEFAULT 0 CHECK (attempt_ordinal >= 0),
     consumed_attempts       integer NOT NULL DEFAULT 0 CHECK (consumed_attempts >= 0),
@@ -399,7 +400,11 @@ CREATE INDEX flow_command_event_waits_reverse_idx
     WHERE satisfied_position IS NULL;
 ```
 
-The once-only `wait_started_at` and `wait_deadline_at` live on the command because one `Within` bounds the node's complete `Await` set.
+The accepted `wait_timeout_ms` and the once-only `wait_started_at` and
+`wait_deadline_at` live on the command because one `Within` bounds the node's
+complete `Await` set. The timeout is durable declaration data needed to derive
+the deadline later when command dependencies settle; retries and maintenance
+never recompute it from deployed code.
 
 Wait selectors match an exact event version, while application event idempotency reserves `(execution, event name, key)` across versions. An in-flight execution must therefore keep publishers capable of producing the version its waits declare; accepting another version under that natural key cannot satisfy the old wait and prevents a later conflicting republish.
 

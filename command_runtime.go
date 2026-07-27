@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -9,10 +10,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/fault"
 	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/goware/flow/internal/store"
+	"github.com/goware/flow/internal/store/journalcodec"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -255,7 +258,15 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		CreatedAt: claim.CreatedAt, BudgetStartedAt: claim.BudgetStartedAt,
 		Attempt: claim.Attempt, AttemptStartedAt: claim.DBNow,
 	}
+	inputs, err := r.store.LoadCommandInputs(workerCtx, claim.CommandID)
+	if err != nil {
+		r.concludeClaim(context.Background(), claim, classifiedConclusion{
+			class: retrypolicy.ClassInterrupted, code: "dependency_load", message: "dependency inputs could not be loaded",
+		})
+		return
+	}
 	scope := &workScope{args: args, info: info}
+	scope.state.results = workerResultSource(inputs)
 	if err := r.faults.Hit(workerCtx, fault.HandlerStart); err != nil {
 		r.concludeClaim(workerCtx, claim, classifiedConclusion{class: retrypolicy.ClassInterrupted, code: "handler_start_interrupted", message: "handler start was interrupted"})
 		return
@@ -288,6 +299,13 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		})
 		return
 	}
+	events, children, err := prepareWorkerDecision(scope, claim)
+	if err != nil {
+		r.concludeClaim(context.Background(), claim, classifiedConclusion{
+			class: retrypolicy.ClassPermanent, code: "invalid_decision", message: safeErrorMessage(err),
+		})
+		return
+	}
 	commit := func(tx pgx.Tx) error { return nil }
 	if worker.commit != nil {
 		commit = func(tx pgx.Tx) error { return worker.commit(workerCtx, tx, args, result, info) }
@@ -296,7 +314,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 	for attempt := 0; attempt < settlementAttempts; attempt++ {
 		_, settleErr := r.store.SettleCommandSuccess(context.Background(), store.CommandSuccess{
-			Claim: claim, Result: encoded, Commit: commit,
+			Claim: claim, Result: encoded, Events: events, Children: children, Commit: commit,
 		}, r.faults)
 		if settleErr == nil {
 			r.observe(context.Background(), Observation{
@@ -311,6 +329,13 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 			r.concludeClaim(context.Background(), claim, classifyWorkerError(commitErr.Err, false))
 			return
 		}
+		if errors.Is(settleErr, ErrConflict) || errors.Is(settleErr, ErrInvalid) ||
+			errors.Is(settleErr, ErrInvalidState) || errors.Is(settleErr, ErrPayloadTooLarge) {
+			r.concludeClaim(context.Background(), claim, classifiedConclusion{
+				class: retrypolicy.ClassPermanent, code: "invalid_decision", message: safeErrorMessage(settleErr),
+			})
+			return
+		}
 		ownership, resolveErr := r.store.ResolveCommandAttempt(context.Background(), claim.CommandID, claim.AttemptID, claim.LeaseToken)
 		if resolveErr == nil && ownership == store.AttemptOwnershipConcluded {
 			return
@@ -322,6 +347,90 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 			time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 		}
 	}
+}
+
+func workerResultSource(inputs []store.CommandInput) resultSourceState {
+	state := resultSourceState{restricted: true, values: make(map[string]resultSourceValue, len(inputs))}
+	for _, input := range inputs {
+		value := resultSourceValue{
+			name: input.Name, version: input.Version, status: commandStatus(input.State),
+			result: append([]byte(nil), input.Result...),
+		}
+		if input.Failure != nil {
+			value.failure = &CommandFailure{Code: input.Failure.Code, Message: input.Failure.Message}
+		} else if value.status != "" && value.status != StatusSucceeded {
+			value.failure = &CommandFailure{Code: input.State, Message: "command ended " + input.State}
+		}
+		state.values[input.Key] = value
+	}
+	return state
+}
+
+func commandStatus(state string) CommandStatus {
+	switch CommandStatus(state) {
+	case StatusSucceeded, StatusFailed, StatusCancelled, StatusExpired, StatusSkipped:
+		return CommandStatus(state)
+	default:
+		return ""
+	}
+}
+
+func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]store.ApplicationEvent, []store.CommandCreate, error) {
+	stagedEvents := scope.state.decision.orderedEvents()
+	events := make([]store.ApplicationEvent, 0, len(stagedEvents))
+	for _, staged := range stagedEvents {
+		body, err := canonical.Marshal(journalcodec.ApplicationEventBody{
+			V: 1, Payload: json.RawMessage(staged.payload.BytesCopy()),
+		}, 0)
+		if err != nil {
+			return nil, nil, newError(ErrInvalid, "settle", "event", staged.key, "event body cannot be journaled")
+		}
+		events = append(events, store.ApplicationEvent{
+			ID: uuid.New(), Name: staged.definition.Name, Version: staged.definition.Version,
+			Key: staged.key, Body: body,
+		})
+	}
+	stagedCommands := scope.state.decision.orderedCommands()
+	children := make([]store.CommandCreate, 0, len(stagedCommands))
+	for _, staged := range stagedCommands {
+		child, err := prepareCommand(uuid.New(), staged.key, staged.definition, staged.defaults, staged.args, "worker_spawn")
+		if err != nil {
+			return nil, nil, err
+		}
+		child.ParentCommandID = cloneUUIDPointer(claim.CommandID)
+		child.Required = staged.required
+		if staged.startAfter > 0 {
+			child.ScheduleKind = "spawn_start_after"
+			child.InitialDelay = staged.startAfter
+		}
+		declaration, err := canonical.Marshal(struct {
+			V            int             `json:"v"`
+			Key          string          `json:"key"`
+			Name         string          `json:"name"`
+			Version      int             `json:"version"`
+			Args         json.RawMessage `json:"args"`
+			Origin       string          `json:"origin"`
+			Parent       string          `json:"parent"`
+			Required     bool            `json:"required"`
+			StartAfterMS int64           `json:"start_after_ms,omitempty"`
+		}{
+			V: 1, Key: child.Key, Name: child.Name, Version: child.Version,
+			Args: json.RawMessage(child.Args.BytesCopy()), Origin: child.Origin,
+			Parent: claim.CommandID.String(), Required: child.Required,
+			StartAfterMS: child.InitialDelay.Milliseconds(),
+		}, 0)
+		if err != nil {
+			return nil, nil, newError(ErrInvalid, "settle", "command", child.Key, "declaration cannot be canonicalized")
+		}
+		child.DeclarationFingerprint = declaration.Digest
+		children = append(children, child)
+	}
+	return events, children, nil
+}
+
+func cloneUUIDPointer(value uuid.UUID) *uuid.UUID {
+	copy := value
+	return &copy
 }
 
 func invokeWorker(ctx context.Context, worker erasedWorker, scope *workScope) (result any, err error, panicked bool) {

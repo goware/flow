@@ -124,6 +124,7 @@ CREATE TABLE {{schema}}.flow_commands (
     next_attempt_at         timestamptz,
     wait_started_at         timestamptz,
     wait_deadline_at        timestamptz,
+    wait_timeout_ms         bigint CHECK (wait_timeout_ms IS NULL OR wait_timeout_ms > 0),
 
     attempt_ordinal         integer NOT NULL DEFAULT 0 CHECK (attempt_ordinal >= 0),
     consumed_attempts       integer NOT NULL DEFAULT 0 CHECK (consumed_attempts >= 0),

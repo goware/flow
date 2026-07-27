@@ -126,6 +126,25 @@ func (registry *runtimeRegistry) workerKeys() []definitionKey {
 	return result
 }
 
+func (registry *runtimeRegistry) plan(name string, version int) (erasedPlan, bool) {
+	plan, ok := registry.plans[definitionKey{name: name, version: version}]
+	return plan, ok
+}
+
+func (registry *runtimeRegistry) planKeys() []definitionKey {
+	result := make([]definitionKey, 0, len(registry.plans))
+	for key := range registry.plans {
+		result = append(result, key)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].name == result[j].name {
+			return result[i].version < result[j].version
+		}
+		return result[i].name < result[j].name
+	})
+	return result
+}
+
 func cloneMap[K comparable, V any](source map[K]V) map[K]V {
 	result := make(map[K]V, len(source))
 	for key, value := range source {

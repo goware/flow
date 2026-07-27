@@ -188,7 +188,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	serviceCtx, stopServices := context.WithCancel(context.Background())
 	var services sync.WaitGroup
-	services.Add(2)
+	services.Add(3)
 	go func() {
 		defer services.Done()
 		r.runLeaseManager(serviceCtx)
@@ -196,6 +196,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 	go func() {
 		defer services.Done()
 		r.runMaintenance(serviceCtx)
+	}()
+	go func() {
+		defer services.Done()
+		r.runPlanScheduler(serviceCtx)
 	}()
 
 	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: "run", Outcome: "started", Worker: r.replicaName()})
@@ -313,6 +317,15 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 			_ = r.faults.Hit(ctx, fault.MaintenanceAfterProbe)
 			for _, id := range ids {
 				changed, expireErr := r.store.ExpireExecution(ctx, id, "execution deadline reached")
+				if expireErr == nil && changed {
+					progress = true
+				}
+			}
+		}
+		if waits, err := r.store.ProbeExpiredCommandWaits(ctx, 128); err == nil {
+			_ = r.faults.Hit(ctx, fault.MaintenanceAfterProbe)
+			for _, candidate := range waits {
+				changed, expireErr := r.store.ExpireCommandWait(ctx, candidate)
 				if expireErr == nil && changed {
 					progress = true
 				}

@@ -28,6 +28,9 @@ type Execution struct {
 	CommandCount      int
 	OpenCommands      int
 	PlanDirty         bool
+	PlanQuiescent     bool
+	PlanRevision      int64
+	PlanWaitingCount  int
 	RootCommandID     *uuid.UUID
 	LastPosition      int64
 	Input             []byte
@@ -39,23 +42,32 @@ type Execution struct {
 }
 
 type Command struct {
-	ID               uuid.UUID
-	Key              string
-	Name             string
-	Version          int
-	Origin           string
-	Required         bool
-	State            string
-	Args             []byte
-	Queue            string
-	RetryPolicy      []byte
-	AttemptTimeoutMS *int64
-	CreatedPosition  int64
-	TerminalPosition *int64
-	Result           []byte
-	FailureCode      string
-	FailureMessage   string
-	Attempts         []Attempt
+	ID                    uuid.UUID
+	Key                   string
+	Name                  string
+	Version               int
+	Origin                string
+	ParentCommandID       *uuid.UUID
+	Required              bool
+	State                 string
+	Args                  []byte
+	Queue                 string
+	RetryPolicy           []byte
+	AttemptTimeoutMS      *int64
+	ScheduleKind          string
+	InitialDelayMS        *int64
+	BudgetStartedAt       *time.Time
+	NextAttemptAt         *time.Time
+	Dependencies          []journalcodec.DependencyGroupBody
+	Waits                 []journalcodec.EventWaitBody
+	WithinMS              *int64
+	ChildMembershipClosed bool
+	CreatedPosition       int64
+	TerminalPosition      *int64
+	Result                []byte
+	FailureCode           string
+	FailureMessage        string
+	Attempts              []Attempt
 }
 
 type Attempt struct {
@@ -188,6 +200,18 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			Origin: body.Origin, Required: body.Required, State: body.InitialState,
 			Args: slices.Clone(body.Args), Queue: body.Queue, RetryPolicy: slices.Clone(body.RetryPolicy),
 			AttemptTimeoutMS: pointerClone(body.AttemptTimeoutMS), CreatedPosition: row.Position,
+			ScheduleKind: body.ScheduleKind, InitialDelayMS: pointerClone(body.InitialDelayMS),
+			BudgetStartedAt: pointerClone(body.BudgetStartedAt), NextAttemptAt: pointerClone(body.NextAttemptAt),
+			Dependencies: slices.Clone(body.Dependencies), Waits: slices.Clone(body.Waits), WithinMS: pointerClone(body.WithinMS),
+		}
+		if body.ParentCommandID != "" {
+			parentID, err := uuid.Parse(body.ParentCommandID)
+			if err != nil {
+				return errors.New("CommandCreated parent identity is invalid")
+			}
+			command := state.Commands[bodyID]
+			command.ParentCommandID = &parentID
+			state.Commands[bodyID] = command
 		}
 		state.CommandCount++
 		state.OpenCommands++
@@ -268,6 +292,19 @@ func (state *Execution) Apply(row store.JournalRow) error {
 	case store.ExecutionFailing:
 		state.Status = "failing"
 
+	case store.PlanReconciled:
+		body, err := journalcodec.Decode[journalcodec.PlanReconciledBody](row.Body)
+		if err != nil {
+			return err
+		}
+		if row.PlanRevision == nil || body.Revision != *row.PlanRevision || body.Revision != state.PlanRevision+1 {
+			return errors.New("PlanReconciled revision is not contiguous")
+		}
+		state.PlanRevision = body.Revision
+		state.PlanDirty = false
+		state.PlanQuiescent = body.Quiescent
+		state.PlanWaitingCount = body.WaitingReads
+
 	case store.EventRecorded:
 		if row.EventClass == nil {
 			return errors.New("EventRecorded has no class")
@@ -310,6 +347,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 					return err
 				}
 				command.Result = slices.Clone(body.Result)
+				command.ChildMembershipClosed = true
 			} else {
 				body, err := journalcodec.Decode[journalcodec.TerminalEventBody](row.Body)
 				if err != nil {
@@ -325,6 +363,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			state.OpenCommands--
 			if state.DriverMode == store.DriverPlan {
 				state.PlanDirty = true
+				state.PlanQuiescent = false
 			}
 		case "execution_terminal":
 			if row.TerminalStatus == nil {

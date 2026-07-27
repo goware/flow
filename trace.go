@@ -12,20 +12,24 @@ import (
 )
 
 type Execution struct {
-	ID           ExecutionID
-	Mode         string
-	Type         string
-	Version      int
-	Key          string
-	Status       string
-	FailFast     bool
-	MaxCommands  int
-	CommandCount int
-	OpenCommands int
-	DeadlineAt   *time.Time
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	Metadata     json.RawMessage
+	ID               ExecutionID
+	Mode             string
+	Type             string
+	Version          int
+	Key              string
+	Status           string
+	FailFast         bool
+	MaxCommands      int
+	CommandCount     int
+	OpenCommands     int
+	PlanDirty        bool
+	PlanQuiescent    bool
+	PlanRevision     PlanRevision
+	PlanWaitingCount int
+	DeadlineAt       *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	Metadata         json.RawMessage
 }
 
 type TraceAttempt struct {
@@ -43,21 +47,42 @@ type TraceAttempt struct {
 }
 
 type TraceCommand struct {
-	ID               CommandID
-	Key              string
-	Name             string
-	Version          int
-	Origin           string
-	Required         bool
-	State            string
-	Args             json.RawMessage
-	Result           json.RawMessage
-	Queue            string
-	CreatedPosition  JournalPosition
-	TerminalPosition *JournalPosition
-	FailureCode      string
-	FailureMessage   string
-	Attempts         []TraceAttempt
+	ID                    CommandID
+	Key                   string
+	Name                  string
+	Version               int
+	Origin                string
+	ParentCommandID       CommandID
+	Required              bool
+	State                 string
+	Args                  json.RawMessage
+	Result                json.RawMessage
+	Queue                 string
+	ScheduleKind          string
+	InitialDelay          time.Duration
+	BudgetStartedAt       *time.Time
+	NextAttemptAt         *time.Time
+	Within                time.Duration
+	ChildMembershipClosed bool
+	Dependencies          []TraceDependencyGroup
+	Waits                 []TraceEventWait
+	CreatedPosition       JournalPosition
+	TerminalPosition      *JournalPosition
+	FailureCode           string
+	FailureMessage        string
+	Attempts              []TraceAttempt
+}
+
+type TraceDependencyGroup struct {
+	Kind      string
+	Threshold *int
+	Members   []string
+}
+
+type TraceEventWait struct {
+	Namespace string
+	Name      string
+	Version   int
 }
 
 type ExecutionTrace struct {
@@ -124,9 +149,11 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		ID: id, Mode: string(state.DriverMode), Type: state.DefinitionName, Version: state.DefinitionVersion,
 		Key: state.ExecutionKey, Status: state.Status, FailFast: state.FailFast, MaxCommands: state.MaxCommands,
 		CommandCount: state.CommandCount, OpenCommands: state.OpenCommands, DeadlineAt: cloneTimePointer(state.DeadlineAt),
+		PlanDirty: state.PlanDirty, PlanQuiescent: state.PlanQuiescent,
+		PlanRevision: PlanRevision(state.PlanRevision), PlanWaitingCount: state.PlanWaitingCount,
 		CreatedAt: rows[0].RecordedAt, UpdatedAt: rows[len(rows)-1].RecordedAt,
 		Metadata: json.RawMessage(append([]byte(nil), state.Metadata...)),
-	}, History: historyEntries(rows)}
+	}, History: historyEntries(rows), results: resultSourceState{values: make(map[string]resultSourceValue)}}
 	result.Commands = make([]TraceCommand, 0, len(state.Commands))
 	for _, command := range state.Commands {
 		item := TraceCommand{
@@ -134,7 +161,26 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 			Origin: command.Origin, Required: command.Required, State: command.State,
 			Args: json.RawMessage(append([]byte(nil), command.Args...)), Result: json.RawMessage(append([]byte(nil), command.Result...)),
 			Queue: command.Queue, CreatedPosition: JournalPosition(command.CreatedPosition),
+			ScheduleKind: command.ScheduleKind, BudgetStartedAt: cloneTimePointer(command.BudgetStartedAt),
+			NextAttemptAt: cloneTimePointer(command.NextAttemptAt), ChildMembershipClosed: command.ChildMembershipClosed,
 			FailureCode: command.FailureCode, FailureMessage: command.FailureMessage,
+		}
+		if command.ParentCommandID != nil {
+			item.ParentCommandID = CommandID(command.ParentCommandID.String())
+		}
+		if command.InitialDelayMS != nil {
+			item.InitialDelay = time.Duration(*command.InitialDelayMS) * time.Millisecond
+		}
+		if command.WithinMS != nil {
+			item.Within = time.Duration(*command.WithinMS) * time.Millisecond
+		}
+		for _, group := range command.Dependencies {
+			item.Dependencies = append(item.Dependencies, TraceDependencyGroup{
+				Kind: group.Kind, Threshold: cloneIntPointer(group.Threshold), Members: append([]string(nil), group.Members...),
+			})
+		}
+		for _, wait := range command.Waits {
+			item.Waits = append(item.Waits, TraceEventWait{Namespace: wait.Namespace, Name: wait.Name, Version: wait.Version})
 		}
 		if command.TerminalPosition != nil {
 			position := JournalPosition(*command.TerminalPosition)
@@ -151,9 +197,27 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 			}
 		}
 		result.Commands = append(result.Commands, item)
+		value := resultSourceValue{
+			name: command.Name, version: command.Version, status: commandStatus(command.State),
+			result: append([]byte(nil), command.Result...),
+		}
+		if command.FailureCode != "" {
+			value.failure = &CommandFailure{Code: command.FailureCode, Message: command.FailureMessage}
+		} else if value.status != "" && value.status != StatusSucceeded {
+			value.failure = &CommandFailure{Code: command.State, Message: "command ended " + command.State}
+		}
+		result.results.values[command.Key] = value
 	}
 	sort.Slice(result.Commands, func(i, j int) bool { return result.Commands[i].Key < result.Commands[j].Key })
 	return result, nil
+}
+
+func cloneIntPointer(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func cloneTimePointer(value *time.Time) *time.Time {

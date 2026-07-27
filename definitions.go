@@ -270,6 +270,3 @@ func appendValidation(errs []error, err error) []error {
 	}
 	return errs
 }
-
-// The concrete semantics are added with plan reconciliation in Phase 6.
-type Plan struct{}
