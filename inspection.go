@@ -82,6 +82,29 @@ func LookupExecution(ctx context.Context, c Client, typ, key string) (Execution,
 	}
 }
 
+// LookupLiveExecution finds the one non-terminal execution currently holding
+// a live-scoped key for the definition, if any. Live keys admit many settled
+// executions per key over time but at most one live holder; this is the
+// lookup that matches that invariant. found=false means no live holder —
+// settled executions with the key may still exist.
+func LookupLiveExecution(ctx context.Context, c Client, typ, key string) (Execution, bool, error) {
+	if err := definition.ValidateName(typ); err != nil {
+		return Execution{}, false, newError(ErrInvalid, "lookup", "execution type", typ, "invalid definition name")
+	}
+	if key == "" || len(key) > maxExecutionKeyBytes || !utf8.ValidString(key) {
+		return Execution{}, false, newError(ErrInvalid, "lookup", "execution key", "", "key is empty, malformed, or too long")
+	}
+	client, err := resolveClient(c)
+	if err != nil {
+		return Execution{}, false, err
+	}
+	row, found, err := client.runtime.store.LookupLiveExecutionInTx(ctx, client.tx, typ, key)
+	if err != nil || !found {
+		return Execution{}, false, err
+	}
+	return executionFromStore(row), true, nil
+}
+
 func ListExecutions(ctx context.Context, c Client, filter ExecutionFilter) (ExecutionPage, error) {
 	client, err := resolveClient(c)
 	if err != nil {
@@ -260,4 +283,36 @@ func decodeExecutionCursor(value string) (struct {
 	}
 	result.CreatedAt, result.ID = cursor.CreatedAt, id
 	return result, nil
+}
+
+// QueueDepth is a point-in-time operational snapshot of one queue lane.
+// Ready commands are deliverable now, Delayed commands wait out a retry
+// backoff or start delay, and Running commands hold an attempt lease.
+// OldestReadyFor is how long the oldest deliverable command has been ready;
+// a growing value with stable Ready means no compatible worker is claiming
+// the lane.
+type QueueDepth struct {
+	Queue          string
+	Ready          int64
+	Delayed        int64
+	Running        int64
+	OldestReadyFor time.Duration
+}
+
+// GetQueueDepth reports the lane's current deliverable, scheduled, and leased
+// command counts. It reads operational delivery state, not application
+// events: the counts change as attempts are claimed and settled.
+func GetQueueDepth(ctx context.Context, c Client, queue string) (QueueDepth, error) {
+	client, err := resolveClient(c)
+	if err != nil {
+		return QueueDepth{}, err
+	}
+	row, err := client.runtime.store.QueueDepthInTx(ctx, client.tx, queue)
+	if err != nil {
+		return QueueDepth{}, err
+	}
+	return QueueDepth{
+		Queue: queue, Ready: row.Ready, Delayed: row.Delayed,
+		Running: row.Running, OldestReadyFor: row.OldestReadyFor,
+	}, nil
 }

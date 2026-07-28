@@ -76,12 +76,21 @@ type CoordinatorCreate struct {
 	RetryPolicy canonical.Value
 }
 
+// Execution key scopes. Permanent keys identify one execution forever and
+// rediscover it idempotently; live keys are held only while their execution
+// is non-terminal and are released at settlement.
+const (
+	KeyScopePermanent = "permanent"
+	KeyScopeLive      = "live"
+)
+
 type StartRequest struct {
 	ID                uuid.UUID
 	Mode              DriverMode
 	DefinitionName    string
 	DefinitionVersion int
 	Key               string
+	KeyScope          string
 	StartFingerprint  [32]byte
 	Input             canonical.Value
 	Metadata          canonical.Value
@@ -107,9 +116,28 @@ func (s *Store) StartInTx(ctx context.Context, tx pgx.Tx, request StartRequest) 
 	if err := validateStartRequest(request); err != nil {
 		return StartResult{}, err
 	}
+	if request.KeyScope == "" {
+		request.KeyScope = KeyScopePermanent
+	}
+	// A live-keyed insert can conflict with a live holder that settles before
+	// the rediscovery lookup runs; one further insert attempt covers that
+	// window without looping unboundedly.
+	attempts := 1
+	if request.KeyScope == KeyScopeLive {
+		attempts = 2
+	}
+	for attempt := 0; ; attempt++ {
+		result, retry, err := s.startAttempt(ctx, tx, request)
+		if err == nil || !retry || attempt+1 >= attempts {
+			return result, err
+		}
+	}
+}
+
+func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartRequest) (StartResult, bool, error) {
 	var dbNow time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
-		return StartResult{}, MapError("capture start time", err)
+		return StartResult{}, false, MapError("capture start time", err)
 	}
 	deadlineAt := deadlineAt(dbNow, request.Deadline)
 	planDirty := request.Mode == DriverPlan
@@ -126,62 +154,87 @@ func (s *Store) StartInTx(ctx context.Context, tx pgx.Tx, request StartRequest) 
 
 	var inserted uuid.UUID
 	err := tx.QueryRow(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_executions")+` (
-		execution_id,driver_mode,definition_name,definition_version,execution_key,status,fail_fast,
+		execution_id,driver_mode,definition_name,definition_version,execution_key,key_scope,status,fail_fast,
 		start_fingerprint,input,input_hash,metadata,metadata_canonical,metadata_hash,
 		deadline_at,max_commands,command_count,open_commands,plan_dirty,plan_dirty_since,
 		next_journal_position,root_command_id,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$15,$16,$17,1,$18,$19,$19,$19)
+	) VALUES ($1,$2,$3,$4,$5,$6,'running',$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$16,$17,$18,1,$19,$20,$20,$20)
 	ON CONFLICT DO NOTHING RETURNING execution_id`,
-		request.ID, string(request.Mode), request.DefinitionName, request.DefinitionVersion, request.Key,
+		request.ID, string(request.Mode), request.DefinitionName, request.DefinitionVersion, request.Key, request.KeyScope,
 		request.FailFast, request.StartFingerprint[:], request.Input.Bytes, request.Input.Digest[:],
 		string(request.Metadata.Bytes), request.Metadata.Bytes, request.Metadata.Digest[:], deadlineAt,
 		request.MaxCommands, commandCount, planDirty, planDirtySince, rootID, dbNow,
 	).Scan(&inserted)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return StartResult{}, MapError("insert execution", err)
+		return StartResult{}, false, MapError("insert execution", err)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return s.loadEquivalentStart(ctx, tx, request)
+		result, retry, loadErr := s.loadEquivalentStart(ctx, tx, request)
+		return result, retry, loadErr
 	}
 	if inserted != request.ID {
-		return StartResult{}, fmt.Errorf("%w: inserted execution identity differs", flowerr.ErrInvalidState)
+		return StartResult{}, false, fmt.Errorf("%w: inserted execution identity differs", flowerr.ErrInvalidState)
 	}
 
 	semantic, err := s.AdoptSemantic(tx, request.ID, dbNow)
 	if err != nil {
-		return StartResult{}, err
+		return StartResult{}, false, err
 	}
 	entries, err := startJournalEntries(request, dbNow, deadlineAt)
 	if err != nil {
-		return StartResult{}, err
+		return StartResult{}, false, err
 	}
 	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: entries})
 	if err != nil {
-		return StartResult{}, err
+		return StartResult{}, false, err
 	}
 
 	if request.Root != nil {
 		if len(journal.Journal) != 2 {
-			return StartResult{}, fmt.Errorf("%w: direct start journal shape", flowerr.ErrInvalidState)
+			return StartResult{}, false, fmt.Errorf("%w: direct start journal shape", flowerr.ErrInvalidState)
 		}
-		if err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position, dbNow, dbNow); err != nil {
-			return StartResult{}, err
+		if err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position, dbNow, dbNow.Add(request.Root.InitialDelay)); err != nil {
+			return StartResult{}, false, err
 		}
 	}
 	if request.Coordinator != nil {
 		if len(journal.Journal) != 1 {
-			return StartResult{}, fmt.Errorf("%w: coordinator start journal shape", flowerr.ErrInvalidState)
+			return StartResult{}, false, fmt.Errorf("%w: coordinator start journal shape", flowerr.ErrInvalidState)
 		}
 		if err := s.insertCoordinator(ctx, tx, request, journal.Journal[0].Position, dbNow); err != nil {
-			return StartResult{}, err
+			return StartResult{}, false, err
 		}
 	}
-	return StartResult{ExecutionID: request.ID, RootCommandID: rootID, Created: true}, nil
+	return StartResult{ExecutionID: request.ID, RootCommandID: rootID, Created: true}, false, nil
 }
 
-func (s *Store) loadEquivalentStart(ctx context.Context, tx pgx.Tx, request StartRequest) (StartResult, error) {
+// loadEquivalentStart resolves an insert that conflicted on the idempotency
+// index. Permanent keys rediscover the one execution that owns the key and
+// require an equivalent start identity. Live keys rediscover whichever live
+// execution currently holds the key, with no identity comparison — the caller
+// asked to ensure a live execution exists, not to describe a specific one.
+// retry=true means the conflicting live holder settled before the lookup;
+// the caller may attempt the insert again.
+func (s *Store) loadEquivalentStart(ctx context.Context, tx pgx.Tx, request StartRequest) (StartResult, bool, error) {
 	if request.Key == "" {
-		return StartResult{}, fmt.Errorf("%w: unkeyed start unexpectedly conflicted", flowerr.ErrInvalidState)
+		return StartResult{}, false, fmt.Errorf("%w: unkeyed start unexpectedly conflicted", flowerr.ErrInvalidState)
+	}
+	if request.KeyScope == KeyScopeLive {
+		var id uuid.UUID
+		var rootID *uuid.UUID
+		err := tx.QueryRow(ctx, `SELECT execution_id,root_command_id
+			FROM `+pgschema.Table(s.schema, "flow_executions")+`
+			WHERE driver_mode=$1 AND definition_name=$2 AND execution_key=$3
+			  AND key_scope=$4 AND status IN ('running','failing') FOR UPDATE`,
+			string(request.Mode), request.DefinitionName, request.Key, KeyScopeLive,
+		).Scan(&id, &rootID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return StartResult{}, true, fmt.Errorf("%w: live key holder settled during start", flowerr.ErrConflict)
+		}
+		if err != nil {
+			return StartResult{}, false, MapError("load live execution", err)
+		}
+		return StartResult{ExecutionID: id, RootCommandID: clonePointer(rootID), Created: false}, false, nil
 	}
 	var id uuid.UUID
 	var version int
@@ -189,24 +242,29 @@ func (s *Store) loadEquivalentStart(ctx context.Context, tx pgx.Tx, request Star
 	var rootID *uuid.UUID
 	err := tx.QueryRow(ctx, `SELECT execution_id,definition_version,start_fingerprint,input,metadata_canonical,root_command_id
 		FROM `+pgschema.Table(s.schema, "flow_executions")+`
-		WHERE driver_mode=$1 AND definition_name=$2 AND execution_key=$3 FOR UPDATE`,
-		string(request.Mode), request.DefinitionName, request.Key,
+		WHERE driver_mode=$1 AND definition_name=$2 AND execution_key=$3 AND key_scope=$4 FOR UPDATE`,
+		string(request.Mode), request.DefinitionName, request.Key, KeyScopePermanent,
 	).Scan(&id, &version, &fingerprint, &input, &metadata, &rootID)
 	if err != nil {
-		return StartResult{}, MapError("load existing execution", err)
+		return StartResult{}, false, MapError("load existing execution", err)
 	}
 	if version != request.DefinitionVersion || !bytes.Equal(fingerprint, request.StartFingerprint[:]) ||
 		!bytes.Equal(input, request.Input.Bytes) || !bytes.Equal(metadata, request.Metadata.Bytes) {
-		return StartResult{}, fmt.Errorf("%w: execution start identity differs", flowerr.ErrConflict)
+		return StartResult{}, false, fmt.Errorf("%w: execution start identity differs", flowerr.ErrConflict)
 	}
-	return StartResult{ExecutionID: id, RootCommandID: clonePointer(rootID), Created: false}, nil
+	return StartResult{ExecutionID: id, RootCommandID: clonePointer(rootID), Created: false}, false, nil
 }
 
 func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time.Time) ([]JournalEntry, error) {
+	keyScope := ""
+	if request.KeyScope != KeyScopePermanent {
+		keyScope = request.KeyScope
+	}
 	body := journalcodec.ExecutionStartedBody{
 		V: 1, ExecutionID: request.ID.String(), DriverMode: string(request.Mode),
 		DefinitionName: request.DefinitionName, DefinitionVersion: request.DefinitionVersion,
-		ExecutionKey: request.Key, Input: json.RawMessage(request.Input.BytesCopy()), FailFast: request.FailFast,
+		ExecutionKey: request.Key, KeyScope: keyScope,
+		Input: json.RawMessage(request.Input.BytesCopy()), FailFast: request.FailFast,
 		DeadlineMode: request.Deadline.Mode, DeadlineDuration: request.Deadline.Duration.Milliseconds(),
 		DeadlineAt: clonePointer(deadlineAt), MaxCommands: request.MaxCommands,
 		Metadata: json.RawMessage(request.Metadata.BytesCopy()),
@@ -221,7 +279,7 @@ func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time
 	}
 	entries := []JournalEntry{start}
 	if request.Root != nil {
-		created, err := commandCreatedEntry(*request.Root, dbNow, dbNow)
+		created, err := commandCreatedEntry(*request.Root, dbNow, dbNow.Add(request.Root.InitialDelay))
 		if err != nil {
 			return nil, err
 		}
@@ -1041,6 +1099,12 @@ func validateStartRequest(request StartRequest) error {
 	}
 	if request.Mode != DriverDirect && request.Mode != DriverPlan && request.Mode != DriverCoordinator {
 		return fmt.Errorf("%w: invalid driver mode", flowerr.ErrInvalid)
+	}
+	if request.KeyScope != "" && request.KeyScope != KeyScopePermanent && request.KeyScope != KeyScopeLive {
+		return fmt.Errorf("%w: invalid execution key scope", flowerr.ErrInvalid)
+	}
+	if request.KeyScope == KeyScopeLive && request.Key == "" {
+		return fmt.Errorf("%w: live key scope requires an execution key", flowerr.ErrInvalid)
 	}
 	if request.Deadline.Mode != "none" && request.Deadline.Mode != "duration" {
 		return fmt.Errorf("%w: invalid deadline mode", flowerr.ErrInvalid)

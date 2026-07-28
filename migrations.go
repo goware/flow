@@ -22,7 +22,7 @@ import (
 
 const (
 	defaultSchema         = "public"
-	currentSchemaVersion  = 1
+	currentSchemaVersion  = 2
 	currentReaderVersion  = 1
 	currentWriterVersion  = 1
 	migrationToken        = "{{schema}}"
@@ -80,6 +80,7 @@ var migrationFiles = []struct {
 	minWriter int
 }{
 	{version: 1, name: "initial", path: "migrations/001_initial.sql", minReader: 1, minWriter: 1},
+	{version: 2, name: "live_keys", path: "migrations/002_live_keys.sql", minReader: 1, minWriter: 1},
 }
 
 // Migrate applies every unapplied embedded Flow migration in its own
