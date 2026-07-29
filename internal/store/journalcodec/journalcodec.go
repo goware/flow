@@ -20,6 +20,7 @@ type ExecutionStartedBody struct {
 	DefinitionName    string          `json:"definition_name"`
 	DefinitionVersion int             `json:"definition_version"`
 	ExecutionKey      string          `json:"execution_key"`
+	KeyScope          string          `json:"key_scope,omitempty"`
 	Input             json.RawMessage `json:"input"`
 	FailFast          bool            `json:"fail_fast"`
 	DeadlineMode      string          `json:"deadline_mode"`

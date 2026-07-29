@@ -35,13 +35,17 @@ type ExecutionOption interface {
 }
 
 type executionOptions struct {
-	deadline    store.DeadlineSpec
-	deadlineSet bool
-	failFast    bool
-	failFastSet bool
-	metadata    map[string]string
-	metadataSet bool
-	errs        []error
+	deadline      store.DeadlineSpec
+	deadlineSet   bool
+	failFast      bool
+	failFastSet   bool
+	metadata      map[string]string
+	metadataSet   bool
+	keyScope      string
+	keyScopeSet   bool
+	startDelay    time.Duration
+	startDelaySet bool
+	errs          []error
 }
 
 type executionOptionFunc func(*executionOptions)
@@ -96,6 +100,41 @@ func WithFailFast(enabled bool) ExecutionOption {
 	})
 }
 
+// WithLiveKey scopes the execution key to live executions: while a running or
+// failing execution holds the key, Execute rediscovers it without comparing
+// start identity — a silent, queue-style dedupe no-op — and once that
+// execution reaches a terminal status the key is released for a new start.
+// Live-keyed starts therefore give at-most-one live execution per key, not
+// at-most-one execution ever. Requires a non-empty key.
+func WithLiveKey() ExecutionOption {
+	return executionOptionFunc(func(options *executionOptions) {
+		if options.keyScopeSet {
+			options.errs = append(options.errs, errors.New("key scope configured more than once"))
+			return
+		}
+		options.keyScopeSet = true
+		options.keyScope = store.KeyScopeLive
+	})
+}
+
+// WithStartDelay schedules a direct execution's root command to become
+// deliverable after the delay instead of immediately, mirroring StartAfter
+// for spawned children. Plan and coordinator starts reject it.
+func WithStartDelay(delay time.Duration) ExecutionOption {
+	return executionOptionFunc(func(options *executionOptions) {
+		if options.startDelaySet {
+			options.errs = append(options.errs, errors.New("start delay configured more than once"))
+			return
+		}
+		options.startDelaySet = true
+		if delay < time.Millisecond {
+			options.errs = append(options.errs, errors.New("start delay must be at least one millisecond"))
+			return
+		}
+		options.startDelay = delay
+	})
+}
+
 func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (ExecutionHandle, error) {
 	var definitionError error
 	if cmd.def == nil {
@@ -120,10 +159,14 @@ func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts .
 	if err != nil {
 		return ExecutionHandle{}, err
 	}
+	if options.startDelay > 0 {
+		root.ScheduleKind = "execute_delay"
+		root.InitialDelay = options.startDelay
+	}
 	request := store.StartRequest{
 		ID: uuid.New(), Mode: store.DriverDirect, DefinitionName: cmd.Name(), DefinitionVersion: cmd.Version(), Key: key,
-		StartFingerprint: fingerprint, Input: input, Metadata: metadata, FailFast: options.failFast,
-		Deadline: options.deadline, MaxCommands: client.runtime.maxCommands, Root: &root,
+		KeyScope: options.keyScope, StartFingerprint: fingerprint, Input: input, Metadata: metadata,
+		FailFast: options.failFast, Deadline: options.deadline, MaxCommands: client.runtime.maxCommands, Root: &root,
 	}
 	return executeStart(ctx, client, request)
 }
@@ -148,10 +191,13 @@ func (plan PlanDef[A]) Execute(ctx context.Context, key string, args A, opts ...
 	if err != nil {
 		return ExecutionHandle{}, err
 	}
+	if options.startDelay > 0 {
+		return ExecutionHandle{}, newError(ErrInvalid, "execute", "plan", plan.def.Name, "plan starts do not accept a start delay")
+	}
 	return executeStart(ctx, client, store.StartRequest{
 		ID: uuid.New(), Mode: store.DriverPlan, DefinitionName: plan.def.Name, DefinitionVersion: plan.def.Version, Key: key,
-		StartFingerprint: fingerprint, Input: input, Metadata: metadata, FailFast: options.failFast,
-		Deadline: options.deadline, MaxCommands: client.runtime.maxCommands,
+		KeyScope: options.keyScope, StartFingerprint: fingerprint, Input: input, Metadata: metadata,
+		FailFast: options.failFast, Deadline: options.deadline, MaxCommands: client.runtime.maxCommands,
 	})
 }
 
@@ -175,13 +221,16 @@ func (coordinator Coordinator[S]) Execute(ctx context.Context, key string, initi
 	if err != nil {
 		return ExecutionHandle{}, err
 	}
+	if options.startDelay > 0 {
+		return ExecutionHandle{}, newError(ErrInvalid, "execute", "coordinator", coordinator.def.Name, "coordinator starts do not accept a start delay")
+	}
 	policy, err := retrypolicy.CanonicalPublic(defaultRetryPolicy())
 	if err != nil {
 		return ExecutionHandle{}, newError(ErrInvalid, "execute", "coordinator", coordinator.def.Name, "invalid default retry policy")
 	}
 	request := store.StartRequest{
 		ID: uuid.New(), Mode: store.DriverCoordinator, DefinitionName: coordinator.def.Name,
-		DefinitionVersion: coordinator.def.Version, Key: key, StartFingerprint: fingerprint,
+		DefinitionVersion: coordinator.def.Version, Key: key, KeyScope: options.keyScope, StartFingerprint: fingerprint,
 		Input: input, Metadata: metadata, FailFast: options.failFast, Deadline: options.deadline,
 		MaxCommands: client.runtime.maxCommands,
 		Coordinator: &store.CoordinatorCreate{ID: uuid.New(), State: input, RetryPolicy: policy},
@@ -411,6 +460,9 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	if err := errors.Join(options.errs...); err != nil {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "options", "", err.Error())
 	}
+	if options.keyScope == store.KeyScopeLive && key == "" {
+		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "key", "", "live key scope requires a non-empty execution key")
+	}
 	if err := validateMetadata(options.metadata); err != nil {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, err
 	}
@@ -418,21 +470,26 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	if err != nil {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, mapCanonicalError("execute", "metadata", err)
 	}
+	// key_scope and start_delay_ms are omitted when zero so fingerprints of
+	// starts that predate these options remain rediscoverable.
 	fingerprintRecord := struct {
 		V                 int             `json:"v"`
 		DriverMode        string          `json:"driver_mode"`
 		DefinitionName    string          `json:"definition_name"`
 		DefinitionVersion int             `json:"definition_version"`
 		ExecutionKey      string          `json:"execution_key"`
+		KeyScope          string          `json:"key_scope,omitempty"`
 		Input             json.RawMessage `json:"input"`
 		DeadlineMode      string          `json:"deadline_mode"`
 		DeadlineDuration  int64           `json:"deadline_duration"`
 		FailFast          bool            `json:"fail_fast"`
+		StartDelayMS      int64           `json:"start_delay_ms,omitempty"`
 		Metadata          json.RawMessage `json:"metadata"`
 	}{
 		V: 1, DriverMode: string(mode), DefinitionName: name, DefinitionVersion: version,
-		ExecutionKey: key, Input: json.RawMessage(input.BytesCopy()), DeadlineMode: options.deadline.Mode,
-		DeadlineDuration: int64(options.deadline.Duration), FailFast: options.failFast,
+		ExecutionKey: key, KeyScope: options.keyScope, Input: json.RawMessage(input.BytesCopy()),
+		DeadlineMode: options.deadline.Mode, DeadlineDuration: int64(options.deadline.Duration),
+		FailFast: options.failFast, StartDelayMS: options.startDelay.Milliseconds(),
 		Metadata: json.RawMessage(metadata.BytesCopy()),
 	}
 	fingerprint, err := canonical.Marshal(fingerprintRecord, 0)

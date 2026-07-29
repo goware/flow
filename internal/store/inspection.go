@@ -75,6 +75,25 @@ func (s *Store) LookupExecutionInTx(ctx context.Context, tx pgx.Tx, definitionNa
 	return s.queryExecutions(ctx, tx, query, definitionName, key)
 }
 
+// LookupLiveExecutionInTx finds the non-terminal execution holding a
+// live-scoped key for one definition. The live-key partial unique index
+// guarantees at most one match.
+func (s *Store) LookupLiveExecutionInTx(ctx context.Context, tx pgx.Tx, definitionName, key string) (ExecutionRow, bool, error) {
+	if definitionName == "" || key == "" {
+		return ExecutionRow{}, false, fmt.Errorf("%w: lookup type and key are required", flowerr.ErrInvalid)
+	}
+	query := s.executionSelect() + ` WHERE definition_name=$1 AND execution_key=$2
+		AND key_scope='live' AND status IN ('running','failing') LIMIT 1`
+	rows, err := s.queryExecutions(ctx, tx, query, definitionName, key)
+	if err != nil {
+		return ExecutionRow{}, false, err
+	}
+	if len(rows) == 0 {
+		return ExecutionRow{}, false, nil
+	}
+	return rows[0], true, nil
+}
+
 func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter ExecutionListFilter) ([]ExecutionRow, error) {
 	if filter.Limit <= 0 || filter.Limit > MaxExecutionListLimit {
 		return nil, fmt.Errorf("%w: execution list limit is invalid", flowerr.ErrInvalid)
@@ -187,4 +206,42 @@ func scanExecution(row pgx.Row) (ExecutionRow, error) {
 	}
 	value.Metadata = append([]byte(nil), metadata...)
 	return value, nil
+}
+
+// QueueDepthRow is a point-in-time projection of one queue lane's operational
+// depth, derived from flow_command_queue.
+type QueueDepthRow struct {
+	Ready          int64
+	Delayed        int64
+	Running        int64
+	OldestReadyFor time.Duration
+}
+
+// QueueDepthInTx counts the lane's deliverable, scheduled, and leased
+// commands. Ready commands are claimable now; Delayed commands wait out a
+// retry backoff or start delay; Running commands hold a lease.
+func (s *Store) QueueDepthInTx(ctx context.Context, tx pgx.Tx, queue string) (QueueDepthRow, error) {
+	if queue == "" {
+		return QueueDepthRow{}, fmt.Errorf("%w: queue name is required", flowerr.ErrInvalid)
+	}
+	query := `SELECT
+		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= clock_timestamp()),
+		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at > clock_timestamp()),
+		COUNT(*) FILTER (WHERE state = 'running'),
+		COALESCE(EXTRACT(EPOCH FROM clock_timestamp() - MIN(next_run_at)
+			FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= clock_timestamp())), 0)
+	FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` WHERE queue = $1`
+	var row QueueDepthRow
+	var oldestSeconds float64
+	var scan pgx.Row
+	if tx != nil {
+		scan = tx.QueryRow(ctx, query, queue)
+	} else {
+		scan = s.db.Conn.QueryRow(ctx, query, queue)
+	}
+	if err := scan.Scan(&row.Ready, &row.Delayed, &row.Running, &oldestSeconds); err != nil {
+		return QueueDepthRow{}, MapError("count queue depth", err)
+	}
+	row.OldestReadyFor = time.Duration(oldestSeconds * float64(time.Second))
+	return row, nil
 }

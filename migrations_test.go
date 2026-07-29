@@ -27,7 +27,7 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckSchema() error = %v", err)
 	}
-	if !status.Compatible || status.Schema != database.Schema || status.CurrentVersion != 1 ||
+	if !status.Compatible || status.Schema != database.Schema || status.CurrentVersion != currentSchemaVersion ||
 		status.MinReaderVersion != 1 || status.MinWriterVersion != 1 || status.AppliedAt.IsZero() {
 		t.Fatalf("CheckSchema() = %#v", status)
 	}
@@ -56,8 +56,8 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	).Scan(&migrations); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if migrations != 1 {
-		t.Fatalf("migration count = %d, want 1", migrations)
+	if migrations != len(migrationFiles) {
+		t.Fatalf("migration count = %d, want %d", migrations, len(migrationFiles))
 	}
 
 	migrationFS, err := MigrationFS(option)
@@ -140,8 +140,8 @@ func TestConcurrentMigrate(t *testing.T) {
 	).Scan(&count); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("migration count = %d, want 1", count)
+	if count != len(migrationFiles) {
+		t.Fatalf("migration count = %d, want %d", count, len(migrationFiles))
 	}
 }
 
@@ -155,12 +155,14 @@ func TestMigrationFSAppliesCompatibleSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MigrationFS() error = %v", err)
 	}
-	rendered, err := fs.ReadFile(migrationFS, "migrations/001_initial.sql")
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
-	}
-	if _, err := database.DB.Conn.Exec(ctx, string(rendered)); err != nil {
-		t.Fatalf("apply external migration: %v", err)
+	for _, file := range migrationFiles {
+		rendered, err := fs.ReadFile(migrationFS, file.path)
+		if err != nil {
+			t.Fatalf("read migration %s: %v", file.path, err)
+		}
+		if _, err := database.DB.Conn.Exec(ctx, string(rendered)); err != nil {
+			t.Fatalf("apply external migration %s: %v", file.path, err)
+		}
 	}
 	if _, err := CheckSchema(ctx, database.DB, option); err != nil {
 		t.Fatalf("CheckSchema() after external migration error = %v", err)
