@@ -456,7 +456,7 @@ Do not retain `Do`, `Declare`, or `Spawn` as aliases. Update error operations an
 Delete:
 
 ```go
-func (n *Node) Await(events ...EventRef) *Node
+func (n *Node) Await(events ...EventName) *Node
 ```
 
 Add:
