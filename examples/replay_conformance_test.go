@@ -54,7 +54,7 @@ func assertReplayMatchesLive(t *testing.T, db *pgkit.DB, schema string, id flow.
 		projected.ExecutionKey != live.Key || projected.Status != live.Status || projected.CommandCount != live.CommandCount ||
 		projected.OpenCommands != live.OpenCommands || projected.PlanDirty != live.PlanDirty ||
 		projected.PlanQuiescent != live.PlanQuiescent || projected.PlanRevision != int64(live.PlanRevision) ||
-		projected.PlanWaitingCount != live.PlanWaitingCount || projected.OutcomeRef != live.OutcomeRef ||
+		projected.PlanWaitingCount != live.PlanWaitingCount ||
 		projected.FailureCode != live.FailureCode || projected.FailureMessage != live.FailureMessage {
 		t.Fatalf("replay/live execution mismatch:\nreplay=%#v\nlive=%#v", projected, live)
 	}

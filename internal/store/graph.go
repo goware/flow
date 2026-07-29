@@ -19,7 +19,6 @@ type graphGroup struct {
 	dependentKey string
 	ordinal      int
 	kind         string
-	threshold    *int
 	members      []graphMember
 }
 
@@ -55,9 +54,8 @@ type graphGroupUpdate struct {
 
 type graphWaitUpdate struct {
 	commandID uuid.UUID
-	namespace string
 	name      string
-	version   int
+	key       string
 	position  int64
 }
 
@@ -283,10 +281,10 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 
 	// A fact accepted on or before the persisted deadline wins even if this
 	// maintenance transaction runs later.
-	rows, err := semantic.PGX().Query(ctx, `SELECT w.event_namespace,w.event_name,w.event_version,
+	rows, err := semantic.PGX().Query(ctx, `SELECT w.event_name,w.event_key,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+` j
-		 WHERE j.execution_id=w.execution_id AND j.event_namespace=w.event_namespace
-		 AND j.event_name=w.event_name AND j.event_version=w.event_version AND j.recorded_at<=$3
+		 WHERE j.execution_id=w.execution_id AND j.event_namespace='application'
+		 AND j.event_name=w.event_name AND j.event_key=w.event_key AND j.recorded_at<=$3
 		 ORDER BY position LIMIT 1)
 		FROM `+pgschema.Table(s.schema, "flow_command_event_waits")+` w
 		WHERE w.command_id=$1 AND w.execution_id=$2 AND w.satisfied_position IS NULL FOR UPDATE`,
@@ -295,16 +293,15 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return false, MapError("lock expiring event waits", err)
 	}
 	type acceptedWait struct {
-		namespace string
-		name      string
-		version   int
-		position  *int64
+		name     string
+		key      string
+		position *int64
 	}
 	var accepted []acceptedWait
 	missing := 0
 	for rows.Next() {
 		var wait acceptedWait
-		if err := rows.Scan(&wait.namespace, &wait.name, &wait.version, &wait.position); err != nil {
+		if err := rows.Scan(&wait.name, &wait.key, &wait.position); err != nil {
 			rows.Close()
 			return false, MapError("scan expiring event wait", err)
 		}
@@ -321,8 +318,8 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	if missing == 0 && len(accepted) > 0 {
 		waitUpdates := make([]graphWaitUpdate, 0, len(accepted))
 		for _, wait := range accepted {
-			waitUpdates = append(waitUpdates, graphWaitUpdate{commandID: candidate.CommandID, namespace: wait.namespace,
-				name: wait.name, version: wait.version, position: *wait.position})
+			waitUpdates = append(waitUpdates, graphWaitUpdate{commandID: candidate.CommandID,
+				name: wait.name, key: wait.key, position: *wait.position})
 		}
 		resolution, err := s.resolveGraphLocked(ctx, semantic, nil, waitUpdates)
 		if err != nil {
@@ -627,16 +624,6 @@ func evaluateDependencyGroup(group graphGroup, states map[uuid.UUID]string) stri
 		if unsuccessful == len(group.members) {
 			return "satisfied"
 		}
-	case "at_least":
-		if group.threshold == nil {
-			return "unsatisfiable"
-		}
-		if succeeded >= *group.threshold {
-			return "satisfied"
-		}
-		if succeeded+(len(group.members)-terminal) < *group.threshold {
-			return "unsatisfiable"
-		}
 	}
 	return "unresolved"
 }
@@ -672,7 +659,7 @@ func (s *Store) loadGraphCommands(ctx context.Context, semantic *SemanticTx) ([]
 }
 
 func (s *Store) loadUnresolvedGraphGroups(ctx context.Context, semantic *SemanticTx) ([]graphGroup, error) {
-	rows, err := semantic.PGX().Query(ctx, `SELECT g.group_id,g.dependent_command_id,d.command_key,g.ordinal,g.kind,g.threshold,
+	rows, err := semantic.PGX().Query(ctx, `SELECT g.group_id,g.dependent_command_id,d.command_key,g.ordinal,g.kind,
 		m.predecessor_command_id,p.state
 		FROM `+pgschema.Table(s.schema, "flow_command_dependency_groups")+` g
 		JOIN `+pgschema.Table(s.schema, "flow_commands")+` d ON d.command_id=g.dependent_command_id
@@ -690,13 +677,12 @@ func (s *Store) loadUnresolvedGraphGroups(ctx context.Context, semantic *Semanti
 		var groupID, dependentID, predecessorID uuid.UUID
 		var dependentKey, kind, predecessorState string
 		var ordinal int
-		var threshold *int
-		if err := rows.Scan(&groupID, &dependentID, &dependentKey, &ordinal, &kind, &threshold, &predecessorID, &predecessorState); err != nil {
+		if err := rows.Scan(&groupID, &dependentID, &dependentKey, &ordinal, &kind, &predecessorID, &predecessorState); err != nil {
 			return nil, MapError("scan unresolved dependency group", err)
 		}
 		if current == nil || current.id != groupID {
 			result = append(result, graphGroup{id: groupID, dependent: dependentID, dependentKey: dependentKey,
-				ordinal: ordinal, kind: kind, threshold: threshold})
+				ordinal: ordinal, kind: kind})
 			current = &result[len(result)-1]
 		}
 		current.members = append(current.members, graphMember{id: predecessorID, state: predecessorState})
@@ -730,8 +716,8 @@ func (s *Store) applyGraphResolution(
 	}
 	for _, wait := range resolution.waits {
 		commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_event_waits")+`
-			SET satisfied_position=$5 WHERE command_id=$1 AND event_namespace=$2 AND event_name=$3 AND event_version=$4
-			AND satisfied_position IS NULL`, wait.commandID, wait.namespace, wait.name, wait.version, wait.position)
+			SET satisfied_position=$4 WHERE command_id=$1 AND event_name=$2 AND event_key=$3
+			AND satisfied_position IS NULL`, wait.commandID, wait.name, wait.key, wait.position)
 		if err != nil {
 			return MapError("satisfy command event wait", err)
 		}
@@ -811,16 +797,15 @@ func (s *Store) applyGraphResolution(
 func (s *Store) matchingWaitsLocked(
 	ctx context.Context,
 	semantic *SemanticTx,
-	namespace, name string,
-	version int,
+	name, key string,
 	position int64,
 ) ([]graphWaitUpdate, error) {
-	rows, err := semantic.PGX().Query(ctx, `SELECT w.command_id,w.event_namespace,w.event_name,w.event_version
+	rows, err := semantic.PGX().Query(ctx, `SELECT w.command_id,w.event_name,w.event_key
 		FROM `+pgschema.Table(s.schema, "flow_command_event_waits")+` w
 		JOIN `+pgschema.Table(s.schema, "flow_commands")+` c USING (command_id)
-		WHERE w.execution_id=$1 AND w.event_namespace=$2 AND w.event_name=$3 AND w.event_version=$4
-		AND w.satisfied_position IS NULL AND (c.wait_deadline_at IS NULL OR $5<=c.wait_deadline_at)
-		ORDER BY w.command_id FOR UPDATE OF w`, semantic.ExecutionID(), namespace, name, version, semantic.DBNow())
+		WHERE w.execution_id=$1 AND w.event_name=$2 AND w.event_key=$3
+		AND w.satisfied_position IS NULL AND (c.wait_deadline_at IS NULL OR $4<=c.wait_deadline_at)
+		ORDER BY w.command_id FOR UPDATE OF w`, semantic.ExecutionID(), name, key, semantic.DBNow())
 	if err != nil {
 		return nil, MapError("lock matching command waits", err)
 	}
@@ -828,7 +813,7 @@ func (s *Store) matchingWaitsLocked(
 	var waits []graphWaitUpdate
 	for rows.Next() {
 		var wait graphWaitUpdate
-		if err := rows.Scan(&wait.commandID, &wait.namespace, &wait.name, &wait.version); err != nil {
+		if err := rows.Scan(&wait.commandID, &wait.name, &wait.key); err != nil {
 			return nil, MapError("scan matching command wait", err)
 		}
 		wait.position = position

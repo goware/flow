@@ -27,7 +27,7 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 	if !strings.Contains(output.String(), "agent thinking on turn 2") || !strings.Contains(output.String(), "running tool broken") {
 		t.Fatalf("output=%q", output.String())
 	}
-	if result.Trace.Execution.Status != "succeeded" || result.Trace.Execution.OutcomeRef != "result/final-report" ||
+	if result.Trace.Execution.Status != "succeeded" ||
 		len(result.Trace.Commands) != 4 || result.Trace.Coordinator == nil || result.Trace.Coordinator.Status != "completed" ||
 		result.Trace.Coordinator.StateRevision != 6 || len(result.Trace.Coordinator.Attempts) != 6 ||
 		result.Trace.Coordinator.InboxPosition == 0 {
@@ -40,16 +40,26 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 	if statuses["turn/1/tool/broken"] != "failed" || statuses["turn/2/think"] != "succeeded" {
 		t.Fatalf("statuses=%v", statuses)
 	}
-	var transitions, outcomes, queueRows int
+	completedEvent := false
+	for _, event := range result.Trace.Events {
+		if event.Name == flowscenarios.AgentCompleted.Name() && event.Key == "final" && event.Class == "application" && event.CoordinatorID != "" {
+			completedEvent = true
+		}
+	}
+	if !completedEvent {
+		t.Fatalf("completed event missing from trace: %+v", result.Trace.Events)
+	}
+	var transitions, outcomes, applicationEvents, queueRows int
 	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FILTER (WHERE entry_kind='coordinator_transition'),
-		count(*) FILTER (WHERE event_class='command_terminal') FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, result.Handle.ID).Scan(&transitions, &outcomes); err != nil {
+		count(*) FILTER (WHERE event_class='command_terminal'),
+		count(*) FILTER (WHERE event_class='application') FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, result.Handle.ID).Scan(&transitions, &outcomes, &applicationEvents); err != nil {
 		t.Fatal(err)
 	}
 	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` WHERE execution_id=$1`, result.Handle.ID).Scan(&queueRows); err != nil {
 		t.Fatal(err)
 	}
-	if transitions != 6 || outcomes != 4 || queueRows != 0 {
-		t.Fatalf("transitions=%d outcomes=%d queue=%d", transitions, outcomes, queueRows)
+	if transitions != 6 || outcomes != 4 || applicationEvents != 2 || queueRows != 0 {
+		t.Fatalf("transitions=%d outcomes=%d application_events=%d queue=%d", transitions, outcomes, applicationEvents, queueRows)
 	}
 	assertReplayMatchesLive(t, database.DB, database.Schema, result.Handle.ID)
 }

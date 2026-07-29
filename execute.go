@@ -267,59 +267,14 @@ func executeStart(ctx context.Context, client resolvedClient, request store.Star
 	return handle, nil
 }
 
-func Issue[A, R any](ctx context.Context, c Client, id ExecutionID, key string, cmd Command[A, R], args A) (CommandID, error) {
-	var definitionError error
-	if cmd.def == nil {
-		definitionError = errors.New("zero definition")
-	}
-	if err := errors.Join(cmd.err, definitionError); err != nil {
-		return "", newError(ErrInvalid, "issue", "command", cmd.Name(), err.Error())
-	}
-	executionID, err := parseExecutionID(id)
-	if err != nil {
-		return "", err
-	}
-	if err := validateStableKey(key, maxCommandKeyBytes, "command"); err != nil {
-		return "", err
-	}
-	input, err := encodeDefinitionValue(cmd.def.Args, args, maxCommandArgumentBytes, "command arguments")
-	if err != nil {
-		return "", err
-	}
-	client, err := resolveClient(c)
-	if err != nil {
-		return "", err
-	}
-	command, err := prepareCommand(uuid.New(), key, cmd.def, cmd.defaults, input, "external_issue")
-	if err != nil {
-		return "", err
-	}
-	var result store.IssueResult
-	err = client.semantic(ctx, executionID, func(semantic *store.SemanticTx) error {
-		if err := client.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
-			return err
-		}
-		var err error
-		result, err = client.runtime.store.IssueLocked(ctx, semantic, command)
+func (event Event[T]) Emit(ctx context.Context, c Client, id ExecutionID, key string, payload T) error {
+	if state := attemptScope(ctx); state != nil {
+		err := newError(ErrInvalidState, "emit", "event", key, "external event ingress is unavailable inside an attempt")
+		state.poison(err)
 		return err
-	})
-	if err != nil {
-		return "", err
 	}
-	commandID := CommandID(result.CommandID.String())
-	if client.tx == nil && result.Created {
-		client.runtime.wakeCommands()
-		client.runtime.observe(ctx, Observation{
-			Kind: ObservationCommand, Operation: "issue", Outcome: "created", ExecutionID: id,
-			CommandID: commandID, CommandKey: key, Name: cmd.Name(), Version: cmd.Version(), Queue: command.Queue,
-		})
-	}
-	return commandID, nil
-}
-
-func Publish[T any](ctx context.Context, c Client, id ExecutionID, event Event[T], key string, payload T) error {
 	if event.err != nil || event.def == nil || event.def.Namespace != "application" {
-		return newError(ErrInvalid, "publish", "event", eventName(event.def), "invalid or derived event definition")
+		return newError(ErrInvalid, "emit", "event", eventName(event.def), "invalid event definition")
 	}
 	executionID, err := parseExecutionID(id)
 	if err != nil {
@@ -334,7 +289,7 @@ func Publish[T any](ctx context.Context, c Client, id ExecutionID, event Event[T
 	}
 	body, err := canonical.Marshal(journalcodec.ApplicationEventBody{V: 1, Payload: json.RawMessage(encoded.BytesCopy())}, 0)
 	if err != nil {
-		return newError(ErrInvalid, "publish", "event", event.def.Name, "payload cannot be journaled")
+		return newError(ErrInvalid, "emit", "event", event.def.Name, "payload cannot be journaled")
 	}
 	client, err := resolveClient(c)
 	if err != nil {
@@ -345,10 +300,10 @@ func Publish[T any](ctx context.Context, c Client, id ExecutionID, event Event[T
 		return err
 	}
 	if existing.Found {
-		if existing.Version == event.def.Version && bytes.Equal(existing.Body, body.Bytes) {
+		if bytes.Equal(existing.Body, body.Bytes) {
 			return nil
 		}
-		return newError(ErrConflict, "publish", "event", key, "event identity differs")
+		return newError(ErrConflict, "emit", "event", key, "event identity differs")
 	}
 	created := false
 	err = client.semantic(ctx, executionID, func(semantic *store.SemanticTx) error {
@@ -356,8 +311,8 @@ func Publish[T any](ctx context.Context, c Client, id ExecutionID, event Event[T
 			return err
 		}
 		var err error
-		created, err = client.runtime.store.PublishLocked(ctx, semantic, store.ApplicationEvent{
-			ID: uuid.New(), Name: event.def.Name, Version: event.def.Version, Key: key, Body: body,
+		created, err = client.runtime.store.EmitLocked(ctx, semantic, store.ApplicationEvent{
+			ID: uuid.New(), Name: event.def.Name, Key: key, Body: body,
 		})
 		return err
 	})
@@ -366,8 +321,8 @@ func Publish[T any](ctx context.Context, c Client, id ExecutionID, event Event[T
 	}
 	if client.tx == nil && created {
 		client.runtime.observe(ctx, Observation{
-			Kind: ObservationEvent, Operation: "publish", Outcome: "created", ExecutionID: id,
-			Name: event.def.Name, Version: event.def.Version,
+			Kind: ObservationEvent, Operation: "emit", Outcome: "created", ExecutionID: id,
+			Name: event.def.Name,
 		})
 	}
 	return nil

@@ -127,8 +127,9 @@ func WithQueueConcurrency(queue string, concurrency int) Option {
 	})
 }
 
-// WithCommandLease configures the renewable ownership lease for command attempts.
-func WithCommandLease(lease time.Duration) Option {
+// withCommandLeaseForTest is an unexported seam for in-package lease and
+// takeover tests. Production callers always use the fixed 60-second lease.
+func withCommandLeaseForTest(lease time.Duration) Option {
 	return runtimeOptionFunc(func(options *runtimeOptions) {
 		if lease < 30*time.Millisecond {
 			options.errs = append(options.errs, errors.New("command lease must be at least 30 milliseconds"))

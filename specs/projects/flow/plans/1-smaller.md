@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Plan: make Flow smaller and lighter
@@ -11,9 +11,10 @@ This plan reduces Flow before its public API and durable formats are frozen. The
 The intended developer model remains:
 
 ```text
+command → worker → events
+
 Commands instruct work.
-Workers do the work.
-Command completion records a durable terminal event.
+Workers do the work and stage the facts their successful decision produces.
 Plans optionally declare bounded command graphs.
 Plans, workers, and coordinators request further command execution through one operation.
 External systems may emit durable facts into an execution.
@@ -40,7 +41,7 @@ The primary action vocabulary becomes:
 | Verb | Meaning |
 |---|---|
 | `Execute` | Durably request asynchronous command execution. The supplied scope determines whether it starts a new execution, reconciles a plan node, or stages a worker/coordinator child. |
-| `Emit` | Record one externally observed application fact in an existing execution. |
+| `Emit` | Stage a worker/coordinator event, or record an externally observed event through `Event.Emit`. |
 | `Cancel` | Administratively terminate a command or execution. |
 
 The supporting plan vocabulary becomes:
@@ -63,6 +64,7 @@ The worker and coordinator vocabulary remains:
 ```text
 ResultOf / OutcomeOf
 Execute
+Emit
 Node.Optional / Node.Delay
 On / OnOutcome / OnStart
 Coordination.Succeed / Coordination.Fail
@@ -135,33 +137,29 @@ Implementation consequences:
 - remove threshold fields from store values, journal bodies, replay, Trace, and flowtest;
 - retain dependency groups and members for the three remaining predicates.
 
-### 4.3 Remove additional staged application events from handlers
+### 4.3 Retain staged application events from decisions
 
-Delete:
+Keep the small decision-scoped operation:
 
 ```go
 func Emit[T any](scope Scope, event Event[T], key string, payload T) error
 ```
 
-Workers already produce the event required by the core model: returning `(result, nil)` atomically records the command's successful terminal event carrying the typed result. Coordinators already journal their state transition and in-execution command requests. No worked example requires a worker or coordinator to record an additional application event in the same decision.
+`flow.Emit` records no SQL while a handler runs. It stages a typed application event in the same decision buffer as child commands. A successful fenced worker settlement commits all staged events, children, the typed result/terminal event, and an optional commit-function write in one transaction. Failure, panic, timeout, cancellation, lease loss, or commit-function rollback exposes none of them. Coordinator events commit with state, inbox advancement, commands, and terminal intent.
 
-When another part of the same execution needs to react to command completion, it uses:
+Plans remain pure and are not an emitting scope. Calling `flow.Emit(plan, ...)` records a deterministic scope defect so the enclosing plan decision cannot partially reconcile.
 
-- an exact command dependency or `Node.Outcome()` in a plan;
-- `ResultOf` or `OutcomeOf` in a dependent worker;
-- `OnOutcome` in a coordinator.
+Each event has a stable non-empty key and canonical payload within the existing 64 KiB bound. A decision may stage multiple events. Ordering is deterministic by event name and key. Repeating identical identity and content coalesces; different content for the same `(name,key)` poisons the decision. Settlement also coalesces with identical durable history and rejects conflicts.
 
-External observations remain first-class through the single `Event.Emit` ingress operation described in §5.1.
+Command dependencies, `Outcome`, and coordinator `OnOutcome` remain the natural tools when the relevant fact is command terminality itself. `flow.Emit` is for additional application facts produced by the accepted decision.
 
 Implementation consequences:
 
-- remove staged-event maps, order lists, codecs, validation, poisoning, and duplicate checks from worker/coordinator scopes;
-- remove staged application events from the settlement batch order;
-- remove staged-event output from flowtest;
-- remove worker/coordinator event-size and cross-version-conflict test cases;
-- retain automatic command terminal events and externally emitted application events.
-
-If a future concrete workload requires several application facts to commit atomically with command success, staged emission can return as an additive handler capability.
+- retain staged-event maps, deterministic ordering, canonical validation, poisoning, and keyed duplicate checks in worker/coordinator scopes;
+- include application events in worker and coordinator settlement batches and exact-wait resolution;
+- expose staged events in `flowtest` worker, coordinator, and direct results;
+- cover success, failure, panic, cancellation, fencing, commit rollback, replay, observation, and trace behavior;
+- retain automatic command terminal events and external `Event.Emit` ingress.
 
 ### 4.4 Move plan command reads onto typed nodes
 
@@ -376,7 +374,7 @@ Keep an unexported runtime configuration seam for in-package integration and fau
 
 ## 5. Renames and consistency changes
 
-### 5.1 Replace `Publish` with the sole explicit `Event.Emit`
+### 5.1 Replace `Publish` with external `Event.Emit`
 
 Delete:
 
@@ -408,11 +406,11 @@ err := BridgeDelivered.Emit(
 )
 ```
 
-This is the only explicit application-event write operation in M1. It always performs durable ingress; it never means an in-memory handler staging operation. `Runtime.InTx(tx)` remains accepted as the `Client`, so an application-table write and the event may still commit atomically.
+This is the external application-event ingress operation in M1. It performs durable SQL immediately. Decision-scoped `flow.Emit` is distinct: it accepts a worker/coordinator scope and only stages an event for fenced settlement. `Runtime.InTx(tx)` remains accepted as the external `Client`, so an application-table write and the ingress event may still commit atomically.
 
 No `Event.With(client)` binding is added in this reduction. Event emission already requires an execution ID and is less frequent than command execution; another binding method would save one argument while adding more state and API.
 
-`Event.Emit` is an ingress operation for processes outside a handler: API services, webhooks, and monitors. Worker and coordinator handler code must not call it — or any other client ingress operation — from inside an attempt. Such a write commits immediately, outside the staged decision and outside the settlement fence, and survives even when the attempt later fails, retries, or loses its lease; with staged handler events removed, it is the one remaining way to leak an unfenced write. A fact a handler produces belongs in its typed result; a write inseparable from its success belongs in the registered commit function; a genuinely external fact belongs to the external process that observed it. The functional specification must state this prohibition alongside the `Event.Emit` contract.
+`Event.Emit` is ingress for processes outside a handler: API services, webhooks, and monitors. Worker and coordinator handler code must not call it — or any other client ingress operation — from inside an attempt because it commits independently of settlement and fencing. The library rejects use through the attempt context and poisons the decision. Handler-produced facts use `flow.Emit`; a database-local write uses the registered commit function; a genuinely external fact uses `Event.Emit` in the external process that observed it.
 
 ### 5.2 Use `Execute` for every command request
 
@@ -782,7 +780,7 @@ Required durable-body changes:
 
 - `CommandCreated` continues to contain canonical arguments, origin, parent, dependencies, wait selectors including event keys, accepted schedule, policy, and causation;
 - plan reconciliation bodies no longer contain quorum thresholds or node retry overrides;
-- worker/coordinator transition bodies no longer contain staged application events;
+- worker/coordinator settlements retain staged application events as ordinary journal `EventRecorded` entries rather than duplicating them inside transition bodies;
 - command terminal journal entries remain unchanged in purpose and reconstructibility;
 - coordinator creation history and projection rows retain the accepted canonical retry policy even though it is not publicly configurable;
 - application-event identity is `(execution_id, event_name, event_key)`; event definitions are unversioned, and a material payload change uses a new event name;
@@ -798,18 +796,18 @@ If preserving an existing non-test database becomes a requirement, stop before e
 2. Update the project overview's developer model and examples.
 3. Apply every removal and rename to the functional specification, including signatures, behavior, examples, limits, acceptance criteria, and surface inventory.
 4. Update architecture and component documents only after the functional contract is coherent.
-5. Replace the original implementation-plan entries for `Issue`, `Publish`, staged `Emit`, `Do`, `Spawn`, `SpawnOption`, `AfterAny`, `Command.Done`, the free plan `Result`/`Outcome`/`Children` helpers, event versions, `LookupExecution`, `WithMaxAttempts`/`WithRetryPolicy`/`Jitter`, `WithCommandLease`, `CommandOutcome`, and the free coordinator completion functions with the reduced design.
+5. Replace the original implementation-plan entries for `Issue`, `Publish`, `Do`, `Spawn`, `SpawnOption`, `AfterAny`, `Command.Done`, the free plan `Result`/`Outcome`/`Children` helpers, event versions, `LookupExecution`, `WithMaxAttempts`/`WithRetryPolicy`/`Jitter`, `WithCommandLease`, `CommandOutcome`, and the free coordinator completion functions with the reduced design; retain staged `Emit`.
 6. Add the commit-function decision rule and the worker-object adjacency example from §8.4 to the functional specification's `WithCommit` section.
-7. Audit every occurrence of the word `Emit` in the specifications, documentation, and code comments for the new meaning. `Emit` previously named the staged handler operation and now names external ingress; a name search alone cannot catch prose that survived with the old semantics attached to the same word.
+7. Audit every occurrence of `Emit` so `flow.Emit(scope, ...)` always means staged decision output and `Event.Emit(ctx, client, ...)` always means external ingress.
 
-Exit condition: searching the normative specifications finds no old API name except in an explicit historical rationale, and every remaining `Emit` reference describes external ingress.
+Exit condition: searching the normative specifications finds no old API name except in an explicit historical rationale, and every `Emit` reference clearly identifies staged output or external ingress.
 
 ### Phase 2 — reduce and rename the public contracts
 
 1. Add package `flow.Execute`, broaden the sealed `Scope` to the three library-owned in-execution scopes, make `Node[R]` result-typed, and make it record scope defects.
-2. Add `Event.Emit`, `EventRef`, `Outcome[R]`, `Node.WaitFor`, `Node.Key`, `Node.Children`, `Node.Outcome`, keyed `Fact`, `WithRetry`, `Attempts`, `Coordination.Succeed`, and `Coordination.Fail`; retain `Node.Optional` and `Node.Delay` as the only option forms.
+2. Add `Event.Emit`, retain staged `flow.Emit`, and add `EventRef`, `Outcome[R]`, `Node.WaitFor`, `Node.Key`, `Node.Children`, `Node.Outcome`, keyed `Fact`, `WithRetry`, `Attempts`, `Coordination.Succeed`, and `Coordination.Fail`; retain `Node.Optional` and `Node.Delay` as the only option forms.
 3. Remove `Publish`, plan `Do`, `Spawn`, `SpawnOption`, free `Optional`, `Await`, and `StartAfter` without aliases; do not introduce `Declare` or free `Delay`.
-4. Remove `Issue`, staged `Emit`, free plan `Result`/`Outcome`/`Children`, `Command.Done`, `AfterAny`, plan-node retry override methods, the `DefineEvent` version parameter and `Event.Version`, `EventName`, `LookupExecution`, `WithMaxAttempts`, `WithRetryPolicy`, `RetryPolicy.Jitter`, `WithCommandLease`, `CommandOutcome`, `CoordinatorScope`, `SucceedExecution`, and `FailExecution`.
+4. Remove `Issue`, free plan `Result`/`Outcome`/`Children`, `Command.Done`, `AfterAny`, plan-node retry override methods, the `DefineEvent` version parameter and `Event.Version`, `EventName`, `LookupExecution`, `WithMaxAttempts`, `WithRetryPolicy`, `RetryPolicy.Jitter`, `WithCommandLease`, `CommandOutcome`, `CoordinatorScope`, `SucceedExecution`, and `FailExecution`.
 5. Simplify sealed interfaces, decision errors, and option state made unnecessary by those deletions.
 6. Update compile-contract tests and `go doc` assertions, including accepted modifiers, deterministic invalid-scope cases, and incompatible or repeated coordinator terminal decisions.
 7. Document the per-scope modifier matrix in the `flow.Execute` package documentation and ship a `flowtest` assertion for scope-defect poisoning, so the settlement-time failure mode is discoverable from docs and tests rather than first encountered in production.
@@ -819,7 +817,7 @@ Exit condition: the package compiles with the target vocabulary, and none of the
 ### Phase 3 — simplify the engine and deterministic test harness
 
 1. Replace separate plan declaration and staged-child recorders with one typed `flow.Execute` entry point while retaining their distinct internal decision representations and acceptance paths.
-2. Remove staged application events from decision buffers and canonical decision comparison.
+2. Retain staged application events in decision buffers with canonical keyed comparison and deterministic ordering.
 3. Remove quorum group evaluation and threshold state.
 4. Remove command-success event descriptors from definitions and event-selector validation.
 5. Make exact event key part of plan facts, reads, waits, declaration equivalence, and simulation.
@@ -844,7 +842,7 @@ Exit condition: fresh migration, replay-vs-projection conformance, and real-Post
 
 ### Phase 5 — simplify runtime scheduling and coordination
 
-1. Remove wake-up, observation, fault, and command-ceiling paths that existed only for `Issue` or staged events.
+1. Remove wake-up, observation, fault, and command-ceiling paths that existed only for `Issue`; retain event settlement observation and fault coverage.
 2. Remove coordinator success-only subscription selection and overlap checks.
 3. Keep `OnOutcome` indexed delivery for every command terminal state.
 4. Rename delayed-child observations and diagnostics to `Delay` while preserving stored timestamps.
@@ -880,61 +878,63 @@ Exit condition: examples compile as public API clients, run against real Postgre
 
 ### Public API
 
-- [ ] `Command.Execute`, `PlanDef.Execute`, `Coordinator.Execute`, and package `flow.Execute` all mean durable asynchronous execution, never invoke a worker inline, and retain their scope-specific idempotency rules.
-- [ ] Plans, workers, and coordinators use package `flow.Execute`; `Do`, `Declare`, and `Spawn` do not exist.
-- [ ] Package `flow.Execute` preserves plan reconciliation, atomic worker-child membership, and atomic coordinator decision semantics according to its sealed scope.
-- [ ] Invalid definitions, modifiers, or node reads poison an in-execution scope even when the returned `Node` is ignored; no partial command set, application write, coordinator state, or successful terminal event commits.
-- [ ] External facts use `Event.Emit`; neither `Publish` nor staged `flow.Emit` exists.
-- [ ] In-execution options use `Node.Optional` and `Node.Delay`; `SpawnOption`, free `Optional`, free `Delay`, and `StartAfter` do not exist.
-- [ ] `WaitFor` and singular `Fact` require an exact event key.
-- [ ] `EventRef` is the sole non-generic event erasure used by `WaitFor`; `EventName` does not exist and only `Event[T]` implements `EventRef`.
-- [ ] `Node[R]` preserves its command result type; `Key()` works in every in-execution scope, while `Children()` and `Outcome()` are plan-only reads.
-- [ ] `Node[R]` is evaluation/decision-local and cannot be retained or shared as durable application state; `Key()` is the durable reference.
-- [ ] Free plan `Result`, `Outcome`, and `Children` helpers, `Command.Done`, `AfterAny`, `Issue`, and plan-node retry overrides do not exist.
-- [ ] `WithCommit` remains the only application-write hook — no `OnCommit` or `Work.Tx()` — and its documentation leads with the §8.4 decision rule and worker-object adjacency example.
-- [ ] The shared generic terminal value is `Outcome[R]`; `CommandOutcome[R]` does not exist, while `Node.Outcome`, `OutcomeOf`, and `OnOutcome` retain one vocabulary.
-- [ ] `DefineEvent` takes no version; wait, fact, subscription, and idempotency identity is `(execution, event name, key)`, and a material event payload change uses a new event name while old publishers remain available until old-name waits drain.
-- [ ] `LookupExecution` does not exist; application code persists `ExecutionID` with its domain object or repeats the identical idempotent `Execute`, while `ListExecutions` remains an operational browsing API.
-- [ ] `WithRetry` is the only retry option and `RetryFor`/`Attempts` the only policy constructors; the effective 20% jitter is persisted, and `WithMaxAttempts`, `WithRetryPolicy`, and `RetryPolicy.Jitter` do not exist.
-- [ ] `WithCommandLease` does not exist and the production attempt lease is fixed at 60 seconds; an unexported in-package seam keeps lease fault tests fast.
-- [ ] Coordinator handlers stage terminality with `c.Succeed()` or `c.Fail(err)`; `SucceedExecution`, `FailExecution`, and public `CoordinatorScope` do not exist.
-- [ ] Coordinator completion carries no result reference, and `outcome_ref` is absent from the schema, `Execution`, and `Trace`.
+- [x] `Command.Execute`, `PlanDef.Execute`, `Coordinator.Execute`, and package `flow.Execute` all mean durable asynchronous execution, never invoke a worker inline, and retain their scope-specific idempotency rules.
+- [x] Plans, workers, and coordinators use package `flow.Execute`; `Do`, `Declare`, and `Spawn` do not exist.
+- [x] Package `flow.Execute` preserves plan reconciliation, atomic worker-child membership, and atomic coordinator decision semantics according to its sealed scope.
+- [x] Invalid definitions, modifiers, or node reads poison an in-execution scope even when the returned `Node` is ignored; no partial command set, application write, coordinator state, or successful terminal event commits.
+- [x] Handler-produced facts use staged `flow.Emit`; external facts use `Event.Emit`; `Publish` does not exist.
+- [x] In-execution options use `Node.Optional` and `Node.Delay`; `SpawnOption`, free `Optional`, free `Delay`, and `StartAfter` do not exist.
+- [x] `WaitFor` and singular `Fact` require an exact event key.
+- [x] `EventRef` is the sole non-generic event erasure used by `WaitFor`; `EventName` does not exist and only `Event[T]` implements `EventRef`.
+- [x] `Node[R]` preserves its command result type; `Key()` works in every in-execution scope, while `Children()` and `Outcome()` are plan-only reads.
+- [x] `Node[R]` is evaluation/decision-local and cannot be retained or shared as durable application state; `Key()` is the durable reference.
+- [x] Free plan `Result`, `Outcome`, and `Children` helpers, `Command.Done`, `AfterAny`, `Issue`, and plan-node retry overrides do not exist.
+- [x] `WithCommit` remains the only application-write hook — no `OnCommit` or `Work.Tx()` — and its documentation leads with the §8.4 decision rule and worker-object adjacency example.
+- [x] The shared generic terminal value is `Outcome[R]`; `CommandOutcome[R]` does not exist, while `Node.Outcome`, `OutcomeOf`, and `OnOutcome` retain one vocabulary.
+- [x] `DefineEvent` takes no version; wait, fact, subscription, and idempotency identity is `(execution, event name, key)`, and a material event payload change uses a new event name while old publishers remain available until old-name waits drain.
+- [x] `LookupExecution` does not exist; application code persists `ExecutionID` with its domain object or repeats the identical idempotent `Execute`, while `ListExecutions` remains an operational browsing API.
+- [x] `WithRetry` is the only retry option and `RetryFor`/`Attempts` the only policy constructors; the effective 20% jitter is persisted, and `WithMaxAttempts`, `WithRetryPolicy`, and `RetryPolicy.Jitter` do not exist.
+- [x] `WithCommandLease` does not exist and the production attempt lease is fixed at 60 seconds; an unexported in-package seam keeps lease fault tests fast.
+- [x] Coordinator handlers stage terminality with `c.Succeed()` or `c.Fail(err)`; `SucceedExecution`, `FailExecution`, and public `CoordinatorScope` do not exist.
+- [x] Coordinator completion carries no result reference, and `outcome_ref` is absent from the schema, `Execution`, and `Trace`.
 
 ### Semantics
 
-- [ ] Successful worker return still records exactly one typed terminal event with its result.
-- [ ] Failed, cancelled, expired, and skipped commands still record exactly one terminal event.
-- [ ] `OnOutcome` delivers every command terminal state exactly once to the coordinator.
-- [ ] `Node.Outcome()` returns unavailable only while its plan command is non-terminal and returns a typed `Outcome[R]` for every terminal state, so unsuccessful commands cannot create a permanently absent result read.
-- [ ] `Node.Children()` returns the authoritative stable child set only after successful membership closure; pending membership is a consulted-but-absent plan read and unsuccessful parent terminality cannot block execution failure.
-- [ ] Two facts with the same definition and different keys release only their exact matching waits.
-- [ ] Wait and `Fact` keys in examples are correlation identities known before the fact occurs; no example uses a runtime-generated value as an event key.
-- [ ] Handler code performs no client ingress; the specification prohibits `Event.Emit` from inside an attempt and no example or test violates it.
-- [ ] Emit-before-wait and wait-before-emit both progress without a lost wake-up.
-- [ ] `Within` begins only after command dependencies settle and a late fact cannot resurrect an expired wait.
-- [ ] Partial-result joins work with `Optional`, `AfterSettled`, and `OutcomeOf`.
-- [ ] Early quorum behavior remains expressible through a coordinator.
-- [ ] Retry policy accepted from the command definition remains durable and unchanged across deployment default changes.
-- [ ] The accepted coordinator retry policy remains durable and unchanged across restart or deployment default changes even though M1 exposes no coordinator retry option.
-- [ ] A coordinator terminal decision commits atomically with its state, commands, and inbox advance; incompatible or repeated terminal calls poison the whole decision.
-- [ ] Dynamic fan-out membership still closes atomically with successful parent settlement.
+- [x] Successful worker return still records exactly one typed terminal event with its result.
+- [x] Successful worker settlement atomically commits every staged application event, child command, typed result/terminal event, and optional commit-function write; every unsuccessful boundary exposes none of the staged output.
+- [x] Failed, cancelled, expired, and skipped commands still record exactly one terminal event.
+- [x] `OnOutcome` delivers every command terminal state exactly once to the coordinator.
+- [x] `Node.Outcome()` returns unavailable only while its plan command is non-terminal and returns a typed `Outcome[R]` for every terminal state, so unsuccessful commands cannot create a permanently absent result read.
+- [x] `Node.Children()` returns the authoritative stable child set only after successful membership closure; pending membership is a consulted-but-absent plan read and unsuccessful parent terminality cannot block execution failure.
+- [x] Two facts with the same definition and different keys release only their exact matching waits.
+- [x] Wait and `Fact` keys in examples are correlation identities known before the fact occurs; no example uses a runtime-generated value as an event key.
+- [x] Handler code performs no client ingress; the specification prohibits `Event.Emit` from inside an attempt and no example or test violates it.
+- [x] Worker and coordinator decisions may stage multiple canonical keyed events; identical repetitions coalesce, conflicts poison, plans cannot emit, and settlement ordering is deterministic.
+- [x] Emit-before-wait and wait-before-emit both progress without a lost wake-up.
+- [x] `Within` begins only after command dependencies settle and a late fact cannot resurrect an expired wait.
+- [x] Partial-result joins work with `Optional`, `AfterSettled`, and `OutcomeOf`.
+- [x] Early quorum behavior remains expressible through a coordinator.
+- [x] Retry policy accepted from the command definition remains durable and unchanged across deployment default changes.
+- [x] The accepted coordinator retry policy remains durable and unchanged across restart or deployment default changes even though M1 exposes no coordinator retry option.
+- [x] A coordinator terminal decision commits atomically with its state, commands, and inbox advance; incompatible or repeated terminal calls poison the whole decision.
+- [x] Dynamic fan-out membership still closes atomically with successful parent settlement.
 
 ### Durability and operations
 
-- [ ] `Event.Emit` is idempotent by execution, event name, and key and works through `Runtime.InTx`.
-- [ ] The journal alone plus its reducer reconstructs command existence, topology, attempts, facts, and terminal outcomes.
-- [ ] Claims remain capacity-bounded, use `SKIP LOCKED`, and never hold a database connection while a worker runs.
-- [ ] Lease loss, takeover, retries, cancellation, and ambiguous commits preserve their existing guarantees.
-- [ ] Notifications remain hints and poll-only operation remains correct.
-- [ ] Direct, plan, coordinator, API-only publisher, and split worker deployments remain supported.
-- [ ] The four real-PostgreSQL examples and their E2E variants pass without unexpected skips.
+- [x] `Event.Emit` is idempotent by execution, event name, and key and works through `Runtime.InTx`.
+- [x] The journal alone plus its reducer reconstructs command existence, topology, attempts, facts, and terminal outcomes.
+- [x] Claims remain capacity-bounded, use `SKIP LOCKED`, and never hold a database connection while a worker runs.
+- [x] Lease loss, takeover, retries, cancellation, and ambiguous commits preserve their existing guarantees.
+- [x] Notifications remain hints and poll-only operation remains correct.
+- [x] Direct, plan, coordinator, API-only publisher, and split worker deployments remain supported.
+- [x] The four real-PostgreSQL examples and their E2E variants pass without unexpected skips.
 
 ### Size reduction
 
-- [ ] Removed API names are absent from `go doc` and repository source outside historical review documents.
-- [ ] The `external_issue`, staged-event, command-success-selector, quorum-threshold, node-policy-override, and event-version branches are deleted rather than disabled; stored coordinator retry policy remains intentionally durable.
-- [ ] The dependency threshold column and obsolete constraints are absent from a fresh schema.
-- [ ] No compatibility aliases or deprecated wrappers are introduced before M1.
+- [x] Removed API names are absent from `go doc` and repository source outside historical review documents.
+- [x] The `external_issue`, command-success-selector, quorum-threshold, node-policy-override, and event-version branches are deleted rather than disabled; staged-event settlement and stored coordinator retry policy remain intentionally durable.
+- [x] The dependency threshold column and obsolete constraints are absent from a fresh schema.
+- [x] No compatibility aliases or deprecated wrappers are introduced before M1.
 
 ## 12. Expected result
 

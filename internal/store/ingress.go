@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -53,10 +54,9 @@ type CommandCreate struct {
 }
 
 type DependencyGroupCreate struct {
-	ID        uuid.UUID
-	Kind      string
-	Threshold *int
-	Members   []DependencyMemberCreate
+	ID      uuid.UUID
+	Kind    string
+	Members []DependencyMemberCreate
 }
 
 type DependencyMemberCreate struct {
@@ -65,9 +65,8 @@ type DependencyMemberCreate struct {
 }
 
 type EventWaitCreate struct {
-	Namespace string
-	Name      string
-	Version   int
+	Name string
+	Key  string
 }
 
 type CoordinatorCreate struct {
@@ -318,16 +317,14 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 		DeclarationFingerprint: hex.EncodeToString(command.DeclarationFingerprint[:]),
 	}
 	for _, group := range command.Dependencies {
-		value := journalcodec.DependencyGroupBody{Kind: group.Kind, Threshold: clonePointer(group.Threshold)}
+		value := journalcodec.DependencyGroupBody{Kind: group.Kind}
 		for _, member := range group.Members {
 			value.Members = append(value.Members, member.Key)
 		}
 		body.Dependencies = append(body.Dependencies, value)
 	}
 	for _, wait := range command.Waits {
-		body.Waits = append(body.Waits, journalcodec.EventWaitBody{
-			Namespace: wait.Namespace, Name: wait.Name, Version: wait.Version,
-		})
+		body.Waits = append(body.Waits, journalcodec.EventWaitBody{Name: wait.Name, Key: wait.Key})
 	}
 	if command.Within > 0 {
 		value := command.Within.Milliseconds()
@@ -362,8 +359,8 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	for index, wait := range command.Waits {
 		var position int64
 		err := tx.QueryRow(ctx, `SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
-			WHERE execution_id=$1 AND event_namespace=$2 AND event_name=$3 AND event_version=$4
-			ORDER BY position LIMIT 1`, executionID, wait.Namespace, wait.Name, wait.Version).Scan(&position)
+			WHERE execution_id=$1 AND event_namespace='application' AND event_name=$2 AND event_key=$3
+			ORDER BY position LIMIT 1`, executionID, wait.Name, wait.Key).Scan(&position)
 		if errors.Is(err, pgx.ErrNoRows) {
 			unsatisfiedWaits++
 			continue
@@ -433,8 +430,8 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 			group.ID = uuid.New()
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_dependency_groups")+`
-			(group_id,execution_id,dependent_command_id,ordinal,kind,threshold)
-			VALUES ($1,$2,$3,$4,$5,$6)`, group.ID, executionID, command.ID, ordinal, group.Kind, group.Threshold); err != nil {
+			(group_id,execution_id,dependent_command_id,ordinal,kind)
+			VALUES ($1,$2,$3,$4,$5)`, group.ID, executionID, command.ID, ordinal, group.Kind); err != nil {
 			return MapError("insert command dependency group", err)
 		}
 		for _, member := range group.Members {
@@ -451,8 +448,8 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 			satisfied = &position
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_event_waits")+`
-			(command_id,execution_id,event_namespace,event_name,event_version,satisfied_position)
-			VALUES ($1,$2,$3,$4,$5,$6)`, command.ID, executionID, wait.Namespace, wait.Name, wait.Version, satisfied); err != nil {
+			(command_id,execution_id,event_name,event_key,satisfied_position)
+			VALUES ($1,$2,$3,$4,$5)`, command.ID, executionID, wait.Name, wait.Key, satisfied); err != nil {
 			return MapError("insert command event wait", err)
 		}
 	}
@@ -501,87 +498,62 @@ func (s *Store) LoadExecutionHead(ctx context.Context, semantic *SemanticTx) (Ex
 	return result, nil
 }
 
-type IssueResult struct {
-	CommandID uuid.UUID
-	Created   bool
-}
-
-func (s *Store) IssueLocked(ctx context.Context, semantic *SemanticTx, command CommandCreate) (IssueResult, error) {
-	head, err := s.LoadExecutionHead(ctx, semantic)
-	if err != nil {
-		return IssueResult{}, err
-	}
-	var existingID uuid.UUID
-	var name, origin string
-	var version int
-	var args, fingerprint []byte
-	err = semantic.PGX().QueryRow(ctx, `SELECT command_id,name,version,origin,args,declaration_fingerprint
-		FROM `+pgschema.Table(s.schema, "flow_commands")+`
-		WHERE execution_id=$1 AND command_key=$2 FOR UPDATE`, head.ID, command.Key).
-		Scan(&existingID, &name, &version, &origin, &args, &fingerprint)
-	if err == nil {
-		if name == command.Name && version == command.Version && origin == command.Origin &&
-			bytes.Equal(args, command.Args.Bytes) && bytes.Equal(fingerprint, command.DeclarationFingerprint[:]) {
-			return IssueResult{CommandID: existingID, Created: false}, nil
-		}
-		return IssueResult{}, fmt.Errorf("%w: command key is owned by a different declaration", flowerr.ErrConflict)
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return IssueResult{}, MapError("lookup command key", err)
-	}
-	if head.Mode == DriverDirect {
-		return IssueResult{}, fmt.Errorf("%w: direct executions reject Issue", flowerr.ErrInvalidState)
-	}
-	if head.Status != "running" && head.Status != "failing" {
-		return IssueResult{}, fmt.Errorf("%w: execution is terminal", flowerr.ErrTerminal)
-	}
-	if head.MaxCommands != 0 && head.CommandCount+1 > head.MaxCommands {
-		return IssueResult{}, fmt.Errorf("%w: execution command ceiling reached", flowerr.ErrInvalid)
-	}
-	command.Origin = "external_issue"
-	command.Required = true
-	command.ParentCommandID = nil
-	command.ScheduleKind = "none"
-	command.InitialDelay = 0
-	entry, err := commandCreatedEntry(command, semantic.DBNow(), semantic.DBNow())
-	if err != nil {
-		return IssueResult{}, err
-	}
-	one := int64(1)
-	entry.CausationPosition = &one
-	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: []JournalEntry{entry}})
-	if err != nil {
-		return IssueResult{}, err
-	}
-	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-		SET command_count=command_count+1,open_commands=open_commands+1,updated_at=$2
-		WHERE execution_id=$1`, head.ID, semantic.DBNow()); err != nil {
-		return IssueResult{}, MapError("increment command count", err)
-	}
-	if err := s.insertCommand(ctx, semantic.PGX(), head.ID, command, journal.Journal[0].Position, semantic.DBNow(), semantic.DBNow()); err != nil {
-		return IssueResult{}, err
-	}
-	return IssueResult{CommandID: command.ID, Created: true}, nil
-}
-
 type ApplicationEvent struct {
-	ID      uuid.UUID
-	Name    string
-	Version int
-	Key     string
-	Body    canonical.Value
+	ID   uuid.UUID
+	Name string
+	Key  string
+	Body canonical.Value
+}
+
+func (s *Store) coalesceApplicationEvents(ctx context.Context, semantic *SemanticTx, events []ApplicationEvent) ([]ApplicationEvent, error) {
+	if len(events) == 0 {
+		return nil, nil
+	}
+	ordered := append([]ApplicationEvent(nil), events...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Name != ordered[j].Name {
+			return ordered[i].Name < ordered[j].Name
+		}
+		return ordered[i].Key < ordered[j].Key
+	})
+	result := make([]ApplicationEvent, 0, len(ordered))
+	seen := make(map[string]ApplicationEvent, len(ordered))
+	for _, event := range ordered {
+		if event.ID == uuid.Nil || event.Name == "" || event.Key == "" || len(event.Body.Bytes) == 0 {
+			return nil, fmt.Errorf("%w: incomplete staged application event", flowerr.ErrInvalid)
+		}
+		identity := event.Name + "\x00" + event.Key
+		if prior, exists := seen[identity]; exists {
+			if bytes.Equal(prior.Body.Bytes, event.Body.Bytes) {
+				continue
+			}
+			return nil, fmt.Errorf("%w: staged application event identity differs", flowerr.ErrConflict)
+		}
+		seen[identity] = event
+		existing, err := s.LookupApplicationEvent(ctx, semantic.PGX(), semantic.ExecutionID(), event.Name, event.Key)
+		if err != nil {
+			return nil, err
+		}
+		if existing.Found {
+			if bytes.Equal(existing.Body, event.Body.Bytes) {
+				continue
+			}
+			return nil, fmt.Errorf("%w: application event identity differs", flowerr.ErrConflict)
+		}
+		result = append(result, event)
+	}
+	return result, nil
 }
 
 type ExistingEvent struct {
-	ID      uuid.UUID
-	Version int
-	Body    []byte
-	Found   bool
+	ID    uuid.UUID
+	Body  []byte
+	Found bool
 }
 
 func (s *Store) LookupApplicationEvent(ctx context.Context, tx pgx.Tx, executionID uuid.UUID, name, key string) (ExistingEvent, error) {
 	var row pgx.Row
-	query := `SELECT event_id,event_version,body FROM ` + pgschema.Table(s.schema, "flow_journal") + `
+	query := `SELECT event_id,body FROM ` + pgschema.Table(s.schema, "flow_journal") + `
 		WHERE execution_id=$1 AND event_namespace='application' AND event_name=$2 AND event_key=$3`
 	if tx != nil {
 		row = tx.QueryRow(ctx, query, executionID, name, key)
@@ -589,7 +561,7 @@ func (s *Store) LookupApplicationEvent(ctx context.Context, tx pgx.Tx, execution
 		row = s.db.Conn.QueryRow(ctx, query, executionID, name, key)
 	}
 	var result ExistingEvent
-	if err := row.Scan(&result.ID, &result.Version, &result.Body); err != nil {
+	if err := row.Scan(&result.ID, &result.Body); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ExistingEvent{}, nil
 		}
@@ -599,13 +571,13 @@ func (s *Store) LookupApplicationEvent(ctx context.Context, tx pgx.Tx, execution
 	return result, nil
 }
 
-func (s *Store) PublishLocked(ctx context.Context, semantic *SemanticTx, event ApplicationEvent) (bool, error) {
+func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event ApplicationEvent) (bool, error) {
 	existing, err := s.LookupApplicationEvent(ctx, semantic.PGX(), semantic.ExecutionID(), event.Name, event.Key)
 	if err != nil {
 		return false, err
 	}
 	if existing.Found {
-		if existing.Version == event.Version && bytes.Equal(existing.Body, event.Body.Bytes) {
+		if bytes.Equal(existing.Body, event.Body.Bytes) {
 			return false, nil
 		}
 		return false, fmt.Errorf("%w: application event identity differs", flowerr.ErrConflict)
@@ -620,14 +592,14 @@ func (s *Store) PublishLocked(ctx context.Context, semantic *SemanticTx, event A
 	entry := JournalEntry{
 		EntryID: uuid.New(), Kind: EventRecorded, EventID: clonePointer(&event.ID),
 		EventNamespace: stringPointer("application"), EventName: clonePointer(&event.Name),
-		EventVersion: clonePointer(&event.Version), EventKey: clonePointer(&event.Key),
+		EventKey:   clonePointer(&event.Key),
 		EventClass: stringPointer("application"), Body: event.Body,
 	}
 	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: []JournalEntry{entry}})
 	if err != nil {
 		return false, err
 	}
-	waits, err := s.matchingWaitsLocked(ctx, semantic, "application", event.Name, event.Version, journal.Journal[0].Position)
+	waits, err := s.matchingWaitsLocked(ctx, semantic, event.Name, event.Key, journal.Journal[0].Position)
 	if err != nil {
 		return false, err
 	}
@@ -1024,12 +996,10 @@ func terminalEventWithCode(commandID uuid.UUID, key, status, code, reason, name,
 		return JournalEntry{}, err
 	}
 	eventID := uuid.New()
-	version := 1
 	body.CommandID = clonePointer(&commandID)
 	body.EventID = &eventID
 	body.EventNamespace = stringPointer("runtime")
 	body.EventName = clonePointer(&name)
-	body.EventVersion = &version
 	body.EventKey = clonePointer(&key)
 	body.EventClass = clonePointer(&class)
 	body.TerminalStatus = clonePointer(&status)
@@ -1042,11 +1012,9 @@ func executionTerminalEvent(status, reason, name string) (JournalEntry, error) {
 		return JournalEntry{}, err
 	}
 	eventID := uuid.New()
-	version := 1
 	body.EventID = &eventID
 	body.EventNamespace = stringPointer("runtime")
 	body.EventName = clonePointer(&name)
-	body.EventVersion = &version
 	body.EventClass = stringPointer("execution_terminal")
 	body.TerminalStatus = clonePointer(&status)
 	return body, nil

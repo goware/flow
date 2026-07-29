@@ -34,11 +34,15 @@ type ToolResult struct {
 type AgentMessage struct {
 	Text string `json:"text"`
 }
+type AgentFinished struct {
+	ResultRef string `json:"result_ref"`
+}
 
 var (
 	AgentThink       = flow.DefineCommand[ThinkArgs, ThinkResult]("example.agent_think", 1)
-	AgentTool        = flow.DefineCommand[ToolArgs, ToolResult]("example.agent_tool", 1, flow.WithMaxAttempts(1))
-	AgentUserMessage = flow.DefineEvent[AgentMessage]("example.agent_user_message", 1)
+	AgentTool        = flow.DefineCommand[ToolArgs, ToolResult]("example.agent_tool", 1, flow.WithRetry(flow.Attempts(1)))
+	AgentUserMessage = flow.DefineEvent[AgentMessage]("example.agent_user_message")
+	AgentCompleted   = flow.DefineEvent[AgentFinished]("example.agent_completed")
 	ResearchAgent    = flow.DefineCoordinator[AgentState]("example.research_agent", 1,
 		flow.OnStart(startResearchAgent),
 		flow.OnOutcome(AgentThink, handleAgentThought),
@@ -51,7 +55,8 @@ func startResearchAgent(_ context.Context, c *flow.Coordination[AgentState]) err
 	c.State.Turn = 1
 	c.State.PendingTools = map[string]bool{}
 	c.State.Outcomes = map[string]flow.CommandStatus{}
-	return flow.Spawn(c, "turn/1/think", AgentThink, ThinkArgs{Turn: 1}, flow.Optional())
+	flow.Execute(c, "turn/1/think", AgentThink, ThinkArgs{Turn: 1}).Optional()
+	return nil
 }
 
 func handleAgentMessage(_ context.Context, c *flow.Coordination[AgentState], received flow.Received[AgentMessage]) error {
@@ -59,27 +64,31 @@ func handleAgentMessage(_ context.Context, c *flow.Coordination[AgentState], rec
 	return nil
 }
 
-func handleAgentThought(_ context.Context, c *flow.Coordination[AgentState], received flow.Received[flow.CommandOutcome[ThinkResult]]) error {
+func handleAgentThought(_ context.Context, c *flow.Coordination[AgentState], received flow.Received[flow.Outcome[ThinkResult]]) error {
 	if received.Payload.Status != flow.StatusSucceeded {
-		return flow.FailExecution(c, errors.New("model command failed"))
+		c.Fail(errors.New("model command failed"))
+		return nil
 	}
 	if received.Payload.Result.FinalResultRef != "" {
-		return flow.SucceedExecution(c, received.Payload.Result.FinalResultRef)
+		if err := flow.Emit(c, AgentCompleted, "final", AgentFinished{ResultRef: received.Payload.Result.FinalResultRef}); err != nil {
+			return err
+		}
+		c.Succeed()
+		return nil
 	}
 	if len(received.Payload.Result.Tools) == 0 {
-		return flow.FailExecution(c, errors.New("model returned no action"))
+		c.Fail(errors.New("model returned no action"))
+		return nil
 	}
 	for _, name := range received.Payload.Result.Tools {
 		key := "turn/1/tool/" + name
-		if err := flow.Spawn(c, key, AgentTool, ToolArgs{Name: name}, flow.Optional()); err != nil {
-			return err
-		}
+		flow.Execute(c, key, AgentTool, ToolArgs{Name: name}).Optional()
 		c.State.PendingTools[key] = true
 	}
 	return nil
 }
 
-func handleAgentTool(_ context.Context, c *flow.Coordination[AgentState], received flow.Received[flow.CommandOutcome[ToolResult]]) error {
+func handleAgentTool(_ context.Context, c *flow.Coordination[AgentState], received flow.Received[flow.Outcome[ToolResult]]) error {
 	if !c.State.PendingTools[received.Key] {
 		return flow.Permanent(fmt.Errorf("unexpected tool outcome %q", received.Key))
 	}
@@ -89,7 +98,8 @@ func handleAgentTool(_ context.Context, c *flow.Coordination[AgentState], receiv
 		return nil
 	}
 	c.State.Turn = 2
-	return flow.Spawn(c, "turn/2/think", AgentThink, ThinkArgs{Turn: 2, UserMessage: c.State.UserMessage}, flow.Optional(), flow.StartAfter(20*time.Millisecond))
+	flow.Execute(c, "turn/2/think", AgentThink, ThinkArgs{Turn: 2, UserMessage: c.State.UserMessage}).Optional().Delay(20 * time.Millisecond)
+	return nil
 }
 
 type AgentResult struct {
@@ -137,7 +147,7 @@ func RunAgent(ctx context.Context, db *pgkit.DB, schema string, output io.Writer
 	if err != nil {
 		return AgentResult{}, err
 	}
-	if err = flow.Publish(ctx, runtime, handle.ID, AgentUserMessage, "message/1", AgentMessage{Text: "focus on durability"}); err != nil {
+	if err = AgentUserMessage.Emit(ctx, runtime, handle.ID, "message/1", AgentMessage{Text: "focus on durability"}); err != nil {
 		return AgentResult{}, err
 	}
 	trace, err := waitForTerminal(ctx, runtime, handle.ID, 8*time.Second)

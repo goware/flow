@@ -56,10 +56,6 @@ func TestExecutionInspectionAndStablePagination(t *testing.T) {
 		got.CommandCount != 1 || got.OpenCommands != 1 || metadata["bucket"] != "0" || metadata["tenant"] != "acme" {
 		t.Fatalf("GetExecution() = %#v", got)
 	}
-	lookedUp, err := LookupExecution(ctx, runtime, command.Name(), handles[2].Key)
-	if err != nil || lookedUp.ID != handles[2].ID {
-		t.Fatalf("LookupExecution() = %#v, %v", lookedUp, err)
-	}
 	if _, err := GetExecution(ctx, runtime, ExecutionID("00000000-0000-0000-0000-000000000001")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetExecution(missing) error = %v", err)
 	}
@@ -107,15 +103,6 @@ func TestExecutionInspectionAndStablePagination(t *testing.T) {
 		t.Fatalf("invalid cursor error = %v", err)
 	}
 
-	// The same definition name/key may intentionally exist in different driver
-	// modes; type/key lookup refuses to select one silently.
-	plan := DefinePlan[inspectionArgs](command.Name(), 1, func(*Plan, inspectionArgs) {})
-	if _, err := plan.With(runtime).Execute(ctx, handles[2].Key, inspectionArgs{Value: "plan"}); err != nil {
-		t.Fatalf("Plan.Execute() error = %v", err)
-	}
-	if _, err := LookupExecution(ctx, runtime, command.Name(), handles[2].Key); !errors.Is(err, ErrConflict) {
-		t.Fatalf("ambiguous LookupExecution() error = %v", err)
-	}
 }
 
 func TestTransactionScopedInspectionAndAwait(t *testing.T) {

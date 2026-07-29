@@ -34,7 +34,6 @@ type ExecutionRow struct {
 	PlanWaitingCount  int
 	PlanWaitingOn     []string
 	DeadlineAt        *time.Time
-	OutcomeRef        string
 	FailureCode       string
 	FailureMessage    string
 	CreatedAt         time.Time
@@ -65,14 +64,6 @@ func (s *Store) GetExecutionInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (
 		return scanExecution(tx.QueryRow(ctx, query, id))
 	}
 	return scanExecution(s.db.Conn.QueryRow(ctx, query, id))
-}
-
-func (s *Store) LookupExecutionInTx(ctx context.Context, tx pgx.Tx, definitionName, key string) ([]ExecutionRow, error) {
-	if definitionName == "" || key == "" {
-		return nil, fmt.Errorf("%w: lookup type and key are required", flowerr.ErrInvalid)
-	}
-	query := s.executionSelect() + ` WHERE definition_name=$1 AND execution_key=$2 ORDER BY driver_mode LIMIT 2`
-	return s.queryExecutions(ctx, tx, query, definitionName, key)
 }
 
 // LookupLiveExecutionInTx finds the non-terminal execution holding a
@@ -141,7 +132,7 @@ func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter Execut
 
 const executionSelectColumns = `SELECT execution_id,driver_mode,definition_name,definition_version,execution_key,status,
 	fail_fast,max_commands,command_count,open_commands,plan_dirty,plan_quiescent,plan_revision,
-	plan_waiting_count,plan_waiting_on,deadline_at,outcome_ref,failure,created_at,updated_at,status_at,
+	plan_waiting_count,plan_waiting_on,deadline_at,failure,created_at,updated_at,status_at,
 	finished_at,metadata FROM `
 
 func (s *Store) executionSelect() string {
@@ -177,17 +168,13 @@ func (s *Store) queryExecutions(ctx context.Context, tx pgx.Tx, query string, ar
 func scanExecution(row pgx.Row) (ExecutionRow, error) {
 	var value ExecutionRow
 	var waiting, failure, metadata []byte
-	var outcome *string
 	if err := row.Scan(
 		&value.ID, &value.Mode, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
 		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.PlanDirty,
 		&value.PlanQuiescent, &value.PlanRevision, &value.PlanWaitingCount, &waiting, &value.DeadlineAt,
-		&outcome, &failure, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
+		&failure, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
 	); err != nil {
 		return ExecutionRow{}, MapError("scan execution", err)
-	}
-	if outcome != nil {
-		value.OutcomeRef = *outcome
 	}
 	if len(waiting) != 0 && string(waiting) != "null" {
 		if err := json.Unmarshal(waiting, &value.PlanWaitingOn); err != nil {

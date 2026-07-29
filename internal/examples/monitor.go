@@ -19,10 +19,10 @@ type ConfirmBridgeResult struct {
 }
 
 var (
-	BridgeDelivered = flow.DefineEvent[BridgeDelivery](BridgeDeliveredName, 1)
+	BridgeDelivered = flow.DefineEvent[BridgeDelivery](BridgeDeliveredName)
 	ConfirmBridge   = flow.DefineCommand[flow.None, ConfirmBridgeResult]("example.confirm_bridge", 1)
 	BridgePlan      = flow.DefinePlan[flow.None]("example.bridge", 1, func(plan *flow.Plan, _ flow.None) {
-		flow.Do(plan, "confirm", ConfirmBridge, flow.None{}).Await(BridgeDelivered).Within(2 * time.Second)
+		flow.Execute(plan, "confirm", ConfirmBridge, flow.None{}).WaitFor(BridgeDelivered, "delivery/example").Within(2 * time.Second)
 	})
 )
 
@@ -74,7 +74,7 @@ func RunMonitor(ctx context.Context, db *pgkit.DB, schema string, output io.Writ
 		case <-time.After(50 * time.Millisecond):
 		}
 		fmt.Fprintln(output, "external monitor observed bridge delivery")
-		monitorResult <- flow.Publish(ctx, publisher, handle.ID, BridgeDelivered, "delivery/example", BridgeDelivery{
+		monitorResult <- BridgeDelivered.Emit(ctx, publisher, handle.ID, "delivery/example", BridgeDelivery{
 			TransactionHash: "0xexample",
 		})
 	}()

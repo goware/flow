@@ -34,12 +34,12 @@ func TestPlanDynamicFanOutJoinEndToEnd(t *testing.T) {
 	prepare := DefineCommand[prepareArgs, prepareResult]("plan.prepare", 1)
 	generate := DefineCommand[generateArgs, generateResult]("plan.generate", 1)
 	plan := DefinePlan[reportArgs]("plan.report", 1, func(p *Plan, args reportArgs) {
-		Do(p, "prepare", prepare, prepareArgs{Parts: args.Parts})
-		children, closed := Children(p, "prepare")
+		prepared := Execute(p, "prepare", prepare, prepareArgs{Parts: args.Parts})
+		children, closed := prepared.Children()
 		if !closed {
 			return
 		}
-		Do(p, "generate", generate, generateArgs{Keys: children}).After(children...)
+		Execute(p, "generate", generate, generateArgs{Keys: children}).After(children...)
 	})
 	var prepareCalls, analysisCalls, generateCalls atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond),
@@ -53,9 +53,7 @@ func TestPlanDynamicFanOutJoinEndToEnd(t *testing.T) {
 			prepareCalls.Add(1)
 			for part := 0; part < work.Args.Parts; part++ {
 				key := fmt.Sprintf("analysis/%d", part)
-				if err := Spawn(work, key, analyze, analysisArgs{Part: part}); err != nil {
-					return prepareResult{}, err
-				}
+				Execute(work, key, analyze, analysisArgs{Part: part})
 			}
 			return prepareResult{Count: work.Args.Parts}, nil
 		}),
@@ -149,10 +147,10 @@ func TestPlanAwaitPublishBeforeDeclareAndWithinExpiry(t *testing.T) {
 	}
 	type delivered struct{ Ref string }
 	type confirmResult struct{ Ref string }
-	fact := DefineEvent[delivered]("plan.bridge_delivered", 1)
+	fact := DefineEvent[delivered]("plan.bridge_delivered")
 	confirm := DefineCommand[None, confirmResult]("plan.confirm_bridge", 1)
 	plan := DefinePlan[None]("plan.await_bridge", 1, func(p *Plan, _ None) {
-		Do(p, "confirm", confirm, None{}).Await(fact).Within(100 * time.Millisecond)
+		Execute(p, "confirm", confirm, None{}).WaitFor(fact, "delivery/early").Within(100 * time.Millisecond)
 	})
 	var calls atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
@@ -172,7 +170,7 @@ func TestPlanAwaitPublishBeforeDeclareAndWithinExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Publish(ctx, runtime, early.ID, fact, "delivery/early", delivered{Ref: "early"}); err != nil {
+	if err := fact.Emit(ctx, runtime, early.ID, "delivery/early", delivered{Ref: "early"}); err != nil {
 		t.Fatal(err)
 	}
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, early.ID, "succeeded", 5*time.Second)
@@ -202,17 +200,13 @@ func TestPlanFailureBranchAndWorkerOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	type value struct{ Value string }
-	failing := DefineCommand[None, value]("plan.failing", 1, WithMaxAttempts(1))
+	failing := DefineCommand[None, value]("plan.failing", 1, WithRetry(Attempts(1)))
 	shouldSkip := DefineCommand[None, None]("plan.should_skip", 1)
 	compensate := DefineCommand[None, value]("plan.compensate", 1)
 	plan := DefinePlan[None]("plan.failure_branch", 1, func(p *Plan, _ None) {
-		Do(p, "failing", failing, None{})
-		// This happy-path read begins temporarily unavailable and becomes
-		// permanently unavailable when failing ends. It may block success, but
-		// must never prevent the explicit failure branch from settling.
-		_, _ = Result(p, "failing", failing)
-		Do(p, "should-skip", shouldSkip, None{}).After("failing")
-		Do(p, "compensate", compensate, None{}).AfterFailed("failing")
+		Execute(p, "failing", failing, None{})
+		Execute(p, "should-skip", shouldSkip, None{}).After("failing")
+		Execute(p, "compensate", compensate, None{}).AfterFailed("failing")
 	})
 	var skippedCalls atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
@@ -272,10 +266,10 @@ func TestWithinLateFactRemainsHistoryWithoutResurrectingWait(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	fact := DefineEvent[None]("within.deadline.fact", 1)
+	fact := DefineEvent[None]("within.deadline.fact")
 	command := DefineCommand[None, None]("within.deadline.command", 1)
 	plan := DefinePlan[None]("within.deadline.plan", 1, func(p *Plan, _ None) {
-		Do(p, "wait", command, None{}).Await(fact).Within(80 * time.Millisecond)
+		Execute(p, "wait", command, None{}).WaitFor(fact, "late").Within(80 * time.Millisecond)
 	})
 	var calls atomic.Int32
 	// Maintenance runs well after the fact is accepted, proving the publish
@@ -312,7 +306,7 @@ func TestWithinLateFactRemainsHistoryWithoutResurrectingWait(t *testing.T) {
 	if waitDeadline.IsZero() || !deadlinePassed {
 		t.Fatalf("wait deadline was not observed as passed: deadline=%s passed=%t error=%v", waitDeadline, deadlinePassed, err)
 	}
-	if err := Publish(ctx, runtime, handle.ID, fact, "late", None{}); err != nil {
+	if err := fact.Emit(ctx, runtime, handle.ID, "late", None{}); err != nil {
 		t.Fatal(err)
 	}
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 2*time.Second)
@@ -343,11 +337,11 @@ func TestPlanMissingFactWaitsUntilExecutionDeadline(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	fact := DefineEvent[None]("missing.fact", 1)
+	fact := DefineEvent[None]("missing.fact")
 	command := DefineCommand[None, None]("missing.fact.command", 1)
 	plan := DefinePlan[None]("missing.fact.plan", 1, func(p *Plan, _ None) {
-		if _, exists := Fact(p, fact); exists {
-			Do(p, "work", command, None{})
+		if _, exists := Fact(p, fact, "never"); exists {
+			Execute(p, "work", command, None{})
 		}
 	})
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
@@ -385,7 +379,7 @@ func TestPlanDefectFailsDurablyWithoutRunningWorker(t *testing.T) {
 	}
 	command := DefineCommand[None, None]("plan.defect_command", 1)
 	plan := DefinePlan[None]("plan.defect", 1, func(p *Plan, _ None) {
-		Do(p, "never", command, None{}).After("missing")
+		Execute(p, "never", command, None{}).After("missing")
 	})
 	var calls atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
@@ -430,18 +424,18 @@ func TestPlanImmediateSkipReconcilesFailureBranchInOneRevision(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	failing := DefineCommand[None, None]("fixedpoint.failing", 1, WithMaxAttempts(1))
+	failing := DefineCommand[None, None]("fixedpoint.failing", 1, WithRetry(Attempts(1)))
 	impossible := DefineCommand[None, None]("fixedpoint.impossible", 1)
 	recoverCommand := DefineCommand[None, None]("fixedpoint.recover", 1)
 	plan := DefinePlan[None]("fixedpoint.plan", 1, func(p *Plan, _ None) {
-		Do(p, "failing", failing, None{})
-		outcome, terminal := Outcome(p, "failing", failing)
+		failed := Execute(p, "failing", failing, None{})
+		outcome, terminal := failed.Outcome()
 		if !terminal || outcome.Status == StatusSucceeded {
 			return
 		}
-		Do(p, "impossible", impossible, None{}).After("failing")
-		if impossibleOutcome, settled := Outcome(p, "impossible", impossible); settled && impossibleOutcome.Status == StatusSkipped {
-			Do(p, "recover", recoverCommand, None{}).AfterFailed("impossible")
+		impossibleNode := Execute(p, "impossible", impossible, None{}).After("failing")
+		if impossibleOutcome, settled := impossibleNode.Outcome(); settled && impossibleOutcome.Status == StatusSkipped {
+			Execute(p, "recover", recoverCommand, None{}).AfterFailed("impossible")
 		}
 	})
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithPlanVerification(true))
@@ -512,9 +506,9 @@ func TestPlanInitialScheduleBeyondDeadlineExpiresInFixedPoint(t *testing.T) {
 	delayed := DefineCommand[None, None]("fixedpoint.delayed", 1)
 	recoverCommand := DefineCommand[None, None]("fixedpoint.delay_recovery", 1)
 	plan := DefinePlan[None]("fixedpoint.delay_plan", 1, func(plan *Plan, _ None) {
-		Do(plan, "delayed", delayed, None{}).Delay(time.Hour)
-		if outcome, terminal := Outcome(plan, "delayed", delayed); terminal && outcome.Status == StatusExpired {
-			Do(plan, "recover", recoverCommand, None{}).AfterFailed("delayed")
+		delayedNode := Execute(plan, "delayed", delayed, None{}).Delay(time.Hour)
+		if outcome, terminal := delayedNode.Outcome(); terminal && outcome.Status == StatusExpired {
+			Execute(plan, "recover", recoverCommand, None{}).AfterFailed("delayed")
 		}
 	})
 	var delayedCalls, recoveryCalls atomic.Int32
@@ -577,13 +571,13 @@ func TestPlanLazyFactsAndDeterminismFailure(t *testing.T) {
 	type route struct {
 		Name string `json:"name"`
 	}
-	routeSelected := DefineEvent[route]("lazy.route_selected", 1)
-	unrelated := DefineEvent[route]("lazy.unrelated", 1)
+	routeSelected := DefineEvent[route]("lazy.route_selected")
+	unrelated := DefineEvent[route]("lazy.unrelated")
 	command := DefineCommand[route, None]("lazy.run", 1)
 	plan := DefinePlan[None]("lazy.plan", 1, func(p *Plan, _ None) {
-		selected, ok := Fact(p, routeSelected)
+		selected, ok := Fact(p, routeSelected, "route/1")
 		if ok {
-			Do(p, "run", command, selected)
+			Execute(p, "run", command, selected)
 		}
 	})
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithPlanVerification(true))
@@ -599,10 +593,10 @@ func TestPlanLazyFactsAndDeterminismFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Publish(ctx, runtime, handle.ID, unrelated, "unrelated/1", route{Name: "ignored"}); err != nil {
+	if err := unrelated.Emit(ctx, runtime, handle.ID, "unrelated/1", route{Name: "ignored"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := Publish(ctx, runtime, handle.ID, routeSelected, "route/1", route{Name: "chosen"}); err != nil {
+	if err := routeSelected.Emit(ctx, runtime, handle.ID, "route/1", route{Name: "chosen"}); err != nil {
 		t.Fatal(err)
 	}
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
@@ -617,7 +611,7 @@ func TestPlanLazyFactsAndDeterminismFailure(t *testing.T) {
 		if flips.Add(1)%2 == 0 {
 			key = "b"
 		}
-		Do(p, key, command, route{Name: key})
+		Execute(p, key, command, route{Name: key})
 	})
 	badRuntime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithPlanVerification(true))
 	if err != nil {
@@ -650,7 +644,7 @@ func TestPlanReconcilerRollbackLeavesDirtyForTakeover(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := DefineCommand[None, None]("takeover.command", 1)
-	plan := DefinePlan[None]("takeover.plan", 1, func(p *Plan, _ None) { Do(p, "work", command, None{}) })
+	plan := DefinePlan[None]("takeover.plan", 1, func(p *Plan, _ None) { Execute(p, "work", command, None{}) })
 	first, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)

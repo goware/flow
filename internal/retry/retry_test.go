@@ -9,7 +9,7 @@ func TestPolicyBuildersAreImmutable(t *testing.T) {
 	t.Parallel()
 
 	base := NewPublicFor(time.Hour)
-	modified := base.Attempts(8).Backoff(time.Second, 2*time.Second).Jitter(0)
+	modified := base.Attempts(8).Backoff(time.Second, 2*time.Second)
 	baseValue := ValueOf(base)
 	modifiedValue := ValueOf(modified)
 	if baseValue.MaxAttempts != nil {
@@ -38,8 +38,6 @@ func TestPolicyValidation(t *testing.T) {
 		NewPublicAttempts(0),
 		NewPublicFor(time.Minute).Backoff(),
 		NewPublicFor(time.Minute).Backoff(-time.Second),
-		NewPublicFor(time.Minute).Jitter(-0.1),
-		NewPublicFor(time.Minute).Jitter(1.1),
 	}
 	for i, policy := range tests {
 		if err := ValidatePublic(policy); err == nil {
@@ -124,7 +122,7 @@ func TestDecideElapsedDeadlineAndJitter(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
-	public := NewPublicFor(time.Minute).Backoff(10 * time.Second).Jitter(0.5)
+	public := NewPublicFor(time.Minute).Backoff(10 * time.Second)
 	input := Input{DBNow: now, BudgetStartedAt: now.Add(-20 * time.Second), AttemptID: "stable", Classification: ClassRetryable}
 	first, err := DecidePublic(public, input)
 	if err != nil {
@@ -138,8 +136,8 @@ func TestDecideElapsedDeadlineAndJitter(t *testing.T) {
 		t.Fatalf("jitter decision is not deterministic: %#v %#v", first, second)
 	}
 	delay := first.NextAttemptAt.Sub(now)
-	if delay < 5*time.Second || delay > 15*time.Second {
-		t.Fatalf("jitter delay = %s, want [5s,15s]", delay)
+	if delay < 8*time.Second || delay > 12*time.Second {
+		t.Fatalf("jitter delay = %s, want [8s,12s]", delay)
 	}
 
 	deadline := now.Add(5 * time.Second)
@@ -198,7 +196,7 @@ func TestDecideValidation(t *testing.T) {
 func TestPublicPolicyCanonicalRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	want := NewPublicFor(3*time.Hour).Attempts(11).Backoff(time.Second, 7*time.Second).Jitter(0.1)
+	want := NewPublicFor(3*time.Hour).Attempts(11).Backoff(time.Second, 7*time.Second)
 	encoded, err := CanonicalPublic(want)
 	if err != nil {
 		t.Fatalf("CanonicalPublic() error = %v", err)

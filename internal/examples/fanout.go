@@ -43,12 +43,12 @@ var (
 	PrepareReport  = flow.DefineCommand[PrepareReportArgs, PrepareReportResult]("example.prepare_report", 1)
 	GenerateReport = flow.DefineCommand[GenerateReportArgs, GenerateReportResult]("example.generate_report", 1)
 	ReportPlan     = flow.DefinePlan[ReportArgs]("example.report", 1, func(plan *flow.Plan, args ReportArgs) {
-		flow.Do(plan, "prepare", PrepareReport, PrepareReportArgs{Parts: args.Parts})
-		children, closed := flow.Children(plan, "prepare")
+		prepare := flow.Execute(plan, "prepare", PrepareReport, PrepareReportArgs{Parts: args.Parts})
+		children, closed := prepare.Children()
 		if !closed {
 			return
 		}
-		flow.Do(plan, "generate", GenerateReport, GenerateReportArgs{AnalysisKeys: children}).After(children...)
+		flow.Execute(plan, "generate", GenerateReport, GenerateReportArgs{AnalysisKeys: children}).After(children...)
 	})
 )
 
@@ -73,9 +73,7 @@ func RunFanOut(ctx context.Context, db *pgkit.DB, schema string, output io.Write
 			fmt.Fprintf(output, "planning %d report analyses\n", work.Args.Parts)
 			for part := range work.Args.Parts {
 				key := fmt.Sprintf("analysis/%d", part)
-				if err := flow.Spawn(work, key, AnalyzePart, AnalyzePartArgs{Part: part}); err != nil {
-					return PrepareReportResult{}, err
-				}
+				flow.Execute(work, key, AnalyzePart, AnalyzePartArgs{Part: part})
 			}
 			return PrepareReportResult{Count: work.Args.Parts}, nil
 		}),

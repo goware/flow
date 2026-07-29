@@ -29,7 +29,7 @@ func BenchmarkPlanReconciliation(b *testing.B) {
 			command := DefineCommand[None, None](fmt.Sprintf("benchmark.plan.command.%d", size), 1)
 			plan := DefinePlan[None](fmt.Sprintf("benchmark.plan.%d", size), 1, func(plan *Plan, _ None) {
 				for index := range size {
-					Do(plan, fmt.Sprintf("work/%04d", index), command, None{})
+					Execute(plan, fmt.Sprintf("work/%04d", index), command, None{})
 				}
 			})
 			if err := runtime.Register(plan); err != nil {

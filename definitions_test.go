@@ -29,11 +29,6 @@ func TestDefinitionIdentityAndBinding(t *testing.T) {
 	if cmd.Name() != "send_receipt" || cmd.Version() != 2 {
 		t.Fatalf("command identity = %s/%d", cmd.Name(), cmd.Version())
 	}
-	done := cmd.Done()
-	if done.def.Name != cmd.Name() || done.def.Version != cmd.Version() || done.def.Namespace != "command_success" {
-		t.Fatalf("Done() identity = %#v", done.def)
-	}
-
 	clientA, clientB := &dummyClient{id: 1}, &dummyClient{id: 2}
 	boundA := cmd.With(clientA)
 	boundB := boundA.With(clientB)
@@ -70,8 +65,8 @@ func TestDefinitionValidation(t *testing.T) {
 		{name: "empty name", cmd: DefineCommand[testArgs, testResult]("", 1)},
 		{name: "whitespace", cmd: DefineCommand[testArgs, testResult]("bad name", 1)},
 		{name: "zero version", cmd: DefineCommand[testArgs, testResult]("valid", 0)},
-		{name: "invalid attempts", cmd: DefineCommand[testArgs, testResult]("valid", 1, WithMaxAttempts(0))},
-		{name: "duplicate retry", cmd: DefineCommand[testArgs, testResult]("valid", 1, WithMaxAttempts(2), WithRetryPolicy(RetryFor(time.Minute)))},
+		{name: "invalid attempts", cmd: DefineCommand[testArgs, testResult]("valid", 1, WithRetry(Attempts(0)))},
+		{name: "duplicate retry", cmd: DefineCommand[testArgs, testResult]("valid", 1, WithRetry(Attempts(2)), WithRetry(RetryFor(time.Minute)))},
 		{name: "invalid timeout", cmd: DefineCommand[testArgs, testResult]("valid", 1, WithTimeout(0))},
 		{name: "invalid queue", cmd: DefineCommand[testArgs, testResult]("valid", 1, WithQueue("bad queue"))},
 	}
@@ -81,9 +76,6 @@ func TestDefinitionValidation(t *testing.T) {
 				t.Fatal("invalid command has no validation error")
 			}
 		})
-	}
-	if got := (Command[testArgs, testResult]{}).Done(); got.err == nil {
-		t.Fatal("Done on zero command has no validation error")
 	}
 }
 
@@ -101,18 +93,11 @@ func TestRegistrationValidation(t *testing.T) {
 		t.Fatal("nil worker was accepted")
 	}
 
-	event := DefineEvent[string]("noticed", 1)
+	event := DefineEvent[string]("noticed")
 	handler := func(context.Context, *Coordination[int], Received[string]) error { return nil }
 	duplicate := DefineCoordinator("duplicate", 1, On(event, handler), On(event, handler))
 	if duplicate.err == nil {
 		t.Fatal("duplicate coordinator event selector was accepted")
-	}
-	overlap := DefineCoordinator("overlap", 1,
-		On(cmd.Done(), func(context.Context, *Coordination[int], Received[testResult]) error { return nil }),
-		OnOutcome(cmd, func(context.Context, *Coordination[int], Received[CommandOutcome[testResult]]) error { return nil }),
-	)
-	if overlap.err == nil {
-		t.Fatal("success/outcome overlap was accepted")
 	}
 	starts := DefineCoordinator("starts", 1,
 		OnStart(func(context.Context, *Coordination[int]) error { return nil }),
@@ -125,7 +110,7 @@ func TestRegistrationValidation(t *testing.T) {
 		t.Fatal("zero event handler was accepted")
 	}
 	if DefineCoordinator("zero-command", 1,
-		OnOutcome(Command[testArgs, testResult]{}, func(context.Context, *Coordination[int], Received[CommandOutcome[testResult]]) error { return nil }),
+		OnOutcome(Command[testArgs, testResult]{}, func(context.Context, *Coordination[int], Received[Outcome[testResult]]) error { return nil }),
 	).err == nil {
 		t.Fatal("zero command outcome handler was accepted")
 	}
@@ -135,21 +120,24 @@ func TestCoordinatorTerminalDecision(t *testing.T) {
 	t.Parallel()
 
 	scope := &Coordination[int]{scope: &scopeState{}}
-	if err := SucceedExecution(scope, "result/1"); err != nil {
-		t.Fatalf("SucceedExecution() error = %v", err)
+	scope.Succeed()
+	scope.Succeed()
+	if scope.scope.firstError != nil {
+		t.Fatalf("equivalent terminal decision poison = %v", scope.scope.firstError)
 	}
-	if err := SucceedExecution(scope, "result/1"); err != nil {
-		t.Fatalf("equivalent SucceedExecution() error = %v", err)
+	scope.State++
+	scope.Succeed()
+	if !errors.Is(scope.scope.firstError, ErrConflict) {
+		t.Fatalf("state-after-terminal poison = %v", scope.scope.firstError)
 	}
-	if err := SucceedExecution(scope, "result/2"); !errors.Is(err, ErrConflict) {
-		t.Fatalf("conflicting SucceedExecution() error = %v", err)
-	}
+
+	scope = &Coordination[int]{scope: &scopeState{}}
+	scope.Succeed()
+	scope.Fail(errors.New("failed"))
 	if !errors.Is(scope.scope.firstError, ErrConflict) {
 		t.Fatalf("scope poison = %v", scope.scope.firstError)
 	}
-	if err := FailExecution((*Coordination[int])(nil), errors.New("failed")); !errors.Is(err, ErrInvalidState) {
-		t.Fatalf("inactive FailExecution() error = %v", err)
-	}
+	(*Coordination[int])(nil).Fail(errors.New("ignored"))
 }
 
 func TestErasedWorkerRegistration(t *testing.T) {
@@ -236,7 +224,7 @@ func TestErasedPlanRegistration(t *testing.T) {
 func TestErasedCoordinatorRegistration(t *testing.T) {
 	t.Parallel()
 
-	event := DefineEvent[string]("notice", 1)
+	event := DefineEvent[string]("notice")
 	cmd := DefineCommand[testArgs, testResult]("erase_outcome", 1)
 	coordinator := DefineCoordinator("erase_coordinator", 3,
 		OnStart(func(_ context.Context, coordination *Coordination[int]) error {
@@ -247,7 +235,7 @@ func TestErasedCoordinatorRegistration(t *testing.T) {
 			coordination.State += len(received.Payload)
 			return nil
 		}),
-		OnOutcome(cmd, func(_ context.Context, coordination *Coordination[int], received Received[CommandOutcome[testResult]]) error {
+		OnOutcome(cmd, func(_ context.Context, coordination *Coordination[int], received Received[Outcome[testResult]]) error {
 			if received.Payload.Status == StatusSucceeded {
 				coordination.State += 10
 			}
@@ -264,9 +252,9 @@ func TestErasedCoordinatorRegistration(t *testing.T) {
 	erased := registration.value.(erasedCoordinator)
 	scope := &coordinatorScope{state: 0}
 	for key, payload := range map[string]any{
-		"start":                      nil,
-		"event:application:notice:1": Received[string]{Payload: "abc"},
-		"outcome:command_terminal:erase_outcome:1": Received[CommandOutcome[testResult]]{Payload: CommandOutcome[testResult]{Status: StatusSucceeded}},
+		"start":                    nil,
+		"event:application:notice": Received[string]{Payload: "abc"},
+		"outcome:command_terminal:erase_outcome:1": Received[Outcome[testResult]]{Payload: Outcome[testResult]{Status: StatusSucceeded}},
 	} {
 		handler, ok := erased.handlers[key]
 		if !ok {
@@ -283,7 +271,7 @@ func TestErasedCoordinatorRegistration(t *testing.T) {
 	if err := start.invoke(context.Background(), &coordinatorScope{state: "wrong"}, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("state type error = %v", err)
 	}
-	eventHandler := erased.handlers["event:application:notice:1"]
+	eventHandler := erased.handlers["event:application:notice"]
 	if err := eventHandler.invoke(context.Background(), scope, Received[int]{Payload: 1}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("payload type error = %v", err)
 	}

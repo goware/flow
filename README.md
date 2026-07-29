@@ -3,7 +3,7 @@
 `flow` is a Go library for event-driven, durable, distributed work execution backed by PostgreSQL.
 
 ```text
-command  →  worker  →  event
+command  →  worker  →  events
                      └→ optional child commands
 ```
 
@@ -45,13 +45,18 @@ type ReceiptSent struct {
 }
 
 var SendReceipt = flow.DefineCommand[ReceiptArgs, ReceiptSent]("send_receipt", 1)
+var ReceiptDelivered = flow.DefineEvent[ReceiptSent]("receipt_delivered")
 
 func sendReceipt(ctx context.Context, work *flow.Work[ReceiptArgs]) (ReceiptSent, error) {
     id, err := provider.Send(ctx, work.Args.Email)
     if err != nil {
         return ReceiptSent{}, err
     }
-    return ReceiptSent{ProviderMessageID: id}, nil
+    result := ReceiptSent{ProviderMessageID: id}
+    if err := flow.Emit(work, ReceiptDelivered, "order/"+work.Args.OrderID, result); err != nil {
+        return ReceiptSent{}, err
+    }
+    return result, nil
 }
 
 rt, err := flow.New(db)
@@ -81,17 +86,17 @@ if err != nil {
 execution, err := flow.AwaitExecution(ctx, rt, handle.ID)
 ```
 
-`Execute` always enqueues; it never calls the worker inline. Any compatible replica may claim the command. A renewable lease and settlement fence prevent two attempts from both committing progression. Handlers remain at-least-once at the external-effect boundary, so externally visible effects still need stable idempotency keys.
+`Execute` always enqueues; it never calls the worker inline. Any compatible replica may claim the command. `flow.Emit` only stages a typed event in the worker decision: successful fenced settlement commits staged events, children, the typed result, and an optional commit-function write together. Failure, panic, timeout, cancellation, lease loss, or rollback exposes none of the staged output. Handlers remain at-least-once at the external-effect boundary, so externally visible effects still need stable idempotency keys.
 
 ## Choose only the orchestration you need
 
 - Direct mode is a durable background command and its bounded spawned child tree. No plan is required.
 - A plan is a pure Go function for dependencies, joins, waits, and fact-driven branching. The runtime re-evaluates it from immutable durable inputs.
 - A coordinator is a durable serialized state machine for adaptive agents, open-ended membership, loops, and mixed command outcomes.
-- `flow.Publish` lets a webhook, batch monitor, or another process record a fact into an execution. An awaited command consumes no worker, connection, or lease while waiting.
+- `Event.Emit` lets a webhook, batch monitor, or another process record an external fact into an execution. Worker and coordinator handlers use staged `flow.Emit` instead. An awaited command consumes no worker, connection, or lease while waiting.
 - `flow.WithCommit` declares a short database-local tail that commits atomically with command success. Its inputs are restricted to durable command arguments, result, and metadata.
 
-Use `GetExecution` or `LookupExecution` for bounded summaries, `ListExecutions` for stable cursor pagination, `History` for incremental journal pages, and `Trace` for the current graph plus events, attempts, causation, waits, coordinator state, and operational delivery detail.
+Use `GetExecution` for bounded summaries, `ListExecutions` for stable cursor pagination, `History` for incremental journal pages, and `Trace` for the current graph plus events, attempts, causation, waits, coordinator state, and operational delivery detail.
 
 ## Runnable examples
 
@@ -130,7 +135,7 @@ go test ./...
 go test -race ./...
 ```
 
-`flowtest.RunWorker`, `RunCommit`, `RunDirect`, `RunPlan`, `Simulate`, `AssertPlanDeterministic`, and `RunCoordinator` invoke the production deterministic recorders without PostgreSQL. SQL behavior, locking, leases, fencing, and commit-function SQL remain integration tests.
+`flowtest.RunWorker`, `RunCommit`, `RunDirect`, `RunPlan`, `Simulate`, `AssertPlanDeterministic`, and `RunCoordinator` invoke the production deterministic recorders without PostgreSQL and expose staged events alongside commands. SQL behavior, locking, leases, fencing, and commit-function SQL remain integration tests.
 
 ## Deployment roles
 
@@ -146,7 +151,7 @@ All roles point at one PostgreSQL database. Schedulers use bounded process-local
 ## Guarantees and boundaries
 
 - Per-execution journal positions are gap-free and commit ordered.
-- Command creation and exactly one terminal event per command reconstruct the settled execution graph.
+- Journaled command creation and terminal settlement reconstruct the settled execution graph; each command retains exactly one terminal event.
 - Queue delivery, retries, leases, and attempts are operational records; they are not fabricated as application events.
 - Plans are pure and additive. Facts and terminal outcomes are immutable and durably re-readable.
 - Command/worker progression is atomic in PostgreSQL, but arbitrary external APIs cannot share that transaction.

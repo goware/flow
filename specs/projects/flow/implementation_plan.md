@@ -2,35 +2,56 @@
 status: complete
 ---
 
-# Implementation Plan: flow
+# Implementation Plan: flow smaller API migration
+
+## Controlling contract
+
+[`1-smaller.md`](1-smaller.md) is the controlling amendment. The synchronized overview, functional specification, architecture, and component documents describe its integrated end state. Removed pre-release APIs receive no compatibility aliases or deprecated wrappers.
+
+The existing Milestone 1 implementation is the tested baseline. This migration changes it in coherent layers while preserving journal ordering, fencing, retries, distributed operation, and real-PostgreSQL examples.
 
 ## Delivery discipline
 
-Each phase begins with a focused `phase_plans/phase_N.md`, implements one coherent dependency layer, and ends with spec-aware review. A phase may land as several small, reviewable changes rather than one oversized change; each change includes the tests for the behavior it introduces, and their union satisfies the phase plan. The relevant portions of functional specification §22 and each component's acceptance conditions are the exit checklist for that phase; acceptance testing is not deferred to the end.
+Each phase includes implementation, unit/integration tests, replay updates, observer/fault updates, formatting, and relevant acceptance checks. A phase may land in several reviewable changes. The worktree's untracked review documents are user material and remain untouched.
 
-Inspection, replay, observation, and fault injection grow with the implementation. Phase 1 establishes the observer and test fault-hook contracts. Phase 3 starts the replay reducer when the first durable journal projections exist. Every later phase extends those threads alongside each new write path or state transition, so no phase leaves instrumentation, fault coverage, or replay semantics to be retrofitted.
+Inspection and replay evolve with each write path. Database migration and row codecs change together. Public examples compile at every phase after the public-contract switch; temporary internal adapters are allowed only within one phase and are deleted before its exit.
 
-## Examples and end-to-end contract
+## Examples and E2E contract
 
-The implementation includes at least four runnable examples corresponding to functional specification §5:
+The repository retains four runnable examples and matching E2E tests:
 
-1. a direct background command;
-2. a planned dynamic fan-out and fan-in;
-3. an external monitor publishing a fact that releases waiting work; and
-4. a durable adaptive agent driven by a coordinator.
+1. direct background command;
+2. dynamic fan-out/fan-in plan;
+3. external monitor using exact-key `Event.Emit`;
+4. durable adaptive coordinator agent.
 
-Example application work may use deterministic stubs that print, sleep briefly, and inject controlled success or failure. Flow itself is never faked: every example runs against a real PostgreSQL database using the embedded migrations, durable queue, journal, leases, and runtime. Where relevant, an example runs multiple runtime replicas to demonstrate distributed claiming and takeover.
-
-Each example is also an automated end-to-end test. Shared scenario code prevents the runnable example and its test from drifting. Tests assert the public result, `Trace`, and `History`, then query PostgreSQL to verify the expected `flow_` rows, journal order and causation, queue cleanup, terminal projections, and exactly-once committed progression despite at-least-once handler invocation. Crash, retry, timeout, and restart variants are added where they materially prove the scenario's durability.
+Examples may print and sleep briefly for fake application work. Flow itself is never mocked in E2E tests. Tests use real PostgreSQL, exercise embedded migrations and runtime schedulers, and assert public result, `Trace`, `History`, graph/journal order, queue cleanup, and terminal projections. Multi-replica/takeover variants remain where relevant.
 
 ## Phases
 
-- [x] Phase 1: Build the public contracts and deterministic foundation — package layout, typed IDs and definitions, immutable binding and registration metadata, canonical JSON and fingerprints, codecs, structured errors, declarative retry policy, pure engine value types, the no-op observer contract, internal named fault-hook mechanism, and the initial database-free `flowtest` harness.
-- [x] Phase 2: Build the PostgreSQL schema and store — embedded migrations, all nine `flow_` tables, constraints and indexes, row codecs, SQL error mapping, execution-first locking, gap-free journal allocation, deterministic append batches, the foundational bounded `History` journal scan, and the internal ordered semantic-transaction executor that every later write path extends.
-- [x] Phase 3: Implement execution creation and ingress — idempotent direct/plan/coordinator starts, command identity and creation, stored command ceilings and counters, queue materialization, `Execute`, `Issue`, `Publish`, cancellation, `Runtime.InTx`, application-event idempotency, the public `History` path, and the initial replay reducer for `ExecutionStarted`, `CommandCreated`, ingress events, and their materialized projections.
-- [x] Phase 4: Deliver direct distributed command execution — frozen runtime registry, capacity-bounded `SKIP LOCKED` claims, attempt history, leases, renewal and takeover, worker invocation, fencing, retries, timeouts and deadlines, declared commit functions, poll-first wake-up with optional notifications, graceful shutdown, minimal public `Trace`, replay of command attempts and terminal outcomes, and the real-PostgreSQL direct background-command example and end-to-end test. Exit evidence includes claim-probe query plans at required table scales plus same-execution burst and head-of-lane-kind benchmarks.
-- [x] Phase 5: Add durable graph semantics — staged `Emit` and `Spawn`, atomic child-membership closure, dependency groups, event waits, delays and `Within`, dependency-scoped `ResultOf` and `OutcomeOf`, skip cascades, fail-fast, cancellation/expiry races, and mode-correct completion for closed direct command trees.
-- [x] Phase 6: Implement plan-driven execution — the pure plan recorder and reads, declaration validation, lazy snapshot loading, reconciliation by key, dirty-plan scheduling and takeover, bounded fixed-point processing, compact `PlanReconciled` history and replay, purity verification, and the real-PostgreSQL planned fan-out/join and external-monitor examples with end-to-end tests. Exit evidence includes dirty-probe and plan-snapshot query plans at required scales plus 10/100/1,000-command reconciliation benchmarks.
-- [x] Phase 7: Implement coordinators and durable agents — typed coordinator definitions and state, start activation, `On` and `OnOutcome`, ordered historical delivery, serialized and fenced decisions, retryable handler failures, staged events and commands, explicit terminal decisions, and the real-PostgreSQL adaptive-agent example and end-to-end test.
-- [x] Phase 8: Complete inspection, testing, and operational surfaces — finish `Get`, `Lookup`, rich `Trace`, `List`, and `AwaitExecution` around the `History` foundation; complete `flowtest` worker/plan/coordinator support and the replay-vs-live conformance harness; finish observer coverage, migration compatibility checks, safe diagnostics, and documentation for the supported deployment roles.
-- [x] Phase 9: Harden and release Milestone 1 — run the complete functional-spec §22 suite, every runnable example as a real-PostgreSQL end-to-end test, direct database invariant checks, PostgreSQL concurrency and fault injection, ambiguous-commit and crash recovery, race tests, poll-only operation, rolling-version deployments, query-plan and workload benchmarks, journal-growth measurements, worked-example conformance, and final public API/documentation review.
+- [x] Baseline Milestone 1: original nine implementation phases completed and tests passing before the smaller-API migration.
+
+- [x] Phase 1 — synchronize design artifacts: incorporate `1-smaller.md` into project overview, functional spec, architecture, engine/runtime/schema components, and this implementation plan; mark them draft during implementation and complete only after final verification.
+
+- [x] Phase 2 — reduce public contracts and pure values: introduce `Outcome[R]`, unversioned `Event[T]`, sealed `EventRef`, `WithRetry`/`Attempts`, fixed persisted jitter, typed `Node[R]`, universal in-execution `Execute`, node `Key`/`Optional`/`Delay`, node plan reads, exact-key `Fact`/`WaitFor`, and `Coordination.Succeed`/`Fail`; remove legacy public names without aliases; update compile contracts and deterministic tests.
+
+- [x] Phase 3 — simplify decision engines: retain small staged worker/coordinator application events while removing separate plan/child verbs and options, quorum dependencies, free plan reads, plan-node retry overrides, command-success event descriptors, and external command injection; preserve atomic worker membership, outcome reads, scope poisoning, plan purity, coordinator fan-in, and replay semantics.
+
+- [x] Phase 4 — migrate PostgreSQL storage and ingress: edit the initial migration and all SQL/codecs to remove event versions, dependency thresholds, external-issue origin, command-success selector namespace, and execution `outcome_ref`; add exact event keys to waits; retain coordinator retry policy/hash; implement `Event.Emit`; update store/replay/migration/concurrency tests and query-plan evidence.
+
+- [x] Phase 5 — update distributed runtime and operations: remove legacy wake/observer/fault paths, make claims and settlement consume reduced records, keep a fixed 60-second public lease with an unexported test seam, persist fixed effective retry/coordinator policies, use staged coordinator methods, and preserve multi-replica, poll-only, cancellation, deadline, fencing, and transaction-order guarantees.
+
+- [x] Phase 6 — rewrite examples, documentation, and E2E tests: migrate all public/internal examples and tests to `Execute`, `Event.Emit`, exact keys, `Outcome[R]`, node reads, `Node.Delay`, and coordinator methods; ensure direct/fan-out/monitor/agent programs run against real PostgreSQL and assert trace/history/database state.
+- [x] Follow-up — restore `flow.Emit(scope,event,key,payload)` for worker/coordinator decisions; settle staged events atomically with children, terminal output, state/inbox, and commit functions; extend flowtest, replay/trace assertions, fault coverage, examples, and docs.
+
+- [x] Phase 7 — final hardening and signoff: run gofmt, static analysis, complete unit/integration/E2E suite, PostgreSQL fault/race/replay tests, query-plan/benchmark checks, removed-symbol and schema audits, `go doc` review, and requirement-by-requirement acceptance evidence; then mark all synchronized specs and `1-smaller.md` complete.
+
+## Global exit checklist
+
+- No removed exported identifier appears in `go doc github.com/goware/flow`.
+- No legacy implementation branch remains for `Issue`, quorum, event versions, node retry overrides, command-success selectors, or free coordinator completion. Staged handler events are a retained first-class settlement path.
+- Exactly nine `flow_` tables remain with the reduced columns/constraints.
+- Stored command and coordinator retry behavior is stable across restarts and rolling defaults.
+- Full replay equals live projections.
+- All four real-PostgreSQL E2E examples pass without unexpected skips.
+- The worktree contains no unintended modifications to user review documents.

@@ -1,8 +1,9 @@
 // Package flow provides event-driven, durable, distributed work execution on
 // PostgreSQL.
 //
-// Commands instruct work, workers do the work, and events record durable
-// facts. Workers may atomically stage bounded child commands. Optional pure
+// The primary model is command → worker → events: commands instruct work,
+// workers do the work, and events record durable facts. Workers may atomically
+// stage typed application events and bounded child commands. Optional pure
 // plans describe dependencies, joins, waits, and fact-driven branching;
 // durable coordinators handle adaptive agents, loops, and open-ended work.
 // The execution graph is a projection of command creation, terminal events,

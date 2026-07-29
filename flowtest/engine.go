@@ -1,6 +1,7 @@
 package flowtest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,13 +15,6 @@ import (
 	"github.com/goware/flow/internal/testengine"
 )
 
-type StagedEvent struct {
-	Name    string
-	Version int
-	Key     string
-	Payload json.RawMessage
-}
-
 type StagedCommand struct {
 	Key        string
 	Name       string
@@ -28,6 +22,12 @@ type StagedCommand struct {
 	Args       json.RawMessage
 	Required   bool
 	StartAfter time.Duration
+}
+
+type StagedEvent struct {
+	Name    string
+	Key     string
+	Payload json.RawMessage
 }
 
 type Dependency struct {
@@ -70,8 +70,8 @@ type WorkerResult[R any] struct {
 	Result   R
 	Err      error
 	Panicked bool
-	Events   []StagedEvent
 	Commands []StagedCommand
+	Events   []StagedEvent
 }
 
 // RunWorker invokes the registered production worker and production staged
@@ -101,7 +101,7 @@ func RunWorker[A, R any](ctx context.Context, registration flow.Registration, ar
 		return WorkerResult[R]{}, err
 	}
 	output := WorkerResult[R]{Err: result.HandlerError, Panicked: result.Panicked,
-		Events: publicEvents(result.Events), Commands: publicCommands(result.Commands)}
+		Commands: publicCommands(result.Commands), Events: publicEvents(result.Events)}
 	if result.HandlerError == nil && !result.Panicked && len(result.Value) != 0 {
 		if err := canonical.Decode(result.Value, &output.Result); err != nil {
 			return WorkerResult[R]{}, fmt.Errorf("flowtest: decode worker result: %w", err)
@@ -147,11 +147,10 @@ func FailedCommand[A, R any](key string, command flow.Command[A, R], code, messa
 type EventRef struct {
 	Namespace string
 	Name      string
-	Version   int
 }
 
 func EventReference[T any](event flow.Event[T]) EventRef {
-	return EventRef{Namespace: "application", Name: event.Name(), Version: event.Version()}
+	return EventRef{Namespace: "application", Name: event.Name()}
 }
 
 type PlanEvent struct {
@@ -162,7 +161,7 @@ type PlanEvent struct {
 func Fact[T any](position int64, event flow.Event[T], key string, payload T) PlanEvent {
 	encoded, err := canonical.Marshal(payload, 64<<10)
 	return PlanEvent{value: testengine.PlanEvent{ID: uuid.NewString(), Position: position, Namespace: "application",
-		Name: event.Name(), Version: event.Version(), Key: key, Payload: encoded.BytesCopy()}, err: err}
+		Name: event.Name(), Key: key, Payload: encoded.BytesCopy()}, err: err}
 }
 
 type PlanWorld struct {
@@ -222,7 +221,7 @@ func RunPlan[A any](plan flow.PlanDef[A], args A, world PlanWorld) (PlanResult, 
 	}
 	knownEvents := make([]testengine.EventSelector, len(world.KnownEvents))
 	for i, event := range world.KnownEvents {
-		knownEvents[i] = testengine.EventSelector{Namespace: event.Namespace, Name: event.Name, Version: event.Version}
+		knownEvents[i] = testengine.EventSelector{Namespace: event.Namespace, Name: event.Name}
 	}
 	result, err := testengine.Invoke(plan, testengine.Request{Operation: testengine.Plan, Args: encoded.BytesCopy(),
 		ExecutionID: string(world.ExecutionID), Status: world.Status, MaxCommands: world.MaxCommands,
@@ -291,12 +290,12 @@ func Start() CoordinatorDelivery { return CoordinatorDelivery{kind: "start"} }
 
 func DeliverEvent[T any](position int64, event flow.Event[T], key string, recordedAt time.Time, payload T) CoordinatorDelivery {
 	encoded, _ := canonical.Marshal(payload, 64<<10)
-	return CoordinatorDelivery{kind: "event", namespace: "application", name: event.Name(), version: event.Version(),
+	return CoordinatorDelivery{kind: "event", namespace: "application", name: event.Name(),
 		key: key, position: position, recordedAt: recordedAt, payload: encoded.BytesCopy()}
 }
 
 func DeliverOutcome[A, R any](position int64, command flow.Command[A, R], key string, recordedAt time.Time,
-	outcome flow.CommandOutcome[R]) CoordinatorDelivery {
+	outcome flow.Outcome[R]) CoordinatorDelivery {
 	result, _ := canonical.Marshal(outcome.Result, 256<<10)
 	delivery := CoordinatorDelivery{kind: "outcome", namespace: "command_terminal", name: command.Name(),
 		version: command.Version(), key: key, position: position, recordedAt: recordedAt,
@@ -311,10 +310,9 @@ type CoordinatorResult[S any] struct {
 	State          S
 	Err            error
 	Panicked       bool
-	Events         []StagedEvent
 	Commands       []StagedCommand
+	Events         []StagedEvent
 	Terminal       string
-	ResultRef      string
 	TerminalReason string
 }
 
@@ -326,7 +324,7 @@ func RunCoordinator[S any](ctx context.Context, coordinator flow.Coordinator[S],
 	}
 	result, err := testengine.Invoke(coordinator, testengine.Request{Operation: testengine.Coordinator, Context: ctx,
 		State: stateBytes.BytesCopy(), DeliveryKind: delivery.kind, DeliveryNamespace: delivery.namespace,
-		DeliveryName: delivery.name, DeliveryVersion: delivery.version, DeliveryKey: delivery.key,
+		DeliveryName: delivery.name, DeliveryCommandVersion: delivery.version, DeliveryKey: delivery.key,
 		DeliveryPosition: delivery.position, DeliveryRecordedAt: delivery.recordedAt, DeliveryPayload: delivery.payload,
 		DeliveryStatus: delivery.status, DeliveryResult: delivery.result,
 		DeliveryFailureCode: delivery.failureCode, DeliveryFailureMessage: delivery.failureMessage})
@@ -334,8 +332,8 @@ func RunCoordinator[S any](ctx context.Context, coordinator flow.Coordinator[S],
 		return CoordinatorResult[S]{}, err
 	}
 	output := CoordinatorResult[S]{Err: result.HandlerError, Panicked: result.Panicked,
-		Events: publicEvents(result.Events), Commands: publicCommands(result.Commands), Terminal: result.Terminal,
-		ResultRef: result.ResultRef, TerminalReason: result.TerminalReason}
+		Commands: publicCommands(result.Commands), Events: publicEvents(result.Events), Terminal: result.Terminal,
+		TerminalReason: result.TerminalReason}
 	if err := canonical.Decode(result.State, &output.State); err != nil {
 		return CoordinatorResult[S]{}, err
 	}
@@ -368,6 +366,7 @@ func RunDirect[A, R any](ctx context.Context, root flow.Registration, args A, ma
 	queue := []item{{key: "root", reg: root, args: rootArgs.BytesCopy(), root: true}}
 	seen := map[string]struct{}{"root": {}}
 	output := DirectResult[R]{Commands: make(map[string]json.RawMessage)}
+	seenEvents := make(map[string]StagedEvent)
 	for len(queue) != 0 {
 		current := queue[0]
 		queue = queue[1:]
@@ -383,7 +382,17 @@ func RunDirect[A, R any](ctx context.Context, root flow.Registration, args A, ma
 			return DirectResult[R]{}, errors.New("flowtest: worker panicked")
 		}
 		output.Commands[current.key] = append([]byte(nil), decision.Value...)
-		output.Events = append(output.Events, publicEvents(decision.Events)...)
+		for _, event := range publicEvents(decision.Events) {
+			identity := event.Name + "\x00" + event.Key
+			if prior, exists := seenEvents[identity]; exists {
+				if bytes.Equal(prior.Payload, event.Payload) {
+					continue
+				}
+				return DirectResult[R]{}, fmt.Errorf("flowtest: conflicting event identity %s/%s", event.Name, event.Key)
+			}
+			seenEvents[identity] = event
+			output.Events = append(output.Events, event)
+		}
 		if current.root {
 			if err := canonical.Decode(decision.Value, &output.Result); err != nil {
 				return DirectResult[R]{}, err
@@ -413,19 +422,20 @@ func bridgeInfo(info flow.CommandInfo) testengine.Info {
 		Attempt: info.Attempt, AttemptStartedAt: info.AttemptStartedAt}
 }
 
-func publicEvents(values []testengine.StagedEvent) []StagedEvent {
-	result := make([]StagedEvent, len(values))
-	for i, value := range values {
-		result[i] = StagedEvent{Name: value.Name, Version: value.Version, Key: value.Key, Payload: value.Payload}
-	}
-	return result
-}
-
 func publicCommands(values []testengine.StagedCommand) []StagedCommand {
 	result := make([]StagedCommand, len(values))
 	for i, value := range values {
 		result[i] = StagedCommand{Key: value.Key, Name: value.Name, Version: value.Version,
 			Args: value.Args, Required: value.Required, StartAfter: value.StartAfter}
+	}
+	return result
+}
+
+func publicEvents(values []testengine.StagedEvent) []StagedEvent {
+	result := make([]StagedEvent, len(values))
+	for i, value := range values {
+		result[i] = StagedEvent{Name: value.Name, Key: value.Key,
+			Payload: append(json.RawMessage(nil), value.Payload...)}
 	}
 	return result
 }

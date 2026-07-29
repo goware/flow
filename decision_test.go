@@ -10,47 +10,32 @@ import (
 
 type decisionArgs struct{ Value string }
 type decisionResult struct{ Value string }
-type decisionEvent struct{ Value string }
 
 func TestDecisionBufferCoalescesAndPoisonsConflicts(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_child", 1)
-	event := DefineEvent[decisionEvent]("decision_fact", 1)
 	scope := &Work[None]{scope: &scopeState{}}
 
-	if err := Emit(scope, event, "fact/1", decisionEvent{Value: "one"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := Emit(scope, event, "fact/1", decisionEvent{Value: "one"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := len(scope.scope.decision.events); got != 1 {
-		t.Fatalf("events = %d, want 1", got)
-	}
-	if err := Spawn(scope, "child/1", command, decisionArgs{Value: "one"}, Optional(), StartAfter(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if err := Spawn(scope, "child/1", command, decisionArgs{Value: "one"}, Optional(), StartAfter(time.Second)); err != nil {
-		t.Fatal(err)
+	Execute(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
+	Execute(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
+	if scope.scope.firstError != nil {
+		t.Fatalf("equivalent duplicate poison = %v", scope.scope.firstError)
 	}
 	if got := len(scope.scope.decision.commands); got != 1 {
 		t.Fatalf("commands = %d, want 1", got)
 	}
 
-	err := Spawn(scope, "child/1", command, decisionArgs{Value: "different"})
-	if !errors.Is(err, ErrConflict) || !errors.Is(scope.scope.firstError, ErrConflict) {
-		t.Fatalf("conflict = %v, poison = %v", err, scope.scope.firstError)
-	}
-	if err := Emit(scope, event, "fact/2", decisionEvent{}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("operation after poison = %v", err)
+	Execute(scope, "child/1", command, decisionArgs{Value: "different"})
+	if !errors.Is(scope.scope.firstError, ErrConflict) {
+		t.Fatalf("poison = %v", scope.scope.firstError)
 	}
 }
 
 func TestDecisionBufferRejectsInvalidOptions(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_options", 1)
 	scope := &Work[None]{scope: &scopeState{}}
-	err := Spawn(scope, "child", command, decisionArgs{}, StartAfter(0), StartAfter(time.Second))
-	if !errors.Is(err, ErrInvalid) || len(scope.scope.decision.commands) != 0 {
-		t.Fatalf("Spawn = %v, commands = %d", err, len(scope.scope.decision.commands))
+	Execute(scope, "child", command, decisionArgs{}).Delay(0).Delay(time.Second)
+	if !errors.Is(scope.scope.firstError, ErrInvalid) {
+		t.Fatalf("Execute poison = %v", scope.scope.firstError)
 	}
 }
 

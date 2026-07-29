@@ -267,6 +267,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 	scope := &workScope{args: args, info: info}
 	scope.state.results = workerResultSource(inputs)
+	workerCtx = withAttemptScope(workerCtx, &scope.state)
 	if err := r.faults.Hit(workerCtx, fault.HandlerStart); err != nil {
 		r.concludeClaim(workerCtx, claim, classifiedConclusion{class: retrypolicy.ClassInterrupted, code: "handler_start_interrupted", message: "handler start was interrupted"})
 		return
@@ -308,7 +309,13 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 	commit := func(tx pgx.Tx) error { return nil }
 	if worker.commit != nil {
-		commit = func(tx pgx.Tx) error { return worker.commit(workerCtx, tx, args, result, info) }
+		commit = func(tx pgx.Tx) error {
+			commitErr := worker.commit(workerCtx, tx, args, result, info)
+			if scope.state.firstError != nil {
+				return scope.state.firstError
+			}
+			return commitErr
+		}
 	} else {
 		commit = nil
 	}
@@ -317,15 +324,29 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 			Claim: claim, Result: encoded, Events: events, Children: children, Commit: commit,
 		}, r.faults)
 		if settleErr == nil {
+			for _, event := range events {
+				r.observe(context.Background(), Observation{
+					Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
+					ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+					Name: event.Name, Worker: r.replicaName(),
+				})
+			}
 			r.observe(context.Background(), Observation{
 				Kind: ObservationAttempt, Operation: "settle", Outcome: "succeeded",
 				ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-				Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
+				Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
 			})
 			return
 		}
 		var commitErr *store.CommitFunctionError
 		if errors.As(settleErr, &commitErr) {
+			if errors.Is(commitErr.Err, ErrConflict) || errors.Is(commitErr.Err, ErrInvalid) ||
+				errors.Is(commitErr.Err, ErrInvalidState) || errors.Is(commitErr.Err, ErrPayloadTooLarge) {
+				r.concludeClaim(context.Background(), claim, classifiedConclusion{
+					class: retrypolicy.ClassPermanent, code: "invalid_decision", message: safeErrorMessage(commitErr.Err),
+				})
+				return
+			}
 			r.concludeClaim(context.Background(), claim, classifyWorkerError(commitErr.Err, false))
 			return
 		}
@@ -386,21 +407,20 @@ func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]stor
 			return nil, nil, newError(ErrInvalid, "settle", "event", staged.key, "event body cannot be journaled")
 		}
 		events = append(events, store.ApplicationEvent{
-			ID: uuid.New(), Name: staged.definition.Name, Version: staged.definition.Version,
-			Key: staged.key, Body: body,
+			ID: uuid.New(), Name: staged.definition.Name, Key: staged.key, Body: body,
 		})
 	}
 	stagedCommands := scope.state.decision.orderedCommands()
 	children := make([]store.CommandCreate, 0, len(stagedCommands))
 	for _, staged := range stagedCommands {
-		child, err := prepareCommand(uuid.New(), staged.key, staged.definition, staged.defaults, staged.args, "worker_spawn")
+		child, err := prepareCommand(uuid.New(), staged.key, staged.definition, staged.defaults, staged.args, "worker_child")
 		if err != nil {
 			return nil, nil, err
 		}
 		child.ParentCommandID = cloneUUIDPointer(claim.CommandID)
 		child.Required = staged.required
 		if staged.startAfter > 0 {
-			child.ScheduleKind = "spawn_start_after"
+			child.ScheduleKind = "execute_delay"
 			child.InitialDelay = staged.startAfter
 		}
 		declaration, err := canonical.Marshal(struct {

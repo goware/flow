@@ -14,6 +14,8 @@ func RetryFor(maxElapsed time.Duration) RetryPolicy {
 	return retrypolicy.NewPublicFor(maxElapsed)
 }
 
+func Attempts(max int) RetryPolicy { return retrypolicy.NewPublicAttempts(max) }
+
 func defaultRetryPolicy() RetryPolicy {
 	return retrypolicy.DefaultPublic()
 }

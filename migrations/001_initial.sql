@@ -31,7 +31,6 @@ CREATE TABLE {{schema}}.flow_executions (
 
     next_journal_position bigint NOT NULL DEFAULT 1 CHECK (next_journal_position >= 1),
     root_command_id       uuid,
-    outcome_ref           text,
     failure               jsonb,
 
     created_at            timestamptz NOT NULL,
@@ -143,21 +142,21 @@ CREATE TABLE {{schema}}.flow_commands (
 
     CONSTRAINT flow_commands_execution_key_uq UNIQUE (execution_id, command_key),
     CONSTRAINT flow_commands_origin_ck CHECK
-        (origin IN ('direct_root', 'plan', 'worker_spawn', 'coordinator_spawn', 'external_issue')),
+        (origin IN ('direct_root', 'plan', 'worker_child', 'coordinator_command')),
     CONSTRAINT flow_commands_state_ck CHECK
         (state IN ('pending', 'ready', 'running', 'retry_wait',
                    'succeeded', 'failed', 'cancelled', 'expired', 'skipped')),
     CONSTRAINT flow_commands_schedule_kind_ck CHECK
-        (schedule_kind IN ('none', 'plan_delay', 'spawn_start_after')),
+        (schedule_kind IN ('none', 'plan_delay')),
     CONSTRAINT flow_commands_schedule_shape_ck CHECK (
         (schedule_kind = 'none' AND initial_delay_ms IS NULL)
         OR
         (schedule_kind <> 'none' AND initial_delay_ms IS NOT NULL)
     ),
     CONSTRAINT flow_commands_parent_shape_ck CHECK (
-        (origin = 'worker_spawn' AND parent_command_id IS NOT NULL)
+        (origin = 'worker_child' AND parent_command_id IS NOT NULL)
         OR
-        (origin <> 'worker_spawn' AND parent_command_id IS NULL)
+        (origin <> 'worker_child' AND parent_command_id IS NULL)
     ),
     CONSTRAINT flow_commands_result_shape_ck CHECK (
         (state = 'succeeded' AND result IS NOT NULL AND result_hash IS NOT NULL)
@@ -256,19 +255,13 @@ CREATE TABLE {{schema}}.flow_command_dependency_groups (
         REFERENCES {{schema}}.flow_commands(command_id) ON DELETE CASCADE,
     ordinal              smallint NOT NULL CHECK (ordinal >= 0),
     kind                 text NOT NULL,
-    threshold            integer,
     state                text NOT NULL DEFAULT 'unresolved',
     resolved_at          timestamptz,
 
     CONSTRAINT flow_command_dependency_groups_ordinal_uq
         UNIQUE (dependent_command_id, ordinal),
     CONSTRAINT flow_command_dependency_groups_kind_ck CHECK
-        (kind IN ('all_succeeded', 'all_settled', 'all_failed', 'at_least')),
-    CONSTRAINT flow_command_dependency_groups_threshold_ck CHECK (
-        (kind = 'at_least' AND threshold IS NOT NULL AND threshold > 0)
-        OR
-        (kind <> 'at_least' AND threshold IS NULL)
-    ),
+        (kind IN ('all_succeeded', 'all_settled', 'all_failed')),
     CONSTRAINT flow_command_dependency_groups_state_ck CHECK
         (state IN ('unresolved', 'satisfied', 'unsatisfiable')),
     CONSTRAINT flow_command_dependency_groups_resolved_ck CHECK
@@ -298,21 +291,18 @@ CREATE TABLE {{schema}}.flow_command_event_waits (
         REFERENCES {{schema}}.flow_commands(command_id) ON DELETE CASCADE,
     execution_id       uuid NOT NULL
         REFERENCES {{schema}}.flow_executions(execution_id) ON DELETE CASCADE,
-    event_namespace    text NOT NULL,
     event_name         text NOT NULL,
-    event_version      integer NOT NULL CHECK (event_version > 0),
+    event_key          text NOT NULL CHECK (event_key <> ''),
     satisfied_position bigint,
 
-    PRIMARY KEY (command_id, event_namespace, event_name, event_version),
-    CONSTRAINT flow_command_event_waits_namespace_ck CHECK
-        (event_namespace IN ('application', 'command_success')),
+    PRIMARY KEY (command_id, event_name, event_key),
     CONSTRAINT flow_command_event_waits_position_ck CHECK
         (satisfied_position IS NULL OR satisfied_position >= 1)
 );
 
 CREATE INDEX flow_command_event_waits_reverse_idx
     ON {{schema}}.flow_command_event_waits
-       (execution_id, event_namespace, event_name, event_version, command_id)
+       (execution_id, event_name, event_key, command_id)
     WHERE satisfied_position IS NULL;
 
 CREATE TABLE {{schema}}.flow_coordinators (
@@ -407,7 +397,6 @@ CREATE TABLE {{schema}}.flow_journal (
     event_id           uuid,
     event_namespace    text,
     event_name         text,
-    event_version      integer,
     event_key          text,
     event_class        text,
     terminal_status    text,
@@ -426,13 +415,12 @@ CREATE TABLE {{schema}}.flow_journal (
     CONSTRAINT flow_journal_event_shape_ck CHECK (
         (entry_kind = 'event_recorded'
             AND event_id IS NOT NULL AND event_namespace IS NOT NULL
-            AND event_name IS NOT NULL AND event_version IS NOT NULL
-            AND event_class IS NOT NULL)
+            AND event_name IS NOT NULL AND event_class IS NOT NULL)
         OR
         (entry_kind <> 'event_recorded'
             AND event_id IS NULL AND event_namespace IS NULL
-            AND event_name IS NULL AND event_version IS NULL
-            AND event_key IS NULL AND event_class IS NULL AND terminal_status IS NULL)
+            AND event_name IS NULL AND event_key IS NULL
+            AND event_class IS NULL AND terminal_status IS NULL)
     ),
     CONSTRAINT flow_journal_subject_shape_ck CHECK (
         (entry_kind <> 'command_created' OR command_id IS NOT NULL)
@@ -454,7 +442,7 @@ CREATE TABLE {{schema}}.flow_journal (
         OR (entry_kind <> 'plan_reconciled' AND plan_revision IS NULL)
     ),
     CONSTRAINT flow_journal_event_namespace_ck CHECK
-        (event_namespace IS NULL OR event_namespace IN ('application', 'command_success', 'runtime')),
+        (event_namespace IS NULL OR event_namespace IN ('application', 'runtime')),
     CONSTRAINT flow_journal_event_class_ck CHECK
         (event_class IS NULL OR event_class IN
             ('application', 'command_terminal', 'execution_terminal',
@@ -524,7 +512,7 @@ CREATE UNIQUE INDEX flow_journal_plan_reconciled_uq
 
 CREATE INDEX flow_journal_event_lookup_idx
     ON {{schema}}.flow_journal
-       (execution_id, event_namespace, event_name, event_version, position)
+       (execution_id, event_namespace, event_name, event_key, position)
     WHERE entry_kind = 'event_recorded';
 
 CREATE INDEX flow_journal_command_events_idx

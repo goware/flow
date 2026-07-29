@@ -671,10 +671,26 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		// later from application payloads.
 		request.Children[index].FailureScope = fence.FailureScope
 	}
+	request.Events, err = s.coalesceApplicationEvents(ctx, semantic, request.Events)
+	if err != nil {
+		return SettleResult{}, err
+	}
 	if err := s.validateSuccessfulDecision(ctx, semantic, fence, request); err != nil {
 		return SettleResult{}, err
 	}
-	resolution, err := s.resolveGraphLocked(ctx, semantic, map[uuid.UUID]string{request.Claim.CommandID: "succeeded"}, nil)
+	firstPosition, err := semantic.nextJournalPosition(ctx)
+	if err != nil {
+		return SettleResult{}, err
+	}
+	var waitUpdates []graphWaitUpdate
+	for index, event := range request.Events {
+		waits, matchErr := s.matchingWaitsLocked(ctx, semantic, event.Name, event.Key, firstPosition+1+int64(index))
+		if matchErr != nil {
+			return SettleResult{}, matchErr
+		}
+		waitUpdates = append(waitUpdates, waits...)
+	}
+	resolution, err := s.resolveGraphLocked(ctx, semantic, map[uuid.UUID]string{request.Claim.CommandID: "succeeded"}, waitUpdates)
 	if err != nil {
 		return SettleResult{}, err
 	}
@@ -696,8 +712,7 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		entry := JournalEntry{
 			EntryID: uuid.New(), Kind: EventRecorded, EventID: clonePointer(&event.ID),
 			EventNamespace: stringPointer("application"), EventName: clonePointer(&event.Name),
-			EventVersion: clonePointer(&event.Version), EventKey: clonePointer(&event.Key),
-			EventClass: stringPointer("application"), Body: event.Body,
+			EventKey: clonePointer(&event.Key), EventClass: stringPointer("application"), Body: event.Body,
 		}
 		entry.CommandID = clonePointer(&request.Claim.CommandID)
 		zero := 0
@@ -723,9 +738,8 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	eventID := uuid.New()
 	succeeded.CommandID = clonePointer(&request.Claim.CommandID)
 	succeeded.EventID = &eventID
-	succeeded.EventNamespace = stringPointer("command_success")
+	succeeded.EventNamespace = stringPointer("runtime")
 	succeeded.EventName = clonePointer(&fence.Name)
-	succeeded.EventVersion = clonePointer(&fence.Version)
 	succeeded.EventKey = clonePointer(&fence.Key)
 	succeeded.EventClass = stringPointer("command_terminal")
 	succeeded.TerminalStatus = stringPointer("succeeded")
@@ -834,7 +848,7 @@ func (s *Store) validateSuccessfulDecision(ctx context.Context, semantic *Semant
 		}
 		keys := make([]string, len(request.Children))
 		for index, child := range request.Children {
-			if child.ParentCommandID == nil || *child.ParentCommandID != request.Claim.CommandID || child.Origin != "worker_spawn" {
+			if child.ParentCommandID == nil || *child.ParentCommandID != request.Claim.CommandID || child.Origin != "worker_child" {
 				return fmt.Errorf("%w: invalid worker-spawned child", flowerr.ErrInvalid)
 			}
 			keys[index] = child.Key
@@ -846,18 +860,6 @@ func (s *Store) validateSuccessfulDecision(ctx context.Context, semantic *Semant
 		}
 		if conflicts != 0 {
 			return fmt.Errorf("%w: spawned command key already exists", flowerr.ErrConflict)
-		}
-	}
-	for _, event := range request.Events {
-		existing, err := s.LookupApplicationEvent(ctx, semantic.PGX(), semantic.ExecutionID(), event.Name, event.Key)
-		if err != nil {
-			return err
-		}
-		if existing.Found {
-			if existing.Version != event.Version || !bytes.Equal(existing.Body, event.Body.Bytes) {
-				return fmt.Errorf("%w: emitted event identity differs", flowerr.ErrConflict)
-			}
-			return fmt.Errorf("%w: emitted event identity already exists", flowerr.ErrConflict)
 		}
 	}
 	return nil

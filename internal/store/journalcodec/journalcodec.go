@@ -58,15 +58,13 @@ type CommandCreatedBody struct {
 }
 
 type DependencyGroupBody struct {
-	Kind      string   `json:"kind"`
-	Threshold *int     `json:"threshold,omitempty"`
-	Members   []string `json:"members"`
+	Kind    string   `json:"kind"`
+	Members []string `json:"members"`
 }
 
 type EventWaitBody struct {
-	Namespace string `json:"namespace"`
-	Name      string `json:"name"`
-	Version   int    `json:"version"`
+	Name string `json:"name"`
+	Key  string `json:"key"`
 }
 
 type PlanReconciledBody struct {
@@ -138,7 +136,6 @@ type CoordinatorTransitionBody struct {
 	StateRevision      int64           `json:"state_revision"`
 	State              json.RawMessage `json:"state"`
 	TerminalDecision   string          `json:"terminal_decision,omitempty"`
-	ResultRef          string          `json:"result_ref,omitempty"`
 }
 
 type CommandSucceededBody struct {

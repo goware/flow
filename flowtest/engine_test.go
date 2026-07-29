@@ -2,7 +2,9 @@ package flowtest_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,126 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+type stagedEventState struct{}
+
+func TestStagedEventsAreRecordedDeterministically(t *testing.T) {
+	event := flow.DefineEvent[testFact]("flowtest.worker_event")
+	command := flow.DefineCommand[testArgs, testResult]("flowtest.event_worker", 1)
+	registration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		if err := flow.Emit(work, event, "z", testFact{Value: "last"}); err != nil {
+			return testResult{}, err
+		}
+		if err := flow.Emit(work, event, "a", testFact{Value: "first"}); err != nil {
+			return testResult{}, err
+		}
+		_ = flow.Emit(work, event, "a", testFact{Value: "first"})
+		return testResult{Value: "done"}, nil
+	})
+
+	decision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), registration, testArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Err != nil || len(decision.Events) != 2 || decision.Events[0].Key != "a" || decision.Events[1].Key != "z" {
+		t.Fatalf("decision=%+v", decision)
+	}
+	var payload testFact
+	if err := json.Unmarshal(decision.Events[0].Payload, &payload); err != nil || payload.Value != "first" {
+		t.Fatalf("payload=%s err=%v", decision.Events[0].Payload, err)
+	}
+}
+
+func TestStagedEventDefectsPoisonDecisions(t *testing.T) {
+	event := flow.DefineEvent[testFact]("flowtest.event_conflict")
+	command := flow.DefineCommand[testArgs, testResult]("flowtest.event_conflict_worker", 1)
+	registration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		_ = flow.Emit(work, event, "same", testFact{Value: "one"})
+		_ = flow.Emit(work, event, "same", testFact{Value: "two"})
+		return testResult{}, nil
+	})
+	decision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), registration, testArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(decision.Err, flow.ErrConflict) {
+		t.Fatalf("decision error=%v", decision.Err)
+	}
+
+	plan := flow.DefinePlan[testArgs]("flowtest.plan_emit", 1, func(plan *flow.Plan, _ testArgs) {
+		_ = flow.Emit(plan, event, "invalid", testFact{})
+	})
+	if _, err := flowtest.RunPlan(plan, testArgs{}, flowtest.PlanWorld{}); !errors.Is(err, flow.ErrInvalidState) {
+		t.Fatalf("plan emit error=%v", err)
+	}
+
+	invalid := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		_ = flow.Emit(work, event, "", testFact{})
+		return testResult{}, nil
+	})
+	invalidDecision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), invalid, testArgs{})
+	if err != nil || !errors.Is(invalidDecision.Err, flow.ErrInvalid) {
+		t.Fatalf("invalid key decision=%+v err=%v", invalidDecision, err)
+	}
+
+	oversized := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		_ = flow.Emit(work, event, "large", testFact{Value: strings.Repeat("x", 64<<10)})
+		return testResult{}, nil
+	})
+	oversizedDecision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), oversized, testArgs{})
+	if err != nil || !errors.Is(oversizedDecision.Err, flow.ErrPayloadTooLarge) {
+		t.Fatalf("oversized decision=%+v err=%v", oversizedDecision, err)
+	}
+}
+
+func TestCoordinatorCanStageEventsWithTerminalDecision(t *testing.T) {
+	event := flow.DefineEvent[testFact]("flowtest.coordinator_event")
+	coordinator := flow.DefineCoordinator[stagedEventState]("flowtest.event_coordinator", 1,
+		flow.OnStart(func(_ context.Context, coordination *flow.Coordination[stagedEventState]) error {
+			if err := flow.Emit(coordination, event, "finished", testFact{Value: "yes"}); err != nil {
+				return err
+			}
+			coordination.Succeed()
+			return nil
+		}))
+	decision, err := flowtest.RunCoordinator(context.Background(), coordinator, stagedEventState{}, flowtest.Start())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Err != nil || decision.Terminal != "succeeded" || len(decision.Events) != 1 || decision.Events[0].Key != "finished" {
+		t.Fatalf("decision=%+v", decision)
+	}
+}
+
+func TestExternalEventIngressIsRejectedInsideAttempt(t *testing.T) {
+	event := flow.DefineEvent[testFact]("flowtest.external_in_attempt")
+	command := flow.DefineCommand[testArgs, testResult]("flowtest.external_in_attempt_worker", 1)
+	registration := flow.Handle(command, func(ctx context.Context, _ *flow.Work[testArgs]) (testResult, error) {
+		_ = event.Emit(ctx, nil, flow.ExecutionID("not-used"), "bad", testFact{})
+		return testResult{}, nil
+	})
+	decision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), registration, testArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(decision.Err, flow.ErrInvalidState) {
+		t.Fatalf("decision error=%v", decision.Err)
+	}
+}
+
+func TestCommitCannotIgnoreExternalEventIngressDefect(t *testing.T) {
+	event := flow.DefineEvent[testFact]("flowtest.external_in_commit")
+	command := flow.DefineCommand[testArgs, testResult]("flowtest.external_in_commit_worker", 1)
+	registration := flow.Handle(command,
+		func(context.Context, *flow.Work[testArgs]) (testResult, error) { return testResult{}, nil },
+		flow.WithCommit(func(ctx context.Context, _ flow.Tx, _ flow.Commit[testArgs, testResult]) error {
+			_ = event.Emit(ctx, nil, flow.ExecutionID("not-used"), "bad", testFact{})
+			return nil
+		}))
+	if err := flowtest.RunCommit(context.Background(), registration, &recordingTx{}, testArgs{}, testResult{}, flow.CommandInfo{}); !errors.Is(err, flow.ErrInvalidState) {
+		t.Fatalf("RunCommit error=%v", err)
+	}
+}
 
 type testArgs struct {
 	Value string `json:"value"`
@@ -27,20 +149,14 @@ type testFact struct {
 func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	child := flow.DefineCommand[testArgs, testResult]("flowtest.child", 1)
 	parent := flow.DefineCommand[testArgs, testResult]("flowtest.parent", 1)
-	event := flow.DefineEvent[testFact]("flowtest.fact", 1)
+	directEvent := flow.DefineEvent[testFact]("flowtest.direct_event")
 
 	parentRegistration := flow.Handle(parent, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
 		dependency, err := flow.ResultOf(work, "dependency", child)
 		if err != nil {
 			return testResult{}, err
 		}
-		if err := flow.Emit(work, event, "observed", testFact{Value: dependency.Value}); err != nil {
-			return testResult{}, err
-		}
-		if err := flow.Spawn(work, "child/next", child, testArgs{Value: work.Args.Value},
-			flow.Optional(), flow.StartAfter(time.Second)); err != nil {
-			return testResult{}, err
-		}
+		flow.Execute(work, "child/next", child, testArgs{Value: work.Args.Value}).Optional().Delay(time.Second)
 		return testResult{Value: dependency.Value + "/" + work.Args.Value}, nil
 	}, flow.WithCommit(func(ctx context.Context, tx flow.Tx, commit flow.Commit[testArgs, testResult]) error {
 		_, err := tx.Exec(ctx, "record", commit.Args.Value, commit.Result.Value)
@@ -49,7 +165,7 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 
 	decision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), parentRegistration,
 		testArgs{Value: "parent"}, flowtest.WithDependencies(flowtest.Succeeded("dependency", child, testResult{Value: "ready"})))
-	if err != nil || decision.Err != nil || decision.Result.Value != "ready/parent" || len(decision.Events) != 1 ||
+	if err != nil || decision.Err != nil || decision.Result.Value != "ready/parent" ||
 		len(decision.Commands) != 1 || decision.Commands[0].Required || decision.Commands[0].StartAfter != time.Second {
 		t.Fatalf("RunWorker() = %#v, %v", decision, err)
 	}
@@ -64,34 +180,42 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 
 	root := flow.DefineCommand[testArgs, testResult]("flowtest.root", 1)
 	rootRegistration := flow.Handle(root, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		if err := flow.Spawn(work, "leaf", child, testArgs{Value: "leaf"}); err != nil {
-			return testResult{}, err
-		}
+		_ = flow.Emit(work, directEvent, "shared", testFact{Value: "same"})
+		flow.Execute(work, "leaf", child, testArgs{Value: "leaf"})
 		return testResult{Value: "root"}, nil
 	})
 	childRegistration := flow.Handle(child, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		_ = flow.Emit(work, directEvent, "shared", testFact{Value: "same"})
 		return testResult{Value: work.Args.Value + "/done"}, nil
 	})
 	direct, err := flowtest.RunDirect[testArgs, testResult](context.Background(), rootRegistration,
 		testArgs{Value: "ignored"}, 10, func(name string, version int) (flow.Registration, bool) {
 			return childRegistration, name == child.Name() && version == child.Version()
 		})
-	if err != nil || direct.Result.Value != "root" || string(direct.Commands["leaf"]) != `{"value":"leaf/done"}` {
+	if err != nil || direct.Result.Value != "root" || string(direct.Commands["leaf"]) != `{"value":"leaf/done"}` || len(direct.Events) != 1 {
 		t.Fatalf("RunDirect() = %#v, %v", direct, err)
+	}
+	conflictingChild := flow.Handle(child, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		_ = flow.Emit(work, directEvent, "shared", testFact{Value: "different"})
+		return testResult{Value: work.Args.Value}, nil
+	})
+	if _, err := flowtest.RunDirect[testArgs, testResult](context.Background(), rootRegistration,
+		testArgs{}, 10, func(string, int) (flow.Registration, bool) { return conflictingChild, true }); err == nil {
+		t.Fatal("RunDirect accepted conflicting staged event identities")
 	}
 }
 
 func TestPlanSimulationAndDeterminism(t *testing.T) {
 	analyze := flow.DefineCommand[testArgs, testResult]("flowtest.analyze", 1)
 	finish := flow.DefineCommand[testArgs, testResult]("flowtest.finish", 1)
-	release := flow.DefineEvent[testFact]("flowtest.release", 1)
+	release := flow.DefineEvent[testFact]("flowtest.release")
 	plan := flow.DefinePlan[testArgs]("flowtest.plan", 1, func(plan *flow.Plan, args testArgs) {
-		flow.Do(plan, "analyze", analyze, args)
-		if _, ok := flow.Fact(plan, release); !ok {
+		analysis := flow.Execute(plan, "analyze", analyze, args)
+		if _, ok := flow.Fact(plan, release, "release/1"); !ok {
 			return
 		}
-		if outcome, ok := flow.Outcome(plan, "analyze", analyze); ok && outcome.Status == flow.StatusSucceeded {
-			flow.Do(plan, "finish", finish, args).After("analyze")
+		if outcome, ok := analysis.Outcome(); ok && outcome.Status == flow.StatusSucceeded {
+			flow.Execute(plan, "finish", finish, args).After("analyze")
 		}
 	})
 	firstWorld := flowtest.PlanWorld{KnownEvents: []flowtest.EventRef{flowtest.EventReference(release)}}
@@ -122,26 +246,28 @@ func TestRunCoordinatorHandlesMixedOutcomes(t *testing.T) {
 	coordinator := flow.DefineCoordinator[state]("flowtest.agent", 1,
 		flow.OnStart(func(_ context.Context, coordination *flow.Coordination[state]) error {
 			coordination.State.Pending = 1
-			return flow.Spawn(coordination, "tool/1", task, testArgs{Value: "search"}, flow.Optional())
+			flow.Execute(coordination, "tool/1", task, testArgs{Value: "search"}).Optional()
+			return nil
 		}),
-		flow.OnOutcome(task, func(_ context.Context, coordination *flow.Coordination[state], received flow.Received[flow.CommandOutcome[testResult]]) error {
+		flow.OnOutcome(task, func(_ context.Context, coordination *flow.Coordination[state], received flow.Received[flow.Outcome[testResult]]) error {
 			coordination.State.Pending--
 			if received.Payload.Status != flow.StatusSucceeded {
 				coordination.State.Failed++
 			}
-			return flow.SucceedExecution(coordination, "agent/result")
+			coordination.Succeed()
+			return nil
 		}),
 	)
 	started, err := flowtest.RunCoordinator(context.Background(), coordinator, state{}, flowtest.Start())
 	if err != nil || started.Err != nil || started.State.Pending != 1 || len(started.Commands) != 1 || started.Commands[0].Required {
 		t.Fatalf("coordinator start = %#v, %v", started, err)
 	}
-	failed := flow.CommandOutcome[testResult]{Status: flow.StatusFailed,
+	failed := flow.Outcome[testResult]{Status: flow.StatusFailed,
 		Failure: &flow.CommandFailure{Code: "tool_timeout", Message: "timed out"}}
 	finished, err := flowtest.RunCoordinator(context.Background(), coordinator, started.State,
 		flowtest.DeliverOutcome(5, task, "tool/1", time.Now(), failed))
 	if err != nil || finished.Err != nil || finished.State.Pending != 0 || finished.State.Failed != 1 ||
-		finished.Terminal != "succeeded" || finished.ResultRef != "agent/result" {
+		finished.Terminal != "succeeded" {
 		t.Fatalf("coordinator outcome = %#v, %v", finished, err)
 	}
 }

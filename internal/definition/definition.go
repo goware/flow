@@ -61,11 +61,10 @@ type Command struct {
 	Base
 	Args   Codec
 	Result Codec
-	Done   Event
 }
 
 type Event struct {
-	Base
+	Name      string
 	Namespace string
 	Payload   Codec
 }

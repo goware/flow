@@ -99,12 +99,10 @@ func TestJournalAllocationGapFreeAndHistory(t *testing.T) {
 	one := 1
 	eventID := uuid.New()
 	eventNamespace, eventName, eventKey, eventClass := "application", "observed", "observation/1", "application"
-	eventVersion := 1
 	eventEntry.CausationBatchIndex = &one
 	eventEntry.EventID = &eventID
 	eventEntry.EventNamespace = &eventNamespace
 	eventEntry.EventName = &eventName
-	eventEntry.EventVersion = &eventVersion
 	eventEntry.EventKey = &eventKey
 	eventEntry.EventClass = &eventClass
 
@@ -322,15 +320,15 @@ func TestSchemaConstraints(t *testing.T) {
 
 	groupID := uuid.New()
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_command_dependency_groups")+`
-		(group_id,execution_id,dependent_command_id,ordinal,kind) VALUES ($1,$2,$3,0,'at_least')`, groupID, validID, commandID)
-	assertConstraint(t, err, "flow_command_dependency_groups_threshold_ck")
+		(group_id,execution_id,dependent_command_id,ordinal,kind) VALUES ($1,$2,$3,0,'invalid')`, groupID, validID, commandID)
+	assertConstraint(t, err, "flow_command_dependency_groups_kind_ck")
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_command_event_waits")+`
-		(command_id,execution_id,event_namespace,event_name,event_version) VALUES ($1,$2,'invalid','event',1)`, commandID, validID)
-	assertConstraint(t, err, "flow_command_event_waits_namespace_ck")
+		(command_id,execution_id,event_name,event_key,satisfied_position) VALUES ($1,$2,'event','key',0)`, commandID, validID)
+	assertConstraint(t, err, "flow_command_event_waits_position_ck")
 
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_journal")+`
-		(execution_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,event_version,event_key,event_class,body,body_hash)
-		VALUES ($1,1,$2,'execution_started',clock_timestamp(),$3,'application','event',1,'key','application','{}'::text::bytea,decode(repeat('00',32),'hex'))`,
+		(execution_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,event_key,event_class,body,body_hash)
+		VALUES ($1,1,$2,'execution_started',clock_timestamp(),$3,'application','event','key','application','{}'::text::bytea,decode(repeat('00',32),'hex'))`,
 		validID, uuid.New(), uuid.New())
 	assertConstraint(t, err, "flow_journal_event_shape_ck")
 
@@ -351,7 +349,7 @@ func seedCommand(t *testing.T, db *pgkit.DB, schema string, executionID uuid.UUI
 		command_id,execution_id,command_key,name,version,origin,args,args_hash,declaration_fingerprint,
 		state,queue,retry_policy,retry_policy_hash,budget_started_at,next_attempt_at,
 		created_position,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,'work',1,'external_issue','{}'::text::bytea,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),
+	) VALUES ($1,$2,$3,'work',1,'plan','{}'::text::bytea,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),
 		'ready','default','{}'::jsonb,decode(repeat('00',32),'hex'),clock_timestamp(),clock_timestamp(),
 		1,clock_timestamp(),clock_timestamp(),clock_timestamp())`, id, executionID, key)
 	if err != nil {

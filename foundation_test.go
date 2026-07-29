@@ -66,14 +66,14 @@ func TestRetryPolicyPublicBuilders(t *testing.T) {
 	t.Parallel()
 
 	base := RetryFor(time.Hour)
-	changed := base.Attempts(7).Backoff(time.Second, time.Minute).Jitter(0)
+	changed := base.Attempts(7).Backoff(time.Second, time.Minute)
 	if validateRetryPolicy(base) != nil || validateRetryPolicy(changed) != nil {
 		t.Fatal("valid retry policy rejected")
 	}
 	if validateRetryPolicy(base.Backoff()) == nil {
 		t.Fatal("empty backoff accepted")
 	}
-	cmd := DefineCommand[testArgs, testResult]("retry", 1, WithRetryPolicy(changed))
+	cmd := DefineCommand[testArgs, testResult]("retry", 1, WithRetry(changed))
 	if cmd.err != nil {
 		t.Fatalf("retry command validation = %v", cmd.err)
 	}

@@ -29,23 +29,29 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 		(command_id text PRIMARY KEY,result text NOT NULL)`); err != nil {
 		t.Fatalf("create commit table: %v", err)
 	}
-	retryPolicy := RetryFor(2 * time.Second).Attempts(3).Backoff(10 * time.Millisecond).Jitter(0)
-	retrying := DefineCommand[runtimeArgs, runtimeResult]("runtime.retry", 1, WithRetryPolicy(retryPolicy))
-	permanent := DefineCommand[runtimeArgs, runtimeResult]("runtime.permanent", 1, WithMaxAttempts(5))
-	timed := DefineCommand[runtimeArgs, runtimeResult]("runtime.timeout", 1, WithMaxAttempts(1), WithTimeout(30*time.Millisecond))
+	retryPolicy := RetryFor(2 * time.Second).Attempts(3).Backoff(10 * time.Millisecond)
+	retrying := DefineCommand[runtimeArgs, runtimeResult]("runtime.retry", 1, WithRetry(retryPolicy))
+	permanent := DefineCommand[runtimeArgs, runtimeResult]("runtime.permanent", 1, WithRetry(Attempts(5)))
+	timed := DefineCommand[runtimeArgs, runtimeResult]("runtime.timeout", 1, WithRetry(Attempts(1)), WithTimeout(30*time.Millisecond))
 	committed := DefineCommand[runtimeArgs, runtimeResult]("runtime.commit", 1)
-	commitFailed := DefineCommand[runtimeArgs, runtimeResult]("runtime.commit_failed", 1, WithMaxAttempts(3))
-	exhausted := DefineCommand[runtimeArgs, runtimeResult]("runtime.exhausted", 1, WithMaxAttempts(2))
-	panicked := DefineCommand[runtimeArgs, runtimeResult]("runtime.panic", 1, WithMaxAttempts(1))
-	retryAfter := DefineCommand[runtimeArgs, runtimeResult]("runtime.retry_after", 1, WithMaxAttempts(2))
-	oversized := DefineCommand[runtimeArgs, runtimeResult]("runtime.oversized_result", 1, WithMaxAttempts(5))
+	commitFailed := DefineCommand[runtimeArgs, runtimeResult]("runtime.commit_failed", 1, WithRetry(Attempts(3)))
+	exhausted := DefineCommand[runtimeArgs, runtimeResult]("runtime.exhausted", 1, WithRetry(Attempts(2)))
+	panicked := DefineCommand[runtimeArgs, runtimeResult]("runtime.panic", 1, WithRetry(Attempts(1)))
+	retryAfter := DefineCommand[runtimeArgs, runtimeResult]("runtime.retry_after", 1, WithRetry(Attempts(2)))
+	oversized := DefineCommand[runtimeArgs, runtimeResult]("runtime.oversized_result", 1, WithRetry(Attempts(5)))
+	lifecycleChild := DefineCommand[runtimeArgs, runtimeResult]("runtime.lifecycle_child", 1, WithRetry(Attempts(1)))
+	lifecycleEvent := DefineEvent[runtimeResult]("runtime.lifecycle_event")
+	stageLifecycleOutput := func(work *Work[runtimeArgs], value string) {
+		_ = Emit(work, lifecycleEvent, "output", runtimeResult{Value: value})
+		Execute(work, "child", lifecycleChild, runtimeArgs{Value: value})
+	}
 
 	var retryCalls atomic.Int32
 	var exhaustedCalls atomic.Int32
 	var retryAfterCalls atomic.Int32
 	var oversizedCalls atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(5),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(300*time.Millisecond), WithShutdownGrace(time.Second))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond), WithShutdownGrace(time.Second))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -59,7 +65,8 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 		Handle(permanent, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
 			return runtimeResult{}, Permanent(errors.New("not retryable"))
 		}),
-		Handle(timed, func(ctx context.Context, _ *Work[runtimeArgs]) (runtimeResult, error) {
+		Handle(timed, func(ctx context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
+			stageLifecycleOutput(work, "timeout")
 			<-ctx.Done()
 			return runtimeResult{}, ctx.Err()
 		}),
@@ -79,7 +86,8 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 			exhaustedCalls.Add(1)
 			return runtimeResult{}, errors.New("still unavailable")
 		}),
-		Handle(panicked, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
+		Handle(panicked, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
+			stageLifecycleOutput(work, "panic")
 			panic("worker bug")
 		}),
 		Handle(retryAfter, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
@@ -91,6 +99,9 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 		Handle(oversized, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
 			oversizedCalls.Add(1)
 			return runtimeResult{Value: strings.Repeat("x", maxCommandResultBytes+1)}, nil
+		}),
+		Handle(lifecycleChild, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
+			return runtimeResult{Value: work.Args.Value}, nil
 		}),
 	}
 	if err := runtime.Register(registrations...); err != nil {
@@ -155,6 +166,19 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 	if len(timeoutTrace.Commands[0].Attempts) != 1 || timeoutTrace.Commands[0].Attempts[0].Classification != "timeout" {
 		t.Fatalf("timeout Trace = %#v", timeoutTrace)
 	}
+	for name, handle := range map[string]ExecutionHandle{"timeout": timeoutHandle, "panic": panicHandle} {
+		var eventCount, childCount int
+		if err := database.DB.Conn.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
+			 WHERE execution_id=$1 AND event_class='application'),
+			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
+			 WHERE execution_id=$1 AND parent_command_id IS NOT NULL)`, handle.ID).Scan(&eventCount, &childCount); err != nil {
+			t.Fatalf("%s staged output query: %v", name, err)
+		}
+		if eventCount != 0 || childCount != 0 {
+			t.Fatalf("%s exposed staged events=%d children=%d", name, eventCount, childCount)
+		}
+	}
 	var committedRows int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "runtime_commits")+`
 		WHERE command_id=$1 AND result='atomic'`, commitHandle.RootCommandID).Scan(&committedRows); err != nil || committedRows != 1 {
@@ -186,7 +210,7 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 	}
 }
 
-func TestRuntimeStagesEventsAndDelayedChildrenAtomically(t *testing.T) {
+func TestRuntimeStagesDelayedChildrenAtomically(t *testing.T) {
 	t.Parallel()
 	database := testpg.Open(t)
 	ctx := context.Background()
@@ -196,11 +220,9 @@ func TestRuntimeStagesEventsAndDelayedChildrenAtomically(t *testing.T) {
 	type childArgs struct{ Value string }
 	type childResult struct{ Value string }
 	type rootResult struct{ Children int }
-	type fact struct{ Value string }
 	child := DefineCommand[childArgs, childResult]("graph.child", 1)
 	root := DefineCommand[None, rootResult]("graph.root", 1,
-		WithRetryPolicy(RetryFor(time.Second).Attempts(2).Backoff(10*time.Millisecond).Jitter(0)))
-	observed := DefineEvent[fact]("graph.observed", 1)
+		WithRetry(RetryFor(time.Second).Attempts(2).Backoff(10*time.Millisecond)))
 	var childStartedAt atomic.Int64
 	var rootCalls atomic.Int32
 
@@ -210,15 +232,8 @@ func TestRuntimeStagesEventsAndDelayedChildrenAtomically(t *testing.T) {
 	}
 	if err := runtime.Register(
 		Handle(root, func(_ context.Context, work *Work[None]) (rootResult, error) {
-			if err := Emit(work, observed, "observed/1", fact{Value: "root"}); err != nil {
-				return rootResult{}, err
-			}
-			if err := Spawn(work, "child/required", child, childArgs{Value: "required"}); err != nil {
-				return rootResult{}, err
-			}
-			if err := Spawn(work, "child/delayed", child, childArgs{Value: "delayed"}, Optional(), StartAfter(80*time.Millisecond)); err != nil {
-				return rootResult{}, err
-			}
+			Execute(work, "child/required", child, childArgs{Value: "required"})
+			Execute(work, "child/delayed", child, childArgs{Value: "delayed"}).Optional().Delay(80 * time.Millisecond)
 			if rootCalls.Add(1) == 1 {
 				return rootResult{}, errors.New("retry after staging")
 			}
@@ -250,15 +265,6 @@ func TestRuntimeStagesEventsAndDelayedChildrenAtomically(t *testing.T) {
 	}
 	if len(trace.Commands) != 3 || trace.Execution.CommandCount != 3 || trace.Execution.OpenCommands != 0 {
 		t.Fatalf("Trace topology = commands %d, count %d, open %d", len(trace.Commands), trace.Execution.CommandCount, trace.Execution.OpenCommands)
-	}
-	var applicationEvents int
-	for _, entry := range trace.History {
-		if entry.EventNamespace == "application" && entry.EventName == observed.def.Name {
-			applicationEvents++
-		}
-	}
-	if applicationEvents != 1 {
-		t.Fatalf("application events = %d, want 1", applicationEvents)
 	}
 	if rootCalls.Load() != 2 {
 		t.Fatalf("root calls = %d, want 2", rootCalls.Load())
@@ -300,7 +306,7 @@ func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
 				t.Fatal(err)
 			}
 			type args struct{ Kind string }
-			child := DefineCommand[args, None]("failfast.child."+test.name, 1, WithMaxAttempts(1))
+			child := DefineCommand[args, None]("failfast.child."+test.name, 1, WithRetry(Attempts(1)))
 			root := DefineCommand[None, None]("failfast.root."+test.name, 1)
 			var siblingCalls atomic.Int32
 			runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
@@ -310,12 +316,8 @@ func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
 			}
 			if err := runtime.Register(
 				Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
-					if err := Spawn(work, "a-failure", child, args{Kind: "fail"}); err != nil {
-						return None{}, err
-					}
-					if err := Spawn(work, "z-sibling", child, args{Kind: "sibling"}, StartAfter(60*time.Millisecond)); err != nil {
-						return None{}, err
-					}
+					Execute(work, "a-failure", child, args{Kind: "fail"})
+					Execute(work, "z-sibling", child, args{Kind: "sibling"}).Delay(60 * time.Millisecond)
 					return None{}, nil
 				}),
 				Handle(child, func(_ context.Context, work *Work[args]) (None, error) {
@@ -368,11 +370,11 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatalf("Migrate() error = %v", err)
 	}
-	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.capacity", 1, WithMaxAttempts(2))
+	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.capacity", 1, WithRetry(Attempts(2)))
 	blocking := make(chan struct{})
 	var active, maximum, started atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(90*time.Millisecond), WithShutdownGrace(time.Second))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(90*time.Millisecond), WithShutdownGrace(time.Second))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -410,11 +412,11 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	}
 	stopRuntime(t, cancelRun, runResult)
 
-	takeover := DefineCommand[runtimeArgs, runtimeResult]("runtime.takeover", 1, WithMaxAttempts(2))
+	takeover := DefineCommand[runtimeArgs, runtimeResult]("runtime.takeover", 1, WithRetry(Attempts(2)))
 	firstStarted := make(chan struct{}, 1)
 	releaseFirst := make(chan struct{})
 	first, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(90*time.Millisecond), WithShutdownGrace(0))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(90*time.Millisecond), WithShutdownGrace(0))
 	if err != nil {
 		t.Fatalf("New(first) error = %v", err)
 	}
@@ -446,7 +448,7 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	}
 
 	second, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(90*time.Millisecond), WithShutdownGrace(time.Second))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(90*time.Millisecond), WithShutdownGrace(time.Second))
 	if err != nil {
 		t.Fatalf("New(second) error = %v", err)
 	}
@@ -489,7 +491,7 @@ func TestRuntimeReleasesDatabaseConnectionBeforeWorker(t *testing.T) {
 	}
 	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.connection_release", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(100*time.Millisecond), WithCommandLease(time.Second), WithNotifications(false))
+		WithPollInterval(100*time.Millisecond), withCommandLeaseForTest(time.Second), WithNotifications(false))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -526,7 +528,7 @@ func TestRuntimeQueueConcurrencyAndFairSelection(t *testing.T) {
 	bulkRelease := make(chan struct{})
 	var bulkStarted atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(3),
-		WithQueueConcurrency("bulk", 1), WithPollInterval(5*time.Millisecond), WithCommandLease(time.Second))
+		WithQueueConcurrency("bulk", 1), WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(time.Second))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -584,7 +586,7 @@ func TestRuntimeRollingVersionLeavesUnknownWorkUnclaimed(t *testing.T) {
 		t.Fatalf("v2 Execute() error = %v", err)
 	}
 	oldReplica, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(time.Second))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(time.Second))
 	if err != nil {
 		t.Fatalf("New(old replica) error = %v", err)
 	}
@@ -608,7 +610,7 @@ func TestRuntimeRollingVersionLeavesUnknownWorkUnclaimed(t *testing.T) {
 	stopRuntime(t, cancelOld, oldResult)
 
 	newReplica, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(time.Second))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(time.Second))
 	if err != nil {
 		t.Fatalf("New(new replica) error = %v", err)
 	}
@@ -631,18 +633,22 @@ func TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt(t *testing.T) {
 		t.Fatalf("Migrate() error = %v", err)
 	}
 	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.cancel_active", 1)
+	child := DefineCommand[runtimeArgs, runtimeResult]("runtime.cancel_child", 1)
+	event := DefineEvent[runtimeResult]("runtime.cancel_event")
 	cancelStarted := make(chan struct{}, 1)
 	cancelObserved := make(chan struct{}, 1)
 	otherStarted := make(chan struct{}, 1)
 	otherCancelled := make(chan struct{}, 1)
 	releaseOther := make(chan struct{})
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(300*time.Millisecond))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	if err := runtime.Register(Handle(command, func(ctx context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
 		if work.Args.Value == "cancel" {
+			_ = Emit(work, event, "cancelled", runtimeResult{Value: "must-not-commit"})
+			Execute(work, "child", child, runtimeArgs{Value: "must-not-commit"})
 			cancelStarted <- struct{}{}
 			<-ctx.Done()
 			cancelObserved <- struct{}{}
@@ -656,6 +662,8 @@ func TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt(t *testing.T) {
 			otherCancelled <- struct{}{}
 			return runtimeResult{}, ctx.Err()
 		}
+	}), Handle(child, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
+		return runtimeResult{Value: work.Args.Value}, nil
 	})); err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
@@ -700,6 +708,17 @@ func TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt(t *testing.T) {
 		trace.Commands[0].Attempts[0].FinishedAt == nil || trace.Commands[0].Attempts[0].ConsumedBudget {
 		t.Fatalf("cancelled Trace = %#v", trace)
 	}
+	var eventCount, childCount int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
+		 WHERE execution_id=$1 AND event_class='application'),
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
+		 WHERE execution_id=$1 AND parent_command_id IS NOT NULL)`, cancelHandle.ID).Scan(&eventCount, &childCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 || childCount != 0 {
+		t.Fatalf("cancelled attempt exposed staged events=%d children=%d", eventCount, childCount)
+	}
 }
 
 func TestRuntimeCooperativeShutdownIsRetryableAndBudgetNeutral(t *testing.T) {
@@ -710,10 +729,10 @@ func TestRuntimeCooperativeShutdownIsRetryableAndBudgetNeutral(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatalf("Migrate() error = %v", err)
 	}
-	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.shutdown", 1, WithMaxAttempts(1))
+	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.shutdown", 1, WithRetry(Attempts(1)))
 	started := make(chan struct{}, 1)
 	first, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(300*time.Millisecond), WithShutdownGrace(20*time.Millisecond))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond), WithShutdownGrace(20*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New(first) error = %v", err)
 	}
@@ -737,7 +756,7 @@ func TestRuntimeCooperativeShutdownIsRetryableAndBudgetNeutral(t *testing.T) {
 	stopRuntime(t, cancelFirst, firstResult)
 
 	second, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(300*time.Millisecond))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New(second) error = %v", err)
 	}
@@ -779,7 +798,7 @@ func TestRuntimeDeadlineAndRegistrationLifecycle(t *testing.T) {
 	}
 	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.unhandled", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond),
-		WithCommandLease(90*time.Millisecond), WithShutdownGrace(time.Second))
+		withCommandLeaseForTest(90*time.Millisecond), WithShutdownGrace(time.Second))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -877,7 +896,7 @@ func TestRuntimeExecutesDirectCommand(t *testing.T) {
 	seenInfo := make(chan CommandInfo, 1)
 	command := DefineCommand[runtimeArgs, runtimeResult]("runtime.direct", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
-		WithPollInterval(10*time.Millisecond), WithCommandLease(300*time.Millisecond), WithShutdownGrace(time.Second))
+		WithPollInterval(10*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond), WithShutdownGrace(time.Second))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
