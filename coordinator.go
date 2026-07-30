@@ -1,12 +1,14 @@
 package flow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/definition"
 	"github.com/goware/flow/internal/store/journalcodec"
 )
@@ -23,7 +25,7 @@ func (c *Coordination[S]) flowScope() *scopeState {
 	return c.scope
 }
 
-func (c *Coordination[S]) flowCoordinatorScope() {}
+func (c *Coordination[S]) flowExecuteScope() {}
 
 type Handler[S any] interface {
 	flowCoordinatorHandler() coordinatorHandler[S]
@@ -47,6 +49,9 @@ type coordinatorSelector struct {
 func (s coordinatorSelector) key() string {
 	if s.kind == coordinatorStart {
 		return "start"
+	}
+	if s.kind == coordinatorEvent {
+		return fmt.Sprintf("%s:%s:%s", s.kind, s.namespace, s.name)
 	}
 	return fmt.Sprintf("%s:%s:%s:%d", s.kind, s.namespace, s.name, s.version)
 }
@@ -77,9 +82,9 @@ func OnStart[S any](handler func(context.Context, *Coordination[S]) error) Handl
 }
 
 func On[S, T any](event Event[T], handler func(context.Context, *Coordination[S], Received[T]) error) Handler[S] {
-	ref := event.flowEventName()
+	ref := event.flowEventRef()
 	value := coordinatorHandler[S]{selector: coordinatorSelector{
-		kind: coordinatorEvent, namespace: ref.namespace, name: ref.name, version: ref.version,
+		kind: coordinatorEvent, namespace: ref.namespace, name: ref.name,
 	}, err: event.err}
 	if event.def == nil {
 		value.err = errors.Join(value.err, errors.New("zero event definition"))
@@ -96,21 +101,11 @@ func On[S, T any](event Event[T], handler func(context.Context, *Coordination[S]
 		return handler(ctx, coordination, typed)
 	}
 	value.decode = func(data coordinatorReceivedData) (any, error) {
-		var payloadBytes []byte
-		if ref.namespace == "command_success" {
-			body, err := journalcodec.Decode[journalcodec.CommandSucceededBody](data.body)
-			if err != nil {
-				return nil, newError(ErrInvalidState, "decode", "event", ref.name, "invalid command success body")
-			}
-			payloadBytes = body.Result
-		} else {
-			body, err := journalcodec.Decode[journalcodec.ApplicationEventBody](data.body)
-			if err != nil {
-				return nil, newError(ErrInvalidState, "decode", "event", ref.name, "invalid journal event body")
-			}
-			payloadBytes = body.Payload
+		body, err := journalcodec.Decode[journalcodec.ApplicationEventBody](data.body)
+		if err != nil {
+			return nil, newError(ErrInvalidState, "decode", "event", ref.name, "invalid journal event body")
 		}
-		decoded, err := event.def.Payload.Decode(payloadBytes)
+		decoded, err := event.def.Payload.Decode(body.Payload)
 		if err != nil {
 			return nil, newError(ErrInvalidState, "decode", "event", ref.name, "event payload does not match definition")
 		}
@@ -125,7 +120,7 @@ func On[S, T any](event Event[T], handler func(context.Context, *Coordination[S]
 
 func OnOutcome[S, A, R any](
 	command Command[A, R],
-	handler func(context.Context, *Coordination[S], Received[CommandOutcome[R]]) error,
+	handler func(context.Context, *Coordination[S], Received[Outcome[R]]) error,
 ) Handler[S] {
 	name, version := command.Name(), command.Version()
 	value := coordinatorHandler[S]{selector: coordinatorSelector{
@@ -139,14 +134,14 @@ func OnOutcome[S, A, R any](
 		return value
 	}
 	value.invoke = func(ctx context.Context, coordination *Coordination[S], received any) error {
-		typed, ok := received.(Received[CommandOutcome[R]])
+		typed, ok := received.(Received[Outcome[R]])
 		if !ok {
 			return newError(ErrInvalid, "coordinate", "command", name, "outcome type mismatch")
 		}
 		return handler(ctx, coordination, typed)
 	}
 	value.decode = func(data coordinatorReceivedData) (any, error) {
-		outcome := CommandOutcome[R]{Status: data.status}
+		outcome := Outcome[R]{Status: data.status}
 		if data.status == StatusSucceeded {
 			decoded, err := command.def.Result.Decode(data.result)
 			if err != nil {
@@ -169,7 +164,7 @@ func OnOutcome[S, A, R any](
 			}
 			outcome.Failure = &failure
 		}
-		return Received[CommandOutcome[R]]{EventID: data.eventID, Key: data.key, Position: data.position, RecordedAt: data.recordedAt, Payload: outcome}, nil
+		return Received[Outcome[R]]{EventID: data.eventID, Key: data.key, Position: data.position, RecordedAt: data.recordedAt, Payload: outcome}, nil
 	}
 	return value
 }
@@ -249,35 +244,38 @@ const (
 )
 
 type coordinatorTerminal struct {
-	kind      coordinatorTerminalKind
-	resultRef string
-	reason    error
+	kind   coordinatorTerminalKind
+	reason error
+	state  canonical.Value
 }
 
-func SucceedExecution(scope CoordinatorScope, resultRef string) error {
-	state, err := validCoordinatorScope(scope)
-	if err != nil {
-		return err
+func (c *Coordination[S]) Succeed() {
+	state := c.flowScope()
+	if state == nil {
+		return
 	}
-	return state.setTerminal(coordinatorTerminal{kind: coordinatorSucceeded, resultRef: resultRef})
+	encoded, err := canonical.Marshal(c.State, maxCoordinatorStateBytes)
+	if err != nil {
+		state.poison(newError(ErrInvalid, "complete", "coordinator", "", "state is invalid or too large"))
+		return
+	}
+	_ = state.setTerminal(coordinatorTerminal{kind: coordinatorSucceeded, state: encoded})
 }
 
-func FailExecution(scope CoordinatorScope, reason error) error {
-	state, err := validCoordinatorScope(scope)
-	if err != nil {
-		return err
+func (c *Coordination[S]) Fail(reason error) {
+	state := c.flowScope()
+	if state == nil {
+		return
 	}
 	if reason == nil {
 		reason = errors.New("coordinator failed")
 	}
-	return state.setTerminal(coordinatorTerminal{kind: coordinatorFailed, reason: reason})
-}
-
-func validCoordinatorScope(value CoordinatorScope) (*scopeState, error) {
-	if value == nil || value.flowScope() == nil {
-		return nil, newError(ErrInvalidState, "complete", "coordinator", "", "scope is not active")
+	encoded, err := canonical.Marshal(c.State, maxCoordinatorStateBytes)
+	if err != nil {
+		state.poison(newError(ErrInvalid, "complete", "coordinator", "", "state is invalid or too large"))
+		return
 	}
-	return value.flowScope(), nil
+	_ = state.setTerminal(coordinatorTerminal{kind: coordinatorFailed, reason: reason, state: encoded})
 }
 
 func (s *scopeState) setTerminal(terminal coordinatorTerminal) error {
@@ -287,7 +285,7 @@ func (s *scopeState) setTerminal(terminal coordinatorTerminal) error {
 	}
 	reasonsEqual := (s.terminal.reason == nil && terminal.reason == nil) ||
 		errors.Is(s.terminal.reason, terminal.reason) || errors.Is(terminal.reason, s.terminal.reason)
-	if s.terminal.kind == terminal.kind && s.terminal.resultRef == terminal.resultRef && reasonsEqual {
+	if s.terminal.kind == terminal.kind && reasonsEqual && bytes.Equal(s.terminal.state.Bytes, terminal.state.Bytes) {
 		return nil
 	}
 	err := newError(ErrConflict, "complete", "coordinator", "", "terminal decision already staged")

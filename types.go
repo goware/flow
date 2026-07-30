@@ -28,7 +28,7 @@ type CommandFailure struct {
 	Message string `json:"message"`
 }
 
-type CommandOutcome[R any] struct {
+type Outcome[R any] struct {
 	Status  CommandStatus   `json:"status"`
 	Result  R               `json:"result,omitempty"`
 	Failure *CommandFailure `json:"failure,omitempty"`

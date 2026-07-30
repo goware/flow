@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,9 +29,13 @@ type Plan struct {
 	firstError      error
 }
 
-type Node struct {
-	plan *Plan
-	decl *planDeclaration
+func (p *Plan) flowExecuteScope() {}
+
+type Node[R any] struct {
+	plan  *Plan
+	decl  *planDeclaration
+	scope *scopeState
+	key   string
 }
 
 type planSnapshot struct {
@@ -41,28 +45,28 @@ type planSnapshot struct {
 }
 
 type planDeclaration struct {
-	key            string
-	command        *definition.Command
-	defaults       commandDefaults
-	args           canonical.Value
-	required       bool
-	groups         []planDependency
-	waits          []eventReference
-	within         time.Duration
-	delay          time.Duration
-	optionalSet    bool
-	withinSet      bool
-	delaySet       bool
-	retryOverride  *RetryPolicy
-	maxAttempts    *int
-	retrySet       bool
-	maxAttemptsSet bool
+	key         string
+	command     *definition.Command
+	defaults    commandDefaults
+	args        canonical.Value
+	required    bool
+	groups      []planDependency
+	waits       []planEventWait
+	within      time.Duration
+	delay       time.Duration
+	optionalSet bool
+	withinSet   bool
+	delaySet    bool
 }
 
 type planDependency struct {
-	kind      string
-	threshold *int
-	keys      []string
+	kind string
+	keys []string
+}
+
+type planEventWait struct {
+	eventReference
+	key string
 }
 
 func newPlan(snapshot store.PlanSnapshot) *Plan {
@@ -77,69 +81,73 @@ func newPlan(snapshot store.PlanSnapshot) *Plan {
 		plan.snapshot.commands[command.Key] = command
 	}
 	for _, event := range snapshot.Events {
-		selector := eventReference{namespace: event.Namespace, name: event.Name, version: event.Version}
+		selector := eventReference{namespace: event.Namespace, name: event.Name}
 		plan.snapshot.events[selector] = append(plan.snapshot.events[selector], event)
 	}
 	for _, selector := range snapshot.LoadedSelectors {
-		plan.snapshot.loadedEvents[eventReference{namespace: selector.Namespace, name: selector.Name, version: selector.Version}] = true
+		plan.snapshot.loadedEvents[eventReference{namespace: selector.Namespace, name: selector.Name}] = true
 	}
 	return plan
 }
 
-func Do[A, R any](plan *Plan, key string, cmd Command[A, R], args A) *Node {
+func executePlan[A, R any](plan *Plan, key string, cmd Command[A, R], args A) *Node[R] {
 	if plan == nil {
-		return &Node{}
+		return &Node[R]{key: key}
 	}
 	if plan.firstError != nil {
-		return &Node{plan: plan}
+		return &Node[R]{plan: plan, key: key}
 	}
 	if cmd.def == nil || cmd.err != nil {
 		plan.poison(newError(ErrInvalid, "plan", "command", key, "invalid command definition"))
-		return &Node{plan: plan}
+		return &Node[R]{plan: plan, key: key}
 	}
 	if err := validateStableKey(key, maxCommandKeyBytes, "command"); err != nil {
 		plan.poison(err)
-		return &Node{plan: plan}
+		return &Node[R]{plan: plan, key: key}
 	}
 	encoded, err := encodeDefinitionValue(cmd.def.Args, args, maxCommandArgumentBytes, "command arguments")
 	if err != nil {
 		plan.poison(err)
-		return &Node{plan: plan}
+		return &Node[R]{plan: plan, key: key}
 	}
 	if prior, exists := plan.declarations[key]; exists {
 		if prior.command.Name != cmd.def.Name || prior.command.Version != cmd.def.Version ||
 			!bytes.Equal(prior.args.Bytes, encoded.Bytes) || !equivalentCommandDefaults(prior.defaults, cmd.defaults) {
 			plan.poison(newError(ErrConflict, "plan", "command", key, "duplicate declaration differs"))
 		}
-		return &Node{plan: plan, decl: prior}
+		return &Node[R]{plan: plan, decl: prior, key: key}
 	}
 	decl := &planDeclaration{key: key, command: cmd.def, defaults: cmd.defaults, args: encoded, required: true}
 	plan.declarations[key] = decl
 	plan.order = append(plan.order, key)
-	return &Node{plan: plan, decl: decl}
+	return &Node[R]{plan: plan, decl: decl, key: key}
 }
 
-func Fact[T any](plan *Plan, event Event[T]) (T, bool) {
+func Fact[T any](plan *Plan, event Event[T], key string) (T, bool) {
 	var zero T
-	values := factValues(plan, event)
-	if len(values) == 0 {
-		return zero, false
+	values := factValues(plan, event, false)
+	for _, value := range values {
+		if value.Key != key {
+			continue
+		}
+		decoded, err := event.def.Payload.Decode(value.Payload)
+		if err != nil {
+			plan.poison(newError(ErrInvalidState, "plan", "event", eventName(event.def), "retained event cannot be decoded"))
+			return zero, false
+		}
+		result, ok := decoded.(T)
+		if !ok {
+			plan.poison(newError(ErrInvalidState, "plan", "event", eventName(event.def), "retained event has incompatible type"))
+			return zero, false
+		}
+		return result, true
 	}
-	decoded, err := event.def.Payload.Decode(values[0].Payload)
-	if err != nil {
-		plan.poison(newError(ErrInvalidState, "plan", "event", eventName(event.def), "retained event cannot be decoded"))
-		return zero, false
-	}
-	result, ok := decoded.(T)
-	if !ok {
-		plan.poison(newError(ErrInvalidState, "plan", "event", eventName(event.def), "retained event has incompatible type"))
-		return zero, false
-	}
-	return result, true
+	plan.markWaiting("event:" + event.Name() + ":" + key)
+	return zero, false
 }
 
 func Facts[T any](plan *Plan, event Event[T]) []T {
-	values := factValues(plan, event)
+	values := factValues(plan, event, true)
 	result := make([]T, 0, len(values))
 	for _, value := range values {
 		decoded, err := event.def.Payload.Decode(value.Payload)
@@ -152,7 +160,7 @@ func Facts[T any](plan *Plan, event Event[T]) []T {
 	return result
 }
 
-func factValues[T any](plan *Plan, event Event[T]) []store.PlanEventSnapshot {
+func factValues[T any](plan *Plan, event Event[T], markEmpty bool) []store.PlanEventSnapshot {
 	if plan == nil {
 		return nil
 	}
@@ -160,21 +168,24 @@ func factValues[T any](plan *Plan, event Event[T]) []store.PlanEventSnapshot {
 		plan.poison(newError(ErrInvalid, "plan", "event", eventName(event.def), "invalid event definition"))
 		return nil
 	}
-	selector := eventReference{namespace: event.def.Namespace, name: event.def.Name, version: event.def.Version}
+	selector := eventReference{namespace: event.def.Namespace, name: event.def.Name}
 	plan.readSelectors[selector] = struct{}{}
 	if !plan.snapshot.loadedEvents[selector] {
 		plan.selectorMisses[selector] = struct{}{}
 		return nil
 	}
 	values := plan.snapshot.events[selector]
-	if len(values) == 0 {
-		plan.markWaiting("event:" + selector.namespace + ":" + selector.name + ":" + strconv.Itoa(selector.version))
+	if markEmpty && len(values) == 0 {
+		plan.markWaiting("event:" + selector.namespace + ":" + selector.name)
 	}
 	return values
 }
 
-func Children(plan *Plan, parentKey string) ([]string, bool) {
-	command, known := planCommandForRead(plan, parentKey)
+func (node *Node[R]) Children() ([]string, bool) {
+	if !node.planReadable("children") {
+		return nil, false
+	}
+	command, known := planCommandForRead(node.plan, node.key)
 	if !known {
 		return nil, false
 	}
@@ -182,55 +193,34 @@ func Children(plan *Plan, parentKey string) ([]string, bool) {
 		return append([]string(nil), command.Children...), true
 	}
 	if !isPublicTerminal(command.State) {
-		plan.markWaiting("command:" + parentKey)
+		node.plan.markWaiting("command:" + node.key)
 	}
 	return nil, false
 }
 
-func Result[A, R any](plan *Plan, key string, cmd Command[A, R]) (R, bool) {
-	var zero R
-	command, known := matchingPlanCommand(plan, key, cmd.def)
-	if !known {
-		return zero, false
+func (node *Node[R]) Outcome() (Outcome[R], bool) {
+	var result Outcome[R]
+	if !node.planReadable("outcome") {
+		return result, false
 	}
-	if command.State != "succeeded" {
-		if !isPublicTerminal(command.State) {
-			plan.markWaiting("command:" + key)
-		}
-		return zero, false
-	}
-	if !command.ResultLoaded {
-		plan.valueMisses[command.ID] = struct{}{}
-		return zero, false
-	}
-	decoded, err := cmd.def.Result.Decode(command.Result)
-	if err != nil {
-		plan.poison(newError(ErrInvalidState, "plan", "command", key, "retained result cannot be decoded"))
-		return zero, false
-	}
-	return decoded.(R), true
-}
-
-func Outcome[A, R any](plan *Plan, key string, cmd Command[A, R]) (CommandOutcome[R], bool) {
-	var result CommandOutcome[R]
-	command, known := matchingPlanCommand(plan, key, cmd.def)
+	command, known := matchingPlanCommand(node.plan, node.key, node.decl.command)
 	if !known {
 		return result, false
 	}
 	if !isPublicTerminal(command.State) {
-		plan.markWaiting("command:" + key)
+		node.plan.markWaiting("command:" + node.key)
 		return result, false
 	}
 	result.Status = CommandStatus(command.State)
 	if result.Status == StatusSucceeded {
 		if !command.ResultLoaded {
-			plan.valueMisses[command.ID] = struct{}{}
-			return CommandOutcome[R]{}, false
+			node.plan.valueMisses[command.ID] = struct{}{}
+			return Outcome[R]{}, false
 		}
-		decoded, err := cmd.def.Result.Decode(command.Result)
+		decoded, err := node.decl.command.Result.Decode(command.Result)
 		if err != nil {
-			plan.poison(newError(ErrInvalidState, "plan", "command", key, "retained result cannot be decoded"))
-			return CommandOutcome[R]{}, false
+			node.plan.poison(newError(ErrInvalidState, "plan", "command", node.key, "retained result cannot be decoded"))
+			return Outcome[R]{}, false
 		}
 		result.Result = decoded.(R)
 	} else {
@@ -268,30 +258,33 @@ func matchingPlanCommand(plan *Plan, key string, def *definition.Command) (store
 	return command, true
 }
 
-func (node *Node) After(keys ...string) *Node {
-	return node.addGroup("all_succeeded", nil, keys)
+func (node *Node[R]) Key() string {
+	if node == nil {
+		return ""
+	}
+	return node.key
 }
 
-func (node *Node) AfterSettled(keys ...string) *Node {
-	return node.addGroup("all_settled", nil, keys)
+func (node *Node[R]) After(keys ...string) *Node[R] {
+	return node.addGroup("all_succeeded", keys)
 }
 
-func (node *Node) AfterFailed(keys ...string) *Node {
-	return node.addGroup("all_failed", nil, keys)
+func (node *Node[R]) AfterSettled(keys ...string) *Node[R] {
+	return node.addGroup("all_settled", keys)
 }
 
-func (node *Node) AfterAny(count int, keys ...string) *Node {
-	return node.addGroup("at_least", &count, keys)
+func (node *Node[R]) AfterFailed(keys ...string) *Node[R] {
+	return node.addGroup("all_failed", keys)
 }
 
-func (node *Node) addGroup(kind string, threshold *int, keys []string) *Node {
-	if !node.usable("dependency") {
+func (node *Node[R]) addGroup(kind string, keys []string) *Node[R] {
+	if !node.planUsable("dependency") {
 		return node
 	}
 	normalized := append([]string(nil), keys...)
 	sort.Strings(normalized)
-	if len(normalized) == 0 || threshold != nil && (*threshold <= 0 || *threshold > len(normalized)) {
-		node.plan.poison(newError(ErrInvalid, "plan", "dependency", node.decl.key, "dependency group is empty or has an invalid threshold"))
+	if len(normalized) == 0 {
+		node.plan.poison(newError(ErrInvalid, "plan", "dependency", node.decl.key, "dependency group is empty"))
 		return node
 	}
 	for index, key := range normalized {
@@ -300,39 +293,47 @@ func (node *Node) addGroup(kind string, threshold *int, keys []string) *Node {
 			return node
 		}
 	}
-	node.decl.groups = append(node.decl.groups, planDependency{kind: kind, threshold: cloneIntPointer(threshold), keys: normalized})
+	for _, prior := range node.decl.groups {
+		if prior.kind == kind && slices.Equal(prior.keys, normalized) {
+			return node
+		}
+	}
+	node.decl.groups = append(node.decl.groups, planDependency{kind: kind, keys: normalized})
 	return node
 }
 
-func (node *Node) Await(events ...EventName) *Node {
-	if !node.usable("await") {
+func (node *Node[R]) WaitFor(event EventRef, key string) *Node[R] {
+	if !node.planUsable("wait for") {
 		return node
 	}
-	seen := make(map[eventReference]struct{}, len(node.decl.waits)+len(events))
+	if event == nil {
+		node.plan.poison(newError(ErrInvalid, "plan", "wait", node.decl.key, "nil event selector"))
+		return node
+	}
+	if err := validateStableKey(key, maxCommandKeyBytes, "event"); err != nil {
+		node.plan.poison(err)
+		return node
+	}
+	selector := event.flowEventRef()
+	if selector.name == "" || selector.namespace != "application" {
+		node.plan.poison(newError(ErrInvalid, "plan", "wait", node.decl.key, "invalid event selector"))
+		return node
+	}
+	wait := planEventWait{eventReference: selector, key: key}
 	for _, prior := range node.decl.waits {
-		seen[prior] = struct{}{}
-	}
-	for _, event := range events {
-		if event == nil {
-			node.plan.poison(newError(ErrInvalid, "plan", "await", node.decl.key, "nil event selector"))
+		if prior == wait {
 			return node
 		}
-		selector := event.flowEventName()
-		if selector.name == "" || selector.version <= 0 || (selector.namespace != "application" && selector.namespace != "command_success") {
-			node.plan.poison(newError(ErrInvalid, "plan", "await", node.decl.key, "invalid event selector"))
-			return node
-		}
-		if _, duplicate := seen[selector]; duplicate {
-			continue
-		}
-		seen[selector] = struct{}{}
-		node.decl.waits = append(node.decl.waits, selector)
 	}
+	node.decl.waits = append(node.decl.waits, wait)
 	return node
 }
 
-func (node *Node) Within(duration time.Duration) *Node {
-	if !node.usable("within") {
+func (node *Node[R]) Within(duration time.Duration) *Node[R] {
+	if !node.planUsable("within") {
+		return node
+	}
+	if node.decl.withinSet && node.decl.within == duration {
 		return node
 	}
 	if node.decl.withinSet || duration < time.Millisecond {
@@ -343,65 +344,105 @@ func (node *Node) Within(duration time.Duration) *Node {
 	return node
 }
 
-func (node *Node) Delay(duration time.Duration) *Node {
-	if !node.usable("delay") {
+func (node *Node[R]) Delay(duration time.Duration) *Node[R] {
+	if node == nil {
 		return node
 	}
-	if node.decl.delaySet || duration < time.Millisecond {
-		node.plan.poison(newError(ErrInvalid, "plan", "delay", node.decl.key, "delay must be configured once with a positive duration"))
+	if duration < time.Millisecond {
+		node.poison(newError(ErrInvalid, "execute", "delay", node.key, "delay must be at least one millisecond"))
 		return node
 	}
-	node.decl.delaySet, node.decl.delay = true, duration
+	if node.plan != nil {
+		if !node.planUsable("delay") {
+			return node
+		}
+		if node.decl.delaySet && node.decl.delay == duration {
+			return node
+		}
+		if node.decl.delaySet {
+			node.plan.poison(newError(ErrInvalid, "plan", "delay", node.key, "delay configured more than once"))
+			return node
+		}
+		node.decl.delaySet, node.decl.delay = true, duration
+		return node
+	}
+	if command, ok := node.decisionCommand("delay"); ok {
+		if command.startAfter == duration {
+			return node
+		}
+		if command.startAfter > 0 {
+			node.scope.poison(newError(ErrInvalid, "execute", "delay", node.key, "delay configured more than once"))
+			return node
+		}
+		command.startAfter = duration
+		node.scope.decision.commands[node.key] = command
+	}
 	return node
 }
 
-func (node *Node) Optional() *Node {
-	if !node.usable("optional") {
+func (node *Node[R]) Optional() *Node[R] {
+	if node == nil {
 		return node
 	}
-	if node.decl.optionalSet {
-		node.plan.poison(newError(ErrInvalid, "plan", "optional", node.decl.key, "optional configured more than once"))
+	if node.plan != nil {
+		if !node.planUsable("optional") {
+			return node
+		}
+		if node.decl.optionalSet {
+			return node
+		}
+		node.decl.optionalSet, node.decl.required = true, false
 		return node
 	}
-	node.decl.optionalSet, node.decl.required = true, false
+	if command, ok := node.decisionCommand("optional"); ok {
+		if !command.required {
+			return node
+		}
+		command.required = false
+		node.scope.decision.commands[node.key] = command
+	}
 	return node
 }
 
-func (node *Node) MaxAttempts(max int) *Node {
-	if !node.usable("max attempts") {
-		return node
-	}
-	if node.decl.maxAttemptsSet || node.decl.retrySet || max <= 0 {
-		node.plan.poison(newError(ErrInvalid, "plan", "retry policy", node.decl.key, "max attempts is invalid or duplicated"))
-		return node
-	}
-	node.decl.maxAttemptsSet = true
-	node.decl.maxAttempts = &max
-	return node
+func (node *Node[R]) planReadable(operation string) bool {
+	return node.planUsable(operation)
 }
 
-func (node *Node) RetryPolicy(policy RetryPolicy) *Node {
-	if !node.usable("retry policy") {
-		return node
-	}
-	if node.decl.retrySet || node.decl.maxAttemptsSet || validateRetryPolicy(policy) != nil {
-		node.plan.poison(newError(ErrInvalid, "plan", "retry policy", node.decl.key, "retry policy is invalid or duplicated"))
-		return node
-	}
-	copy := cloneRetryPolicy(policy)
-	node.decl.retrySet, node.decl.retryOverride = true, &copy
-	return node
-}
-
-func (node *Node) usable(operation string) bool {
-	if node == nil || node.plan == nil || node.decl == nil {
+func (node *Node[R]) planUsable(operation string) bool {
+	if node == nil {
 		return false
 	}
-	if node.plan.firstError != nil {
+	if node.plan == nil || node.decl == nil {
+		node.poison(newError(ErrInvalidState, "execute", operation, node.key, "modifier is available only in a plan"))
 		return false
 	}
-	_ = operation
-	return true
+	return node.plan.firstError == nil
+}
+
+func (node *Node[R]) decisionCommand(operation string) (stagedCommand, bool) {
+	if node.scope == nil || node.scope.firstError != nil {
+		return stagedCommand{}, false
+	}
+	if node.scope.terminal != nil {
+		node.scope.poison(newError(ErrInvalidState, "execute", operation, node.key, "coordinator is already terminal"))
+		return stagedCommand{}, false
+	}
+	command, ok := node.scope.decision.commands[node.key]
+	if !ok {
+		node.scope.poison(newError(ErrInvalidState, "execute", operation, node.key, "command is unavailable"))
+	}
+	return command, ok
+}
+
+func (node *Node[R]) poison(err error) {
+	if node == nil {
+		return
+	}
+	if node.plan != nil {
+		node.plan.poison(err)
+	} else if node.scope != nil {
+		node.scope.poison(err)
+	}
 }
 
 func (plan *Plan) poison(err error) {
@@ -436,16 +477,13 @@ func (plan *Plan) waitingDiagnostics() []string {
 func (plan *Plan) missingSelectors() []store.PlanEventSelector {
 	result := make([]store.PlanEventSelector, 0, len(plan.selectorMisses))
 	for selector := range plan.selectorMisses {
-		result = append(result, store.PlanEventSelector{Namespace: selector.namespace, Name: selector.name, Version: selector.version})
+		result = append(result, store.PlanEventSelector{Namespace: selector.namespace, Name: selector.name})
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Namespace != result[j].Namespace {
 			return result[i].Namespace < result[j].Namespace
 		}
-		if result[i].Name != result[j].Name {
-			return result[i].Name < result[j].Name
-		}
-		return result[i].Version < result[j].Version
+		return result[i].Name < result[j].Name
 	})
 	return result
 }
@@ -499,7 +537,7 @@ func (plan *Plan) validate() error {
 	}
 	for _, decl := range plan.declarations {
 		if decl.withinSet && len(decl.waits) == 0 {
-			return newError(ErrInvalid, "plan", "within", decl.key, "Within requires Await")
+			return newError(ErrInvalid, "plan", "within", decl.key, "Within requires WaitFor")
 		}
 		for _, group := range decl.groups {
 			for _, key := range group.keys {
@@ -603,13 +641,7 @@ func buildPlanReconciliation(snapshot store.PlanSnapshot, plan *Plan) (store.Pla
 			}
 			continue
 		}
-		defaults := decl.defaults
-		if decl.maxAttempts != nil {
-			defaults.retryPolicy = attemptRetryPolicy(*decl.maxAttempts)
-		} else if decl.retryOverride != nil {
-			defaults.retryPolicy = cloneRetryPolicy(*decl.retryOverride)
-		}
-		command, err := prepareCommand(ids[key].CommandID, key, decl.command, defaults, decl.args, "plan")
+		command, err := prepareCommand(ids[key].CommandID, key, decl.command, decl.defaults, decl.args, "plan")
 		if err != nil {
 			return store.PlanReconciliation{}, err
 		}
@@ -625,7 +657,7 @@ func buildPlanReconciliation(snapshot store.PlanSnapshot, plan *Plan) (store.Pla
 		}
 		command.Within = decl.within
 		for _, group := range decl.groups {
-			value := store.DependencyGroupCreate{ID: uuid.New(), Kind: group.kind, Threshold: cloneIntPointer(group.threshold)}
+			value := store.DependencyGroupCreate{ID: uuid.New(), Kind: group.kind}
 			for _, dependencyKey := range group.keys {
 				value.Members = append(value.Members, ids[dependencyKey])
 			}
@@ -633,7 +665,7 @@ func buildPlanReconciliation(snapshot store.PlanSnapshot, plan *Plan) (store.Pla
 		}
 		for _, wait := range decl.waits {
 			command.Waits = append(command.Waits, store.EventWaitCreate{
-				Namespace: wait.namespace, Name: wait.name, Version: wait.version,
+				Name: wait.name, Key: wait.key,
 			})
 		}
 		request.Commands = append(request.Commands, command)
@@ -643,36 +675,32 @@ func buildPlanReconciliation(snapshot store.PlanSnapshot, plan *Plan) (store.Pla
 
 func planDeclarationFingerprint(decl *planDeclaration) ([32]byte, error) {
 	type group struct {
-		Kind      string   `json:"kind"`
-		Threshold *int     `json:"threshold,omitempty"`
-		Keys      []string `json:"keys"`
+		Kind string   `json:"kind"`
+		Keys []string `json:"keys"`
 	}
 	type wait struct {
 		Namespace string `json:"namespace"`
 		Name      string `json:"name"`
-		Version   int    `json:"version"`
+		Key       string `json:"key"`
 	}
 	value := struct {
-		V             int             `json:"v"`
-		Key           string          `json:"key"`
-		Name          string          `json:"name"`
-		Version       int             `json:"version"`
-		Args          json.RawMessage `json:"args"`
-		Required      bool            `json:"required"`
-		Groups        []group         `json:"groups,omitempty"`
-		Waits         []wait          `json:"waits,omitempty"`
-		WithinMS      int64           `json:"within_ms,omitempty"`
-		DelayMS       int64           `json:"delay_ms,omitempty"`
-		MaxAttempts   *int            `json:"max_attempts,omitempty"`
-		RetryOverride json.RawMessage `json:"retry_override,omitempty"`
+		V        int             `json:"v"`
+		Key      string          `json:"key"`
+		Name     string          `json:"name"`
+		Version  int             `json:"version"`
+		Args     json.RawMessage `json:"args"`
+		Required bool            `json:"required"`
+		Groups   []group         `json:"groups,omitempty"`
+		Waits    []wait          `json:"waits,omitempty"`
+		WithinMS int64           `json:"within_ms,omitempty"`
+		DelayMS  int64           `json:"delay_ms,omitempty"`
 	}{
 		V: 1, Key: decl.key, Name: decl.command.Name, Version: decl.command.Version,
 		Args: json.RawMessage(decl.args.BytesCopy()), Required: decl.required,
 		WithinMS: decl.within.Milliseconds(), DelayMS: decl.delay.Milliseconds(),
-		MaxAttempts: cloneIntPointer(decl.maxAttempts),
 	}
 	for _, dependency := range decl.groups {
-		value.Groups = append(value.Groups, group{Kind: dependency.kind, Threshold: cloneIntPointer(dependency.threshold), Keys: append([]string(nil), dependency.keys...)})
+		value.Groups = append(value.Groups, group{Kind: dependency.kind, Keys: append([]string(nil), dependency.keys...)})
 	}
 	sort.Slice(value.Groups, func(i, j int) bool {
 		left, _ := canonical.Marshal(value.Groups[i], 0)
@@ -680,7 +708,7 @@ func planDeclarationFingerprint(decl *planDeclaration) ([32]byte, error) {
 		return bytes.Compare(left.Bytes, right.Bytes) < 0
 	})
 	for _, selector := range decl.waits {
-		value.Waits = append(value.Waits, wait{Namespace: selector.namespace, Name: selector.name, Version: selector.version})
+		value.Waits = append(value.Waits, wait{Namespace: selector.namespace, Name: selector.name, Key: selector.key})
 	}
 	sort.Slice(value.Waits, func(i, j int) bool {
 		if value.Waits[i].Namespace != value.Waits[j].Namespace {
@@ -689,15 +717,8 @@ func planDeclarationFingerprint(decl *planDeclaration) ([32]byte, error) {
 		if value.Waits[i].Name != value.Waits[j].Name {
 			return value.Waits[i].Name < value.Waits[j].Name
 		}
-		return value.Waits[i].Version < value.Waits[j].Version
+		return value.Waits[i].Key < value.Waits[j].Key
 	})
-	if decl.retryOverride != nil {
-		policy, err := retrypolicy.CanonicalPublic(*decl.retryOverride)
-		if err != nil {
-			return [32]byte{}, err
-		}
-		value.RetryOverride = json.RawMessage(policy.BytesCopy())
-	}
 	encoded, err := canonical.Marshal(value, 0)
 	if err != nil {
 		return [32]byte{}, newError(ErrInvalid, "plan", "command", decl.key, "declaration cannot be canonicalized")
@@ -751,7 +772,7 @@ func planEvaluationFingerprint(plan *Plan) (canonical.Value, error) {
 			availability = "available"
 		}
 		value.Reads = append(value.Reads, read{
-			Kind: "event", Identity: selector.namespace + ":" + selector.name + ":" + strconv.Itoa(selector.version),
+			Kind: "event", Identity: selector.namespace + ":" + selector.name,
 			Availability: availability,
 		})
 	}

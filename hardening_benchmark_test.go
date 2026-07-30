@@ -10,7 +10,6 @@ import (
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
-	"github.com/jackc/pgx/v5"
 )
 
 // BenchmarkExecutionIngressNotification measures the commit-path cost of the
@@ -70,10 +69,10 @@ func BenchmarkCoordinatorSparseOutcomeScan10K(b *testing.B) {
 		b.Fatal(err)
 	}
 	if _, err := database.DB.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "flow_journal")+` (
-		execution_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,event_version,
+		execution_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,
 		event_key,event_class,body,body_hash)
 		SELECT $1::uuid,1+n,md5(($1::uuid)::text || '/entry/' || n)::uuid,'event_recorded',clock_timestamp(),
-		       md5(($1::uuid)::text || '/event/' || n)::uuid,'application','benchmark.unrelated',1,'event/' || n,
+		       md5(($1::uuid)::text || '/event/' || n)::uuid,'application','benchmark.unrelated','event/' || n,
 		       'application','{}'::text::bytea,decode(repeat('00',32),'hex')
 		FROM generate_series(1,10000) rows(n)`, executionID); err != nil {
 		b.Fatal(err)
@@ -121,23 +120,34 @@ func BenchmarkInspection100Commands(b *testing.B) {
 				b.Fatal(err)
 			}
 			command := DefineCommand[None, None]("benchmark.inspection.command", 1)
-			plan := DefinePlan[None]("benchmark.inspection.plan", 1, func(*Plan, None) {})
+			plan := DefinePlan[None]("benchmark.inspection.plan", 1, func(plan *Plan, _ None) {
+				for index := range 100 {
+					Execute(plan, fmt.Sprintf("work/%03d", index), command, None{})
+				}
+			})
+			if err := runtime.Register(plan); err != nil {
+				b.Fatal(err)
+			}
+			runCtx, cancel := context.WithCancel(ctx)
+			runResult := make(chan error, 1)
+			go func() { runResult <- runtime.Run(runCtx) }()
+			defer func() {
+				cancel()
+				<-runResult
+			}()
 			handle, err := plan.With(runtime).Execute(ctx, "inspection", None{}, WithoutExecutionDeadline())
 			if err != nil {
 				b.Fatal(err)
 			}
-			tx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
-			if err != nil {
-				b.Fatal(err)
-			}
-			for index := range 100 {
-				if _, err := Issue(ctx, runtime.InTx(tx), handle.ID, fmt.Sprintf("work/%03d", index), command, None{}); err != nil {
-					_ = tx.Rollback(ctx)
-					b.Fatal(err)
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				var count int
+				var dirty bool
+				if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count,plan_dirty FROM `+
+					pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).Scan(&count, &dirty); err == nil && count == 100 && !dirty {
+					break
 				}
-			}
-			if err := tx.Commit(ctx); err != nil {
-				b.Fatal(err)
+				time.Sleep(5 * time.Millisecond)
 			}
 			b.ResetTimer()
 			for range b.N {
@@ -173,7 +183,7 @@ func TestJournalGrowthMeasurement100Commands(t *testing.T) {
 	command := DefineCommand[None, None]("measure.journal.command", 1)
 	plan := DefinePlan[None]("measure.journal.plan", 1, func(plan *Plan, _ None) {
 		for index := range 100 {
-			Do(plan, fmt.Sprintf("work/%03d", index), command, None{})
+			Execute(plan, fmt.Sprintf("work/%03d", index), command, None{})
 		}
 	})
 	if err := runtime.Register(plan); err != nil {

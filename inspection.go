@@ -57,31 +57,6 @@ func GetExecution(ctx context.Context, c Client, id ExecutionID) (Execution, err
 	return executionFromStore(row), nil
 }
 
-func LookupExecution(ctx context.Context, c Client, typ, key string) (Execution, error) {
-	if err := definition.ValidateName(typ); err != nil {
-		return Execution{}, newError(ErrInvalid, "lookup", "execution type", typ, "invalid definition name")
-	}
-	if key == "" || len(key) > maxExecutionKeyBytes || !utf8.ValidString(key) {
-		return Execution{}, newError(ErrInvalid, "lookup", "execution key", "", "key is empty, malformed, or too long")
-	}
-	client, err := resolveClient(c)
-	if err != nil {
-		return Execution{}, err
-	}
-	rows, err := client.runtime.store.LookupExecutionInTx(ctx, client.tx, typ, key)
-	if err != nil {
-		return Execution{}, err
-	}
-	switch len(rows) {
-	case 0:
-		return Execution{}, newError(ErrNotFound, "lookup", "execution", typ+"/"+key, "execution does not exist")
-	case 1:
-		return executionFromStore(rows[0]), nil
-	default:
-		return Execution{}, newError(ErrConflict, "lookup", "execution", typ+"/"+key, "key exists in more than one driver mode")
-	}
-}
-
 // LookupLiveExecution finds the one non-terminal execution currently holding
 // a live-scoped key for the definition, if any. Live keys admit many settled
 // executions per key over time but at most one live holder; this is the
@@ -215,7 +190,7 @@ func executionFromStore(row store.ExecutionRow) Execution {
 		CommandCount: row.CommandCount, OpenCommands: row.OpenCommands, PlanDirty: row.PlanDirty,
 		PlanQuiescent: row.PlanQuiescent, PlanRevision: PlanRevision(row.PlanRevision),
 		PlanWaitingCount: row.PlanWaitingCount, PlanWaitingOn: append([]string(nil), row.PlanWaitingOn...),
-		DeadlineAt: cloneTimePointer(row.DeadlineAt), OutcomeRef: row.OutcomeRef,
+		DeadlineAt:  cloneTimePointer(row.DeadlineAt),
 		FailureCode: row.FailureCode, FailureMessage: row.FailureMessage,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StatusAt: row.StatusAt,
 		FinishedAt: cloneTimePointer(row.FinishedAt), Metadata: json.RawMessage(append([]byte(nil), row.Metadata...)),

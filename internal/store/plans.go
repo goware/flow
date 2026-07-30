@@ -49,14 +49,12 @@ type PlanCommandSnapshot struct {
 type PlanEventSelector struct {
 	Namespace string
 	Name      string
-	Version   int
 }
 
 type PlanEventSnapshot struct {
 	Position  int64
 	Namespace string
 	Name      string
-	Version   int
 	Key       string
 	Payload   []byte
 }
@@ -235,21 +233,21 @@ func (s *Store) loadPlanEventSelectorsLocked(
 	through int64,
 	selectors []PlanEventSelector,
 ) ([]PlanEventSnapshot, error) {
-	args := make([]any, 0, 2+len(selectors)*3)
+	args := make([]any, 0, 2+len(selectors)*2)
 	args = append(args, semantic.ExecutionID(), through)
 	var predicates strings.Builder
 	for index, selector := range selectors {
-		if selector.Namespace == "" || selector.Name == "" || selector.Version <= 0 {
+		if selector.Namespace != "application" || selector.Name == "" {
 			return nil, fmt.Errorf("%w: invalid plan event selector", flowerr.ErrInvalid)
 		}
 		if index > 0 {
 			predicates.WriteString(" OR ")
 		}
-		first := 3 + index*3
-		fmt.Fprintf(&predicates, "(event_namespace=$%d AND event_name=$%d AND event_version=$%d)", first, first+1, first+2)
-		args = append(args, selector.Namespace, selector.Name, int32(selector.Version))
+		first := 3 + index*2
+		fmt.Fprintf(&predicates, "(event_namespace=$%d AND event_name=$%d)", first, first+1)
+		args = append(args, selector.Namespace, selector.Name)
 	}
-	query := `SELECT position,event_namespace,event_name,event_version,COALESCE(event_key,''),body
+	query := `SELECT position,event_namespace,event_name,COALESCE(event_key,''),body
 		FROM ` + pgschema.Table(s.schema, "flow_journal") + `
 		WHERE execution_id=$1 AND position<=$2 AND entry_kind='event_recorded' AND (` + predicates.String() + `)
 		ORDER BY position`
@@ -262,25 +260,14 @@ func (s *Store) loadPlanEventSelectorsLocked(
 	for rows.Next() {
 		var event PlanEventSnapshot
 		var body []byte
-		if err := rows.Scan(&event.Position, &event.Namespace, &event.Name, &event.Version, &event.Key, &body); err != nil {
+		if err := rows.Scan(&event.Position, &event.Namespace, &event.Name, &event.Key, &body); err != nil {
 			return nil, MapError("scan selected plan event", err)
 		}
-		switch event.Namespace {
-		case "application":
-			decoded, err := journalcodec.Decode[journalcodec.ApplicationEventBody](body)
-			if err != nil {
-				return nil, err
-			}
-			event.Payload = slices.Clone(decoded.Payload)
-		case "command_success":
-			decoded, err := journalcodec.Decode[journalcodec.CommandSucceededBody](body)
-			if err != nil {
-				return nil, err
-			}
-			event.Payload = slices.Clone(decoded.Result)
-		default:
-			return nil, fmt.Errorf("%w: unsupported plan event namespace", flowerr.ErrInvalidState)
+		decoded, err := journalcodec.Decode[journalcodec.ApplicationEventBody](body)
+		if err != nil {
+			return nil, err
 		}
+		event.Payload = slices.Clone(decoded.Payload)
 		result = append(result, event)
 	}
 	if err := rows.Err(); err != nil {
@@ -587,8 +574,6 @@ func (s *Store) FailPlanLocked(ctx context.Context, semantic *SemanticTx, code, 
 	planFailed.EventID = &planEventID
 	planFailed.EventNamespace = stringPointer("runtime")
 	planFailed.EventName = stringPointer("flow.plan_failed")
-	version := 1
-	planFailed.EventVersion = &version
 	planFailed.EventClass = stringPointer("plan_terminal")
 	planFailed.TerminalStatus = stringPointer("failed")
 	entries := []JournalEntry{planFailed}

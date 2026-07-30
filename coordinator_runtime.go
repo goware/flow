@@ -1,6 +1,7 @@
 package flow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -99,6 +100,7 @@ func (r *Runtime) executeCoordinatorClaim(definition erasedCoordinator, claim st
 		return
 	}
 	scope := &coordinatorScope{state: state}
+	ctx = withAttemptScope(ctx, &scope.scope)
 	handler, received, err := coordinatorHandlerForClaim(definition, claim)
 	if err != nil {
 		r.concludeCoordinator(claim, classifiedConclusion{class: "permanent", code: "delivery_decode", message: safeErrorMessage(err)})
@@ -134,6 +136,10 @@ func (r *Runtime) executeCoordinatorClaim(definition erasedCoordinator, claim st
 		r.concludeCoordinator(claim, classifiedConclusion{class: "permanent", code: "state_encode", message: "coordinator state is invalid or too large"})
 		return
 	}
+	if terminal := scope.scope.terminal; terminal != nil && !bytes.Equal(terminal.state.Bytes, encodedState.Bytes) {
+		r.concludeCoordinator(claim, classifiedConclusion{class: "permanent", code: "invalid_decision", message: "coordinator state changed after terminal decision"})
+		return
+	}
 	events, children, err := prepareCoordinatorDecision(scope)
 	if err != nil {
 		r.concludeCoordinator(claim, classifiedConclusion{class: "permanent", code: "invalid_decision", message: safeErrorMessage(err)})
@@ -143,7 +149,7 @@ func (r *Runtime) executeCoordinatorClaim(definition erasedCoordinator, claim st
 	if terminal := scope.scope.terminal; terminal != nil {
 		switch terminal.kind {
 		case coordinatorSucceeded:
-			request.Terminal, request.ResultRef = "succeeded", terminal.resultRef
+			request.Terminal = "succeeded"
 		case coordinatorFailed:
 			request.Terminal, request.Reason = "failed", safeErrorMessage(terminal.reason)
 		}
@@ -151,8 +157,14 @@ func (r *Runtime) executeCoordinatorClaim(definition erasedCoordinator, claim st
 	for attempt := 0; attempt < settlementAttempts; attempt++ {
 		result, settleErr := r.store.SettleCoordinatorSuccess(context.Background(), request, r.faults)
 		if settleErr == nil {
+			for _, event := range events {
+				r.observe(context.Background(), Observation{
+					Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
+					ExecutionID: ExecutionID(claim.ExecutionID.String()), Name: event.Name, Worker: r.replicaName(),
+				})
+			}
 			r.observe(context.Background(), Observation{Kind: ObservationCoordinator, Operation: "settle", Outcome: result.Status,
-				ExecutionID: ExecutionID(claim.ExecutionID.String()), Name: claim.Name, Version: claim.Version, Worker: r.replicaName()})
+				ExecutionID: ExecutionID(claim.ExecutionID.String()), Name: claim.Name, Version: claim.Version, Worker: r.replicaName(), Count: int64(len(events))})
 			return
 		}
 		if errors.Is(settleErr, ErrLeaseLost) || errors.Is(settleErr, ErrTerminal) {
@@ -177,7 +189,7 @@ func coordinatorHandlerForClaim(definition erasedCoordinator, claim store.Claime
 		return &handler, nil, nil
 	}
 	selector := coordinatorSelector{kind: coordinatorEvent, namespace: claim.Delivery.Namespace,
-		name: claim.Delivery.Name, version: claim.Delivery.Version}
+		name: claim.Delivery.Name}
 	if claim.Delivery.TerminalStatus != "" {
 		outcome := coordinatorSelector{kind: coordinatorOutcome, namespace: "command_terminal",
 			name: claim.Delivery.CommandName, version: claim.Delivery.CommandVersion}
@@ -214,23 +226,28 @@ func invokeCoordinator(ctx context.Context, handler erasedCoordinatorHandler, sc
 }
 
 func prepareCoordinatorDecision(scope *coordinatorScope) ([]store.ApplicationEvent, []store.CommandCreate, error) {
-	events := make([]store.ApplicationEvent, 0, len(scope.scope.decision.events))
-	for _, staged := range scope.scope.decision.orderedEvents() {
-		body, err := canonical.Marshal(journalcodec.ApplicationEventBody{V: 1, Payload: json.RawMessage(staged.payload.BytesCopy())}, 0)
+	stagedEvents := scope.scope.decision.orderedEvents()
+	events := make([]store.ApplicationEvent, 0, len(stagedEvents))
+	for _, staged := range stagedEvents {
+		body, err := canonical.Marshal(journalcodec.ApplicationEventBody{
+			V: 1, Payload: json.RawMessage(staged.payload.BytesCopy()),
+		}, 0)
 		if err != nil {
 			return nil, nil, newError(ErrInvalid, "settle", "event", staged.key, "event body cannot be journaled")
 		}
-		events = append(events, store.ApplicationEvent{ID: uuid.New(), Name: staged.definition.Name, Version: staged.definition.Version, Key: staged.key, Body: body})
+		events = append(events, store.ApplicationEvent{
+			ID: uuid.New(), Name: staged.definition.Name, Key: staged.key, Body: body,
+		})
 	}
 	children := make([]store.CommandCreate, 0, len(scope.scope.decision.commands))
 	for _, staged := range scope.scope.decision.orderedCommands() {
-		child, err := prepareCommand(uuid.New(), staged.key, staged.definition, staged.defaults, staged.args, "coordinator_spawn")
+		child, err := prepareCommand(uuid.New(), staged.key, staged.definition, staged.defaults, staged.args, "coordinator_command")
 		if err != nil {
 			return nil, nil, err
 		}
 		child.Required = staged.required
 		if staged.startAfter > 0 {
-			child.ScheduleKind, child.InitialDelay = "spawn_start_after", staged.startAfter
+			child.ScheduleKind, child.InitialDelay = "execute_delay", staged.startAfter
 		}
 		declaration, err := canonical.Marshal(struct {
 			V            int             `json:"v"`

@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -42,19 +43,25 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 				t.Fatalf("create commit table: %v", err)
 			}
 			command := DefineCommand[runtimeArgs, runtimeResult]("fault.command."+string(point), 1)
+			child := DefineCommand[None, None]("fault.child."+string(point), 1)
+			event := DefineEvent[runtimeResult]("fault.event." + string(point))
 			var calls atomic.Int32
 			runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-				WithPollInterval(5*time.Millisecond), WithCommandLease(300*time.Millisecond))
+				WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond))
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			if err := runtime.Register(Handle(command, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
+			if err := runtime.Register(Handle(command, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
 				calls.Add(1)
+				if err := Emit(work, event, "accepted", runtimeResult{Value: "ok"}); err != nil {
+					return runtimeResult{}, err
+				}
+				Execute(work, "child", child, None{})
 				return runtimeResult{Value: "ok"}, nil
 			}, WithCommit(func(ctx context.Context, tx Tx, commit Commit[runtimeArgs, runtimeResult]) error {
 				_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "fault_commit")+` (command_id) VALUES ($1)`, commit.Info.CommandID)
 				return err
-			}))); err != nil {
+			})), Handle(child, func(context.Context, *Work[None]) (None, error) { return None{}, nil })); err != nil {
 				t.Fatalf("Register() error = %v", err)
 			}
 			var hookMu sync.Mutex
@@ -78,17 +85,18 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 			if calls.Load() != 1 {
 				t.Fatalf("worker calls = %d", calls.Load())
 			}
-			var starts, conclusions, terminalEvents int
+			var starts, conclusions, terminalEvents, applicationEvents int
 			if err := database.DB.Conn.QueryRow(ctx, `SELECT
 				count(*) FILTER (WHERE entry_kind='attempt_started'),
 				count(*) FILTER (WHERE entry_kind='attempt_concluded'),
-				count(*) FILTER (WHERE entry_kind='event_recorded' AND event_class='command_terminal')
+				count(*) FILTER (WHERE entry_kind='event_recorded' AND event_class='command_terminal'),
+				count(*) FILTER (WHERE entry_kind='event_recorded' AND event_class='application')
 				FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, handle.ID).
-				Scan(&starts, &conclusions, &terminalEvents); err != nil {
+				Scan(&starts, &conclusions, &terminalEvents, &applicationEvents); err != nil {
 				t.Fatalf("count history: %v", err)
 			}
-			if starts != 1 || conclusions != 1 || terminalEvents != 1 {
-				t.Fatalf("history starts=%d conclusions=%d terminal=%d", starts, conclusions, terminalEvents)
+			if starts != 2 || conclusions != 2 || terminalEvents != 2 || applicationEvents != 1 {
+				t.Fatalf("history starts=%d conclusions=%d terminal=%d application=%d", starts, conclusions, terminalEvents, applicationEvents)
 			}
 			var commitRows int
 			if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "fault_commit")+`
@@ -107,15 +115,21 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatalf("Migrate() error = %v", err)
 	}
-	command := DefineCommand[runtimeArgs, runtimeResult]("fault.settlement_outage", 1, WithMaxAttempts(1))
+	command := DefineCommand[runtimeArgs, runtimeResult]("fault.settlement_outage", 1, WithRetry(Attempts(1)))
+	event := DefineEvent[runtimeResult]("fault.settlement_outage_event")
+	child := DefineCommand[runtimeArgs, runtimeResult]("fault.settlement_outage_child", 1)
 	first, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(90*time.Millisecond))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(90*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New(first) error = %v", err)
 	}
 	firstReturned := make(chan struct{}, 1)
-	if err := first.Register(Handle(command, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
+	if err := first.Register(Handle(command, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
 		firstReturned <- struct{}{}
+		if err := Emit(work, event, "settled", runtimeResult{Value: "unsettled"}); err != nil {
+			return runtimeResult{}, err
+		}
+		Execute(work, "discarded-child", child, runtimeArgs{Value: "unsettled"})
 		return runtimeResult{Value: "unsettled"}, nil
 	})); err != nil {
 		t.Fatalf("Register(first) error = %v", err)
@@ -141,11 +155,14 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 	stopRuntime(t, cancelFirst, firstResult)
 
 	second, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(90*time.Millisecond))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(90*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New(second) error = %v", err)
 	}
-	if err := second.Register(Handle(command, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
+	if err := second.Register(Handle(command, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
+		if err := Emit(work, event, "settled", runtimeResult{Value: "recovered"}); err != nil {
+			return runtimeResult{}, err
+		}
 		return runtimeResult{Value: "recovered"}, nil
 	})); err != nil {
 		t.Fatalf("Register(second) error = %v", err)
@@ -163,5 +180,25 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 		trace.Commands[0].Attempts[1].Classification != "succeeded" ||
 		trace.Commands[0].FailureCode != "" {
 		t.Fatalf("outage Trace = %#v", trace)
+	}
+	applicationEvents := 0
+	for _, recorded := range trace.Events {
+		if recorded.Class == "application" {
+			applicationEvents++
+			if !strings.Contains(string(recorded.Body), "recovered") || strings.Contains(string(recorded.Body), "unsettled") {
+				t.Fatalf("lost lease retained stale event body %s", recorded.Body)
+			}
+		}
+	}
+	if applicationEvents != 1 {
+		t.Fatalf("outage application events=%d trace=%#v", applicationEvents, trace.Events)
+	}
+	var childCount int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
+		WHERE execution_id=$1 AND parent_command_id IS NOT NULL`, handle.ID).Scan(&childCount); err != nil {
+		t.Fatal(err)
+	}
+	if childCount != 0 {
+		t.Fatalf("lost lease exposed %d staged children", childCount)
 	}
 }

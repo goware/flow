@@ -29,7 +29,7 @@ type ingressState struct {
 	Count int `json:"count"`
 }
 
-func TestExecutionStartsIssueAndPublish(t *testing.T) {
+func TestExecutionStartsAndEventEmit(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -74,43 +74,15 @@ func TestExecutionStartsIssueAndPublish(t *testing.T) {
 	}
 	assertExecutionShape(t, database.Schema, database.DB.Conn, planned, "plan", 0, 0, true)
 
-	issuedID, err := Issue(ctx, runtime, planned.ID, "external", command, ingressArgs{Value: "issued"})
-	if err != nil {
-		t.Fatalf("Issue() error = %v", err)
+	event := DefineEvent[ingressArgs]("ingress.fact")
+	if err := event.Emit(ctx, runtime, planned.ID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
+		t.Fatalf("Emit() error = %v", err)
 	}
-	issuedAgain, err := Issue(ctx, runtime, planned.ID, "external", command, ingressArgs{Value: "issued"})
-	if err != nil || issuedAgain != issuedID {
-		t.Fatalf("repeated Issue() = %s, %v", issuedAgain, err)
+	if err := event.Emit(ctx, runtime, planned.ID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
+		t.Fatalf("repeated Emit() error = %v", err)
 	}
-	retuned := DefineCommand[ingressArgs, ingressResult]("ingress.work", 1, WithQueue("retuned"), WithMaxAttempts(8))
-	issuedRetuned, err := Issue(ctx, runtime, planned.ID, "external", retuned, ingressArgs{Value: "issued"})
-	if err != nil || issuedRetuned != issuedID {
-		t.Fatalf("Issue() under retuned defaults = %s, %v", issuedRetuned, err)
-	}
-	var acceptedQueue string
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT queue FROM `+pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1`, issuedID).Scan(&acceptedQueue); err != nil || acceptedQueue != "default" {
-		t.Fatalf("accepted Issue queue = %q, %v", acceptedQueue, err)
-	}
-	if _, err := Issue(ctx, runtime, planned.ID, "external", command, ingressArgs{Value: "changed"}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("conflicting Issue() error = %v", err)
-	}
-	if _, err := Issue(ctx, runtime, direct.ID, "invalid", command, ingressArgs{}); !errors.Is(err, ErrInvalidState) {
-		t.Fatalf("Issue(direct) error = %v", err)
-	}
-
-	eventV1 := DefineEvent[ingressArgs]("ingress.fact", 1)
-	if err := Publish(ctx, runtime, planned.ID, eventV1, "fact/1", ingressArgs{Value: "seen"}); err != nil {
-		t.Fatalf("Publish() error = %v", err)
-	}
-	if err := Publish(ctx, runtime, planned.ID, eventV1, "fact/1", ingressArgs{Value: "seen"}); err != nil {
-		t.Fatalf("repeated Publish() error = %v", err)
-	}
-	if err := Publish(ctx, runtime, planned.ID, eventV1, "fact/1", ingressArgs{Value: "changed"}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("conflicting Publish() error = %v", err)
-	}
-	eventV2 := DefineEvent[ingressArgs]("ingress.fact", 2)
-	if err := Publish(ctx, runtime, planned.ID, eventV2, "fact/1", ingressArgs{Value: "seen"}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("cross-version Publish() error = %v", err)
+	if err := event.Emit(ctx, runtime, planned.ID, "fact/1", ingressArgs{Value: "changed"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflicting Emit() error = %v", err)
 	}
 
 	coordinatorCalled := false
@@ -226,7 +198,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	command := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1,
-		WithQueue("original"), WithMaxAttempts(3), WithTimeout(111*time.Millisecond))
+		WithQueue("original"), WithRetry(Attempts(3)), WithTimeout(111*time.Millisecond))
 	const callers = 16
 	handles := make([]ExecutionHandle, callers)
 	errs := make([]error, callers)
@@ -261,7 +233,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 		t.Fatalf("New(changed defaults) error = %v", err)
 	}
 	changedCommand := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1,
-		WithQueue("changed"), WithMaxAttempts(9), WithTimeout(999*time.Millisecond))
+		WithQueue("changed"), WithRetry(Attempts(9)), WithTimeout(999*time.Millisecond))
 	repeated, err := changedCommand.With(changedRuntime).Execute(ctx, "same", ingressArgs{Value: "stable"})
 	if err != nil || repeated.Created || repeated.ID != handles[0].ID {
 		t.Fatalf("start under changed defaults = %#v, %v", repeated, err)
@@ -285,21 +257,15 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan.Execute() error = %v", err)
 	}
-	if _, err := Issue(ctx, runtime, planned.ID, "one", command, ingressArgs{}); err != nil {
-		t.Fatalf("Issue(first) error = %v", err)
-	}
-	if _, err := Issue(ctx, runtime, planned.ID, "two", command, ingressArgs{}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("Issue(over ceiling) error = %v", err)
-	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, planned, "plan", 1, 1, true)
-	fact := DefineEvent[ingressArgs]("ceiling.fact", 1)
+	assertExecutionShape(t, database.Schema, database.DB.Conn, planned, "plan", 0, 0, true)
+	fact := DefineEvent[ingressArgs]("ceiling.fact")
 	publishErrors := make(chan error, callers)
 	for range callers {
-		go func() { publishErrors <- Publish(ctx, runtime, planned.ID, fact, "same", ingressArgs{Value: "fact"}) }()
+		go func() { publishErrors <- fact.Emit(ctx, runtime, planned.ID, "same", ingressArgs{Value: "fact"}) }()
 	}
 	for range callers {
 		if err := <-publishErrors; err != nil {
-			t.Fatalf("concurrent Publish() error = %v", err)
+			t.Fatalf("concurrent Emit() error = %v", err)
 		}
 	}
 	var eventCount int
@@ -326,18 +292,18 @@ func TestTransactionExecutionOrdering(t *testing.T) {
 	second, _ := plan.With(runtime).Execute(ctx, "two", ingressArgs{})
 	ids := []ExecutionID{first.ID, second.ID}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	fact := DefineEvent[ingressArgs]("order.fact", 1)
+	fact := DefineEvent[ingressArgs]("order.fact")
 
 	tx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		t.Fatalf("BeginTx() error = %v", err)
 	}
 	client := runtime.InTx(tx)
-	if err := Publish(ctx, client, ids[1], fact, "high", ingressArgs{}); err != nil {
-		t.Fatalf("Publish(high) error = %v", err)
+	if err := fact.Emit(ctx, client, ids[1], "high", ingressArgs{}); err != nil {
+		t.Fatalf("Emit(high) error = %v", err)
 	}
-	if err := Publish(ctx, client, ids[0], fact, "low", ingressArgs{}); !errors.Is(err, ErrInvalidState) {
-		t.Fatalf("Publish(reverse order) error = %v", err)
+	if err := fact.Emit(ctx, client, ids[0], "low", ingressArgs{}); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("Emit(reverse order) error = %v", err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatalf("Rollback() error = %v", err)
@@ -348,11 +314,11 @@ func TestTransactionExecutionOrdering(t *testing.T) {
 		t.Fatalf("BeginTx(ordered) error = %v", err)
 	}
 	client = runtime.InTx(tx)
-	if err := Publish(ctx, client, ids[0], fact, "low", ingressArgs{}); err != nil {
-		t.Fatalf("Publish(low) error = %v", err)
+	if err := fact.Emit(ctx, client, ids[0], "low", ingressArgs{}); err != nil {
+		t.Fatalf("Emit(low) error = %v", err)
 	}
-	if err := Publish(ctx, client, ids[1], fact, "high", ingressArgs{}); err != nil {
-		t.Fatalf("Publish(high ordered) error = %v", err)
+	if err := fact.Emit(ctx, client, ids[1], "high", ingressArgs{}); err != nil {
+		t.Fatalf("Emit(high ordered) error = %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("Commit() error = %v", err)
@@ -401,17 +367,17 @@ func TestRuntimeAndIngressValidation(t *testing.T) {
 	if _, err := command.With(runtime).Execute(ctx, "large", large); !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("Execute(large args) error = %v", err)
 	}
-	if err := Publish(ctx, runtime, ExecutionID("bad"), DefineEvent[ingressArgs]("event", 1), "key", ingressArgs{}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("Publish(invalid ID) error = %v", err)
+	if err := DefineEvent[ingressArgs]("event").Emit(ctx, runtime, ExecutionID("bad"), "key", ingressArgs{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Emit(invalid ID) error = %v", err)
 	}
 	plan := DefinePlan[ingressArgs]("validation.plan", 1, func(*Plan, ingressArgs) {})
 	handle, err := plan.With(runtime).Execute(ctx, "validation/event-size", ingressArgs{})
 	if err != nil {
 		t.Fatalf("Plan.Execute(event size) error = %v", err)
 	}
-	largeEvent := DefineEvent[ingressArgs]("validation.large_event", 1)
-	if err := Publish(ctx, runtime, handle.ID, largeEvent, "large", ingressArgs{Value: strings.Repeat("x", maxApplicationEventBytes)}); !errors.Is(err, ErrPayloadTooLarge) {
-		t.Fatalf("Publish(large payload) error = %v", err)
+	largeEvent := DefineEvent[ingressArgs]("validation.large_event")
+	if err := largeEvent.Emit(ctx, runtime, handle.ID, "large", ingressArgs{Value: strings.Repeat("x", maxApplicationEventBytes)}); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("Emit(large payload) error = %v", err)
 	}
 	if err := CancelExecution(ctx, runtime, ExecutionID("bad"), "reason"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("CancelExecution(invalid ID) error = %v", err)
@@ -478,13 +444,9 @@ func TestIngressCancellationAndTerminalIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan.Execute() error = %v", err)
 	}
-	issued, err := Issue(ctx, runtime, planned.ID, "issued", command, ingressArgs{Value: "stable"})
-	if err != nil {
-		t.Fatalf("Issue() error = %v", err)
-	}
-	fact := DefineEvent[ingressArgs]("cancel.fact", 1)
-	if err := Publish(ctx, runtime, planned.ID, fact, "fact", ingressArgs{Value: "before"}); err != nil {
-		t.Fatalf("Publish() error = %v", err)
+	fact := DefineEvent[ingressArgs]("cancel.fact")
+	if err := fact.Emit(ctx, runtime, planned.ID, "fact", ingressArgs{Value: "before"}); err != nil {
+		t.Fatalf("Emit() error = %v", err)
 	}
 	if err := CancelExecution(ctx, runtime, planned.ID, "stop plan"); err != nil {
 		t.Fatalf("CancelExecution() error = %v", err)
@@ -492,18 +454,11 @@ func TestIngressCancellationAndTerminalIdempotency(t *testing.T) {
 	if err := CancelExecution(ctx, runtime, planned.ID, "stop plan"); err != nil {
 		t.Fatalf("idempotent CancelExecution() error = %v", err)
 	}
-	issuedAgain, err := Issue(ctx, runtime, planned.ID, "issued", command, ingressArgs{Value: "stable"})
-	if err != nil || issuedAgain != issued {
-		t.Fatalf("idempotent Issue(after terminal) = %s, %v", issuedAgain, err)
+	if err := fact.Emit(ctx, runtime, planned.ID, "fact", ingressArgs{Value: "before"}); err != nil {
+		t.Fatalf("idempotent Emit(after terminal) error = %v", err)
 	}
-	if _, err := Issue(ctx, runtime, planned.ID, "new", command, ingressArgs{}); !errors.Is(err, ErrTerminal) {
-		t.Fatalf("new Issue(after terminal) error = %v", err)
-	}
-	if err := Publish(ctx, runtime, planned.ID, fact, "fact", ingressArgs{Value: "before"}); err != nil {
-		t.Fatalf("idempotent Publish(after terminal) error = %v", err)
-	}
-	if err := Publish(ctx, runtime, planned.ID, fact, "new", ingressArgs{}); !errors.Is(err, ErrTerminal) {
-		t.Fatalf("new Publish(after terminal) error = %v", err)
+	if err := fact.Emit(ctx, runtime, planned.ID, "new", ingressArgs{}); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("new Emit(after terminal) error = %v", err)
 	}
 	var dirty bool
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT status,plan_dirty FROM `+pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, planned.ID).Scan(&executionStatus, &dirty); err != nil {
@@ -511,28 +466,6 @@ func TestIngressCancellationAndTerminalIdempotency(t *testing.T) {
 	}
 	if executionStatus != "cancelled" || dirty {
 		t.Fatalf("cancelled plan = %s dirty=%v", executionStatus, dirty)
-	}
-
-	failingPlan, err := plan.With(runtime).Execute(ctx, "cancel/failing-plan", ingressArgs{})
-	if err != nil {
-		t.Fatalf("Plan.Execute(failing) error = %v", err)
-	}
-	failingCommand, err := Issue(ctx, runtime, failingPlan.ID, "required", command, ingressArgs{})
-	if err != nil {
-		t.Fatalf("Issue(failing) error = %v", err)
-	}
-	if err := CancelCommand(ctx, runtime, failingCommand, "command stopped"); err != nil {
-		t.Fatalf("CancelCommand(plan) error = %v", err)
-	}
-	var open int
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT status,plan_dirty,open_commands FROM `+pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, failingPlan.ID).Scan(&executionStatus, &dirty, &open); err != nil {
-		t.Fatalf("read failing plan: %v", err)
-	}
-	if executionStatus != "failing" || !dirty || open != 0 {
-		t.Fatalf("failing plan = %s dirty=%v open=%d", executionStatus, dirty, open)
-	}
-	if err := CancelExecution(ctx, runtime, failingPlan.ID, "finish test"); err != nil {
-		t.Fatalf("CancelExecution(failing plan) error = %v", err)
 	}
 
 	history, err := History(ctx, runtime, direct.ID, HistoryLimit(2))

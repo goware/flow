@@ -2,10 +2,10 @@ package flow
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
@@ -24,7 +24,7 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	command := DefineCommand[runtimeArgs, runtimeResult]("claim.handled", 1)
+	command := DefineCommand[runtimeArgs, runtimeResult]("claim.plan.handled", 1)
 	handle, err := command.With(runtime).Execute(ctx, "locked", runtimeArgs{})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
@@ -73,18 +73,13 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan.Execute() error = %v", err)
 	}
-	unhandled := DefineCommand[runtimeArgs, runtimeResult]("claim.unhandled", 1)
-	for index := range 100 {
-		if _, err := Issue(ctx, runtime, planned.ID, fmt.Sprintf("unhandled/%03d", index), unhandled, runtimeArgs{}); err != nil {
-			t.Fatalf("Issue(unhandled %d) error = %v", index, err)
-		}
-	}
-	handledID, err := Issue(ctx, runtime, planned.ID, "handled", command, runtimeArgs{})
+	executionID, err := uuid.Parse(string(planned.ID))
 	if err != nil {
-		t.Fatalf("Issue(handled) error = %v", err)
+		t.Fatal(err)
 	}
+	seedClaimPlanRows(t, database.Schema, database.DB.Conn, executionID, 101)
 	candidates, err = runtime.store.ProbeCommands(ctx, kinds, 1)
-	if err != nil || len(candidates) != 1 || candidates[0].CommandID.String() != string(handledID) {
+	if err != nil || len(candidates) != 1 || candidates[0].Name != command.Name() {
 		t.Fatalf("handled probe behind backlog = %#v, %v", candidates, err)
 	}
 }

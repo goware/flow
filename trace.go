@@ -29,7 +29,6 @@ type Execution struct {
 	PlanWaitingCount int
 	PlanWaitingOn    []string
 	DeadlineAt       *time.Time
-	OutcomeRef       string
 	FailureCode      string
 	FailureMessage   string
 	CreatedAt        time.Time
@@ -97,15 +96,13 @@ type TraceCommand struct {
 }
 
 type TraceDependencyGroup struct {
-	Kind      string
-	Threshold *int
-	Members   []string
+	Kind    string
+	Members []string
 }
 
 type TraceEventWait struct {
-	Namespace string
-	Name      string
-	Version   int
+	Name string
+	Key  string
 }
 
 type TraceEvent struct {
@@ -113,7 +110,6 @@ type TraceEvent struct {
 	Position          JournalPosition
 	Namespace         string
 	Name              string
-	Version           int
 	Key               string
 	Class             string
 	TerminalStatus    string
@@ -255,11 +251,11 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		}
 		for _, group := range command.Dependencies {
 			item.Dependencies = append(item.Dependencies, TraceDependencyGroup{
-				Kind: group.Kind, Threshold: cloneIntPointer(group.Threshold), Members: append([]string(nil), group.Members...),
+				Kind: group.Kind, Members: append([]string(nil), group.Members...),
 			})
 		}
 		for _, wait := range command.Waits {
-			item.Waits = append(item.Waits, TraceEventWait{Namespace: wait.Namespace, Name: wait.Name, Version: wait.Version})
+			item.Waits = append(item.Waits, TraceEventWait{Name: wait.Name, Key: wait.Key})
 		}
 		if command.TerminalPosition != nil {
 			position := JournalPosition(*command.TerminalPosition)
@@ -310,7 +306,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		entry := historyByPosition[JournalPosition(event.Position)]
 		item := TraceEvent{
 			ID: EventID(event.ID.String()), Position: JournalPosition(event.Position), Namespace: event.Namespace,
-			Name: event.Name, Version: event.Version, Key: event.Key, Class: event.Class,
+			Name: event.Name, Key: event.Key, Class: event.Class,
 			TerminalStatus: event.TerminalStatus, RecordedAt: entry.RecordedAt,
 			CausationPosition: cloneJournalPosition(entry.CausationPosition),
 			Body:              json.RawMessage(append([]byte(nil), event.Body...)),

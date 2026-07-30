@@ -205,7 +205,6 @@ type JournalEntry struct {
 	EventID             *uuid.UUID
 	EventNamespace      *string
 	EventName           *string
-	EventVersion        *int
 	EventKey            *string
 	EventClass          *string
 	TerminalStatus      *string
@@ -365,7 +364,6 @@ type JournalRow struct {
 	EventID           *uuid.UUID
 	EventNamespace    *string
 	EventName         *string
-	EventVersion      *int
 	EventKey          *string
 	EventClass        *string
 	TerminalStatus    *string
@@ -376,7 +374,7 @@ type JournalRow struct {
 var journalColumns = []string{
 	"execution_id", "position", "entry_id", "entry_kind", "recorded_at", "causation_position",
 	"command_id", "attempt_id", "coordinator_id", "plan_revision",
-	"event_id", "event_namespace", "event_name", "event_version", "event_key", "event_class", "terminal_status",
+	"event_id", "event_namespace", "event_name", "event_key", "event_class", "terminal_status",
 	"body", "body_hash",
 }
 
@@ -387,8 +385,8 @@ func rowFromEntry(executionID uuid.UUID, position int64, recordedAt time.Time, c
 		CommandID: clonePointer(entry.CommandID), AttemptID: clonePointer(entry.AttemptID),
 		CoordinatorID: clonePointer(entry.CoordinatorID), PlanRevision: clonePointer(entry.PlanRevision),
 		EventID: clonePointer(entry.EventID), EventNamespace: clonePointer(entry.EventNamespace),
-		EventName: clonePointer(entry.EventName), EventVersion: clonePointer(entry.EventVersion),
-		EventKey: clonePointer(entry.EventKey), EventClass: clonePointer(entry.EventClass),
+		EventName: clonePointer(entry.EventName),
+		EventKey:  clonePointer(entry.EventKey), EventClass: clonePointer(entry.EventClass),
 		TerminalStatus: clonePointer(entry.TerminalStatus), Body: entry.Body.BytesCopy(), BodyHash: entry.Body.Digest,
 	}
 }
@@ -397,7 +395,7 @@ func (row JournalRow) copyValues() []any {
 	return []any{
 		row.ExecutionID, row.Position, row.EntryID, string(row.Kind), row.RecordedAt, row.CausationPosition,
 		row.CommandID, row.AttemptID, row.CoordinatorID, row.PlanRevision,
-		row.EventID, row.EventNamespace, row.EventName, row.EventVersion, row.EventKey, row.EventClass, row.TerminalStatus,
+		row.EventID, row.EventNamespace, row.EventName, row.EventKey, row.EventClass, row.TerminalStatus,
 		row.Body, row.BodyHash[:],
 	}
 }
@@ -451,7 +449,7 @@ func scanJournalRow(row pgx.Row) (JournalRow, error) {
 	if err := row.Scan(
 		&result.ExecutionID, &result.Position, &result.EntryID, &kind, &result.RecordedAt, &result.CausationPosition,
 		&result.CommandID, &result.AttemptID, &result.CoordinatorID, &result.PlanRevision,
-		&result.EventID, &result.EventNamespace, &result.EventName, &result.EventVersion, &result.EventKey,
+		&result.EventID, &result.EventNamespace, &result.EventName, &result.EventKey,
 		&result.EventClass, &result.TerminalStatus, &result.Body, &bodyHash,
 	); err != nil {
 		return JournalRow{}, MapError("scan journal row", err)

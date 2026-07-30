@@ -58,7 +58,6 @@ type PlanEvent struct {
 	Position  int64
 	Namespace string
 	Name      string
-	Version   int
 	Key       string
 	Payload   json.RawMessage
 }
@@ -66,7 +65,6 @@ type PlanEvent struct {
 type EventSelector struct {
 	Namespace string
 	Name      string
-	Version   int
 }
 
 type Request struct {
@@ -90,7 +88,7 @@ type Request struct {
 	DeliveryKind           string
 	DeliveryNamespace      string
 	DeliveryName           string
-	DeliveryVersion        int
+	DeliveryCommandVersion int
 	DeliveryKey            string
 	DeliveryPosition       int64
 	DeliveryRecordedAt     time.Time
@@ -101,13 +99,6 @@ type Request struct {
 	DeliveryFailureMessage string
 }
 
-type StagedEvent struct {
-	Name    string
-	Version int
-	Key     string
-	Payload json.RawMessage
-}
-
 type StagedCommand struct {
 	Key        string
 	Name       string
@@ -115,6 +106,12 @@ type StagedCommand struct {
 	Args       json.RawMessage
 	Required   bool
 	StartAfter time.Duration
+}
+
+type StagedEvent struct {
+	Name    string
+	Key     string
+	Payload json.RawMessage
 }
 
 type Declaration struct {
@@ -139,14 +136,13 @@ type Result struct {
 	Value          json.RawMessage
 	HandlerError   error
 	Panicked       bool
-	Events         []StagedEvent
 	Commands       []StagedCommand
+	Events         []StagedEvent
 	Declarations   []Declaration
 	Reads          []Read
 	WaitingReads   int
 	State          json.RawMessage
 	Terminal       string
-	ResultRef      string
 	TerminalReason string
 }
 

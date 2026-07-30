@@ -58,13 +58,6 @@ func (p PublicPolicy) Backoff(delays ...time.Duration) PublicPolicy {
 	return copy
 }
 
-func (p PublicPolicy) Jitter(fraction float64) PublicPolicy {
-	copy := p.clone()
-	copy.value.Jitter = fraction
-	copy.err = copy.value.Validate()
-	return copy
-}
-
 func (p PublicPolicy) clone() PublicPolicy {
 	return PublicPolicy{value: p.value.Clone(), err: p.err}
 }

@@ -46,6 +46,8 @@ func (w *Work[A]) flowScope() *scopeState {
 	return w.scope
 }
 
+func (w *Work[A]) flowExecuteScope() {}
+
 func (w *Work[A]) flowResultSource() *resultSourceState {
 	if w == nil || w.scope == nil {
 		return nil
@@ -54,16 +56,25 @@ func (w *Work[A]) flowResultSource() *resultSourceState {
 }
 
 type Scope interface {
-	flowScope() *scopeState
+	flowExecuteScope()
+}
+
+type attemptScopeContextKey struct{}
+
+func withAttemptScope(ctx context.Context, state *scopeState) context.Context {
+	return context.WithValue(ctx, attemptScopeContextKey{}, state)
+}
+
+func attemptScope(ctx context.Context) *scopeState {
+	if ctx == nil {
+		return nil
+	}
+	state, _ := ctx.Value(attemptScopeContextKey{}).(*scopeState)
+	return state
 }
 
 type ResultSource interface {
 	flowResultSource() *resultSourceState
-}
-
-type CoordinatorScope interface {
-	Scope
-	flowCoordinatorScope()
 }
 
 type WorkerOption[A, R any] interface {
@@ -238,53 +249,24 @@ func (s *scopeState) poison(err error) {
 	}
 }
 
-// SpawnOption configures one child command staged by Spawn. The interface is
-// sealed so durable command decisions remain canonical and inspectable.
-type SpawnOption interface{ applySpawn(*spawnOptionState) }
-
-type spawnOptionState struct {
-	required      bool
-	optionalSet   bool
-	startAfter    time.Duration
-	startAfterSet bool
-	errs          []error
-}
-
-type spawnOptionFunc func(*spawnOptionState)
-
-func (f spawnOptionFunc) applySpawn(state *spawnOptionState) { f(state) }
-
-func Optional() SpawnOption {
-	return spawnOptionFunc(func(state *spawnOptionState) {
-		if state.optionalSet {
-			state.errs = append(state.errs, errors.New("optional configured more than once"))
-			return
-		}
-		state.optionalSet = true
-		state.required = false
-	})
-}
-
-func StartAfter(delay time.Duration) SpawnOption {
-	return spawnOptionFunc(func(state *spawnOptionState) {
-		if state.startAfterSet {
-			state.errs = append(state.errs, errors.New("start delay configured more than once"))
-			return
-		}
-		state.startAfterSet = true
-		if delay < time.Millisecond {
-			state.errs = append(state.errs, errors.New("start delay must be at least one millisecond"))
-			return
-		}
-		state.startAfter = delay
-	})
-}
-
-// Emit stages an additional typed application fact. It becomes durable only
-// if the enclosing handler decision settles successfully.
+// Emit stages an application event in a worker or coordinator decision. It
+// performs no database work and becomes durable only when the enclosing
+// decision settles successfully. Plans are pure and cannot emit events.
 func Emit[T any](scope Scope, event Event[T], key string, payload T) error {
-	state, err := usableScope(scope, "emit")
+	if plan, ok := scope.(*Plan); ok {
+		err := newError(ErrInvalidState, "emit", "plan", key, "plans cannot emit events")
+		if plan != nil {
+			plan.poison(err)
+		}
+		return err
+	}
+	state, err := usableDecisionScope(scope, "emit")
 	if err != nil {
+		return err
+	}
+	if state.terminal != nil {
+		err = newError(ErrInvalidState, "emit", "event", key, "coordinator is already terminal")
+		state.poison(err)
 		return err
 	}
 	if event.def == nil || event.def.Namespace != "application" || event.err != nil {
@@ -306,7 +288,7 @@ func Emit[T any](scope Scope, event Event[T], key string, payload T) error {
 		state.decision.events = make(map[string]stagedEvent)
 	}
 	if prior, exists := state.decision.events[identity]; exists {
-		if prior.definition.Version == event.def.Version && bytes.Equal(prior.payload.Bytes, encoded.Bytes) {
+		if bytes.Equal(prior.payload.Bytes, encoded.Bytes) {
 			return nil
 		}
 		err = newError(ErrConflict, "emit", "event", key, "event identity was staged with different content")
@@ -318,65 +300,74 @@ func Emit[T any](scope Scope, event Event[T], key string, payload T) error {
 	return nil
 }
 
-// Spawn stages a bounded asynchronous child command. It never invokes a
-// worker inline and performs no database work before successful settlement.
-func Spawn[A, R any](scope Scope, key string, cmd Command[A, R], args A, opts ...SpawnOption) error {
-	state, err := usableScope(scope, "spawn")
+// Execute requests a command from a plan, worker, or coordinator. It never
+// invokes the worker inline. The sealed scope selects the durable acceptance
+// path while Node keeps the public builder vocabulary uniform.
+func Execute[A, R any](scope Scope, key string, cmd Command[A, R], args A) *Node[R] {
+	if plan, ok := scope.(*Plan); ok {
+		return executePlan(plan, key, cmd, args)
+	}
+	state, err := usableDecisionScope(scope, "execute")
+	node := &Node[R]{scope: state, key: key}
 	if err != nil {
-		return err
+		return node
+	}
+	if state.terminal != nil {
+		state.poison(newError(ErrInvalidState, "execute", "command", key, "coordinator is already terminal"))
+		return node
 	}
 	if cmd.def == nil || cmd.err != nil {
-		err = newError(ErrInvalid, "spawn", "command", key, "invalid command definition")
+		err = newError(ErrInvalid, "execute", "command", key, "invalid command definition")
 		state.poison(err)
-		return err
+		return node
 	}
 	if err = validateStableKey(key, maxCommandKeyBytes, "command"); err != nil {
 		state.poison(err)
-		return err
-	}
-	options := spawnOptionState{required: true}
-	for _, option := range opts {
-		if option == nil {
-			options.errs = append(options.errs, errors.New("nil spawn option"))
-			continue
-		}
-		option.applySpawn(&options)
-	}
-	if optionErr := errors.Join(options.errs...); optionErr != nil {
-		err = newError(ErrInvalid, "spawn", "command", key, optionErr.Error())
-		state.poison(err)
-		return err
+		return node
 	}
 	encoded, err := encodeDefinitionValue(cmd.def.Args, args, maxCommandArgumentBytes, "command arguments")
 	if err != nil {
 		state.poison(err)
-		return err
+		return node
 	}
 	staged := stagedCommand{
 		definition: cmd.def, defaults: cmd.defaults, key: key, args: encoded,
-		required: options.required, startAfter: options.startAfter,
+		required: true,
 	}
 	if state.decision.commands == nil {
 		state.decision.commands = make(map[string]stagedCommand)
 	}
 	if prior, exists := state.decision.commands[key]; exists {
-		if equivalentStagedCommand(prior, staged) {
-			return nil
+		if equivalentStagedCommandIdentity(prior, staged) {
+			return node
 		}
-		err = newError(ErrConflict, "spawn", "command", key, "command key was staged with a different declaration")
+		err = newError(ErrConflict, "execute", "command", key, "command key was staged with a different declaration")
 		state.poison(err)
-		return err
+		return node
 	}
 	state.decision.commands[key] = staged
 	state.decision.commandOrder = append(state.decision.commandOrder, key)
-	return nil
+	return node
 }
 
-func usableScope(scope Scope, operation string) (*scopeState, error) {
-	if scope == nil || scope.flowScope() == nil {
+func equivalentStagedCommandIdentity(a, b stagedCommand) bool {
+	left, right := a, b
+	left.required, right.required = true, true
+	left.startAfter, right.startAfter = 0, 0
+	return equivalentStagedCommand(left, right)
+}
+
+type decisionScope interface {
+	Scope
+	flowScope() *scopeState
+}
+
+func usableDecisionScope(scope Scope, operation string) (*scopeState, error) {
+	value, ok := scope.(decisionScope)
+	if !ok || value == nil || value.flowScope() == nil {
 		return nil, newError(ErrInvalidState, operation, "scope", "", "scope is unavailable")
 	}
-	state := scope.flowScope()
+	state := value.flowScope()
 	if state.firstError != nil {
 		return state, state.firstError
 	}
@@ -389,20 +380,19 @@ func equivalentStagedCommand(a, b stagedCommand) bool {
 	}
 	if a.definition.Name != b.definition.Name || a.definition.Version != b.definition.Version ||
 		a.required != b.required || a.startAfter != b.startAfter ||
-		a.defaults.queue != b.defaults.queue || a.defaults.attemptTimeout != b.defaults.attemptTimeout ||
+		!equivalentCommandDefaults(a.defaults, b.defaults) ||
 		!bytes.Equal(a.args.Bytes, b.args.Bytes) {
 		return false
 	}
-	left, leftErr := canonical.Marshal(a.defaults.retryPolicy, 0)
-	right, rightErr := canonical.Marshal(b.defaults.retryPolicy, 0)
-	return leftErr == nil && rightErr == nil && bytes.Equal(left.Bytes, right.Bytes)
+	return true
 }
 
 func (state *decisionState) orderedEvents() []stagedEvent {
 	if state == nil || len(state.events) == 0 {
 		return nil
 	}
-	keys := state.eventOrder
+	keys := append([]string(nil), state.eventOrder...)
+	sort.Strings(keys)
 	result := make([]stagedEvent, 0, len(keys))
 	for _, key := range keys {
 		result = append(result, state.events[key])
@@ -440,8 +430,8 @@ func ResultOf[A, R any](source ResultSource, key string, cmd Command[A, R]) (R, 
 	return result, nil
 }
 
-func OutcomeOf[A, R any](source ResultSource, key string, cmd Command[A, R]) (CommandOutcome[R], error) {
-	var result CommandOutcome[R]
+func OutcomeOf[A, R any](source ResultSource, key string, cmd Command[A, R]) (Outcome[R], error) {
+	var result Outcome[R]
 	value, err := lookupResultSource(source, key, cmd.def, false)
 	if err != nil {
 		return result, Permanent(err)
@@ -454,7 +444,7 @@ func OutcomeOf[A, R any](source ResultSource, key string, cmd Command[A, R]) (Co
 	if value.status == StatusSucceeded {
 		decoded, decodeErr := cmd.def.Result.Decode(value.result)
 		if decodeErr != nil {
-			return CommandOutcome[R]{}, Permanent(newError(ErrInvalidState, "outcome", "command", key, "stored result cannot be decoded"))
+			return Outcome[R]{}, Permanent(newError(ErrInvalidState, "outcome", "command", key, "stored result cannot be decoded"))
 		}
 		result.Result = decoded.(R)
 	}

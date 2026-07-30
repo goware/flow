@@ -331,13 +331,6 @@ func provisionalDependencyState(group store.DependencyGroupCreate, states map[uu
 		if unsuccessful == len(group.Members) {
 			return "satisfied"
 		}
-	case "at_least":
-		if group.Threshold != nil && succeeded >= *group.Threshold {
-			return "satisfied"
-		}
-		if group.Threshold == nil || succeeded+len(group.Members)-terminal < *group.Threshold {
-			return "unsatisfiable"
-		}
 	}
 	return "unresolved"
 }

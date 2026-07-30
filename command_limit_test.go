@@ -17,25 +17,17 @@ func TestCommandCeilingRejectsWorkerPlanAndCoordinatorBatchesAtomically(t *testi
 		t.Fatal(err)
 	}
 	child := DefineCommand[None, None]("ceiling.batch.child", 1)
-	event := DefineEvent[None]("ceiling.batch.event", 1)
 
 	t.Run("worker", func(t *testing.T) {
-		parent := DefineCommand[None, None]("ceiling.batch.parent", 1, WithMaxAttempts(1))
+		parent := DefineCommand[None, None]("ceiling.batch.parent", 1, WithRetry(Attempts(1)))
 		runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(2),
 			WithNotifications(false), WithPollInterval(5*time.Millisecond))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := runtime.Register(Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
-			if err := Emit(work, event, "must-rollback", None{}); err != nil {
-				return None{}, err
-			}
-			if err := Spawn(work, "child/1", child, None{}); err != nil {
-				return None{}, err
-			}
-			if err := Spawn(work, "child/2", child, None{}); err != nil {
-				return None{}, err
-			}
+			Execute(work, "child/1", child, None{})
+			Execute(work, "child/2", child, None{})
 			return None{}, nil
 		})); err != nil {
 			t.Fatal(err)
@@ -54,17 +46,12 @@ func TestCommandCeilingRejectsWorkerPlanAndCoordinatorBatchesAtomically(t *testi
 		if len(trace.Commands) != 1 || trace.Execution.CommandCount != 1 || trace.Commands[0].FailureCode != "invalid_decision" {
 			t.Fatalf("worker ceiling trace = %#v", trace)
 		}
-		for _, recorded := range trace.Events {
-			if recorded.Name == event.Name() {
-				t.Fatal("worker ceiling committed a staged application event")
-			}
-		}
 	})
 
 	t.Run("plan", func(t *testing.T) {
 		plan := DefinePlan[None]("ceiling.batch.plan", 1, func(plan *Plan, _ None) {
-			Do(plan, "child/1", child, None{})
-			Do(plan, "child/2", child, None{})
+			Execute(plan, "child/1", child, None{})
+			Execute(plan, "child/2", child, None{})
 		})
 		runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(1),
 			WithNotifications(false), WithPollInterval(5*time.Millisecond))
@@ -93,10 +80,9 @@ func TestCommandCeilingRejectsWorkerPlanAndCoordinatorBatchesAtomically(t *testi
 	t.Run("coordinator", func(t *testing.T) {
 		coordinator := DefineCoordinator[None]("ceiling.batch.coordinator", 1,
 			OnStart(func(_ context.Context, coordination *Coordination[None]) error {
-				if err := Spawn(coordination, "child/1", child, None{}); err != nil {
-					return err
-				}
-				return Spawn(coordination, "child/2", child, None{})
+				Execute(coordination, "child/1", child, None{})
+				Execute(coordination, "child/2", child, None{})
+				return nil
 			}),
 		)
 		runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(1),

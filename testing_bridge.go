@@ -59,7 +59,7 @@ func testWorker(worker erasedWorker, request testengine.Request) (testengine.Res
 	}
 	scope := &workScope{args: args, info: testCommandInfo(request.Info)}
 	scope.state.results = testDependencies(request.Dependencies)
-	value, handlerErr, panicked := invokeWorker(request.Context, worker, scope)
+	value, handlerErr, panicked := invokeWorker(withAttemptScope(request.Context, &scope.state), worker, scope)
 	if scope.state.firstError != nil {
 		handlerErr = scope.state.firstError
 	}
@@ -71,7 +71,8 @@ func testWorker(worker erasedWorker, request testengine.Request) (testengine.Res
 		}
 		result.Value = json.RawMessage(encoded.BytesCopy())
 	}
-	result.Events, result.Commands = testDecision(scope.state.decision)
+	result.Commands = testDecision(scope.state.decision)
+	result.Events = testEvents(scope.state.decision)
 	return result, nil
 }
 
@@ -91,7 +92,12 @@ func testCommit(worker erasedWorker, request testengine.Request) (testengine.Res
 	if err != nil {
 		return testengine.Result{}, newError(ErrInvalid, "test", "commit result", worker.command.Name, "result does not match definition")
 	}
-	return testengine.Result{}, worker.commit(request.Context, tx, args, result, testCommandInfo(request.Info))
+	scope := scopeState{}
+	err = worker.commit(withAttemptScope(request.Context, &scope), tx, args, result, testCommandInfo(request.Info))
+	if scope.firstError != nil {
+		return testengine.Result{}, scope.firstError
+	}
+	return testengine.Result{}, err
 }
 
 func testPlan(definition erasedPlan, request testengine.Request) (testengine.Result, error) {
@@ -126,15 +132,15 @@ func testPlan(definition erasedPlan, request testengine.Request) (testengine.Res
 	for _, event := range request.Events {
 		snapshot.Events = append(snapshot.Events, store.PlanEventSnapshot{
 			Position: event.Position, Namespace: event.Namespace, Name: event.Name,
-			Version: event.Version, Key: event.Key, Payload: append([]byte(nil), event.Payload...),
+			Key: event.Key, Payload: append([]byte(nil), event.Payload...),
 		})
-		loaded[store.PlanEventSelector{Namespace: event.Namespace, Name: event.Name, Version: event.Version}] = struct{}{}
+		loaded[store.PlanEventSelector{Namespace: event.Namespace, Name: event.Name}] = struct{}{}
 	}
 	for selector := range loaded {
 		snapshot.LoadedSelectors = append(snapshot.LoadedSelectors, selector)
 	}
 	for _, selector := range request.KnownEvents {
-		value := store.PlanEventSelector{Namespace: selector.Namespace, Name: selector.Name, Version: selector.Version}
+		value := store.PlanEventSelector{Namespace: selector.Namespace, Name: selector.Name}
 		if _, exists := loaded[value]; !exists {
 			snapshot.LoadedSelectors = append(snapshot.LoadedSelectors, value)
 		}
@@ -166,7 +172,7 @@ func testPlan(definition erasedPlan, request testengine.Request) (testengine.Res
 			item.Dependencies = append(item.Dependencies, append([]string(nil), group.keys...))
 		}
 		for _, wait := range decl.waits {
-			item.Waits = append(item.Waits, fmt.Sprintf("%s:%s:%d", wait.namespace, wait.name, wait.version))
+			item.Waits = append(item.Waits, fmt.Sprintf("%s:%s:%s", wait.namespace, wait.name, wait.key))
 		}
 		result.Declarations = append(result.Declarations, item)
 	}
@@ -198,7 +204,10 @@ func testCoordinator(definition erasedCoordinator, request testengine.Request) (
 			kind = coordinatorOutcome
 		}
 		selector = coordinatorSelector{kind: kind, namespace: request.DeliveryNamespace,
-			name: request.DeliveryName, version: request.DeliveryVersion}
+			name: request.DeliveryName}
+		if kind == coordinatorOutcome {
+			selector.version = request.DeliveryCommandVersion
+		}
 		handler, ok := definition.handlers[selector.key()]
 		if !ok {
 			return testengine.Result{}, newError(ErrNotFound, "test", "coordinator handler", selector.key(), "handler is not registered")
@@ -231,7 +240,7 @@ func testCoordinator(definition erasedCoordinator, request testengine.Request) (
 		}
 		return testengine.Result{}, newError(ErrNotFound, "test", "coordinator handler", selector.key(), "handler is not registered")
 	}
-	handlerErr, panicked := invokeCoordinator(request.Context, handler, scope, received)
+	handlerErr, panicked := invokeCoordinator(withAttemptScope(request.Context, &scope.scope), handler, scope, received)
 	if scope.scope.firstError != nil {
 		handlerErr = scope.scope.firstError
 	}
@@ -240,9 +249,10 @@ func testCoordinator(definition erasedCoordinator, request testengine.Request) (
 		return testengine.Result{}, encodeErr
 	}
 	result := testengine.Result{State: json.RawMessage(encoded.BytesCopy()), HandlerError: handlerErr, Panicked: panicked}
-	result.Events, result.Commands = testDecision(scope.scope.decision)
+	result.Commands = testDecision(scope.scope.decision)
+	result.Events = testEvents(scope.scope.decision)
 	if terminal := scope.scope.terminal; terminal != nil {
-		result.Terminal, result.ResultRef = string(terminal.kind), terminal.resultRef
+		result.Terminal = string(terminal.kind)
 		if terminal.reason != nil {
 			result.TerminalReason = terminal.reason.Error()
 		}
@@ -269,19 +279,23 @@ func testDependencies(values []testengine.Dependency) resultSourceState {
 	return result
 }
 
-func testDecision(decision decisionState) ([]testengine.StagedEvent, []testengine.StagedCommand) {
-	events := make([]testengine.StagedEvent, 0, len(decision.events))
-	for _, event := range decision.orderedEvents() {
-		events = append(events, testengine.StagedEvent{Name: event.definition.Name, Version: event.definition.Version,
-			Key: event.key, Payload: json.RawMessage(event.payload.BytesCopy())})
-	}
+func testDecision(decision decisionState) []testengine.StagedCommand {
 	commands := make([]testengine.StagedCommand, 0, len(decision.commands))
 	for _, command := range decision.orderedCommands() {
 		commands = append(commands, testengine.StagedCommand{Key: command.key, Name: command.definition.Name,
 			Version: command.definition.Version, Args: json.RawMessage(command.args.BytesCopy()),
 			Required: command.required, StartAfter: command.startAfter})
 	}
-	return events, commands
+	return commands
+}
+
+func testEvents(decision decisionState) []testengine.StagedEvent {
+	events := make([]testengine.StagedEvent, 0, len(decision.events))
+	for _, event := range decision.orderedEvents() {
+		events = append(events, testengine.StagedEvent{Name: event.definition.Name, Key: event.key,
+			Payload: json.RawMessage(event.payload.BytesCopy())})
+	}
+	return events
 }
 
 func testUUID(value string) (uuid.UUID, error) {

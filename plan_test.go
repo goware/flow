@@ -14,30 +14,50 @@ func TestPlanRecorderValidatesTopologyWithoutDatabase(t *testing.T) {
 	snapshot := store.PlanSnapshot{ExecutionID: uuid.New(), Status: "running", MaxCommands: 100, JournalThrough: 1}
 
 	forward := newPlan(snapshot)
-	Do(forward, "second", command, None{}).After("first")
-	Do(forward, "first", command, None{})
+	Execute(forward, "second", command, None{}).After("first")
+	Execute(forward, "first", command, None{})
 	reconciliation, err := buildPlanReconciliation(snapshot, forward)
 	if err != nil || len(reconciliation.Commands) != 2 {
 		t.Fatalf("forward reference commands=%d error=%v", len(reconciliation.Commands), err)
 	}
 
 	missing := newPlan(snapshot)
-	Do(missing, "work", command, None{}).After("typo")
+	Execute(missing, "work", command, None{}).After("typo")
 	if _, err := buildPlanReconciliation(snapshot, missing); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("missing dependency error=%v", err)
 	}
 
 	cycle := newPlan(snapshot)
-	Do(cycle, "a", command, None{}).After("b")
-	Do(cycle, "b", command, None{}).After("a")
+	Execute(cycle, "a", command, None{}).After("b")
+	Execute(cycle, "b", command, None{}).After("a")
 	if _, err := buildPlanReconciliation(snapshot, cycle); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("cycle error=%v", err)
 	}
 
 	invalidWithin := newPlan(snapshot)
-	Do(invalidWithin, "wait", command, None{}).Within(time.Second)
+	Execute(invalidWithin, "wait", command, None{}).Within(time.Second)
 	if _, err := buildPlanReconciliation(snapshot, invalidWithin); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Within without Await error=%v", err)
+	}
+}
+
+func TestPlanEquivalentRepeatedExecuteCoalesces(t *testing.T) {
+	command := DefineCommand[decisionArgs, decisionResult]("plan_duplicate", 1)
+	plan := newPlan(store.PlanSnapshot{})
+	configure := func() {
+		Execute(plan, "child", command, decisionArgs{Value: "same"}).
+			Optional().
+			Delay(time.Second).
+			After("parent")
+	}
+	Execute(plan, "parent", command, decisionArgs{Value: "parent"})
+	configure()
+	configure()
+	if err := plan.validate(); err != nil {
+		t.Fatalf("equivalent repeated Execute poisoned plan: %v", err)
+	}
+	if len(plan.declarations) != 2 {
+		t.Fatalf("declarations = %d, want 2", len(plan.declarations))
 	}
 }
 
@@ -61,13 +81,12 @@ func TestPlanRecorderReadAvailabilityAndDeterministicFingerprint(t *testing.T) {
 		},
 	}
 	first := newPlan(snapshot)
-	if value, ok := Result(first, "done", command); !ok || value.Value != "ready" {
-		t.Fatalf("successful result=%#v available=%t", value, ok)
+	done := Execute(first, "done", command, None{})
+	failed := Execute(first, "failed", command, None{})
+	if outcome, ok := done.Outcome(); !ok || outcome.Status != StatusSucceeded || outcome.Result.Value != "ready" {
+		t.Fatalf("successful outcome=%#v available=%t", outcome, ok)
 	}
-	if _, ok := Result(first, "failed", command); ok {
-		t.Fatal("failed command exposed a successful result")
-	}
-	if outcome, ok := Outcome(first, "failed", command); !ok || outcome.Status != StatusFailed || outcome.Failure.Code != "permanent" {
+	if outcome, ok := failed.Outcome(); !ok || outcome.Status != StatusFailed || outcome.Failure.Code != "permanent" {
 		t.Fatalf("failed outcome=%#v available=%t", outcome, ok)
 	}
 	if first.waitingReads != 0 {
@@ -78,9 +97,10 @@ func TestPlanRecorderReadAvailabilityAndDeterministicFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := newPlan(snapshot)
-	_, _ = Result(second, "failed", command)
-	_, _ = Outcome(second, "failed", command)
-	_, _ = Result(second, "done", command)
+	secondFailed := Execute(second, "failed", command, None{})
+	secondDone := Execute(second, "done", command, None{})
+	_, _ = secondFailed.Outcome()
+	_, _ = secondDone.Outcome()
 	right, err := planEvaluationFingerprint(second)
 	if err != nil {
 		t.Fatal(err)

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -86,7 +85,6 @@ type CoordinatorDelivery struct {
 	EventID        *uuid.UUID
 	Namespace      string
 	Name           string
-	Version        int
 	Key            string
 	RecordedAt     time.Time
 	Body           []byte
@@ -269,9 +267,9 @@ func (s *Store) selectCoordinatorDeliveryLocked(ctx context.Context, semantic *S
 		return &CoordinatorDelivery{Start: true, Key: "start"}, false, nil
 	}
 	var eventNamespaces, eventNames, outcomeNames []string
-	var eventVersions, outcomeVersions []int32
+	var outcomeVersions []int32
 	for _, selector := range selectors {
-		if selector.Name == "" || selector.Version <= 0 {
+		if selector.Name == "" || (selector.Outcome && selector.Version <= 0) {
 			return nil, false, fmt.Errorf("%w: invalid coordinator selector", flowerr.ErrInvalid)
 		}
 		if selector.Outcome {
@@ -280,19 +278,18 @@ func (s *Store) selectCoordinatorDeliveryLocked(ctx context.Context, semantic *S
 		} else {
 			eventNamespaces = append(eventNamespaces, selector.Namespace)
 			eventNames = append(eventNames, selector.Name)
-			eventVersions = append(eventVersions, int32(selector.Version))
 		}
 	}
 	var position int64
 	err := semantic.PGX().QueryRow(ctx, `SELECT j.position FROM `+pgschema.Table(s.schema, "flow_journal")+` j
 		WHERE j.execution_id=$1 AND j.position>$2 AND j.entry_kind='event_recorded' AND (
-		  EXISTS (SELECT 1 FROM unnest($3::text[],$4::text[],$5::integer[]) s(namespace,name,version)
-		          WHERE j.event_namespace=s.namespace AND j.event_name=s.name AND j.event_version=s.version)
+		  EXISTS (SELECT 1 FROM unnest($3::text[],$4::text[]) s(namespace,name)
+		          WHERE j.event_namespace=s.namespace AND j.event_name=s.name)
 		  OR (j.event_class='command_terminal' AND EXISTS (
 		      SELECT 1 FROM `+pgschema.Table(s.schema, "flow_commands")+` c,
-		          unnest($6::text[],$7::integer[]) s(name,version)
+		          unnest($5::text[],$6::integer[]) s(name,version)
 		      WHERE c.command_id=j.command_id AND c.name=s.name AND c.version=s.version)))
-		ORDER BY j.position LIMIT 1`, semantic.ExecutionID(), scan, eventNamespaces, eventNames, eventVersions,
+		ORDER BY j.position LIMIT 1`, semantic.ExecutionID(), scan, eventNamespaces, eventNames,
 		outcomeNames, outcomeVersions).Scan(&position)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var head int64
@@ -329,12 +326,12 @@ func (s *Store) loadCoordinatorDeliveryLocked(ctx context.Context, semantic *Sem
 	var commandName *string
 	var commandVersion *int
 	var result, failure []byte
-	err := semantic.PGX().QueryRow(ctx, `SELECT j.event_id,j.event_namespace,j.event_name,j.event_version,j.event_key,
+	err := semantic.PGX().QueryRow(ctx, `SELECT j.event_id,j.event_namespace,j.event_name,j.event_key,
 		j.recorded_at,j.body,j.terminal_status,c.name,c.version,c.result,c.terminal_failure
 		FROM `+pgschema.Table(s.schema, "flow_journal")+` j
 		LEFT JOIN `+pgschema.Table(s.schema, "flow_commands")+` c ON c.command_id=j.command_id
 		WHERE j.execution_id=$1 AND j.position=$2 AND j.entry_kind='event_recorded'`, semantic.ExecutionID(), *position).
-		Scan(&eventID, &value.Namespace, &value.Name, &value.Version, &eventKey, &value.RecordedAt,
+		Scan(&eventID, &value.Namespace, &value.Name, &eventKey, &value.RecordedAt,
 			&value.Body, &terminal, &commandName, &commandVersion, &result, &failure)
 	if err != nil {
 		return CoordinatorDelivery{}, MapError("load coordinator delivery", err)
@@ -357,13 +354,12 @@ func (s *Store) loadCoordinatorDeliveryLocked(ctx context.Context, semantic *Sem
 }
 
 type CoordinatorSuccess struct {
-	Claim     ClaimedCoordinator
-	State     canonical.Value
-	Events    []ApplicationEvent
-	Children  []CommandCreate
-	Terminal  string
-	ResultRef string
-	Reason    string
+	Claim    ClaimedCoordinator
+	State    canonical.Value
+	Events   []ApplicationEvent
+	Children []CommandCreate
+	Terminal string
+	Reason   string
 }
 
 func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request CoordinatorSuccess, hook fault.Hook) (SettleResult, error) {
@@ -372,9 +368,6 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 	}
 	if len(request.State.Bytes) == 0 || (request.Terminal != "" && request.Terminal != "succeeded" && request.Terminal != "failed") {
 		return SettleResult{}, fmt.Errorf("%w: invalid coordinator decision", flowerr.ErrInvalid)
-	}
-	if request.Terminal != "" && len(request.Children) != 0 {
-		return SettleResult{}, fmt.Errorf("%w: terminal coordinator decision cannot spawn commands", flowerr.ErrInvalid)
 	}
 	semantic, err := s.BeginSemantic(ctx, request.Claim.ExecutionID, LockBlocking)
 	if err != nil {
@@ -397,8 +390,24 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 		}
 		return SettleResult{Terminal: true, Status: "expired"}, nil
 	}
+	request.Events, err = s.coalesceApplicationEvents(ctx, semantic, request.Events)
+	if err != nil {
+		return SettleResult{}, err
+	}
 	if err := s.validateCoordinatorOutputs(ctx, semantic, fence.head, request); err != nil {
 		return SettleResult{}, err
+	}
+	firstPosition, err := semantic.nextJournalPosition(ctx)
+	if err != nil {
+		return SettleResult{}, err
+	}
+	var waitUpdates []graphWaitUpdate
+	for index, event := range request.Events {
+		waits, matchErr := s.matchingWaitsLocked(ctx, semantic, event.Name, event.Key, firstPosition+1+int64(index))
+		if matchErr != nil {
+			return SettleResult{}, matchErr
+		}
+		waitUpdates = append(waitUpdates, waits...)
 	}
 	concluded, err := coordinatorAttemptConcluded(request.Claim, fence, "succeeded", false, fence.consumed, nil, "", "", semantic.DBNow())
 	if err != nil {
@@ -406,10 +415,12 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 	}
 	entries := []JournalEntry{concluded}
 	for _, event := range request.Events {
-		entry := JournalEntry{EntryID: uuid.New(), Kind: EventRecorded, EventID: clonePointer(&event.ID),
-			CoordinatorID: clonePointer(&request.Claim.CoordinatorID), EventNamespace: stringPointer("application"),
-			EventName: clonePointer(&event.Name), EventVersion: clonePointer(&event.Version), EventKey: clonePointer(&event.Key),
-			EventClass: stringPointer("application"), Body: event.Body}
+		entry := JournalEntry{
+			EntryID: uuid.New(), Kind: EventRecorded, EventID: clonePointer(&event.ID),
+			EventNamespace: stringPointer("application"), EventName: clonePointer(&event.Name),
+			EventKey: clonePointer(&event.Key), EventClass: stringPointer("application"), Body: event.Body,
+		}
+		entry.CoordinatorID = clonePointer(&request.Claim.CoordinatorID)
 		zero := 0
 		entry.CausationBatchIndex = &zero
 		entries = append(entries, entry)
@@ -431,7 +442,7 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 		V: 1, CoordinatorID: request.Claim.CoordinatorID.String(), DeliveryKey: request.Claim.DeliveryKey,
 		HandledPosition: clonePointer(request.Claim.Delivery.Position), PriorStateRevision: fence.stateRevision,
 		StateRevision: fence.stateRevision + 1, State: json.RawMessage(request.State.BytesCopy()),
-		TerminalDecision: request.Terminal, ResultRef: request.ResultRef,
+		TerminalDecision: request.Terminal,
 	})
 	if err != nil {
 		return SettleResult{}, err
@@ -441,18 +452,6 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 	transition.CausationBatchIndex = &zero
 	entries = append(entries, transition)
 
-	first, err := semantic.nextJournalPosition(ctx)
-	if err != nil {
-		return SettleResult{}, err
-	}
-	var waitUpdates []graphWaitUpdate
-	for i, event := range request.Events {
-		matches, err := s.matchingWaitsLocked(ctx, semantic, "application", event.Name, event.Version, first+int64(1+i))
-		if err != nil {
-			return SettleResult{}, err
-		}
-		waitUpdates = append(waitUpdates, matches...)
-	}
 	resolution, err := s.resolveGraphLocked(ctx, semantic, nil, waitUpdates)
 	if err != nil {
 		return SettleResult{}, err
@@ -469,6 +468,34 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 		cancelled, err = s.coordinatorTerminalCommandsLocked(ctx, semantic)
 		if err != nil {
 			return SettleResult{}, err
+		}
+		if len(resolution.skipped) != 0 {
+			skippedIDs := make(map[uuid.UUID]struct{}, len(resolution.skipped))
+			for _, command := range resolution.skipped {
+				skippedIDs[command.id] = struct{}{}
+			}
+			kept := cancelled[:0]
+			for _, command := range cancelled {
+				if _, skipped := skippedIDs[command.ID]; !skipped {
+					kept = append(kept, command)
+				}
+			}
+			cancelled = kept
+		}
+		// Commands staged by a terminal coordinator decision are still part of
+		// that decision's durable output. Record their creation, then terminalize
+		// them in the same journal batch so the execution never exposes runnable
+		// work after its terminal transition.
+		for _, child := range request.Children {
+			cancelled = append(cancelled, terminalizedCommand{ID: child.ID, Key: child.Key, Required: child.Required})
+		}
+		if request.Terminal == "succeeded" {
+			for _, command := range cancelled {
+				if command.Required {
+					return SettleResult{}, fmt.Errorf("%w: coordinator cannot succeed with required open command %q",
+						flowerr.ErrInvalidState, command.Key)
+				}
+			}
 		}
 		for i := range cancelled {
 			causationIndex := transitionIndex
@@ -576,10 +603,10 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 			return SettleResult{}, MapError("complete coordinator", err)
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET status=$2,open_commands=0,failure=CASE WHEN $2='failed' THEN $3::jsonb ELSE failure END,
-			    outcome_ref=CASE WHEN $2='succeeded' THEN NULLIF($5,'') ELSE outcome_ref END,
-			    finished_at=$4,updated_at=$4,status_at=$4 WHERE execution_id=$1`, semantic.ExecutionID(),
-			request.Terminal, jsonString(failure), semantic.DBNow(), request.ResultRef); err != nil {
+			SET status=$2,command_count=command_count+$3,open_commands=0,
+			    failure=CASE WHEN $2='failed' THEN $4::jsonb ELSE failure END,
+			    finished_at=$5,updated_at=$5,status_at=$5 WHERE execution_id=$1`, semantic.ExecutionID(),
+			request.Terminal, len(request.Children), jsonString(failure), semantic.DBNow()); err != nil {
 			return SettleResult{}, MapError("complete coordinator execution", err)
 		}
 	}
@@ -652,7 +679,7 @@ func (s *Store) validateCoordinatorOutputs(ctx context.Context, semantic *Semant
 	}
 	keys := make([]string, len(request.Children))
 	for i, child := range request.Children {
-		if child.Origin != "coordinator_spawn" || child.ParentCommandID != nil {
+		if child.Origin != "coordinator_command" || child.ParentCommandID != nil {
 			return fmt.Errorf("%w: invalid coordinator-spawned command", flowerr.ErrInvalid)
 		}
 		keys[i] = child.Key
@@ -667,24 +694,13 @@ func (s *Store) validateCoordinatorOutputs(ctx context.Context, semantic *Semant
 			return fmt.Errorf("%w: coordinator command key already exists", flowerr.ErrConflict)
 		}
 	}
-	for _, event := range request.Events {
-		existing, err := s.LookupApplicationEvent(ctx, semantic.PGX(), semantic.ExecutionID(), event.Name, event.Key)
-		if err != nil {
-			return err
-		}
-		if existing.Found {
-			if existing.Version == event.Version && bytes.Equal(existing.Body, event.Body.Bytes) {
-				return fmt.Errorf("%w: coordinator event identity already exists", flowerr.ErrConflict)
-			}
-			return fmt.Errorf("%w: coordinator event identity differs", flowerr.ErrConflict)
-		}
-	}
 	return nil
 }
 
 type terminalizedCommand struct {
 	ID               uuid.UUID
 	Key              string
+	Required         bool
 	journalIndex     int
 	AttemptID        *uuid.UUID
 	AttemptOrdinal   int
@@ -693,7 +709,7 @@ type terminalizedCommand struct {
 }
 
 func (s *Store) coordinatorTerminalCommandsLocked(ctx context.Context, semantic *SemanticTx) ([]terminalizedCommand, error) {
-	rows, err := semantic.PGX().Query(ctx, `SELECT c.command_id,c.command_key,c.attempt_ordinal,c.consumed_attempts,
+	rows, err := semantic.PGX().Query(ctx, `SELECT c.command_id,c.command_key,c.required,c.attempt_ordinal,c.consumed_attempts,
 		q.active_attempt_id,(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
 		 WHERE execution_id=c.execution_id AND attempt_id=q.active_attempt_id AND entry_kind='attempt_started')
 		FROM `+pgschema.Table(s.schema, "flow_commands")+` c
@@ -707,7 +723,7 @@ func (s *Store) coordinatorTerminalCommandsLocked(ctx context.Context, semantic 
 	var result []terminalizedCommand
 	for rows.Next() {
 		var value terminalizedCommand
-		if err := rows.Scan(&value.ID, &value.Key, &value.AttemptOrdinal, &value.ConsumedAttempts,
+		if err := rows.Scan(&value.ID, &value.Key, &value.Required, &value.AttemptOrdinal, &value.ConsumedAttempts,
 			&value.AttemptID, &value.AttemptPosition); err != nil {
 			return nil, MapError("scan coordinator terminal command", err)
 		}
@@ -802,9 +818,9 @@ func (s *Store) SettleCoordinatorConclusion(ctx context.Context, request Coordin
 		if err != nil {
 			return SettleResult{}, err
 		}
-		eventID, version := uuid.New(), 1
+		eventID := uuid.New()
 		failed.CoordinatorID = clonePointer(&request.Claim.CoordinatorID)
-		failed.EventID, failed.EventNamespace, failed.EventName, failed.EventVersion = &eventID, stringPointer("runtime"), stringPointer("flow.coordinator_failed"), &version
+		failed.EventID, failed.EventNamespace, failed.EventName = &eventID, stringPointer("runtime"), stringPointer("flow.coordinator_failed")
 		failed.EventClass, failed.TerminalStatus = stringPointer("coordinator_terminal"), stringPointer("failed")
 		zero := 0
 		failed.CausationBatchIndex = &zero

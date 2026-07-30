@@ -27,13 +27,14 @@ func TestFlowtestFoundation(t *testing.T) {
 	}
 
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
-	decision, err := flowtest.DecideRetry(flow.RetryFor(time.Hour).Backoff(time.Second).Jitter(0), flowtest.RetryInput{
+	decision, err := flowtest.DecideRetry(flow.RetryFor(time.Hour).Backoff(time.Second), flowtest.RetryInput{
 		DBNow: now, BudgetStartedAt: now, AttemptID: "attempt-1", Class: flowtest.Retryable,
 	})
 	if err != nil {
 		t.Fatalf("DecideRetry() error = %v", err)
 	}
-	if !decision.Retry || decision.NextAttemptAt != now.Add(time.Second) || decision.ConsumedAttempts != 1 {
+	delay := decision.NextAttemptAt.Sub(now)
+	if !decision.Retry || delay < 800*time.Millisecond || delay > 1200*time.Millisecond || decision.ConsumedAttempts != 1 {
 		t.Fatalf("DecideRetry() = %#v", decision)
 	}
 }

@@ -33,7 +33,6 @@ type Execution struct {
 	PlanWaitingCount  int
 	RootCommandID     *uuid.UUID
 	LastPosition      int64
-	OutcomeRef        string
 	FailureCode       string
 	FailureMessage    string
 	CreatedAt         time.Time
@@ -96,7 +95,6 @@ type Event struct {
 	Position       int64
 	Namespace      string
 	Name           string
-	Version        int
 	Key            string
 	Class          string
 	TerminalStatus string
@@ -386,9 +384,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Coordinator.StartPending = false
 		state.Coordinator.DeliveryState = "idle"
 		state.Coordinator.DeliveryKey = ""
-		if body.TerminalDecision == "succeeded" {
-			state.OutcomeRef = body.ResultRef
-		}
 		if body.HandledPosition != nil {
 			state.Coordinator.InboxPosition = *body.HandledPosition
 		}
@@ -397,12 +392,12 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		if row.EventClass == nil {
 			return errors.New("EventRecorded has no class")
 		}
-		if row.EventID == nil || row.EventNamespace == nil || row.EventName == nil || row.EventVersion == nil {
+		if row.EventID == nil || row.EventNamespace == nil || row.EventName == nil {
 			return errors.New("EventRecorded has incomplete selector metadata")
 		}
 		event := Event{
 			ID: *row.EventID, Position: row.Position, Namespace: *row.EventNamespace,
-			Name: *row.EventName, Version: *row.EventVersion, Class: *row.EventClass,
+			Name: *row.EventName, Class: *row.EventClass,
 			CommandID: pointerClone(row.CommandID), Body: slices.Clone(row.Body),
 		}
 		if row.EventKey != nil {

@@ -34,11 +34,12 @@ func TestCoordinatorLeaseTakeoverAcrossReplicas(t *testing.T) {
 			return ctx.Err()
 		}
 		c.State++
-		return SucceedExecution(c, "result/takeover")
+		c.Succeed()
+		return nil
 	}))
 	newReplica := func() *Runtime {
 		r, err := New(database.DB, WithSchema(database.Schema), WithCoordinatorConcurrency(1), WithPollInterval(5*time.Millisecond),
-			WithCommandLease(90*time.Millisecond), WithShutdownGrace(300*time.Millisecond))
+			withCommandLeaseForTest(90*time.Millisecond), WithShutdownGrace(300*time.Millisecond))
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -89,8 +90,17 @@ func TestCoordinatorPermanentFailureFailsExecution(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	coordinator := DefineCoordinator[int]("coordinator.permanent", 1, OnStart(func(context.Context, *Coordination[int]) error { return Permanent(errors.New("bad decision")) }))
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	event := DefineEvent[coordinatorNotice]("coordinator.permanent_event")
+	child := DefineCommand[None, None]("coordinator.permanent_child", 1)
+	coordinator := DefineCoordinator[int]("coordinator.permanent", 1, OnStart(func(_ context.Context, coordination *Coordination[int]) error {
+		coordination.State = 9
+		_ = Emit(coordination, event, "discarded", coordinatorNotice{Value: "discarded"})
+		Execute(coordination, "discarded-child", child, None{})
+		return Permanent(errors.New("bad decision"))
+	}))
+	observer := &recordingObserver{}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond),
+		WithNotifications(false), WithObserver(observer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,18 +115,73 @@ func TestCoordinatorPermanentFailureFailsExecution(t *testing.T) {
 	defer stopRuntime(t, cancel, result)
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 5*time.Second)
 	var coordinatorStatus, executionStatus string
-	var terminalEvents int
-	if err = database.DB.Conn.QueryRow(ctx, `SELECT c.status,e.status FROM `+pgschema.Table(database.Schema, "flow_coordinators")+` c
-		JOIN `+pgschema.Table(database.Schema, "flow_executions")+` e USING(execution_id) WHERE c.execution_id=$1`, handle.ID).Scan(&coordinatorStatus, &executionStatus); err != nil {
+	var state []byte
+	var revision, inbox int64
+	var terminalEvents, applicationEvents, transitions, childCount int
+	if err = database.DB.Conn.QueryRow(ctx, `SELECT c.status,e.status,c.state,c.state_revision,c.inbox_position FROM `+pgschema.Table(database.Schema, "flow_coordinators")+` c
+		JOIN `+pgschema.Table(database.Schema, "flow_executions")+` e USING(execution_id) WHERE c.execution_id=$1`, handle.ID).
+		Scan(&coordinatorStatus, &executionStatus, &state, &revision, &inbox); err != nil {
 		t.Fatal(err)
 	}
-	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE execution_id=$1 AND event_class='coordinator_terminal'`, handle.ID).Scan(&terminalEvents); err != nil {
+	if err = database.DB.Conn.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE event_class='coordinator_terminal'),
+		count(*) FILTER (WHERE event_class='application'),
+		count(*) FILTER (WHERE entry_kind='coordinator_transition')
+		FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, handle.ID).
+		Scan(&terminalEvents, &applicationEvents, &transitions); err != nil {
 		t.Fatal(err)
 	}
-	if coordinatorStatus != "failed" || executionStatus != "failed" || terminalEvents != 1 {
-		t.Fatalf("coordinator=%s execution=%s events=%d", coordinatorStatus, executionStatus, terminalEvents)
+	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
+		WHERE execution_id=$1`, handle.ID).Scan(&childCount); err != nil {
+		t.Fatal(err)
 	}
+	decoded, err := coordinator.def.State.Decode(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := decoded.(int)
+	if coordinatorStatus != "failed" || executionStatus != "failed" || terminalEvents != 1 ||
+		applicationEvents != 0 || transitions != 0 || childCount != 0 || initial != 0 || revision != 0 || inbox != 0 {
+		t.Fatalf("coordinator=%s execution=%s terminal=%d application=%d transitions=%d children=%d state=%d revision=%d inbox=%d",
+			coordinatorStatus, executionStatus, terminalEvents, applicationEvents, transitions, childCount, initial, revision, inbox)
+	}
+	waitForMatchingObservations(t, observer, 1, func(observation Observation) bool {
+		return observation.ExecutionID == handle.ID && observation.Kind == ObservationCoordinator && observation.Operation == "conclude"
+	})
+	for _, observation := range observer.snapshot() {
+		if observation.ExecutionID == handle.ID && observation.Kind == ObservationEvent && observation.Operation == "settle" {
+			t.Fatalf("rolled-back coordinator decision emitted settlement observation=%+v", observation)
+		}
+	}
+}
+
+func TestCoordinatorMutationAfterTerminalFailsExecution(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := DefineCoordinator[int]("coordinator.mutation_after_terminal", 1,
+		OnStart(func(_ context.Context, coordination *Coordination[int]) error {
+			coordination.Succeed()
+			coordination.State++
+			return nil
+		}))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := coordinator.With(runtime).Execute(ctx, "mutation-after-terminal", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, result := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, result)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 5*time.Second)
 }
 
 func TestCoordinatorScanCursorAvoidsRepeatedIdleHistoryScans(t *testing.T) {
@@ -163,8 +228,8 @@ func TestCoordinatorScanCursorAvoidsRepeatedIdleHistoryScans(t *testing.T) {
 	if err != nil || len(candidates) != 0 {
 		t.Fatalf("unchanged idle probe = %#v, %v", candidates, err)
 	}
-	unrelated := DefineEvent[None]("coordinator.scan_cursor.unrelated", 1)
-	if err := Publish(ctx, api, handle.ID, unrelated, "new-history", None{}); err != nil {
+	unrelated := DefineEvent[None]("coordinator.scan_cursor.unrelated")
+	if err := unrelated.Emit(ctx, api, handle.ID, "new-history", None{}); err != nil {
 		t.Fatal(err)
 	}
 	candidates, err = api.store.ProbeCoordinators(ctx, kinds, 10)
@@ -200,8 +265,8 @@ func TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	task := DefineCommand[coordinatorTaskArgs, coordinatorTaskResult]("coordinator.test.task", 1, WithMaxAttempts(1))
-	notice := DefineEvent[coordinatorNotice]("coordinator.test.notice", 1)
+	task := DefineCommand[coordinatorTaskArgs, coordinatorTaskResult]("coordinator.test.task", 1, WithRetry(Attempts(1)))
+	notice := DefineEvent[coordinatorNotice]("coordinator.test.notice")
 	var starts atomic.Int32
 	coordinator := DefineCoordinator[coordinatorTestState]("coordinator.test", 1,
 		OnStart(func(_ context.Context, c *Coordination[coordinatorTestState]) error {
@@ -210,25 +275,24 @@ func TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion(t *testing.T) {
 			}
 			c.State.Started = true
 			c.State.Outcomes = map[string]CommandStatus{}
-			if err := Spawn(c, "task/good", task, coordinatorTaskArgs{Key: "good"}, Optional()); err != nil {
-				return err
-			}
-			return Spawn(c, "task/bad", task, coordinatorTaskArgs{Key: "bad", Fail: true}, Optional())
+			Execute(c, "task/good", task, coordinatorTaskArgs{Key: "good"}).Optional()
+			Execute(c, "task/bad", task, coordinatorTaskArgs{Key: "bad", Fail: true}).Optional()
+			return nil
 		}),
 		On(notice, func(_ context.Context, c *Coordination[coordinatorTestState], received Received[coordinatorNotice]) error {
 			c.State.Notice = received.Payload.Value
 			return nil
 		}),
-		OnOutcome(task, func(_ context.Context, c *Coordination[coordinatorTestState], received Received[CommandOutcome[coordinatorTaskResult]]) error {
+		OnOutcome(task, func(_ context.Context, c *Coordination[coordinatorTestState], received Received[Outcome[coordinatorTaskResult]]) error {
 			c.State.Outcomes[received.Key] = received.Payload.Status
 			if len(c.State.Outcomes) == 2 {
-				return SucceedExecution(c, "result/coordinator")
+				c.Succeed()
 			}
 			return nil
 		}),
 	)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2), WithCoordinatorConcurrency(2),
-		WithPollInterval(5*time.Millisecond), WithCommandLease(250*time.Millisecond), WithShutdownGrace(time.Second))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(250*time.Millisecond), WithShutdownGrace(time.Second))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -251,8 +315,8 @@ func TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if err = Publish(ctx, runtime, handle.ID, notice, "early", coordinatorNotice{Value: "retained"}); err != nil {
-		t.Fatalf("Publish: %v", err)
+	if err = notice.Emit(ctx, runtime, handle.ID, "early", coordinatorNotice{Value: "retained"}); err != nil {
+		t.Fatalf("Emit: %v", err)
 	}
 	cancelRun, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancelRun, runResult)

@@ -37,7 +37,6 @@ type HistoryEntry struct {
 	EventID           EventID
 	EventNamespace    string
 	EventName         string
-	EventVersion      int
 	EventKey          string
 	EventClass        string
 	TerminalStatus    string
@@ -137,9 +136,6 @@ func historyEntries(rows []store.JournalRow) []HistoryEntry {
 		}
 		if row.EventName != nil {
 			entry.EventName = *row.EventName
-		}
-		if row.EventVersion != nil {
-			entry.EventVersion = *row.EventVersion
 		}
 		if row.EventKey != nil {
 			entry.EventKey = *row.EventKey

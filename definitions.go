@@ -36,8 +36,8 @@ type Coordinator[S any] struct {
 	err      error
 }
 
-type EventName interface {
-	flowEventName() eventReference
+type EventRef interface {
+	flowEventRef() eventReference
 }
 
 type CommandOption interface {
@@ -53,7 +53,6 @@ type commandDefaults struct {
 type commandOptionState struct {
 	defaults        commandDefaults
 	retryConfigured bool
-	maxConfigured   bool
 	timeoutSet      bool
 	queueSet        bool
 	errs            []error
@@ -67,13 +66,8 @@ func DefineCommand[A, R any](name string, version int, opts ...CommandOption) Co
 	base := definition.Base{Kind: definition.CommandKind, Name: name, Version: version}
 	argsCodec := definition.NewCodec[A]()
 	resultCodec := definition.NewCodec[R]()
-	done := definition.Event{
-		Base:      definition.Base{Kind: definition.EventKind, Name: name, Version: version},
-		Namespace: "command_success",
-		Payload:   resultCodec,
-	}
 	command := Command[A, R]{
-		def: &definition.Command{Base: base, Args: argsCodec, Result: resultCodec, Done: done},
+		def: &definition.Command{Base: base, Args: argsCodec, Result: resultCodec},
 	}
 	state := commandOptionState{defaults: commandDefaults{
 		retryPolicy: defaultRetryPolicy(),
@@ -91,14 +85,13 @@ func DefineCommand[A, R any](name string, version int, opts ...CommandOption) Co
 	return command
 }
 
-func DefineEvent[T any](name string, version int) Event[T] {
-	base := definition.Base{Kind: definition.EventKind, Name: name, Version: version}
+func DefineEvent[T any](name string) Event[T] {
 	event := Event[T]{def: &definition.Event{
-		Base:      base,
+		Name:      name,
 		Namespace: "application",
 		Payload:   definition.NewCodec[T](),
 	}}
-	event.err = definition.ValidateBase(base)
+	event.err = definition.ValidateName(name)
 	return event
 }
 
@@ -124,8 +117,6 @@ func DefineCoordinator[S any](name string, version int, handlers ...Handler[S]) 
 	coordinator.err = definition.ValidateBase(base)
 
 	seen := make(map[string]struct{}, len(handlers))
-	successCommands := make(map[string]struct{})
-	outcomeCommands := make(map[string]struct{})
 	for _, handler := range handlers {
 		if handler == nil {
 			coordinator.err = errors.Join(coordinator.err, errors.New("nil coordinator handler"))
@@ -139,29 +130,8 @@ func DefineCoordinator[S any](name string, version int, handlers ...Handler[S]) 
 			coordinator.err = errors.Join(coordinator.err, fmt.Errorf("duplicate coordinator handler %s", key))
 		}
 		seen[key] = struct{}{}
-		switch value.selector.kind {
-		case coordinatorEvent:
-			if value.selector.namespace == "command_success" {
-				successCommands[value.selector.nameVersion()] = struct{}{}
-			}
-		case coordinatorOutcome:
-			outcomeCommands[value.selector.nameVersion()] = struct{}{}
-		}
-	}
-	for key := range successCommands {
-		if _, overlap := outcomeCommands[key]; overlap {
-			coordinator.err = errors.Join(coordinator.err, fmt.Errorf("overlapping success and outcome handlers for %s", key))
-		}
 	}
 	return coordinator
-}
-
-func (c Command[A, R]) Done() Event[R] {
-	if c.def == nil {
-		return Event[R]{err: errors.New("zero command definition")}
-	}
-	done := c.def.Done
-	return Event[R]{def: &done, err: c.err}
 }
 
 func (c Command[A, R]) Name() string {
@@ -184,11 +154,11 @@ func (c Command[A, R]) With(client Client) Command[A, R] {
 	return copy
 }
 
-func (e Event[T]) flowEventName() eventReference {
+func (e Event[T]) flowEventRef() eventReference {
 	if e.def == nil {
 		return eventReference{}
 	}
-	return eventReference{namespace: e.def.Namespace, name: e.def.Name, version: e.def.Version}
+	return eventReference{namespace: e.def.Namespace, name: e.def.Name}
 }
 
 func (e Event[T]) Name() string {
@@ -196,13 +166,6 @@ func (e Event[T]) Name() string {
 		return ""
 	}
 	return e.def.Name
-}
-
-func (e Event[T]) Version() int {
-	if e.def == nil {
-		return 0
-	}
-	return e.def.Version
 }
 
 func (p PlanDef[A]) Name() string {
@@ -246,21 +209,9 @@ func (c Coordinator[S]) With(client Client) Coordinator[S] {
 	return copy
 }
 
-func WithMaxAttempts(max int) CommandOption {
+func WithRetry(policy RetryPolicy) CommandOption {
 	return commandOptionFunc(func(state *commandOptionState) {
-		if state.retryConfigured || state.maxConfigured {
-			state.errs = append(state.errs, errors.New("retry policy configured more than once"))
-			return
-		}
-		state.maxConfigured = true
-		state.defaults.retryPolicy = attemptRetryPolicy(max)
-		state.errs = appendValidation(state.errs, validateRetryPolicy(state.defaults.retryPolicy))
-	})
-}
-
-func WithRetryPolicy(policy RetryPolicy) CommandOption {
-	return commandOptionFunc(func(state *commandOptionState) {
-		if state.retryConfigured || state.maxConfigured {
+		if state.retryConfigured {
 			state.errs = append(state.errs, errors.New("retry policy configured more than once"))
 			return
 		}
@@ -303,7 +254,6 @@ func WithQueue(queue string) CommandOption {
 type eventReference struct {
 	namespace string
 	name      string
-	version   int
 }
 
 func appendValidation(errs []error, err error) []error {

@@ -68,11 +68,11 @@ func TestDirtyPlanAndEventSnapshotQueryPlans(t *testing.T) {
 	}
 
 	eventPlan := explainText(t, database.DB.Conn, `EXPLAIN (ANALYZE,BUFFERS,WAL,FORMAT TEXT)
-		SELECT position,event_namespace,event_name,event_version,COALESCE(event_key,''),body
+		SELECT position,event_namespace,event_name,COALESCE(event_key,''),body
 		FROM `+pgschema.Table(database.Schema, "flow_journal")+`
 		WHERE execution_id=$1 AND position<=$2 AND entry_kind='event_recorded'
-		  AND event_namespace=$3 AND event_name=$4 AND event_version=$5
-		ORDER BY position`, executionID, int64(scale+1), "application", "plan.query.wanted", int32(1))
+		  AND event_namespace=$3 AND event_name=$4
+		ORDER BY position`, executionID, int64(scale+1), "application", "plan.query.wanted")
 	t.Logf("exact event snapshot at %d rows:\n%s", scale, eventPlan)
 	if !strings.Contains(eventPlan, "flow_journal_event_lookup_idx") {
 		t.Fatalf("exact event snapshot did not use flow_journal_event_lookup_idx:\n%s", eventPlan)
@@ -110,14 +110,14 @@ func seedDirtyPlanExecutions(t testing.TB, schema string, db *pgxpool.Pool, base
 		execution_id,driver_mode,definition_name,definition_version,execution_key,status,fail_fast,
 		start_fingerprint,input,input_hash,metadata,metadata_canonical,metadata_hash,deadline_at,max_commands,
 		command_count,open_commands,plan_dirty,plan_dirty_since,plan_quiescent,plan_revision,plan_waiting_count,
-		plan_waiting_on,next_journal_position,root_command_id,outcome_ref,failure,created_at,updated_at,status_at,finished_at)
+		plan_waiting_on,next_journal_position,root_command_id,failure,created_at,updated_at,status_at,finished_at)
 	SELECT md5(source.execution_id::text || '/plan/' || n::text)::uuid,source.driver_mode,
 		CASE WHEN n <= GREATEST(0,$2::integer-10) THEN 'plan.query.unhandled' ELSE source.definition_name END,
 		source.definition_version,'query/' || n::text,source.status,source.fail_fast,source.start_fingerprint,source.input,
 		source.input_hash,source.metadata,source.metadata_canonical,source.metadata_hash,source.deadline_at,source.max_commands,
 		source.command_count,source.open_commands,true,source.plan_dirty_since + n * interval '1 microsecond',false,
 		source.plan_revision,source.plan_waiting_count,source.plan_waiting_on,source.next_journal_position,NULL,
-		source.outcome_ref,source.failure,source.created_at,source.updated_at,source.status_at,source.finished_at
+		source.failure,source.created_at,source.updated_at,source.status_at,source.finished_at
 	FROM `+table+` source CROSS JOIN generate_series(1,$2::integer-1) rows(n) WHERE source.execution_id=$1`, base, count)
 	if err != nil {
 		t.Fatalf("seed dirty plans: %v", err)
@@ -131,11 +131,11 @@ func seedPlanEventRows(t testing.TB, schema string, db *pgxpool.Pool, executionI
 	t.Helper()
 	table := pgschema.Table(schema, "flow_journal")
 	tag, err := db.Exec(context.Background(), `INSERT INTO `+table+` (
-		execution_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,event_version,
+		execution_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,
 		event_key,event_class,body,body_hash)
 	SELECT $1::uuid,n+1,md5($1::text || '/entry/' || n::text)::uuid,'event_recorded',clock_timestamp(),
 		md5($1::text || '/event/' || n::text)::uuid,'application',
-		CASE WHEN n % 100 = 0 THEN 'plan.query.wanted' ELSE 'plan.query.unrelated' END,1,
+		CASE WHEN n % 100 = 0 THEN 'plan.query.wanted' ELSE 'plan.query.unrelated' END,
 		'event/' || n::text,'application','{}'::bytea,decode(repeat('00',32),'hex')
 	FROM generate_series(1,$2::integer) rows(n)`, executionID, count)
 	if err != nil {

@@ -44,9 +44,9 @@ import (
 	"context"
 	flow "github.com/goware/flow"
 )
-var event = flow.DefineEvent[string]("compile.event", 1)
+var event = flow.DefineEvent[string]("compile.event")
 func invalid(client flow.Client, id flow.ExecutionID) {
-	_ = flow.Publish(context.Background(), client, id, event, "key", 42)
+	_ = event.Emit(context.Background(), client, id, "key", 42)
 }
 `,
 	}
