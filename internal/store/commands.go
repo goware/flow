@@ -216,10 +216,22 @@ func (s *Store) ClaimCommands(
 	}
 	defer semantic.Rollback(context.WithoutCancel(ctx))
 
+	// The execution row is FOR-UPDATE locked for the whole batch (BeginSemantic
+	// above), so its status and deadline cannot change until this transaction
+	// commits or rolls back: one read here covers every candidate instead of
+	// one read per candidate.
+	var executionStatus string
+	var executionDeadline *time.Time
+	if err := semantic.PGX().QueryRow(ctx, `SELECT status,deadline_at FROM `+
+		pgschema.Table(s.schema, "flow_executions")+` WHERE execution_id=$1`, executionID).
+		Scan(&executionStatus, &executionDeadline); err != nil {
+		return ClaimBatchResult{}, MapError("load claim execution", err)
+	}
+
 	result := ClaimBatchResult{Commands: make([]ClaimedCommand, 0, len(candidates))}
 	current := semantic
 	for _, candidate := range candidates {
-		claimed, stale, claimErr := s.claimCommandLocked(ctx, current, candidate, lease, owner, hook)
+		claimed, stale, claimErr := s.claimCommandLocked(ctx, current, candidate, executionStatus, executionDeadline, lease, owner, hook)
 		if claimErr != nil {
 			return ClaimBatchResult{}, claimErr
 		}
@@ -253,17 +265,12 @@ func (s *Store) claimCommandLocked(
 	ctx context.Context,
 	semantic *SemanticTx,
 	candidate CommandCandidate,
+	executionStatus string,
+	executionDeadline *time.Time,
 	lease time.Duration,
 	owner string,
 	hook fault.Hook,
 ) (*ClaimedCommand, bool, error) {
-	var executionStatus string
-	var executionDeadline *time.Time
-	if err := semantic.PGX().QueryRow(ctx, `SELECT status,deadline_at FROM `+
-		pgschema.Table(s.schema, "flow_executions")+` WHERE execution_id=$1`, semantic.ExecutionID()).
-		Scan(&executionStatus, &executionDeadline); err != nil {
-		return nil, false, MapError("load claim execution", err)
-	}
 	if executionStatus != "running" && executionStatus != "failing" {
 		return nil, true, nil
 	}
