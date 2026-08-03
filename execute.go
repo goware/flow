@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -28,6 +29,17 @@ const (
 	maxCommandKeyBytes        = 1024
 	defaultExecutionDeadline  = 30 * 24 * time.Hour
 )
+
+// emptyExecutionMetadata is the canonical encoding shared by every start that
+// carries no metadata. Encoding the empty map is deterministic, so one value
+// serves all such starts; its bytes are never mutated by consumers.
+var emptyExecutionMetadata = func() canonical.Value {
+	value, err := canonical.Marshal(map[string]string{}, maxExecutionMetadataBytes)
+	if err != nil {
+		panic(fmt.Sprintf("flow: canonicalize empty execution metadata: %v", err))
+	}
+	return value
+}()
 
 // ExecutionOption is a sealed start option shared by all execution modes.
 type ExecutionOption interface {
@@ -403,7 +415,7 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	}
 	options := executionOptions{
 		deadline: store.DeadlineSpec{Mode: "duration", Duration: defaultExecutionDeadline},
-		failFast: true, metadata: map[string]string{},
+		failFast: true,
 	}
 	for _, option := range supplied {
 		if option == nil {
@@ -418,12 +430,16 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	if options.keyScope == store.KeyScopeLive && key == "" {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "key", "", "live key scope requires a non-empty execution key")
 	}
-	if err := validateMetadata(options.metadata); err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, err
-	}
-	metadata, err := canonical.Marshal(options.metadata, maxExecutionMetadataBytes)
-	if err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, mapCanonicalError("execute", "metadata", err)
+	metadata := emptyExecutionMetadata
+	if len(options.metadata) > 0 {
+		if err := validateMetadata(options.metadata); err != nil {
+			return executionOptions{}, canonical.Value{}, [32]byte{}, err
+		}
+		var err error
+		metadata, err = canonical.Marshal(options.metadata, maxExecutionMetadataBytes)
+		if err != nil {
+			return executionOptions{}, canonical.Value{}, [32]byte{}, mapCanonicalError("execute", "metadata", err)
+		}
 	}
 	// key_scope and start_delay_ms are omitted when zero so fingerprints of
 	// starts that predate these options remain rediscoverable.
