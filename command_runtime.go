@@ -533,13 +533,10 @@ func commandAttemptRemaining(claim store.ClaimedCommand) (time.Duration, bool) {
 	if claim.AttemptTimeout > 0 {
 		deadline = claim.DBNow.Add(claim.AttemptTimeout)
 	}
-	if policy, err := retrypolicy.PublicFromCanonical(claim.RetryPolicy); err == nil {
-		value := retrypolicy.ValueOf(policy)
-		if value.MaxElapsed != nil {
-			candidate := claim.BudgetStartedAt.Add(*value.MaxElapsed)
-			if deadline.IsZero() || candidate.Before(deadline) {
-				deadline = candidate
-			}
+	if claim.RetryMaxElapsed != nil {
+		candidate := claim.BudgetStartedAt.Add(*claim.RetryMaxElapsed)
+		if deadline.IsZero() || candidate.Before(deadline) {
+			deadline = candidate
 		}
 	}
 	if claim.ExecutionDeadline != nil && (deadline.IsZero() || claim.ExecutionDeadline.Before(deadline)) {

@@ -90,7 +90,7 @@ type ClaimedCommand struct {
 	Version                int
 	Queue                  string
 	Args                   []byte
-	RetryPolicy            []byte
+	RetryMaxElapsed        *time.Duration
 	AttemptTimeout         time.Duration
 	CreatedAt              time.Time
 	BudgetStartedAt        time.Time
@@ -355,8 +355,9 @@ func (s *Store) claimCommandLocked(
 	}
 	return &ClaimedCommand{
 		CommandID: candidate.CommandID, ExecutionID: candidate.ExecutionID, CommandKey: key,
-		Name: name, Version: version, Queue: queue, Args: slices.Clone(args), RetryPolicy: slices.Clone(policyBytes),
-		AttemptTimeout: attemptTimeout, CreatedAt: createdAt, BudgetStartedAt: budgetStartedAt,
+		Name: name, Version: version, Queue: queue, Args: slices.Clone(args),
+		RetryMaxElapsed: clonePointer(policyValue.MaxElapsed),
+		AttemptTimeout:  attemptTimeout, CreatedAt: createdAt, BudgetStartedAt: budgetStartedAt,
 		ExecutionDeadline: clonePointer(executionDeadline), Attempt: ordinal + 1, ConsumedAttempts: consumed,
 		AttemptID: attemptID, LeaseToken: token, DBNow: semantic.DBNow(), LeaseExpiresAt: leaseExpiresAt,
 		AttemptStartedPosition: journal.Journal[0].Position,
