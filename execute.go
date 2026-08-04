@@ -273,6 +273,27 @@ func (event Event[T]) Emit(ctx context.Context, c Client, id ExecutionID, key st
 		state.poison(err)
 		return err
 	}
+	return event.emitExternal(ctx, c, id, key, payload)
+}
+
+// Deliver is Emit permitted inside a command attempt. It exists for
+// cross-execution signaling: a handler concluding work in one execution
+// delivers an event into another execution (typically a coordinator)
+// transactionally with its own client — pass a Runtime.InTx client to commit
+// the event atomically with the handler's application writes.
+//
+// Delivery is detached from the attempt's decision: it is not staged with
+// the attempt's settle, so the event exists even if the attempt later fails
+// or retries. Event identity makes that safe — a redelivered attempt
+// re-delivering the same (name, key, payload) is a no-op, and a different
+// payload under the same key is an ErrConflict. Within the attempt's own
+// execution, prefer the staged Emit(work, ...) form, which settles atomically
+// with the decision.
+func (event Event[T]) Deliver(ctx context.Context, c Client, id ExecutionID, key string, payload T) error {
+	return event.emitExternal(ctx, c, id, key, payload)
+}
+
+func (event Event[T]) emitExternal(ctx context.Context, c Client, id ExecutionID, key string, payload T) error {
 	if event.err != nil || event.def == nil || event.def.Namespace != "application" {
 		return newError(ErrInvalid, "emit", "event", eventName(event.def), "invalid event definition")
 	}
