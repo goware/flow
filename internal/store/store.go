@@ -96,6 +96,13 @@ type SemanticTx struct {
 	closed      bool
 	applied     bool
 	failed      bool
+	// nextPosition caches the execution's next journal position for the
+	// lifetime of the owned transaction. The execution row is FOR UPDATE
+	// locked until commit and reserveJournal is the only writer of
+	// next_journal_position, so the cached value cannot drift from the row;
+	// reserveJournal's guarded UPDATE still verifies it against durable state.
+	nextPosition      int64
+	nextPositionKnown bool
 }
 
 func (s *Store) BeginSemantic(ctx context.Context, id uuid.UUID, mode LockMode) (*SemanticTx, error) {
@@ -287,15 +294,21 @@ func (tx *SemanticTx) Apply(ctx context.Context, changes PersistedChangeSet) (Ap
 func (tx *SemanticTx) continueBatch() *SemanticTx {
 	return &SemanticTx{
 		store: tx.store, tx: tx.tx, executionID: tx.executionID, dbNow: tx.dbNow,
+		nextPosition: tx.nextPosition, nextPositionKnown: tx.nextPositionKnown,
 	}
 }
 
 func (tx *SemanticTx) nextJournalPosition(ctx context.Context) (int64, error) {
+	if tx.nextPositionKnown {
+		return tx.nextPosition, nil
+	}
 	var next int64
 	if err := tx.tx.QueryRow(ctx, `SELECT next_journal_position FROM `+
 		pgschema.Table(tx.store.schema, "flow_executions")+` WHERE execution_id=$1`, tx.executionID).Scan(&next); err != nil {
 		return 0, MapError("read journal position", err)
 	}
+	tx.nextPosition = next
+	tx.nextPositionKnown = true
 	return next, nil
 }
 
@@ -314,6 +327,8 @@ func (tx *SemanticTx) reserveJournal(ctx context.Context, expected int64, count 
 	if first != expected {
 		return fmt.Errorf("%w: journal allocator changed while execution was locked", flowerr.ErrInvalidState)
 	}
+	tx.nextPosition = expected + int64(count)
+	tx.nextPositionKnown = true
 	return nil
 }
 
