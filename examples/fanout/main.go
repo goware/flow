@@ -57,6 +57,10 @@ var (
 	})
 )
 
+type fanoutExample struct {
+	output io.Writer
+}
+
 func main() {
 	ctx := context.Background()
 	databaseURL := os.Getenv("FLOW_EXAMPLE_DATABASE_URL")
@@ -77,7 +81,14 @@ func main() {
 		panic(err)
 	}
 
-	handle, trace, err := runFanOut(ctx, db, "public", os.Stdout)
+	runtime, err := newFlowRuntime(db, "public", os.Stdout)
+	if err != nil {
+		panic(err)
+	}
+	stopFlowRuntime := runFlowRuntime(runtime)
+	defer stopFlowRuntime()
+
+	handle, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		panic(err)
 	}
@@ -85,11 +96,8 @@ func main() {
 		handle.ID, len(trace.Commands), len(trace.History))
 }
 
-// runFanOut executes a dynamic plan. The prepare worker creates independent
-// child analyses; once that authoritative child set is closed, the plan joins
-// the children and the final worker reads their durable results.
-func runFanOut(ctx context.Context, db *pgkit.DB, schema string, output io.Writer) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	output = synchronized(output)
+func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
+	example := &fanoutExample{output: synchronized(output)}
 	runtime, err := flow.New(db,
 		flow.WithSchema(schema),
 		flow.WithWorkerConcurrency(8),
@@ -97,52 +105,76 @@ func runFanOut(ctx context.Context, db *pgkit.DB, schema string, output io.Write
 		flow.WithPlanVerification(true),
 	)
 	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return nil, err
 	}
 	if err := runtime.Register(
 		reportPlan,
-		flow.Handle(prepareReport, func(_ context.Context, work *flow.Work[prepareReportArgs]) (prepareReportResult, error) {
-			fmt.Fprintf(output, "planning %d report analyses\n", work.Args.Parts)
-			for part := range work.Args.Parts {
-				key := fmt.Sprintf("analysis/%d", part)
-				flow.Execute(work, key, analyzePart, analyzePartArgs{Part: part})
-			}
-			return prepareReportResult{Count: work.Args.Parts}, nil
-		}),
-		flow.Handle(analyzePart, func(ctx context.Context, work *flow.Work[analyzePartArgs]) (analyzePartResult, error) {
-			fmt.Fprintf(output, "analyzing part %d\n", work.Args.Part)
-			select {
-			case <-ctx.Done():
-				return analyzePartResult{}, ctx.Err()
-			case <-time.After(20 * time.Millisecond):
-			}
-			return analyzePartResult{Score: work.Args.Part + 1}, nil
-		}),
-		flow.Handle(generateReport, func(_ context.Context, work *flow.Work[generateReportArgs]) (generateReportResult, error) {
-			total := 0
-			for _, key := range work.Args.AnalysisKeys {
-				analysis, err := flow.ResultOf(work, key, analyzePart)
-				if err != nil {
-					return generateReportResult{}, err
-				}
-				total += analysis.Score
-			}
-			fmt.Fprintf(output, "generated report with score %d\n", total)
-			return generateReportResult{Total: total}, nil
-		}),
+		flow.Handle(prepareReport, example.prepareReport),
+		flow.Handle(analyzePart, example.analyzePart),
+		flow.Handle(generateReport, example.generateReport),
 	); err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return nil, err
 	}
+	return runtime, nil
+}
 
-	cancelRun, runResult := startRuntime(runtime)
-	defer stopRuntime(cancelRun, runResult)
+func runFlowRuntime(runtime *flow.Runtime) func() {
+	runContext, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- runtime.Run(runContext) }()
+	return func() {
+		cancel()
+		select {
+		case <-result:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
 
+// runExampleCommand executes a dynamic fan-out plan and waits for its terminal
+// trace.
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
 	handle, err := reportPlan.With(runtime).Execute(ctx, "report/example", reportArgs{Parts: 3})
 	if err != nil {
 		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
 	}
 	trace, err := waitForTerminal(ctx, runtime, handle.ID, 8*time.Second)
 	return handle, trace, err
+}
+
+// prepareReport is the planning worker handler.
+func (example *fanoutExample) prepareReport(_ context.Context, work *flow.Work[prepareReportArgs]) (prepareReportResult, error) {
+	fmt.Fprintf(example.output, "planning %d report analyses\n", work.Args.Parts)
+	for part := range work.Args.Parts {
+		key := fmt.Sprintf("analysis/%d", part)
+		flow.Execute(work, key, analyzePart, analyzePartArgs{Part: part})
+	}
+	return prepareReportResult{Count: work.Args.Parts}, nil
+}
+
+// analyzePart is the analysis worker handler.
+func (example *fanoutExample) analyzePart(ctx context.Context, work *flow.Work[analyzePartArgs]) (analyzePartResult, error) {
+	fmt.Fprintf(example.output, "analyzing part %d\n", work.Args.Part)
+	select {
+	case <-ctx.Done():
+		return analyzePartResult{}, ctx.Err()
+	case <-time.After(20 * time.Millisecond):
+	}
+	return analyzePartResult{Score: work.Args.Part + 1}, nil
+}
+
+// generateReport is the final worker handler.
+func (example *fanoutExample) generateReport(_ context.Context, work *flow.Work[generateReportArgs]) (generateReportResult, error) {
+	total := 0
+	for _, key := range work.Args.AnalysisKeys {
+		analysis, err := flow.ResultOf(work, key, analyzePart)
+		if err != nil {
+			return generateReportResult{}, err
+		}
+		total += analysis.Score
+	}
+	fmt.Fprintf(example.output, "generated report with score %d\n", total)
+	return generateReportResult{Total: total}, nil
 }
 
 type synchronizedWriter struct {
@@ -161,21 +193,6 @@ func synchronized(writer io.Writer) io.Writer {
 		writer = io.Discard
 	}
 	return &synchronizedWriter{writer: writer}
-}
-
-func startRuntime(runtime *flow.Runtime) (context.CancelFunc, <-chan error) {
-	runContext, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- runtime.Run(runContext) }()
-	return cancel, result
-}
-
-func stopRuntime(cancel context.CancelFunc, result <-chan error) {
-	cancel()
-	select {
-	case <-result:
-	case <-time.After(2 * time.Second):
-	}
 }
 
 func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.ExecutionID, timeout time.Duration) (flow.ExecutionTrace, error) {

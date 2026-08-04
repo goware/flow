@@ -60,6 +60,10 @@ var (
 	)
 )
 
+type agentExample struct {
+	output io.Writer
+}
+
 func main() {
 	ctx := context.Background()
 	databaseURL := os.Getenv("FLOW_EXAMPLE_DATABASE_URL")
@@ -80,12 +84,69 @@ func main() {
 		panic(err)
 	}
 
-	handle, trace, err := runAgent(ctx, db, "public", os.Stdout)
+	runtime, err := newFlowRuntime(db, "public", os.Stdout)
+	if err != nil {
+		panic(err)
+	}
+	stopFlowRuntime := runFlowRuntime(runtime)
+	defer stopFlowRuntime()
+
+	handle, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("agent execution %s completed with %d commands and %d journal entries\n",
 		handle.ID, len(trace.Commands), len(trace.History))
+}
+
+func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
+	example := &agentExample{output: synchronized(output)}
+	runtime, err := flow.New(db,
+		flow.WithSchema(schema),
+		flow.WithWorkerConcurrency(4),
+		flow.WithCoordinatorConcurrency(2),
+		flow.WithPollInterval(10*time.Millisecond),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := runtime.Register(
+		researchAgent,
+		flow.Handle(agentThink, example.agentThink),
+		flow.Handle(agentTool, example.agentTool),
+	); err != nil {
+		return nil, err
+	}
+	return runtime, nil
+}
+
+func runFlowRuntime(runtime *flow.Runtime) func() {
+	runContext, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- runtime.Run(runContext) }()
+	return func() {
+		cancel()
+		select {
+		case <-result:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// runExampleCommand executes a durable two-turn agent and waits for its
+// terminal trace.
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
+	handle, err := researchAgent.With(runtime).Execute(ctx, "agent/example", agentState{})
+	if err != nil {
+		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+	}
+	if err = agentUserMessage.Emit(ctx, runtime, handle.ID, "message/1", agentMessage{
+		Text: "focus on durability",
+	}); err != nil {
+		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+	}
+	trace, err := waitForTerminal(ctx, runtime, handle.ID, 8*time.Second)
+	return handle, trace, err
 }
 
 func startResearchAgent(_ context.Context, coordination *flow.Coordination[agentState]) error {
@@ -144,65 +205,32 @@ func handleAgentTool(_ context.Context, coordination *flow.Coordination[agentSta
 	return nil
 }
 
-// runAgent demonstrates a durable two-turn agent. The first model command
-// fans out two optional tool calls, including a controlled failure. Once every
-// outcome arrives, the coordinator schedules a final model command and emits
-// an application event before completing.
-func runAgent(ctx context.Context, db *pgkit.DB, schema string, output io.Writer) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	output = synchronized(output)
-	runtime, err := flow.New(db,
-		flow.WithSchema(schema),
-		flow.WithWorkerConcurrency(4),
-		flow.WithCoordinatorConcurrency(2),
-		flow.WithPollInterval(10*time.Millisecond),
-	)
-	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+// agentThink is the model worker handler.
+func (example *agentExample) agentThink(ctx context.Context, work *flow.Work[thinkArgs]) (thinkResult, error) {
+	fmt.Fprintf(example.output, "agent thinking on turn %d\n", work.Args.Turn)
+	select {
+	case <-ctx.Done():
+		return thinkResult{}, ctx.Err()
+	case <-time.After(15 * time.Millisecond):
 	}
-	if err = runtime.Register(
-		researchAgent,
-		flow.Handle(agentThink, func(ctx context.Context, work *flow.Work[thinkArgs]) (thinkResult, error) {
-			fmt.Fprintf(output, "agent thinking on turn %d\n", work.Args.Turn)
-			select {
-			case <-ctx.Done():
-				return thinkResult{}, ctx.Err()
-			case <-time.After(15 * time.Millisecond):
-			}
-			if work.Args.Turn == 1 {
-				return thinkResult{Tools: []string{"search", "broken"}}, nil
-			}
-			return thinkResult{FinalResultRef: "result/final-report"}, nil
-		}),
-		flow.Handle(agentTool, func(ctx context.Context, work *flow.Work[toolArgs]) (toolResult, error) {
-			fmt.Fprintf(output, "running tool %s\n", work.Args.Name)
-			select {
-			case <-ctx.Done():
-				return toolResult{}, ctx.Err()
-			case <-time.After(20 * time.Millisecond):
-			}
-			if work.Args.Name == "broken" {
-				return toolResult{}, flow.Permanent(errors.New("controlled tool failure"))
-			}
-			return toolResult{OutputRef: "result/" + work.Args.Name}, nil
-		}),
-	); err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+	if work.Args.Turn == 1 {
+		return thinkResult{Tools: []string{"search", "broken"}}, nil
 	}
+	return thinkResult{FinalResultRef: "result/final-report"}, nil
+}
 
-	cancelRun, runResult := startRuntime(runtime)
-	defer stopRuntime(cancelRun, runResult)
-
-	handle, err := researchAgent.With(runtime).Execute(ctx, "agent/example", agentState{})
-	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+// agentTool is the tool worker handler.
+func (example *agentExample) agentTool(ctx context.Context, work *flow.Work[toolArgs]) (toolResult, error) {
+	fmt.Fprintf(example.output, "running tool %s\n", work.Args.Name)
+	select {
+	case <-ctx.Done():
+		return toolResult{}, ctx.Err()
+	case <-time.After(20 * time.Millisecond):
 	}
-	if err = agentUserMessage.Emit(ctx, runtime, handle.ID, "message/1", agentMessage{
-		Text: "focus on durability",
-	}); err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+	if work.Args.Name == "broken" {
+		return toolResult{}, flow.Permanent(errors.New("controlled tool failure"))
 	}
-	trace, err := waitForTerminal(ctx, runtime, handle.ID, 8*time.Second)
-	return handle, trace, err
+	return toolResult{OutputRef: "result/" + work.Args.Name}, nil
 }
 
 type synchronizedWriter struct {
@@ -221,21 +249,6 @@ func synchronized(writer io.Writer) io.Writer {
 		writer = io.Discard
 	}
 	return &synchronizedWriter{writer: writer}
-}
-
-func startRuntime(runtime *flow.Runtime) (context.CancelFunc, <-chan error) {
-	runContext, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- runtime.Run(runContext) }()
-	return cancel, result
-}
-
-func stopRuntime(cancel context.CancelFunc, result <-chan error) {
-	cancel()
-	select {
-	case <-result:
-	case <-time.After(2 * time.Second):
-	}
 }
 
 func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.ExecutionID, timeout time.Duration) (flow.ExecutionTrace, error) {

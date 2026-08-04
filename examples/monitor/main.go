@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/goware/flow"
@@ -33,6 +32,15 @@ var (
 	})
 )
 
+type monitorExample struct {
+	output io.Writer
+}
+
+type externalMonitor struct {
+	publisher *flow.Runtime
+	output    io.Writer
+}
+
 func main() {
 	ctx := context.Background()
 	databaseURL := os.Getenv("FLOW_EXAMPLE_DATABASE_URL")
@@ -53,64 +61,82 @@ func main() {
 		panic(err)
 	}
 
-	handle, trace, err := runMonitor(ctx, db, "public", os.Stdout)
+	runtime, err := newFlowRuntime(db, "public", os.Stdout)
+	if err != nil {
+		panic(err)
+	}
+	monitor, err := newExternalMonitor(db, "public", os.Stdout)
+	if err != nil {
+		panic(err)
+	}
+	stopFlowRuntime := runFlowRuntime(runtime)
+	defer stopFlowRuntime()
+
+	handle, trace, err := runExampleCommand(ctx, runtime, monitor)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("execution %s completed with %d journal entries\n", handle.ID, len(trace.History))
 }
 
-// runMonitor demonstrates a long external wait without a polling worker. The
-// command consumes no worker, lease, or connection while a separately deployed
-// publisher waits for the external fact and emits the event that releases it.
-func runMonitor(ctx context.Context, db *pgkit.DB, schema string, output io.Writer) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	output = synchronized(output)
+func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
+	if output == nil {
+		output = io.Discard
+	}
+	example := &monitorExample{output: output}
 	runtime, err := flow.New(db,
 		flow.WithSchema(schema),
 		flow.WithWorkerConcurrency(2),
 		flow.WithPollInterval(20*time.Millisecond),
 	)
 	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
-	}
-
-	// The monitor has only the lightweight client surface. It deliberately
-	// registers neither the plan nor its worker, proving publishers and plan
-	// processors can be deployed independently.
-	publisher, err := flow.New(db, flow.WithSchema(schema))
-	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return nil, err
 	}
 	if err := runtime.Register(
 		bridgePlan,
-		flow.Handle(confirmBridge, func(_ context.Context, _ *flow.Work[flow.None]) (confirmBridgeResult, error) {
-			fmt.Fprintln(output, "bridge delivery confirmed")
-			return confirmBridgeResult{Confirmed: true}, nil
-		}),
+		flow.Handle(confirmBridge, example.confirmBridge),
 	); err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return nil, err
 	}
+	return runtime, nil
+}
 
-	cancelRun, runResult := startRuntime(runtime)
-	defer stopRuntime(cancelRun, runResult)
+// newExternalMonitor creates only the lightweight publisher surface. It
+// registers neither the plan nor its worker, demonstrating that publishers and
+// plan processors can be deployed independently.
+func newExternalMonitor(db *pgkit.DB, schema string, output io.Writer) (*externalMonitor, error) {
+	if output == nil {
+		output = io.Discard
+	}
+	publisher, err := flow.New(db, flow.WithSchema(schema))
+	if err != nil {
+		return nil, err
+	}
+	return &externalMonitor{publisher: publisher, output: output}, nil
+}
 
+func runFlowRuntime(runtime *flow.Runtime) func() {
+	runContext, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- runtime.Run(runContext) }()
+	return func() {
+		cancel()
+		select {
+		case <-result:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// runExampleCommand executes a plan that waits for an independently published
+// event and returns its terminal trace.
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *externalMonitor) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
 	handle, err := bridgePlan.With(runtime).Execute(ctx, "bridge/example", flow.None{})
 	if err != nil {
 		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
 	}
 	monitorResult := make(chan error, 1)
-	go func() {
-		select {
-		case <-ctx.Done():
-			monitorResult <- ctx.Err()
-			return
-		case <-time.After(50 * time.Millisecond):
-		}
-		fmt.Fprintln(output, "external monitor observed bridge delivery")
-		monitorResult <- bridgeDelivered.Emit(ctx, publisher, handle.ID, "delivery/example", bridgeDelivery{
-			TransactionHash: "0xexample",
-		})
-	}()
+	go func() { monitorResult <- monitor.observeBridgeDelivery(ctx, handle.ID) }()
 
 	trace, err := waitForTerminal(ctx, runtime, handle.ID, 8*time.Second)
 	if err != nil {
@@ -122,37 +148,22 @@ func runMonitor(ctx context.Context, db *pgkit.DB, schema string, output io.Writ
 	return handle, trace, nil
 }
 
-type synchronizedWriter struct {
-	mu     sync.Mutex
-	writer io.Writer
+// confirmBridge is the worker handler.
+func (example *monitorExample) confirmBridge(_ context.Context, _ *flow.Work[flow.None]) (confirmBridgeResult, error) {
+	fmt.Fprintln(example.output, "bridge delivery confirmed")
+	return confirmBridgeResult{Confirmed: true}, nil
 }
 
-func (writer *synchronizedWriter) Write(value []byte) (int, error) {
-	writer.mu.Lock()
-	defer writer.mu.Unlock()
-	return writer.writer.Write(value)
-}
-
-func synchronized(writer io.Writer) io.Writer {
-	if writer == nil {
-		writer = io.Discard
-	}
-	return &synchronizedWriter{writer: writer}
-}
-
-func startRuntime(runtime *flow.Runtime) (context.CancelFunc, <-chan error) {
-	runContext, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- runtime.Run(runContext) }()
-	return cancel, result
-}
-
-func stopRuntime(cancel context.CancelFunc, result <-chan error) {
-	cancel()
+func (monitor *externalMonitor) observeBridgeDelivery(ctx context.Context, executionID flow.ExecutionID) error {
 	select {
-	case <-result:
-	case <-time.After(2 * time.Second):
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(50 * time.Millisecond):
 	}
+	fmt.Fprintln(monitor.output, "external monitor observed bridge delivery")
+	return bridgeDelivered.Emit(ctx, monitor.publisher, executionID, "delivery/example", bridgeDelivery{
+		TransactionHash: "0xexample",
+	})
 }
 
 func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.ExecutionID, timeout time.Duration) (flow.ExecutionTrace, error) {

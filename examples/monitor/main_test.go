@@ -20,9 +20,20 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 		t.Fatalf("Migrate() error = %v", err)
 	}
 	var output bytes.Buffer
-	handle, trace, err := runMonitor(ctx, database.DB, database.Schema, &output)
+	runtime, err := newFlowRuntime(database.DB, database.Schema, &output)
 	if err != nil {
-		t.Fatalf("runMonitor() error = %v", err)
+		t.Fatalf("newFlowRuntime() error = %v", err)
+	}
+	monitor, err := newExternalMonitor(database.DB, database.Schema, &output)
+	if err != nil {
+		t.Fatalf("newExternalMonitor() error = %v", err)
+	}
+	stopFlowRuntime := runFlowRuntime(runtime)
+	defer stopFlowRuntime()
+
+	handle, trace, err := runExampleCommand(ctx, runtime, monitor)
+	if err != nil {
+		t.Fatalf("runExampleCommand() error = %v", err)
 	}
 	if !strings.Contains(output.String(), "external monitor observed bridge delivery") ||
 		!strings.Contains(output.String(), "bridge delivery confirmed") {

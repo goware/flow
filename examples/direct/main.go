@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/goware/flow"
@@ -23,6 +22,10 @@ type receiptSent struct {
 }
 
 var sendReceipt = flow.DefineCommand[receiptArgs, receiptSent]("example.send_receipt", 1)
+
+type directExample struct {
+	output io.Writer
+}
 
 func main() {
 	ctx := context.Background()
@@ -44,46 +47,54 @@ func main() {
 		panic(err)
 	}
 
-	handle, trace, err := runDirect(ctx, db, "public", os.Stdout)
+	runtime, err := newFlowRuntime(db, "public", os.Stdout)
+	if err != nil {
+		panic(err)
+	}
+	stopFlowRuntime := runFlowRuntime(runtime)
+	defer stopFlowRuntime()
+
+	handle, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("execution %s completed with %d journal entries\n", handle.ID, len(trace.History))
 }
 
-// runDirect executes one command using a real PostgreSQL-backed Flow runtime.
-// The injected writer lets the end-to-end test observe the same application
-// output that a user sees when running this example.
-func runDirect(ctx context.Context, db *pgkit.DB, schema string, output io.Writer) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	output = synchronized(output)
+func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
+	if output == nil {
+		output = io.Discard
+	}
+	example := &directExample{output: output}
 	runtime, err := flow.New(db,
 		flow.WithSchema(schema),
 		flow.WithWorkerConcurrency(2),
 		flow.WithPollInterval(20*time.Millisecond),
 	)
 	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return nil, err
 	}
+	if err := runtime.Register(flow.Handle(sendReceipt, example.sendReceipt)); err != nil {
+		return nil, err
+	}
+	return runtime, nil
+}
 
-	worker := func(ctx context.Context, work *flow.Work[receiptArgs]) (receiptSent, error) {
-		fmt.Fprintf(output, "sending receipt for %s to %s (command %s)\n",
-			work.Args.OrderID, work.Args.Email, work.Info().CommandID)
+func runFlowRuntime(runtime *flow.Runtime) func() {
+	runContext, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- runtime.Run(runContext) }()
+	return func() {
+		cancel()
 		select {
-		case <-ctx.Done():
-			return receiptSent{}, ctx.Err()
-		case <-time.After(25 * time.Millisecond):
+		case <-result:
+		case <-time.After(2 * time.Second):
 		}
-		result := receiptSent{ProviderMessageID: "stub-" + work.Args.OrderID}
-		fmt.Fprintf(output, "receipt sent: %s\n", result.ProviderMessageID)
-		return result, nil
 	}
-	if err := runtime.Register(flow.Handle(sendReceipt, worker)); err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
-	}
+}
 
-	cancelRun, runResult := startRuntime(runtime)
-	defer stopRuntime(cancelRun, runResult)
-
+// runExampleCommand submits one command and waits for its terminal trace.
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
 	handle, err := sendReceipt.With(runtime).Execute(ctx, "receipt/example-order", receiptArgs{
 		OrderID: "example-order",
 		Email:   "person@example.com",
@@ -95,37 +106,18 @@ func runDirect(ctx context.Context, db *pgkit.DB, schema string, output io.Write
 	return handle, trace, err
 }
 
-type synchronizedWriter struct {
-	mu     sync.Mutex
-	writer io.Writer
-}
-
-func (writer *synchronizedWriter) Write(value []byte) (int, error) {
-	writer.mu.Lock()
-	defer writer.mu.Unlock()
-	return writer.writer.Write(value)
-}
-
-func synchronized(writer io.Writer) io.Writer {
-	if writer == nil {
-		writer = io.Discard
-	}
-	return &synchronizedWriter{writer: writer}
-}
-
-func startRuntime(runtime *flow.Runtime) (context.CancelFunc, <-chan error) {
-	runContext, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- runtime.Run(runContext) }()
-	return cancel, result
-}
-
-func stopRuntime(cancel context.CancelFunc, result <-chan error) {
-	cancel()
+// sendReceipt is the worker handler
+func (example *directExample) sendReceipt(ctx context.Context, work *flow.Work[receiptArgs]) (receiptSent, error) {
+	fmt.Fprintf(example.output, "sending receipt for %s to %s (command %s)\n",
+		work.Args.OrderID, work.Args.Email, work.Info().CommandID)
 	select {
-	case <-result:
-	case <-time.After(2 * time.Second):
+	case <-ctx.Done():
+		return receiptSent{}, ctx.Err()
+	case <-time.After(25 * time.Millisecond):
 	}
+	result := receiptSent{ProviderMessageID: "stub-" + work.Args.OrderID}
+	fmt.Fprintf(example.output, "receipt sent: %s\n", result.ProviderMessageID)
+	return result, nil
 }
 
 func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.ExecutionID, timeout time.Duration) (flow.ExecutionTrace, error) {

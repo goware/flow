@@ -20,9 +20,16 @@ func TestFanOutExampleEndToEnd(t *testing.T) {
 		t.Fatalf("Migrate() error = %v", err)
 	}
 	var output bytes.Buffer
-	handle, trace, err := runFanOut(ctx, database.DB, database.Schema, &output)
+	runtime, err := newFlowRuntime(database.DB, database.Schema, &output)
 	if err != nil {
-		t.Fatalf("runFanOut() error = %v", err)
+		t.Fatalf("newFlowRuntime() error = %v", err)
+	}
+	stopFlowRuntime := runFlowRuntime(runtime)
+	defer stopFlowRuntime()
+
+	handle, trace, err := runExampleCommand(ctx, runtime)
+	if err != nil {
+		t.Fatalf("runExampleCommand() error = %v", err)
 	}
 	if !strings.Contains(output.String(), "generated report with score 6") {
 		t.Fatalf("example output = %q", output.String())
