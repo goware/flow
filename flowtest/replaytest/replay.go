@@ -1,4 +1,6 @@
-package examples_test
+// Package replaytest provides PostgreSQL-backed assertions for verifying that
+// Flow's journal replay agrees with its live projections.
+package replaytest
 
 import (
 	"bytes"
@@ -13,7 +15,9 @@ import (
 	"github.com/goware/pgkit/v2"
 )
 
-func assertReplayMatchesLive(t *testing.T, db *pgkit.DB, schema string, id flow.ExecutionID) {
+// AssertMatchesLive checks that folding an execution's journal produces
+// the same execution, command, and coordinator state as the live projections.
+func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.ExecutionID) {
 	t.Helper()
 	ctx := context.Background()
 	runtime, err := flow.New(db, flow.WithSchema(schema))
