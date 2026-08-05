@@ -13,7 +13,7 @@ The engine owns typed contracts and deterministic worker decisions. It transform
 
 Commands retain name/version, argument/result codecs, retry policy, attempt timeout, and queue. Events retain a name and payload codec. Definitions are immutable; invalid names/versions/options and nil workers fail validation.
 
-`Work[A]` exposes typed `Args` and immutable `CommandInfo`. Its private state records the first defect, staged events, staged children, declared event snapshots, and stable insertion order. `Execute` and `Emit` accept only `*Work`.
+`Work[A]` exposes typed `Args` and immutable `CommandInfo`. Its private state records the first defect, staged events, staged sub-commands, declared event snapshots, and stable insertion order. `Execute` and `Emit` accept only `*Work`.
 
 Durable arguments, results, event payloads, metadata, retry settings, and journal bodies use bounded canonical JSON and hashes. A command fingerprint covers definition, key, arguments, parent, required flag, exact waits, delay, wait budget, queue, timeout, and retry policy.
 
@@ -35,6 +35,6 @@ Before a worker runs, the runtime supplies immutable canonical snapshots for eve
 
 Before settlement the engine returns the first defect, encodes the result, sorts events by name/key, sorts commands by key, validates modifiers, computes fingerprints, and enforces the execution command ceiling. No partially valid decision is accepted.
 
-Required command failure may enter reduced fail-fast. Optional failure is observable but does not determine success. Running attempts remain fenced and settleable; children staged after failure begins are recorded cancelled.
+Required command failure may enter reduced fail-fast. Optional failure is observable but does not determine success. Running attempts remain fenced and settleable; sub-commands staged after failure begins are recorded cancelled.
 
 `flowtest` uses the production recorder and codecs. It supports worker invocation, declared event fixtures, staged event/command inspection, modifier inspection, commit callbacks, and command-ceiling validation without PostgreSQL.

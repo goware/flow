@@ -3,7 +3,7 @@
 //
 // The primary model is command → worker → events: commands instruct work,
 // workers do the work, and events record durable facts. Workers may atomically
-// stage typed application events and bounded child commands. Exact event gates
+// stage typed application events and bounded sub-commands. Exact event gates
 // provide bounded sequencing and all-of joins by holding a command until its
 // execution-scoped facts exist. Command creation, terminal events, and causation are retained in one
 // ordered per-execution journal.

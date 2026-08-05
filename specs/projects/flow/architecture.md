@@ -15,7 +15,7 @@ Flow is a typed API over a PostgreSQL-backed durable command engine. Commands ar
 flow/
 ├── definitions.go          command and event definitions
 ├── execute.go              execution starts, external events, cancellation
-├── worker.go / node.go     worker decisions, ReadEvent, child builder
+├── worker.go / node.go     worker decisions, ReadEvent, sub-command builder
 ├── runtime*.go             registration, command scheduling, shutdown
 ├── inspection.go           execution queries
 ├── history.go / trace.go   journal and reconstructed diagnostics
@@ -28,7 +28,7 @@ flow/
     └── store/              migrations and PostgreSQL transitions
 ```
 
-The typed layer validates command/event definitions and erases worker types behind codecs. The decision engine records events and child commands without SQL. The store owns lock ordering, journal batches, projections, readiness, and fences. The runtime claims registered command versions and invokes workers without holding a connection.
+The typed layer validates command/event definitions and erases worker types behind codecs. The decision engine records events and sub-commands without SQL. The store owns lock ordering, journal batches, projections, readiness, and fences. The runtime claims registered command versions and invokes workers without holding a connection.
 
 ## Transaction and command model
 
@@ -45,7 +45,7 @@ pending/ready/retry_wait -> cancelled | expired
 
 Initial delay and exact event waits are independent prerequisites. Claims install attempt/lease fences. A reclaimed stale invocation may finish locally but cannot settle.
 
-Worker success may atomically include application commit SQL, a result, events, child commands and waits, parent terminal facts, readiness changes, and execution progression. Duplicate declarations compare canonical fingerprints; same-decision repeats may add distinct waits but may not change singleton declaration fields.
+Worker success may atomically include application commit SQL, a result, events, sub-commands and waits, parent terminal facts, readiness changes, and execution progression. Duplicate declarations compare canonical fingerprints; same-decision repeats may add distinct waits but may not change singleton declaration fields.
 
 ## Event-input architecture
 
@@ -55,7 +55,7 @@ This mechanism supports sibling and cross-branch joins without a second state ma
 
 ## Failure, replay, and scaling
 
-Required failure can enter execution `failing`, cancelling work without live attempts. Running attempts retain their fences; accepted events/results remain durable, while newly staged children are recorded cancelled.
+Required failure can enter execution `failing`, cancelling work without live attempts. Running attempts retain their fences; accepted events/results remain durable, while newly staged sub-commands are recorded cancelled.
 
 The journal is semantic history. Replay folds it without callbacks. Trace adds current operational command data and wait satisfaction positions. Queue and lease churn remain projection-only except for attempt boundaries.
 

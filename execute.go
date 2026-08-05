@@ -122,7 +122,7 @@ func WithLiveKey() ExecutionOption {
 }
 
 // WithStartDelay schedules an execution's root command to become deliverable
-// after the delay instead of immediately, mirroring Delay for child commands.
+// after the delay instead of immediately, mirroring Delay for sub-commands.
 func WithStartDelay(delay time.Duration) ExecutionOption {
 	return executionOptionFunc(func(options *executionOptions) {
 		if options.startDelaySet {

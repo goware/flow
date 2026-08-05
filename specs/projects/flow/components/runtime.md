@@ -19,7 +19,7 @@ The scheduler probes `flow_command_queue` for registered exact command versions 
 
 Claim materialization loads typed arguments, command information, and all exact declared event inputs in bounded queries. Database resources are released before worker code runs. Invocation adds attempt timeout, panic recovery, error classification, and private decision state.
 
-Success settlement atomically accepts commit callback SQL, result, events, children, readiness changes, and execution progression under the attempt fence. Failure settlement records retry or terminal failure and applies reduced fail-fast/completion.
+Success settlement atomically accepts commit callback SQL, result, events, sub-commands, readiness changes, and execution progression under the attempt fence. Failure settlement records retry or terminal failure and applies reduced fail-fast/completion.
 
 ## Event ingress and readiness
 

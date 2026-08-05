@@ -136,7 +136,7 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Executi
 }
 
 // agentThink owns the entire agent transition: it reads only declared event
-// inputs, stages tool children and the next gated turn, or emits completion.
+// inputs, stages tool sub-commands and the next gated turn, or emits completion.
 func (example *agentExample) agentThink(ctx context.Context, work *flow.Work[thinkArgs]) (thinkResult, error) {
 	fmt.Fprintf(example.output, "agent thinking on turn %d\n", work.Args.Turn)
 	select {

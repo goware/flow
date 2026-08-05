@@ -22,7 +22,7 @@ Semantic mutations lock their execution first. Journal positions are gap-free an
 | `flow_journal` | immutable ordered semantic history and retained events |
 | `flow_schema_migrations` | checksummed migration records |
 
-There is one execution kind. Permanent and live-key uniqueness use `(definition_name, execution_key)`. A null parent identifies the root command; a non-null parent identifies a worker-staged child.
+There is one execution kind. Permanent and live-key uniqueness use `(definition_name, execution_key)`. A null parent identifies the root command; a non-null parent identifies a worker-staged sub-command.
 
 ## Commands, waits, and journal
 
@@ -34,7 +34,7 @@ Journal kinds are `execution_started`, `execution_failing`, `command_created`, `
 
 ## Transactions and maintenance
 
-Start creates one execution and root command. Success settlement accepts the application commit callback, result, staged events/children, attempt conclusion, wait resolution, and completion progression atomically. Failure settlement applies retry classification or terminal/fail-fast transitions.
+Start creates one execution and root command. Success settlement accepts the application commit callback, result, staged events/sub-commands, attempt conclusion, wait resolution, and completion progression atomically. Failure settlement applies retry classification or terminal/fail-fast transitions.
 
 External event ingress enforces exact identity, appends the event, records satisfying positions, and recalculates readiness. Equivalent repeats are idempotent; conflicting repeats fail; terminal executions cannot be reopened.
 

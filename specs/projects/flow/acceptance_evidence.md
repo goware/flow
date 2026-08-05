@@ -23,7 +23,7 @@ This matrix records evidence for the command/worker/event architecture. PostgreS
 | Contract | Evidence |
 |---|---|
 | Event-before/after declaration resolves exact name/key waits | `TestDirectRootWaitsForExactApplicationEvent` and store tests |
-| Same-decision staged event supplies a child gate | `TestWorkerEventSatisfiesNewChildGateInSameDecision` |
+| Same-decision staged event supplies a sub-command gate | `TestWorkerEventSatisfiesNewChildGateInSameDecision` |
 | Multiple waits are AND conditions and duplicate declarations normalize | decision and `flowtest` gate tests |
 | `ReadEvent` is declared-only, typed, repeatable, and decision-poisoning on misuse | `flowtest` declared-input tests and runtime event-gate tests |
 | Retry/lease takeover receives the same immutable gated payload and satisfying position | `TestRuntimeCapacityLeaseRenewalAndTakeover` |

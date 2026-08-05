@@ -149,7 +149,7 @@ type DirectResult[R any] struct {
 }
 
 // RunDirect recursively executes a closed tree of successful worker
-// decisions. Resolver supplies registrations for staged child name/version.
+// decisions. Resolver supplies registrations for staged sub-command name/version.
 func RunDirect[A, R any](ctx context.Context, root flow.Registration, args A, maxCommands int,
 	resolver func(name string, version int) (flow.Registration, bool)) (DirectResult[R], error) {
 	if maxCommands == 0 {

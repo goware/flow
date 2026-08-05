@@ -14,7 +14,7 @@ completed_at: 2026-08-04
 - [x] Make commands the only execution root and durable orchestration unit.
 - [x] Add bounded exact event snapshots and typed `ReadEvent` access.
 - [x] Enforce at most 256 exact waits per command and expose satisfying positions in trace.
-- [x] Keep worker-staged events/children/result/application commit atomic and fenced.
+- [x] Keep worker-staged events/sub-commands/result/application commit atomic and fenced.
 - [x] Rewrite fan-out as two command-owned fan-out/join phases.
 - [x] Rewrite agent as a bounded self-composing command loop.
 - [x] Make monitor consume its externally published gated event.

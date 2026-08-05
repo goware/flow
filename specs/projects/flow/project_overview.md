@@ -14,7 +14,7 @@ commands + workers + execution-scoped events
 ```
 
 - A command is a durable typed instruction.
-- A worker performs one command, returns a typed result, and may atomically emit events or stage bounded child commands.
+- A worker performs one command, returns a typed result, and may atomically emit events or stage bounded sub-commands.
 - A command may wait for exact application events and read only those declared inputs.
 - The command tree owns lifecycle and provenance; events synchronize work across branches.
 
@@ -24,7 +24,7 @@ There is one execution kind and one scheduler. Flow has no declarative workflow 
 
 Every execution starts with one root command. Workers may stage sequences, dynamic fan-outs, gated joins, repeated fan-out/join phases, and bounded command loops. Stable execution-local command keys make retries idempotent. Multiple event waits are exact AND gates; `Within` gives externally gated work a deliberate lifetime.
 
-Workers consume sibling or external data with `ReadEvent`, which is limited to gates declared on the current command. Parent-computed data is passed directly in child arguments. Larger data belongs behind stable application references.
+Workers consume sibling or external data with `ReadEvent`, which is limited to gates declared on the current command. Parent-computed data is passed directly in sub-command arguments. Larger data belongs behind stable application references.
 
 Flow deliberately does not implement first-of-N races, quorum gates, reactions to unsuccessful command outcomes, or open-ended mutable workflow state.
 

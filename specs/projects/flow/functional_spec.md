@@ -21,7 +21,7 @@ Flow supports direct background work, worker-created command trees, sequence, dy
 
 `command.With(client).Execute(ctx, executionKey, args, options...)` durably starts or rediscovers one asynchronous root command. Execution options include deadline, metadata, fail-fast policy, key scope, initial delay, exact waits, and a wait budget.
 
-Inside a worker, `Execute(work, key, command, args)` stages a child and returns an ephemeral `Node`. `Optional`, `Delay`, `WaitFor`, and `Within` modify its declaration. `Emit(work, event, key, payload)` stages an application event. The worker result, commit callback, events, and children are accepted atomically only when the fenced decision succeeds.
+Inside a worker, `Execute(work, key, command, args)` stages a sub-command and returns an ephemeral `Node`. `Optional`, `Delay`, `WaitFor`, and `Within` modify its declaration. `Emit(work, event, key, payload)` stages an application event. The worker result, commit callback, events, and sub-commands are accepted atomically only when the fenced decision succeeds.
 
 Equivalent duplicate declarations coalesce. Repeated declarations of one key within a single decision merge distinct waits. Arguments, optionality, delay, or wait-budget disagreement poisons the complete decision. A later decision cannot amend an already-durable command declaration.
 
@@ -35,7 +35,7 @@ At most 256 waits may be declared for one command. Claim materialization loads a
 
 ## Lifecycle and failure
 
-Every execution begins with one root command. Child commands retain a single parent for provenance; gates may synchronize commands across branches. An execution succeeds when all commands are terminal and no required command failed or expired. Application events alone do not keep it open; a predeclared gated command does.
+Every execution begins with one root command. Sub-commands retain a single parent for provenance; gates may synchronize commands across branches. An execution succeeds when all commands are terminal and no required command failed or expired. Application events alone do not keep it open; a predeclared gated command does.
 
 Required terminal failure enters reduced fail-fast by default, cancelling work without active attempts while preserving valid running settlements. Optional failure does not fail the execution, but optional work still contributes to liveness. Externally gated optional commands should normally have a `Within` budget.
 

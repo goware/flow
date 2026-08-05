@@ -3,12 +3,12 @@
 `flow` is a Go library for event-driven, durable, distributed work execution backed by PostgreSQL.
 
 ```text
-command -> worker -> result + events + child commands
+command -> worker -> result + events
                          |
-                         +-> exact event-gated commands
+                         +-> optional sub-commands
 ```
 
-Commands are the only durable unit of orchestration. Workers perform typed work, emit immutable execution-scoped events, and stage bounded child commands. Exact event gates provide sequencing and joins. PostgreSQL stores the queue, leases, projections, and a gap-free journal for each execution.
+Commands are the only durable unit of orchestration. Workers perform typed work, emit immutable execution-scoped events, and stage bounded sub-commands. Exact event gates provide sequencing and joins. PostgreSQL stores the queue, leases, projections, and a gap-free journal for each execution.
 
 ## Install
 
@@ -63,7 +63,7 @@ handle, err := sendEmail.With(runtime).Execute(ctx, "email/order-42", emailArgs{
 
 ## Composing work
 
-A successful worker may atomically emit events and stage child commands:
+A successful worker may atomically emit events and stage sub-commands:
 
 ```go
 var charged = flow.DefineEvent[chargeResult]("billing.charged")
@@ -82,7 +82,7 @@ Repeated declarations with the same key and canonical content coalesce. Conflict
 
 ## Exact event gates and inputs
 
-A root or child command may wait for exact application events:
+A root or sub-command may wait for exact application events:
 
 ```go
 var approved = flow.DefineEvent[approval]("orders.approved")
@@ -101,7 +101,7 @@ value, err := flow.ReadEvent(work, approved, "approval/42")
 
 Multiple waits are AND conditions. Matching is exact on event name and key within one execution. Events recorded before command declaration still satisfy the gate. `Within` starts at command creation and runs independently of `Delay`. At most 256 waits may be declared for one command; larger joins should use a tree of join commands or stable external references.
 
-External systems publish with `Event.Emit`. Workers use `flow.Emit` so their events commit atomically with their accepted result and child declarations.
+External systems publish with `Event.Emit`. Workers use `flow.Emit` so their events commit atomically with their accepted result and sub-command declarations.
 
 Fan-out, fan-in, multi-stage joins, branches, and bounded loops are ordinary command composition. Flow intentionally has no separate coordinator/state-machine API, outcome subscriptions, OR/quorum/race gates, or automatic result dataflow.
 
