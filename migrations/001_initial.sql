@@ -11,10 +11,8 @@ CREATE TABLE {{schema}}.flow_executions (
 
     start_fingerprint     bytea NOT NULL CHECK (octet_length(start_fingerprint) = 32),
     input                 bytea NOT NULL,
-    input_hash            bytea NOT NULL CHECK (octet_length(input_hash) = 32),
     metadata              jsonb NOT NULL DEFAULT '{}'::jsonb,
     metadata_canonical    bytea NOT NULL,
-    metadata_hash         bytea NOT NULL CHECK (octet_length(metadata_hash) = 32),
 
     deadline_at           timestamptz,
     max_commands          integer NOT NULL CHECK (max_commands >= 0),
@@ -74,7 +72,6 @@ CREATE TABLE {{schema}}.flow_commands (
     required                boolean NOT NULL DEFAULT true,
 
     args                    bytea NOT NULL,
-    args_hash               bytea NOT NULL CHECK (octet_length(args_hash) = 32),
     declaration_fingerprint bytea NOT NULL CHECK (octet_length(declaration_fingerprint) = 32),
 
     state                   text NOT NULL,
@@ -83,7 +80,6 @@ CREATE TABLE {{schema}}.flow_commands (
     queue                   text NOT NULL,
     attempt_timeout_ms      bigint CHECK (attempt_timeout_ms IS NULL OR attempt_timeout_ms > 0),
     retry_policy            jsonb NOT NULL,
-    retry_policy_hash       bytea NOT NULL CHECK (octet_length(retry_policy_hash) = 32),
 
     initial_delay_ms        bigint CHECK (initial_delay_ms IS NULL OR initial_delay_ms > 0),
     budget_started_at       timestamptz,
@@ -96,7 +92,6 @@ CREATE TABLE {{schema}}.flow_commands (
     consumed_attempts       integer NOT NULL DEFAULT 0 CHECK (consumed_attempts >= 0),
 
     result                  bytea,
-    result_hash             bytea CHECK (result_hash IS NULL OR octet_length(result_hash) = 32),
     last_error              jsonb,
     terminal_failure       jsonb,
     terminal_position       bigint,
@@ -112,9 +107,9 @@ CREATE TABLE {{schema}}.flow_commands (
         (state IN ('pending', 'ready', 'running', 'retry_wait',
                    'succeeded', 'failed', 'cancelled', 'expired')),
     CONSTRAINT flow_commands_result_shape_ck CHECK (
-        (state = 'succeeded' AND result IS NOT NULL AND result_hash IS NOT NULL)
+        (state = 'succeeded' AND result IS NOT NULL)
         OR
-        (state <> 'succeeded' AND result IS NULL AND result_hash IS NULL)
+        (state <> 'succeeded' AND result IS NULL)
     ),
     CONSTRAINT flow_commands_pending_shape_ck CHECK (
         state <> 'pending' OR unsatisfied_waits > 0
@@ -170,7 +165,6 @@ CREATE TABLE {{schema}}.flow_command_queue (
     lease_owner       text,
     lease_started_at  timestamptz,
     lease_expires_at  timestamptz,
-    updated_at        timestamptz NOT NULL,
 
     CONSTRAINT flow_command_queue_state_ck CHECK
         (state IN ('ready', 'retry_wait', 'running')),

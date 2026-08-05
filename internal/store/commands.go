@@ -308,7 +308,7 @@ func (s *Store) claimCommandLocked(
 	leaseExpiresAt := semantic.DBNow().Add(lease)
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+`
 		SET state='running',active_attempt_id=$2,lease_token=$3,lease_owner=$4,
-		    lease_started_at=$5,lease_expires_at=$6,updated_at=$5
+		    lease_started_at=$5,lease_expires_at=$6
 		WHERE command_id=$1`, candidate.CommandID, attemptID, token, owner, semantic.DBNow(), leaseExpiresAt); err != nil {
 		return nil, false, MapError("claim command queue row", err)
 	}
@@ -519,7 +519,7 @@ func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, d
 		SELECT * FROM unnest($1::uuid[],$2::uuid[],$3::uuid[])
 	), renewed AS (
 		UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+` q
-		SET lease_expires_at=n.now+($4 * interval '1 millisecond'),updated_at=n.now
+		SET lease_expires_at=n.now+($4 * interval '1 millisecond')
 		FROM requested r,now_value n
 		WHERE q.command_id=r.command_id AND q.active_attempt_id=r.attempt_id AND q.lease_token=r.token
 		  AND q.state='running' AND q.lease_expires_at>n.now
@@ -797,9 +797,9 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		return SettleResult{}, err
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-		SET state='succeeded',result=$2,result_hash=$3,last_error=NULL,terminal_failure=NULL,
-		    terminal_position=$4,finished_at=$5,updated_at=$5,status_at=$5
-		WHERE command_id=$1`, request.Claim.CommandID, request.Result.Bytes, request.Result.Digest[:],
+		SET state='succeeded',result=$2,last_error=NULL,terminal_failure=NULL,
+		    terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
+		WHERE command_id=$1`, request.Claim.CommandID, request.Result.Bytes,
 		journal.Journal[parentTerminalIndex].Position, semantic.DBNow()); err != nil {
 		return SettleResult{}, MapError("settle successful command", err)
 	}
@@ -1030,8 +1030,8 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+`
 			SET state='retry_wait',next_run_at=$2,active_attempt_id=NULL,lease_token=NULL,lease_owner=NULL,
-			    lease_started_at=NULL,lease_expires_at=NULL,updated_at=$3 WHERE command_id=$1`,
-			request.Claim.CommandID, decision.NextAttemptAt, semantic.DBNow()); err != nil {
+			    lease_started_at=NULL,lease_expires_at=NULL WHERE command_id=$1`,
+			request.Claim.CommandID, decision.NextAttemptAt); err != nil {
 			return SettleResult{}, MapError("release command for retry", err)
 		}
 	} else {
@@ -1432,7 +1432,7 @@ func (s *Store) RecoverExpiredCommandLease(ctx context.Context, candidate Expire
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+`
 		SET state='retry_wait',next_run_at=$2,active_attempt_id=NULL,lease_token=NULL,lease_owner=NULL,
-		    lease_started_at=NULL,lease_expires_at=NULL,updated_at=$2 WHERE command_id=$1`,
+		    lease_started_at=NULL,lease_expires_at=NULL WHERE command_id=$1`,
 		candidate.CommandID, semantic.DBNow()); err != nil {
 		return false, MapError("recover expired command delivery", err)
 	}

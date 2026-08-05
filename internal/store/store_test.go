@@ -313,9 +313,13 @@ func TestSchemaConstraints(t *testing.T) {
 	commandID := seedCommand(t, db, schema, validID, "command")
 	_, err = db.Conn.Exec(ctx, `UPDATE `+pgschema.Table(schema, "flow_commands")+` SET consumed_attempts=2, attempt_ordinal=1 WHERE command_id=$1`, commandID)
 	assertConstraint(t, err, "flow_commands_attempt_counts_ck")
+	_, err = db.Conn.Exec(ctx, `UPDATE `+pgschema.Table(schema, "flow_commands")+` SET result='{}'::text::bytea WHERE command_id=$1`, commandID)
+	assertConstraint(t, err, "flow_commands_result_shape_ck")
+	_, err = db.Conn.Exec(ctx, `UPDATE `+pgschema.Table(schema, "flow_commands")+` SET state='succeeded' WHERE command_id=$1`, commandID)
+	assertConstraint(t, err, "flow_commands_result_shape_ck")
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_command_queue")+`
-		(command_id,execution_id,queue,name,version,state,next_run_at,lease_token,updated_at)
-		VALUES ($1,$2,'default','work',1,'ready',clock_timestamp(),$3,clock_timestamp())`, commandID, validID, uuid.New())
+		(command_id,execution_id,queue,name,version,state,next_run_at,lease_token)
+		VALUES ($1,$2,'default','work',1,'ready',clock_timestamp(),$3)`, commandID, validID, uuid.New())
 	assertConstraint(t, err, "flow_command_queue_lease_shape_ck")
 
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_command_event_waits")+`
@@ -336,11 +340,11 @@ func seedCommand(t *testing.T, db *pgkit.DB, schema string, executionID uuid.UUI
 	t.Helper()
 	id := uuid.New()
 	_, err := db.Conn.Exec(context.Background(), `INSERT INTO `+pgschema.Table(schema, "flow_commands")+` (
-		command_id,execution_id,command_key,name,version,args,args_hash,declaration_fingerprint,
-		state,queue,retry_policy,retry_policy_hash,budget_started_at,next_attempt_at,
+		command_id,execution_id,command_key,name,version,args,declaration_fingerprint,
+		state,queue,retry_policy,budget_started_at,next_attempt_at,
 		created_position,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,'work',1,'{}'::text::bytea,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),
-		'ready','default','{}'::jsonb,decode(repeat('00',32),'hex'),clock_timestamp(),clock_timestamp(),
+	) VALUES ($1,$2,$3,'work',1,'{}'::text::bytea,decode(repeat('00',32),'hex'),
+		'ready','default','{}'::jsonb,clock_timestamp(),clock_timestamp(),
 		1,clock_timestamp(),clock_timestamp(),clock_timestamp())`, id, executionID, key)
 	if err != nil {
 		t.Fatalf("seed command: %v", err)
@@ -373,11 +377,11 @@ func seedExecution(t *testing.T, db *pgkit.DB, schema, key string) uuid.UUID {
 func executionInsertSQL(schema string) string {
 	return `INSERT INTO ` + pgschema.Table(schema, "flow_executions") + ` (
 		execution_id, definition_name, definition_version, execution_key, status,
-		start_fingerprint, input, input_hash, metadata, metadata_canonical, metadata_hash,
+		start_fingerprint, input, metadata, metadata_canonical,
 		max_commands, created_at, updated_at, status_at, finished_at
 	) VALUES ($1,$2,$3,$4,$5,
-		decode(repeat('00',32),'hex'), '{}'::text::bytea, decode(repeat('00',32),'hex'),
-		'{}'::jsonb, '{}'::text::bytea, decode(repeat('00',32),'hex'),
+		decode(repeat('00',32),'hex'), '{}'::text::bytea,
+		'{}'::jsonb, '{}'::text::bytea,
 		100, clock_timestamp(), clock_timestamp(), clock_timestamp(), $6)`
 }
 

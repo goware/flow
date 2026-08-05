@@ -459,9 +459,9 @@ func (s *Store) applyReadinessResolution(
 		}
 		if commandTag.RowsAffected() > 0 {
 			_, err = semantic.PGX().Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_queue")+`
-				(command_id,execution_id,queue,name,version,state,next_run_at,updated_at)
-				VALUES ($1,$2,$3,$4,$5,'ready',$6,$7) ON CONFLICT (command_id) DO NOTHING`,
-				command.id, semantic.ExecutionID(), command.queue, command.name, command.version, nextRun, semantic.DBNow())
+				(command_id,execution_id,queue,name,version,state,next_run_at)
+				VALUES ($1,$2,$3,$4,$5,'ready',$6) ON CONFLICT (command_id) DO NOTHING`,
+				command.id, semantic.ExecutionID(), command.queue, command.name, command.version, nextRun)
 			if err != nil {
 				return MapError("enqueue gated command", err)
 			}

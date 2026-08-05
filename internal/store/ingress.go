@@ -122,14 +122,14 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	var inserted uuid.UUID
 	err := tx.QueryRow(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_executions")+` (
 		execution_id,definition_name,definition_version,execution_key,key_scope,status,fail_fast,
-		start_fingerprint,input,input_hash,metadata,metadata_canonical,metadata_hash,
+		start_fingerprint,input,metadata,metadata_canonical,
 		deadline_at,max_commands,command_count,open_commands,
 		next_journal_position,root_command_id,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$15,1,$16,$17,$17,$17)
+	) VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$13,1,$14,$15,$15,$15)
 	ON CONFLICT DO NOTHING RETURNING execution_id`,
 		request.ID, request.DefinitionName, request.DefinitionVersion, request.Key, request.KeyScope,
-		request.FailFast, request.StartFingerprint[:], request.Input.Bytes, request.Input.Digest[:],
-		string(request.Metadata.Bytes), request.Metadata.Bytes, request.Metadata.Digest[:], deadlineAt,
+		request.FailFast, request.StartFingerprint[:], request.Input.Bytes,
+		string(request.Metadata.Bytes), request.Metadata.Bytes, deadlineAt,
 		request.MaxCommands, commandCount, rootID, dbNow,
 	).Scan(&inserted)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -341,14 +341,14 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_commands")+` (
 		command_id,execution_id,command_key,name,version,parent_command_id,required,
-		args,args_hash,declaration_fingerprint,state,unsatisfied_waits,
-		queue,attempt_timeout_ms,retry_policy,retry_policy_hash,initial_delay_ms,
+		args,declaration_fingerprint,state,unsatisfied_waits,
+		queue,attempt_timeout_ms,retry_policy,initial_delay_ms,
 		budget_started_at,next_attempt_at,wait_timeout_ms,created_position,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17,$18,$19,$20,$21,$22,$22,$22)`,
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$20,$20)`,
 		command.ID, executionID, command.Key, command.Name, command.Version,
-		command.ParentCommandID, command.Required, command.Args.Bytes, command.Args.Digest[:],
+		command.ParentCommandID, command.Required, command.Args.Bytes,
 		command.DeclarationFingerprint[:], state, unsatisfiedWaits, command.Queue, timeoutMS,
-		string(command.RetryPolicy.Bytes), command.RetryPolicy.Digest[:], initialDelayMS,
+		string(command.RetryPolicy.Bytes), initialDelayMS,
 		acceptedBudget, acceptedNext, withinMS, createdPosition, budgetStartedAt,
 	)
 	if err != nil {
@@ -375,9 +375,9 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	}
 	if state == "ready" {
 		_, err = tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_queue")+`
-			(command_id,execution_id,queue,name,version,state,next_run_at,updated_at)
-			VALUES ($1,$2,$3,$4,$5,'ready',$6,$7)`,
-			command.ID, executionID, command.Queue, command.Name, command.Version, nextAttemptAt, budgetStartedAt)
+			(command_id,execution_id,queue,name,version,state,next_run_at)
+			VALUES ($1,$2,$3,$4,$5,'ready',$6)`,
+			command.ID, executionID, command.Queue, command.Name, command.Version, nextAttemptAt)
 		if err != nil {
 			return MapError("enqueue command", err)
 		}

@@ -73,6 +73,44 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	}
 }
 
+func TestMigrationPrunesOnlyUnusedProjectionColumns(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	var pruned int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_schema=$1 AND (
+			(table_name='flow_executions' AND column_name IN ('input_hash','metadata_hash'))
+			OR (table_name='flow_commands' AND column_name IN ('args_hash','retry_policy_hash','result_hash'))
+			OR (table_name='flow_command_queue' AND column_name='updated_at')
+		)`, database.Schema).Scan(&pruned); err != nil {
+		t.Fatalf("inspect pruned columns: %v", err)
+	}
+	if pruned != 0 {
+		t.Fatalf("unused projection columns remaining = %d, want 0", pruned)
+	}
+
+	var retained int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_schema=$1 AND (
+			(table_name='flow_executions' AND column_name IN ('input','metadata_canonical'))
+			OR (table_name='flow_commands' AND column_name IN
+				('declaration_fingerprint','result','last_error','terminal_failure'))
+		)`, database.Schema).Scan(&retained); err != nil {
+		t.Fatalf("inspect retained columns: %v", err)
+	}
+	if retained != 6 {
+		t.Fatalf("retained semantic projection columns = %d, want 6", retained)
+	}
+}
+
 func TestMigrationChecksumMismatch(t *testing.T) {
 	t.Parallel()
 
