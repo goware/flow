@@ -12,11 +12,17 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// Execution is a durable execution state snapshot. Execute returns the
+// snapshot as of durable acceptance; GetExecution, AwaitExecution, and other
+// inspection reads return the current or final state. Created reports whether
+// the producing Execute call created the execution; it is false for an
+// idempotent rediscovery and always false on inspection reads.
 type Execution struct {
 	ID             ExecutionID
 	Type           string
 	Version        int
 	Key            string
+	RootCommandID  CommandID
 	Status         string
 	FailFast       bool
 	MaxCommands    int
@@ -30,6 +36,7 @@ type Execution struct {
 	StatusAt       time.Time
 	FinishedAt     *time.Time
 	Metadata       json.RawMessage
+	Created        bool
 }
 
 type TraceAttempt struct {

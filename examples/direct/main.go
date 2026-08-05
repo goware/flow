@@ -54,11 +54,11 @@ func main() {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	handle, trace, err := runExampleCommand(ctx, runtime)
+	exec, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("execution %s completed with %d journal entries\n", handle.ID, len(trace.History))
+	fmt.Printf("execution %s completed with %d journal entries\n", exec.ID, len(trace.History))
 }
 
 func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
@@ -94,16 +94,16 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 }
 
 // runExampleCommand submits one command and waits for its terminal trace.
-func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	handle, err := sendReceipt.With(runtime).Execute(ctx, "receipt/example-order", receiptArgs{
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Execution, flow.ExecutionTrace, error) {
+	exec, err := sendReceipt.With(runtime).Execute(ctx, "receipt/example-order", receiptArgs{
 		OrderID: "example-order",
 		Email:   "person@example.com",
 	})
 	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return flow.Execution{}, flow.ExecutionTrace{}, err
 	}
-	trace, err := waitForTerminal(ctx, runtime, handle.ID, 5*time.Second)
-	return handle, trace, err
+	trace, err := waitForTerminal(ctx, runtime, exec.ID, 5*time.Second)
+	return exec, trace, err
 }
 
 // sendReceipt is the worker handler

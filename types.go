@@ -25,14 +25,6 @@ type CommandFailure struct {
 	Message string `json:"message"`
 }
 
-type ExecutionHandle struct {
-	ID            ExecutionID
-	Type          string
-	Key           string
-	RootCommandID CommandID
-	Created       bool
-}
-
 type CommandInfo struct {
 	ExecutionID ExecutionID
 	CommandID   CommandID

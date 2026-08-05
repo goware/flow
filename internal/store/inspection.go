@@ -22,6 +22,7 @@ type ExecutionRow struct {
 	DefinitionName    string
 	DefinitionVersion int
 	Key               string
+	RootCommandID     *uuid.UUID
 	Status            string
 	FailFast          bool
 	MaxCommands       int
@@ -126,7 +127,7 @@ func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter Execut
 
 const executionSelectColumns = `SELECT execution_id,definition_name,definition_version,execution_key,status,
 	fail_fast,max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
-	finished_at,metadata FROM `
+	finished_at,metadata,root_command_id FROM `
 
 func (s *Store) executionSelect() string {
 	return executionSelectColumns + pgschema.Table(s.schema, "flow_executions")
@@ -165,6 +166,7 @@ func scanExecution(row pgx.Row) (ExecutionRow, error) {
 		&value.ID, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
 		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.DeadlineAt,
 		&failure, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
+		&value.RootCommandID,
 	); err != nil {
 		return ExecutionRow{}, MapError("scan execution", err)
 	}

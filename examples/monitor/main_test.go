@@ -31,7 +31,7 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	handle, trace, err := runExampleCommand(ctx, runtime, monitor)
+	exec, trace, err := runExampleCommand(ctx, runtime, monitor)
 	if err != nil {
 		t.Fatalf("runExampleCommand() error = %v", err)
 	}
@@ -49,19 +49,19 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 	var factRows, queueRows, satisfiedWaits int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
 		WHERE execution_id=$1 AND event_namespace='application' AND event_name=$2`,
-		handle.ID, bridgeDeliveredName).Scan(&factRows); err != nil {
+		exec.ID, bridgeDeliveredName).Scan(&factRows); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_event_waits")+`
-		WHERE execution_id=$1 AND satisfied_position IS NOT NULL`, handle.ID).Scan(&satisfiedWaits); err != nil {
+		WHERE execution_id=$1 AND satisfied_position IS NOT NULL`, exec.ID).Scan(&satisfiedWaits); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE execution_id=$1`, handle.ID).Scan(&queueRows); err != nil {
+		WHERE execution_id=$1`, exec.ID).Scan(&queueRows); err != nil {
 		t.Fatal(err)
 	}
 	if factRows != 1 || satisfiedWaits != 1 || queueRows != 0 {
 		t.Fatalf("database rows facts=%d satisfied_waits=%d queue=%d", factRows, satisfiedWaits, queueRows)
 	}
-	replaytest.AssertMatchesLive(t, database.DB, database.Schema, handle.ID)
+	replaytest.AssertMatchesLive(t, database.DB, database.Schema, exec.ID)
 }

@@ -308,7 +308,7 @@ To avoid enlarging M1 while unifying the verb, command-dependency and fact-wait 
 
 The error contract deliberately changes:
 
-- external definition methods perform a PostgreSQL ingress transaction immediately and continue returning `(ExecutionHandle, error)`;
+- external definition methods perform a PostgreSQL ingress transaction immediately and continue returning `(Execution, error)`;
 - in-execution `flow.Execute` performs no SQL and returns a `Node`;
 - invalid in-execution definitions, duplicate conflicts, or modifiers record the first error on the plan/worker/coordinator scope;
 - a poisoned plan records `PlanFailed`, a poisoned worker becomes a permanently failed attempt decision, and a poisoned coordinator records its existing deterministic failure path;
@@ -345,7 +345,7 @@ Delete:
 func LookupExecution(ctx context.Context, c Client, typ, key string) (Execution, error)
 ```
 
-`ListExecutions` is an operational browsing API and is not an exact replacement for point lookup. Application code that must reconnect a domain object to an execution must instead persist the returned `ExecutionID` with that domain object, preferably in the same application transaction through `Runtime.InTx`. A caller recovering from an ambiguous start may also repeat the identical keyed `Execute`, which is idempotent and returns the same handle. `GetExecution` by `ExecutionID` remains; `ListExecutions` remains for filtering and operator discovery rather than application identity.
+`ListExecutions` is an operational browsing API and is not an exact replacement for point lookup. Application code that must reconnect a domain object to an execution must instead persist the returned `ExecutionID` with that domain object, preferably in the same application transaction through `Runtime.InTx`. A caller recovering from an ambiguous start may also repeat the identical keyed `Execute`, which is idempotent and returns the same `Execution` snapshot. `GetExecution` by `ExecutionID` remains; `ListExecutions` remains for filtering and operator discovery rather than application identity.
 
 Deleting `LookupExecution` also deletes its multi-mode ambiguity rule — `ErrConflict` when one name/key pair exists under more than one driver mode — and the tests that rule requires. The functional specification and examples must make durable `ExecutionID` persistence the normal integration pattern rather than teaching prefix scans as lookup.
 
@@ -421,9 +421,9 @@ No `Event.With(client)` binding is added in this reduction. Event emission alrea
 Keep the existing definition methods that start executions:
 
 ```go
-func (c Command[A, R]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (ExecutionHandle, error)
-func (p PlanDef[A]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (ExecutionHandle, error)
-func (c Coordinator[S]) Execute(ctx context.Context, key string, initial S, opts ...ExecutionOption) (ExecutionHandle, error)
+func (c Command[A, R]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (Execution, error)
+func (p PlanDef[A]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (Execution, error)
+func (c Coordinator[S]) Execute(ctx context.Context, key string, initial S, opts ...ExecutionOption) (Execution, error)
 ```
 
 Add one generic package function for work inside an existing execution:
@@ -572,7 +572,7 @@ The former success string reference was the last stringly-typed value on the coo
 No orchestration vocabulary is required:
 
 ```go
-handle, err := SendReceipt.With(rt).Execute(
+execution, err := SendReceipt.With(rt).Execute(
     ctx,
     "receipt/"+orderID,
     SendReceiptArgs{OrderID: orderID},

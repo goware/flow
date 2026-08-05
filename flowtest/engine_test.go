@@ -80,11 +80,11 @@ func TestRunWorkerReadsDeclaredEventInputs(t *testing.T) {
 	event := flow.DefineEvent[testFact]("flowtest.worker_input")
 	command := flow.DefineCommand[testArgs, testResult]("flowtest.input_worker", 1)
 	registration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		first, err := flow.ReadEvent(work, event, "input/1")
+		first, err := flow.GetEventValue(work, event, "input/1")
 		if err != nil {
 			return testResult{}, err
 		}
-		second, err := flow.ReadEvent(work, event, "input/1")
+		second, err := flow.GetEventValue(work, event, "input/1")
 		if err != nil {
 			return testResult{}, err
 		}
@@ -102,7 +102,7 @@ func TestRunWorkerReadsDeclaredEventInputs(t *testing.T) {
 
 	wrongType := flow.DefineEvent[int]("flowtest.worker_input")
 	wrongRegistration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		_, err := flow.ReadEvent(work, wrongType, "input/1")
+		_, err := flow.GetEventValue(work, wrongType, "input/1")
 		return testResult{}, err
 	})
 	wrong, err := flowtest.RunWorker[testArgs, testResult](context.Background(), wrongRegistration, testArgs{},
@@ -192,7 +192,7 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 		return testResult{Value: "root"}, nil
 	})
 	childRegistration := flow.Handle(child, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		if _, err := flow.ReadEvent(work, directEvent, "shared"); err != nil {
+		if _, err := flow.GetEventValue(work, directEvent, "shared"); err != nil {
 			return testResult{}, err
 		}
 		_ = flow.Emit(work, directEvent, "shared", testFact{Value: "same"})

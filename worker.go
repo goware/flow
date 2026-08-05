@@ -400,16 +400,17 @@ func (state *decisionState) orderedCommands() []stagedCommand {
 	return result
 }
 
-// ReadEvent returns the immutable payload for an exact event gate declared by
-// the currently executing command. The lookup is in-memory and performs no SQL.
-func ReadEvent[W, T any](work *Work[W], event Event[T], key string) (T, error) {
+// GetEventValue returns the typed value attached to an exact event gate
+// declared by the current command. The value is already in memory when the
+// worker starts; this function does not wait or query the database.
+func GetEventValue[W, T any](work *Work[W], event Event[T], key string) (T, error) {
 	var zero T
-	state, err := usableWork(work, "read event")
+	state, err := usableWork(work, "get event value")
 	if err != nil {
 		return zero, err
 	}
 	if event.def == nil || event.def.Namespace != "application" || event.err != nil {
-		err = newError(ErrInvalid, "read", "event", key, "invalid application event definition")
+		err = newError(ErrInvalid, "get", "event value", key, "invalid application event definition")
 		state.poison(err)
 		return zero, err
 	}
@@ -419,19 +420,19 @@ func ReadEvent[W, T any](work *Work[W], event Event[T], key string) (T, error) {
 	}
 	input, ok := state.eventInputs[event.def.Name+"\x00"+key]
 	if !ok {
-		err = newError(ErrInvalidState, "read", "event", key, "event was not declared as an input to this command")
+		err = newError(ErrInvalidState, "get", "event value", key, "event was not declared as an input to this command")
 		state.poison(err)
 		return zero, err
 	}
 	decoded, err := event.def.Payload.Decode(input.payload)
 	if err != nil {
-		err = newError(ErrInvalidState, "read", "event", key, "stored event payload cannot be decoded")
+		err = newError(ErrInvalidState, "get", "event value", key, "stored event payload cannot be decoded")
 		state.poison(err)
 		return zero, err
 	}
 	result, ok := decoded.(T)
 	if !ok {
-		err = newError(ErrInvalidState, "read", "event", key, "stored event payload has an incompatible type")
+		err = newError(ErrInvalidState, "get", "event value", key, "stored event payload has an incompatible type")
 		state.poison(err)
 		return zero, err
 	}

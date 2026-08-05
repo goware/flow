@@ -38,9 +38,9 @@ func BenchmarkExecutionIngressNotification(b *testing.B) {
 	}
 }
 
-// BenchmarkReadEventLookup256 measures the worker-time O(1) lookup at the
+// BenchmarkGetEventValueLookup256 measures the worker-time O(1) lookup at the
 // maximum declared-input count. No database work occurs in the benchmark.
-func BenchmarkReadEventLookup256(b *testing.B) {
+func BenchmarkGetEventValueLookup256(b *testing.B) {
 	event := DefineEvent[int]("benchmark.read_event")
 	inputs := make(map[string]eventInputSnapshot, maxCommandEventWaits)
 	for index := range maxCommandEventWaits {
@@ -55,9 +55,9 @@ func BenchmarkReadEventLookup256(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		value, err := ReadEvent(work, event, "input/255")
+		value, err := GetEventValue(work, event, "input/255")
 		if err != nil || value != 255 {
-			b.Fatalf("ReadEvent() = %d, %v", value, err)
+			b.Fatalf("GetEventValue() = %d, %v", value, err)
 		}
 	}
 }
@@ -86,17 +86,17 @@ func BenchmarkEventSnapshotMaterialization256(b *testing.B) {
 		for wait := range maxCommandEventWaits {
 			opts = append(opts, WaitFor(event, fmt.Sprintf("input/%03d", wait)))
 		}
-		handle, err := command.With(runtime).Execute(ctx, fmt.Sprintf("snapshot/%d", index), None{}, opts...)
+		exec, err := command.With(runtime).Execute(ctx, fmt.Sprintf("snapshot/%d", index), None{}, opts...)
 		if err != nil {
 			b.Fatal(err)
 		}
 		for wait := range maxCommandEventWaits {
-			if err := event.Emit(ctx, runtime, handle.ID, fmt.Sprintf("input/%03d", wait), payload); err != nil {
+			if err := event.Emit(ctx, runtime, exec.ID, fmt.Sprintf("input/%03d", wait), payload); err != nil {
 				b.Fatal(err)
 			}
 		}
-		commandID, _ := uuid.Parse(string(handle.RootCommandID))
-		executionID, _ := uuid.Parse(string(handle.ID))
+		commandID, _ := uuid.Parse(string(exec.RootCommandID))
+		executionID, _ := uuid.Parse(string(exec.ID))
 		candidate := store.CommandCandidate{CommandID: commandID, ExecutionID: executionID,
 			Queue: defaultQueue, Name: command.Name(), Version: command.Version()}
 		b.StartTimer()
@@ -119,17 +119,17 @@ func BenchmarkInspection100Commands(b *testing.B) {
 			if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 				b.Fatal(err)
 			}
-			runtime, handle, stop := startHundredCommandExecution(b, database, ctx, "inspection")
+			runtime, exec, stop := startHundredCommandExecution(b, database, ctx, "inspection")
 			defer stop()
 			b.ResetTimer()
 			for range b.N {
 				switch operation {
 				case "history":
-					if _, err := History(ctx, runtime, handle.ID, HistoryLimit(1_000)); err != nil {
+					if _, err := History(ctx, runtime, exec.ID, HistoryLimit(1_000)); err != nil {
 						b.Fatal(err)
 					}
 				case "trace":
-					if _, err := Trace(ctx, runtime, handle.ID); err != nil {
+					if _, err := Trace(ctx, runtime, exec.ID); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -147,12 +147,12 @@ func TestJournalGrowthMeasurement100Commands(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	_, handle, stop := startHundredCommandExecution(t, database, ctx, "journal-growth")
+	_, exec, stop := startHundredCommandExecution(t, database, ctx, "journal-growth")
 	defer stop()
 	var rows int
 	var tupleBytes, bodyBytes int64
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*),COALESCE(sum(pg_column_size(j)),0),COALESCE(sum(octet_length(body)),0)
-		FROM `+pgschema.Table(database.Schema, "flow_journal")+` j WHERE execution_id=$1`, handle.ID).
+		FROM `+pgschema.Table(database.Schema, "flow_journal")+` j WHERE execution_id=$1`, exec.ID).
 		Scan(&rows, &tupleBytes, &bodyBytes); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ type benchmarkTB interface {
 	Fatal(...any)
 }
 
-func startHundredCommandExecution(tb benchmarkTB, database testpg.Database, ctx context.Context, key string) (*Runtime, ExecutionHandle, func()) {
+func startHundredCommandExecution(tb benchmarkTB, database testpg.Database, ctx context.Context, key string) (*Runtime, Execution, func()) {
 	tb.Helper()
 	child := DefineCommand[None, None]("benchmark.inspection.child", 1)
 	root := DefineCommand[None, None]("benchmark.inspection.root", 1)
@@ -191,20 +191,20 @@ func startHundredCommandExecution(tb benchmarkTB, database testpg.Database, ctx 
 	runCtx, cancel := context.WithCancel(ctx)
 	runResult := make(chan error, 1)
 	go func() { runResult <- runtime.Run(runCtx) }()
-	handle, err := root.With(runtime).Execute(ctx, key, None{}, WithoutExecutionDeadline())
+	exec, err := root.With(runtime).Execute(ctx, key, None{}, WithoutExecutionDeadline())
 	if err != nil {
 		cancel()
 		tb.Fatal(err)
 	}
 	deadlineCtx, deadlineCancel := context.WithTimeout(ctx, 10*time.Second)
-	settled, err := AwaitExecution(deadlineCtx, runtime, handle.ID)
+	settled, err := AwaitExecution(deadlineCtx, runtime, exec.ID)
 	deadlineCancel()
 	if err != nil || settled.Status != "succeeded" || settled.CommandCount != 100 {
 		cancel()
 		<-runResult
 		tb.Fatal("hundred-command execution failed", err, settled)
 	}
-	return runtime, handle, func() {
+	return runtime, exec, func() {
 		cancel()
 		<-runResult
 	}

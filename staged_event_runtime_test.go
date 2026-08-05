@@ -128,18 +128,18 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 		WHERE execution_id=$1`, successHandle.ID).Scan(&committed); err != nil || committed != 1 {
 		t.Fatalf("commit rows=%d err=%v", committed, err)
 	}
-	for _, handle := range []ExecutionHandle{failureHandle, commitFailureHandle, commitIngressHandle} {
+	for _, exec := range []Execution{failureHandle, commitFailureHandle, commitIngressHandle} {
 		var eventCount, childCount int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT
 			count(*) FILTER (WHERE event_class='application'),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
 			 WHERE execution_id=$1 AND parent_command_id IS NOT NULL)
-			FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, handle.ID).
+			FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, exec.ID).
 			Scan(&eventCount, &childCount); err != nil {
 			t.Fatal(err)
 		}
 		if eventCount != 0 || childCount != 0 {
-			t.Fatalf("rolled-back decision %s exposed events=%d children=%d", handle.ID, eventCount, childCount)
+			t.Fatalf("rolled-back decision %s exposed events=%d children=%d", exec.ID, eventCount, childCount)
 		}
 	}
 	var poisonedCommitRows int
@@ -247,11 +247,11 @@ func TestWorkerStagedEventCoalescesOrConflictsWithDurableIdentity(t *testing.T) 
 	defer stopRuntime(t, cancel, runResult)
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, equivalent.ID, "succeeded", 5*time.Second)
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, conflicting.ID, "failed", 5*time.Second)
-	for _, handle := range []ExecutionHandle{equivalent, conflicting} {
+	for _, exec := range []Execution{equivalent, conflicting} {
 		var count int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-			WHERE execution_id=$1 AND event_class='application'`, handle.ID).Scan(&count); err != nil || count != 1 {
-			t.Fatalf("execution=%s application events=%d err=%v", handle.ID, count, err)
+			WHERE execution_id=$1 AND event_class='application'`, exec.ID).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("execution=%s application events=%d err=%v", exec.ID, count, err)
 		}
 	}
 }

@@ -114,7 +114,7 @@ Ordinary external callers should generally use `Event.Emit` when detached or cro
 The receiving side is an ordinary command whose execution contains an event-gated sub-command:
 
 ```go
-func runStage(ctx context.Context, client flow.Client, stageRunKey string) (flow.ExecutionHandle, error) {
+func runStage(ctx context.Context, client flow.Client, stageRunKey string) (flow.Execution, error) {
 	return awaitStage.With(client).Execute(
 		ctx,
 		stageRunKey,
@@ -129,7 +129,7 @@ Its worker reads the already-satisfied event normally:
 
 ```go
 func awaitStageWorker(_ context.Context, work *flow.Work[AwaitStageArgs]) (flow.None, error) {
-	completed, err := flow.ReadEvent(work, stageCompleted, work.Args.EventKey)
+	completed, err := flow.GetEventValue(work, stageCompleted, work.Args.EventKey)
 	if err != nil {
 		return flow.None{}, err
 	}
@@ -191,7 +191,7 @@ This commits the target event independently. It is appropriate only when no appl
 Multiple producer executions may deliver distinct exact events to one target execution. The target can use existing `WaitFor` gates to express an AND-join:
 
 ```go
-handle, err := joinResults.With(runtime).Execute(ctx, "join/42", args,
+execution, err := joinResults.With(runtime).Execute(ctx, "join/42", args,
 	flow.WaitFor(resultReady, "part-a"),
 	flow.WaitFor(resultReady, "part-b"),
 	flow.WaitFor(resultReady, "part-c"),
@@ -345,7 +345,7 @@ Its original target was a long-lived coordinator because it was built against `m
 1. Start a stage-run execution containing a command gated on the exact terminal event for that run.
 2. Persist its `ExecutionID` with the application's stage-run identity.
 3. A producer transaction performs the business write and calls `terminalEvent.Deliver` with that target ID using `runtime.InTx(tx)`.
-4. The target gated command becomes runnable after commit and reads the event with `ReadEvent`.
+4. The target gated command becomes runnable after commit and gets the event value with `GetEventValue`.
 5. If the application needs another run, start a new run identity rather than reopening mutable coordinator state.
 
 This preserves the useful part of PR 10 without reintroducing:
@@ -429,7 +429,7 @@ Prove:
 Replace PR 10's coordinator-shaped example with command-only tests proving:
 
 - a producer execution delivers a terminal event to a separate gated execution;
-- the gated worker reads the delivered payload with `ReadEvent`;
+- the gated worker gets the delivered payload with `GetEventValue`;
 - several producer executions can satisfy an exact multi-event join;
 - a new stage run uses a new execution identity rather than reopening the old target.
 
@@ -459,7 +459,7 @@ This plan is complete when:
 6. A regular runtime client provides explicit independently committed delivery.
 7. Existing target-local event identity, idempotency, gate, and terminal-state rules are preserved.
 8. A committed delivery survives source failure, retry, and lease loss.
-9. The receiving examples and tests use only commands, workers, exact events, `WaitFor`, and `ReadEvent`.
+9. The receiving examples and tests use only commands, workers, exact events, `WaitFor`, and `GetEventValue`.
 10. No schema, coordinator, scheduler, subscription, broadcast, or replay machinery is added.
 11. Public documentation clearly distinguishes staged `Emit`, external `Emit`, and cross-execution `Deliver`.
 12. The full PostgreSQL-backed and race test suites pass.
@@ -513,7 +513,7 @@ An outbox remains appropriate across databases or external systems, but it is un
 
 1. Add focused failing tests for cross-execution delivery, transaction commit/rollback, retry idempotency, and preservation of the existing `Event.Emit` attempt guard.
 2. Factor the existing external event-ingress helper and add `Event.Deliver`.
-3. Add the command-only receiving acceptance test based on an exact `WaitFor` gate and `ReadEvent`.
+3. Add the command-only receiving acceptance test based on an exact `WaitFor` gate and `GetEventValue`.
 4. Update API documentation and active specifications.
 5. Run the full PostgreSQL-backed, race, and vet suites.
 6. Confirm the production diff contains no attempt-context, storage-schema, scheduler, replay, or coordinator changes.

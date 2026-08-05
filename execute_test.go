@@ -42,7 +42,7 @@ func TestExecutionStartsAndEventEmit(t *testing.T) {
 		t.Fatalf("Command.Execute() error = %v", err)
 	}
 	if !direct.Created || direct.RootCommandID == "" || direct.Type != command.Name() {
-		t.Fatalf("direct handle = %#v", direct)
+		t.Fatalf("direct exec = %#v", direct)
 	}
 	assertExecutionShape(t, database.Schema, database.DB.Conn, direct, 1, 1)
 
@@ -89,23 +89,23 @@ func TestApplicationEventCannotReopenTerminalExecution(t *testing.T) {
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	handle, err := command.With(runtime).Execute(ctx, "terminal-event", None{})
+	exec, err := command.With(runtime).Execute(ctx, "terminal-event", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
-	before, err := History(ctx, runtime, handle.ID)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	before, err := History(ctx, runtime, exec.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := event.Emit(ctx, runtime, handle.ID, "late", "must not be recorded"); !errors.Is(err, ErrTerminal) {
+	if err := event.Emit(ctx, runtime, exec.ID, "late", "must not be recorded"); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("late Event.Emit() error=%v, want ErrTerminal", err)
 	}
-	after, err := History(ctx, runtime, handle.ID)
+	after, err := History(ctx, runtime, exec.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	execution, err := GetExecution(ctx, runtime, handle.ID)
+	execution, err := GetExecution(ctx, runtime, exec.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,14 +198,14 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	command := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1,
 		WithQueue("original"), WithRetry(Attempts(3)), WithTimeout(111*time.Millisecond))
 	const callers = 16
-	handles := make([]ExecutionHandle, callers)
+	execs := make([]Execution, callers)
 	errs := make([]error, callers)
 	var group sync.WaitGroup
 	for index := range callers {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			handles[index], errs[index] = command.With(runtime).Execute(ctx, "same", ingressArgs{Value: "stable"})
+			execs[index], errs[index] = command.With(runtime).Execute(ctx, "same", ingressArgs{Value: "stable"})
 		}()
 	}
 	group.Wait()
@@ -214,17 +214,17 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 		if errs[index] != nil {
 			t.Fatalf("concurrent Execute(%d) error = %v", index, errs[index])
 		}
-		if handles[index].ID != handles[0].ID || handles[index].RootCommandID != handles[0].RootCommandID {
-			t.Fatalf("concurrent handle %d = %#v, first %#v", index, handles[index], handles[0])
+		if execs[index].ID != execs[0].ID || execs[index].RootCommandID != execs[0].RootCommandID {
+			t.Fatalf("concurrent exec %d = %#v, first %#v", index, execs[index], execs[0])
 		}
-		if handles[index].Created {
+		if execs[index].Created {
 			created++
 		}
 	}
 	if created != 1 {
-		t.Fatalf("created handles = %d, want 1", created)
+		t.Fatalf("created execs = %d, want 1", created)
 	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, handles[0], 1, 1)
+	assertExecutionShape(t, database.Schema, database.DB.Conn, execs[0], 1, 1)
 
 	changedRuntime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(99))
 	if err != nil {
@@ -233,7 +233,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	changedCommand := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1,
 		WithQueue("changed"), WithRetry(Attempts(9)), WithTimeout(999*time.Millisecond))
 	repeated, err := changedCommand.With(changedRuntime).Execute(ctx, "same", ingressArgs{Value: "stable"})
-	if err != nil || repeated.Created || repeated.ID != handles[0].ID {
+	if err != nil || repeated.Created || repeated.ID != execs[0].ID {
 		t.Fatalf("start under changed defaults = %#v, %v", repeated, err)
 	}
 	var maxCommands, acceptedAttempts int
@@ -242,7 +242,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT e.max_commands,c.queue,
 		(c.retry_policy->>'max_attempts')::integer,c.attempt_timeout_ms FROM `+
 		pgschema.Table(database.Schema, "flow_executions")+` e JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c USING (execution_id)
-		WHERE e.execution_id=$1`, handles[0].ID).Scan(&maxCommands, &queue, &acceptedAttempts, &timeoutMS); err != nil {
+		WHERE e.execution_id=$1`, execs[0].ID).Scan(&maxCommands, &queue, &acceptedAttempts, &timeoutMS); err != nil {
 		t.Fatalf("read accepted defaults: %v", err)
 	}
 	if maxCommands != 1 || queue != "original" || acceptedAttempts != 3 || timeoutMS != 111 {
@@ -253,7 +253,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	fact := DefineEvent[ingressArgs]("ceiling.fact")
 	publishErrors := make(chan error, callers)
 	for range callers {
-		go func() { publishErrors <- fact.Emit(ctx, runtime, handles[0].ID, "same", ingressArgs{Value: "fact"}) }()
+		go func() { publishErrors <- fact.Emit(ctx, runtime, execs[0].ID, "same", ingressArgs{Value: "fact"}) }()
 	}
 	for range callers {
 		if err := <-publishErrors; err != nil {
@@ -262,7 +262,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	}
 	var eventCount int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE execution_id=$1 AND event_class='application'`, handles[0].ID).Scan(&eventCount); err != nil || eventCount != 1 {
+		WHERE execution_id=$1 AND event_class='application'`, execs[0].ID).Scan(&eventCount); err != nil || eventCount != 1 {
 		t.Fatalf("concurrent event count = %d, %v", eventCount, err)
 	}
 }
@@ -362,12 +362,12 @@ func TestRuntimeAndIngressValidation(t *testing.T) {
 	if err := DefineEvent[ingressArgs]("event").Emit(ctx, runtime, ExecutionID("bad"), "key", ingressArgs{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Emit(invalid ID) error = %v", err)
 	}
-	handle, err := command.With(runtime).Execute(ctx, "validation/event-size", ingressArgs{})
+	exec, err := command.With(runtime).Execute(ctx, "validation/event-size", ingressArgs{})
 	if err != nil {
 		t.Fatalf("Command.Execute(event size) error = %v", err)
 	}
 	largeEvent := DefineEvent[ingressArgs]("validation.large_event")
-	if err := largeEvent.Emit(ctx, runtime, handle.ID, "large", ingressArgs{Value: strings.Repeat("x", maxApplicationEventBytes)}); !errors.Is(err, ErrPayloadTooLarge) {
+	if err := largeEvent.Emit(ctx, runtime, exec.ID, "large", ingressArgs{Value: strings.Repeat("x", maxApplicationEventBytes)}); !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("Emit(large payload) error = %v", err)
 	}
 	if err := CancelExecution(ctx, runtime, ExecutionID("bad"), "reason"); !errors.Is(err, ErrInvalid) {
@@ -463,18 +463,18 @@ type queryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func assertExecutionShape(t *testing.T, schema string, db queryRower, handle ExecutionHandle, commands, open int) {
+func assertExecutionShape(t *testing.T, schema string, db queryRower, exec Execution, commands, open int) {
 	t.Helper()
 	var gotCommands, gotOpen, journalCount, queueCount int
 	if err := db.QueryRow(context.Background(), `SELECT command_count,open_commands FROM `+
-		pgschema.Table(schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).
+		pgschema.Table(schema, "flow_executions")+` WHERE execution_id=$1`, exec.ID).
 		Scan(&gotCommands, &gotOpen); err != nil {
 		t.Fatalf("read execution: %v", err)
 	}
-	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM `+pgschema.Table(schema, "flow_journal")+` WHERE execution_id=$1`, handle.ID).Scan(&journalCount); err != nil {
+	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM `+pgschema.Table(schema, "flow_journal")+` WHERE execution_id=$1`, exec.ID).Scan(&journalCount); err != nil {
 		t.Fatalf("count journal: %v", err)
 	}
-	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM `+pgschema.Table(schema, "flow_command_queue")+` WHERE execution_id=$1`, handle.ID).Scan(&queueCount); err != nil {
+	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM `+pgschema.Table(schema, "flow_command_queue")+` WHERE execution_id=$1`, exec.ID).Scan(&queueCount); err != nil {
 		t.Fatalf("count queue: %v", err)
 	}
 	wantJournal := 1 + commands

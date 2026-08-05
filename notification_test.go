@@ -35,7 +35,7 @@ func TestNotificationHintsCommitButDoNotRollback(t *testing.T) {
 		t.Fatalf("LISTEN: %v", err)
 	}
 
-	handle, err := command.With(runtime).Execute(ctx, "notify/commit", runtimeArgs{})
+	exec, err := command.With(runtime).Execute(ctx, "notify/commit", runtimeArgs{})
 	if err != nil {
 		t.Fatalf("Execute(commit) error = %v", err)
 	}
@@ -46,7 +46,7 @@ func TestNotificationHintsCommitButDoNotRollback(t *testing.T) {
 		t.Fatalf("WaitForNotification(commit) error = %v", err)
 	}
 	id, valid := store.ParseNotificationHint(notification.Payload)
-	if !valid || id.String() != string(handle.ID) || notification.Channel != channel {
+	if !valid || id.String() != string(exec.ID) || notification.Channel != channel {
 		t.Fatalf("notification = %#v, parsed=%s/%t", notification, id, valid)
 	}
 	if len(notification.Payload) > 128 {
