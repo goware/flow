@@ -42,7 +42,7 @@ func TestDeliverFromActiveWorker(t *testing.T) {
 	guardErr := make(chan error, 1)
 	if err := runtime.Register(
 		Handle(target, func(_ context.Context, work *Work[None]) (None, error) {
-			payload, err := ReadEvent(work, event, "done")
+			payload, err := GetEventValue(work, event, "done")
 			if err == nil {
 				received <- payload
 			}
@@ -122,7 +122,7 @@ func TestDeliverInCallerTransaction(t *testing.T) {
 	}
 	runs := make(chan ExecutionID, 2)
 	if err := runtime.Register(Handle(target, func(_ context.Context, work *Work[None]) (None, error) {
-		if _, err := ReadEvent(work, event, "done"); err != nil {
+		if _, err := GetEventValue(work, event, "done"); err != nil {
 			return None{}, err
 		}
 		runs <- work.Info().ExecutionID
@@ -243,7 +243,7 @@ func TestDeliverIdentityLifecycleAndGateParity(t *testing.T) {
 		Payload deliveredPayload
 	}, 2)
 	if err := runtime.Register(Handle(target, func(_ context.Context, work *Work[None]) (None, error) {
-		payload, err := ReadEvent(work, event, "ready")
+		payload, err := GetEventValue(work, event, "ready")
 		if err == nil {
 			received <- struct {
 				ID      ExecutionID
@@ -279,7 +279,7 @@ func TestDeliverIdentityLifecycleAndGateParity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !second.Created || second.ID == first.ID {
-		t.Fatalf("new stage handle = %#v, first = %#v", second, first)
+		t.Fatalf("new stage exec = %#v, first = %#v", second, first)
 	}
 	if err := event.Deliver(ctx, runtime, second.ID, "ready", payload); err != nil {
 		t.Fatal(err)
@@ -324,7 +324,7 @@ func TestDeliverMultiProducerFanIn(t *testing.T) {
 		Handle(join, func(_ context.Context, work *Work[None]) (None, error) {
 			values := make([]string, 0, len(keys))
 			for _, key := range keys {
-				payload, err := ReadEvent(work, event, key)
+				payload, err := GetEventValue(work, event, key)
 				if err != nil {
 					return None{}, err
 				}
@@ -344,20 +344,20 @@ func TestDeliverMultiProducerFanIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	producers := make([]ExecutionHandle, 0, len(keys))
+	producers := make([]Execution, 0, len(keys))
 	for index, key := range keys {
-		handle, err := producer.With(runtime).Execute(ctx, key, deliveredPart{
+		exec, err := producer.With(runtime).Execute(ctx, key, deliveredPart{
 			Target: joinHandle.ID, Key: key, Value: string(rune('A' + index)),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		producers = append(producers, handle)
+		producers = append(producers, exec)
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	for _, handle := range producers {
-		waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
+	for _, exec := range producers {
+		waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	}
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, joinHandle.ID, "succeeded", 5*time.Second)
 	if values := <-joined; len(values) != 3 || values[0] != "A" || values[1] != "B" || values[2] != "C" {

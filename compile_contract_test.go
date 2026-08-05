@@ -22,6 +22,7 @@ func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 		"Coordinator": {}, "Coordination": {}, "Handler": {}, "DefineCoordinator": {},
 		"OnStart": {}, "OnEvent": {}, "OnOutcome": {}, "Received": {}, "CoordinatorID": {},
 		"Outcome": {}, "OutcomeOf": {}, "ResultSource": {}, "Scope": {}, "WithCoordinatorConcurrency": {},
+		"ReadEvent": {}, "ExecutionHandle": {}, "ExecutionReceipt": {},
 	}
 	entries, err := os.ReadDir(filepath.Dir(currentFile))
 	if err != nil {

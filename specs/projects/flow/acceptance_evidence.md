@@ -12,6 +12,7 @@ This matrix records evidence for the command/worker/event architecture. PostgreS
 | Contract | Evidence |
 |---|---|
 | Commands are the only execution starts and workers the only registrations | `definitions_test.go`, `execute_test.go`, `TestRemovedPublicAPINamesStayRemoved` |
+| `Execute` and inspection return one `Execution` snapshot type; `Created` marks acceptance | execution and inspection tests |
 | `Execute`/`Emit` are worker-only and `Node` is non-generic | `decision_test.go`, `flowtest/engine_test.go` |
 | Typed successful lookup is trace-only | `TestResultOfEnforcesSnapshot`, inspection/replay tests |
 | Dynamic two-stage fan-out/fan-in needs no second state machine | `examples/fanout/main.go`, `examples/fanout/main_test.go` |
@@ -28,7 +29,7 @@ This matrix records evidence for the command/worker/event architecture. PostgreS
 | Event-before/after declaration resolves exact name/key waits | `TestDirectRootWaitsForExactApplicationEvent` and store tests |
 | Same-decision staged event supplies a sub-command gate | `TestWorkerEventSatisfiesNewChildGateInSameDecision` |
 | Multiple waits are AND conditions and duplicate declarations normalize | decision and `flowtest` gate tests |
-| `ReadEvent` is declared-only, typed, repeatable, and decision-poisoning on misuse | `flowtest` declared-input tests and runtime event-gate tests |
+| `GetEventValue` is declared-only, typed, repeatable, and decision-poisoning on misuse | `flowtest` declared-input tests and runtime event-gate tests |
 | Retry/lease takeover receives the same immutable gated payload and satisfying position | `TestRuntimeCapacityLeaseRenewalAndTakeover` |
 | Claim input materialization is bounded and detached from the connection | `BenchmarkEventSnapshotMaterialization256`, runtime claim tests |
 | 256 waits are accepted and 257 rejected | `command_limit_test.go` |

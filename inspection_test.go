@@ -34,17 +34,17 @@ func TestExecutionInspectionAndStablePagination(t *testing.T) {
 	}
 	command := DefineCommand[inspectionArgs, inspectionResult]("inspection.work", 1)
 
-	var handles []ExecutionHandle
+	var execs []Execution
 	for index := 0; index < 5; index++ {
-		handle, err := command.With(runtime).Execute(ctx, fmt.Sprintf("batch/%02d", index), inspectionArgs{Value: fmt.Sprint(index)},
+		exec, err := command.With(runtime).Execute(ctx, fmt.Sprintf("batch/%02d", index), inspectionArgs{Value: fmt.Sprint(index)},
 			WithMetadata(map[string]string{"tenant": "acme", "bucket": fmt.Sprint(index % 2)}))
 		if err != nil {
 			t.Fatalf("Execute(%d) error = %v", index, err)
 		}
-		handles = append(handles, handle)
+		execs = append(execs, exec)
 	}
 
-	got, err := GetExecution(ctx, runtime, handles[2].ID)
+	got, err := GetExecution(ctx, runtime, execs[2].ID)
 	if err != nil {
 		t.Fatalf("GetExecution() error = %v", err)
 	}
@@ -52,7 +52,7 @@ func TestExecutionInspectionAndStablePagination(t *testing.T) {
 	if err := json.Unmarshal(got.Metadata, &metadata); err != nil {
 		t.Fatalf("decode metadata: %v", err)
 	}
-	if got.ID != handles[2].ID || got.Type != command.Name() || got.Status != "running" ||
+	if got.ID != execs[2].ID || got.Type != command.Name() || got.Status != "running" ||
 		got.CommandCount != 1 || got.OpenCommands != 1 || metadata["bucket"] != "0" || metadata["tenant"] != "acme" {
 		t.Fatalf("GetExecution() = %#v", got)
 	}
@@ -148,20 +148,20 @@ func TestTransactionScopedInspectionAndAwait(t *testing.T) {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	runDone := make(chan error, 1)
 	go func() { runDone <- runtime.Run(runCtx) }()
-	handle, err := command.With(runtime).Execute(ctx, "await/terminal", inspectionArgs{Value: "done"})
+	exec, err := command.With(runtime).Execute(ctx, "await/terminal", inspectionArgs{Value: "done"})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelWait()
-	execution, err := AwaitExecution(waitCtx, runtime, handle.ID)
+	execution, err := AwaitExecution(waitCtx, runtime, exec.ID)
 	if err != nil {
 		t.Fatalf("AwaitExecution() error = %v", err)
 	}
 	if execution.Status != "succeeded" || execution.FinishedAt == nil || execution.OpenCommands != 0 {
 		t.Fatalf("AwaitExecution() = %#v", execution)
 	}
-	trace, err := Trace(ctx, runtime, handle.ID)
+	trace, err := Trace(ctx, runtime, exec.ID)
 	if err != nil {
 		t.Fatalf("Trace() error = %v", err)
 	}

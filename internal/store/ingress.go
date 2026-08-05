@@ -71,10 +71,12 @@ type StartRequest struct {
 	Root              *CommandCreate
 }
 
+// StartResult carries the accepted execution row as of durable acceptance.
+// Created is false when an idempotent start rediscovered an existing
+// execution.
 type StartResult struct {
-	ExecutionID   uuid.UUID
-	RootCommandID *uuid.UUID
-	Created       bool
+	Row     ExecutionRow
+	Created bool
 }
 
 // StartInTx creates or idempotently rediscovers an execution inside tx. It
@@ -160,7 +162,14 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	if err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position, dbNow, dbNow.Add(request.Root.InitialDelay)); err != nil {
 		return StartResult{}, false, err
 	}
-	return StartResult{ExecutionID: request.ID, RootCommandID: rootID, Created: true}, false, nil
+	// Mirror the row this transaction just inserted instead of re-reading it.
+	return StartResult{Row: ExecutionRow{
+		ID: request.ID, DefinitionName: request.DefinitionName, DefinitionVersion: request.DefinitionVersion,
+		Key: request.Key, RootCommandID: clonePointer(rootID), Status: "running", FailFast: request.FailFast,
+		MaxCommands: request.MaxCommands, CommandCount: commandCount, OpenCommands: commandCount,
+		DeadlineAt: clonePointer(deadlineAt), CreatedAt: dbNow, UpdatedAt: dbNow, StatusAt: dbNow,
+		Metadata: request.Metadata.BytesCopy(),
+	}, Created: true}, false, nil
 }
 
 // loadEquivalentStart resolves an insert that conflicted on the idempotency
@@ -176,30 +185,32 @@ func (s *Store) loadEquivalentStart(ctx context.Context, tx pgx.Tx, request Star
 	}
 	if request.KeyScope == KeyScopeLive {
 		var id uuid.UUID
-		var rootID *uuid.UUID
-		err := tx.QueryRow(ctx, `SELECT execution_id,root_command_id
+		err := tx.QueryRow(ctx, `SELECT execution_id
 			FROM `+pgschema.Table(s.schema, "flow_executions")+`
 			WHERE definition_name=$1 AND execution_key=$2
 			  AND key_scope=$3 AND status IN ('running','failing') FOR UPDATE`,
 			request.DefinitionName, request.Key, KeyScopeLive,
-		).Scan(&id, &rootID)
+		).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StartResult{}, true, fmt.Errorf("%w: live key holder settled during start", flowerr.ErrConflict)
 		}
 		if err != nil {
 			return StartResult{}, false, MapError("load live execution", err)
 		}
-		return StartResult{ExecutionID: id, RootCommandID: clonePointer(rootID), Created: false}, false, nil
+		row, err := s.GetExecutionInTx(ctx, tx, id)
+		if err != nil {
+			return StartResult{}, false, err
+		}
+		return StartResult{Row: row, Created: false}, false, nil
 	}
 	var id uuid.UUID
 	var version int
 	var fingerprint, input, metadata []byte
-	var rootID *uuid.UUID
-	err := tx.QueryRow(ctx, `SELECT execution_id,definition_version,start_fingerprint,input,metadata_canonical,root_command_id
+	err := tx.QueryRow(ctx, `SELECT execution_id,definition_version,start_fingerprint,input,metadata_canonical
 		FROM `+pgschema.Table(s.schema, "flow_executions")+`
 		WHERE definition_name=$1 AND execution_key=$2 AND key_scope=$3 FOR UPDATE`,
 		request.DefinitionName, request.Key, KeyScopePermanent,
-	).Scan(&id, &version, &fingerprint, &input, &metadata, &rootID)
+	).Scan(&id, &version, &fingerprint, &input, &metadata)
 	if err != nil {
 		return StartResult{}, false, MapError("load existing execution", err)
 	}
@@ -207,7 +218,11 @@ func (s *Store) loadEquivalentStart(ctx context.Context, tx pgx.Tx, request Star
 		!bytes.Equal(input, request.Input.Bytes) || !bytes.Equal(metadata, request.Metadata.Bytes) {
 		return StartResult{}, false, fmt.Errorf("%w: execution start identity differs", flowerr.ErrConflict)
 	}
-	return StartResult{ExecutionID: id, RootCommandID: clonePointer(rootID), Created: false}, false, nil
+	row, err := s.GetExecutionInTx(ctx, tx, id)
+	if err != nil {
+		return StartResult{}, false, err
+	}
+	return StartResult{Row: row, Created: false}, false, nil
 }
 
 func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time.Time) ([]JournalEntry, error) {

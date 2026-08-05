@@ -12,7 +12,8 @@ completed_at: 2026-08-04
 ## Completed delivery
 
 - [x] Make commands the only execution root and durable orchestration unit.
-- [x] Add bounded exact event snapshots and typed `ReadEvent` access.
+- [x] Return one `Execution` snapshot type from `Execute` and inspection; `Created` distinguishes creation from rediscovery.
+- [x] Add bounded exact event snapshots and typed `GetEventValue` access.
 - [x] Enforce at most 256 exact waits per command and expose satisfying positions in trace.
 - [x] Keep worker-staged events/sub-commands/result/application commit atomic and fenced.
 - [x] Rewrite fan-out as two command-owned fan-out/join phases.

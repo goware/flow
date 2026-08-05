@@ -54,12 +54,16 @@ if err := runtime.Register(flow.Handle(sendEmail, sendEmailWorker)); err != nil 
 }
 go runtime.Run(ctx)
 
-handle, err := sendEmail.With(runtime).Execute(ctx, "email/order-42", emailArgs{
+exec, err := sendEmail.With(runtime).Execute(ctx, "email/order-42", emailArgs{
 	To: "person@example.com",
 })
 ```
 
 `Execute` always creates or rediscovers durable asynchronous work; it never calls a worker inline. A stable non-empty execution key is permanently idempotent by default. `flow.WithLiveKey()` instead deduplicates only while an execution is non-terminal.
+
+`Execute` returns the `Execution` snapshot as of durable acceptance; `Created`
+reports whether this call created it. `GetExecution` and `AwaitExecution`
+return the same type with the execution's current or final state.
 
 ## Composing work
 
@@ -93,10 +97,10 @@ flow.Execute(work, "fulfill/42", fulfill, args).
 	Delay(time.Second)
 ```
 
-The waiting worker reads only the events declared as its inputs:
+The waiting worker gets the value attached to a declared event:
 
 ```go
-value, err := flow.ReadEvent(work, approved, "approval/42")
+value, err := flow.GetEventValue(work, approved, "approval/42")
 ```
 
 Multiple waits are AND conditions. Matching is exact on event name and key within one execution. Events recorded before command declaration still satisfy the gate. `Within` starts at command creation and runs independently of `Delay`. At most 256 waits may be declared for one command; larger joins should use a tree of join commands or stable external references.

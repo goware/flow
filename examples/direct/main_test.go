@@ -28,7 +28,7 @@ func TestDirectExampleEndToEnd(t *testing.T) {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	handle, trace, err := runExampleCommand(ctx, runtime)
+	receipt, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		t.Fatalf("runExampleCommand() error = %v", err)
 	}
@@ -41,15 +41,15 @@ func TestDirectExampleEndToEnd(t *testing.T) {
 	}
 	var queueRows, journalRows int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE execution_id=$1`, handle.ID).Scan(&queueRows); err != nil {
+		WHERE execution_id=$1`, receipt.ID).Scan(&queueRows); err != nil {
 		t.Fatalf("count queue rows: %v", err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE execution_id=$1`, handle.ID).Scan(&journalRows); err != nil {
+		WHERE execution_id=$1`, receipt.ID).Scan(&journalRows); err != nil {
 		t.Fatalf("count journal rows: %v", err)
 	}
 	if queueRows != 0 || journalRows != 6 || len(trace.History) != journalRows {
 		t.Fatalf("database rows queue=%d journal=%d trace=%d", queueRows, journalRows, len(trace.History))
 	}
-	replaytest.AssertMatchesLive(t, database.DB, database.Schema, handle.ID)
+	replaytest.AssertMatchesLive(t, database.DB, database.Schema, receipt.ID)
 }

@@ -27,7 +27,7 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := runtime.Register(Handle(command, func(_ context.Context, work *Work[None]) (None, error) {
-		payload, err := ReadEvent(work, event, "ready")
+		payload, err := GetEventValue(work, event, "ready")
 		if err != nil {
 			return None{}, err
 		}
@@ -38,13 +38,13 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handle, err := command.With(runtime).Execute(ctx, "direct", None{},
+	exec, err := command.With(runtime).Execute(ctx, "direct", None{},
 		WaitFor(event, "ready"), WaitFor(event, "ready"), Within(2*time.Second), Within(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
 	repeated, err := command.With(runtime).Execute(ctx, "direct", None{}, WaitFor(event, "ready"), Within(2*time.Second))
-	if err != nil || repeated.Created || repeated.ID != handle.ID {
+	if err != nil || repeated.Created || repeated.ID != exec.ID {
 		t.Fatalf("equivalent gated start = %+v, %v", repeated, err)
 	}
 	if _, err := command.With(runtime).Execute(ctx, "direct", None{}, WaitFor(event, "other"), Within(2*time.Second)); !errors.Is(err, ErrConflict) {
@@ -54,7 +54,7 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 	var state string
 	var unsatisfied int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT state,unsatisfied_waits FROM `+
-		pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1`, handle.RootCommandID).
+		pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1`, exec.RootCommandID).
 		Scan(&state, &unsatisfied); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 	}
 	var queued int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+
-		pgschema.Table(database.Schema, "flow_command_queue")+` WHERE command_id=$1`, handle.RootCommandID).Scan(&queued); err != nil {
+		pgschema.Table(database.Schema, "flow_command_queue")+` WHERE command_id=$1`, exec.RootCommandID).Scan(&queued); err != nil {
 		t.Fatal(err)
 	}
 	if queued != 0 {
@@ -72,31 +72,31 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	if err := event.Emit(ctx, runtime, handle.ID, "not-ready", "ignored"); err != nil {
+	if err := event.Emit(ctx, runtime, exec.ID, "not-ready", "ignored"); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if calls.Load() != 0 {
 		t.Fatalf("non-matching event released root, calls=%d", calls.Load())
 	}
-	if err := event.Emit(ctx, runtime, handle.ID, "ready", "approved"); err != nil {
+	if err := event.Emit(ctx, runtime, exec.ID, "ready", "approved"); err != nil {
 		t.Fatal(err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	if calls.Load() != 1 {
 		t.Fatalf("worker calls=%d", calls.Load())
 	}
 	if value, _ := received.Load().(string); value != "approved" {
-		t.Fatalf("ReadEvent payload=%q", value)
+		t.Fatalf("GetEventValue payload=%q", value)
 	}
-	trace, err := Trace(ctx, runtime, handle.ID)
+	trace, err := Trace(ctx, runtime, exec.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(trace.Commands) != 1 || len(trace.Commands[0].Waits) != 1 || trace.Commands[0].Waits[0].SatisfiedPosition == nil {
 		t.Fatalf("trace wait satisfaction=%+v", trace.Commands)
 	}
-	assertReplayMatches(t, runtime, handle.ID)
+	assertReplayMatches(t, runtime, exec.ID)
 }
 
 func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
@@ -223,11 +223,11 @@ func TestWorkerEventSatisfiesNewChildGateInSameDecision(t *testing.T) {
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	handle, err := parent.With(runtime).Execute(ctx, "same-decision", None{})
+	exec, err := parent.With(runtime).Execute(ctx, "same-decision", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	if childCalls.Load() != 1 {
 		t.Fatalf("child calls=%d", childCalls.Load())
 	}
@@ -236,7 +236,7 @@ func TestWorkerEventSatisfiesNewChildGateInSameDecision(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.wait_started_at,
 		count(*) FILTER (WHERE w.satisfied_position IS NOT NULL) FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 		JOIN `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w USING (command_id)
-		WHERE c.execution_id=$1 AND c.command_key='child' GROUP BY c.command_id`, handle.ID).Scan(&waitStarted, &satisfied); err != nil {
+		WHERE c.execution_id=$1 AND c.command_key='child' GROUP BY c.command_id`, exec.ID).Scan(&waitStarted, &satisfied); err != nil {
 		t.Fatal(err)
 	}
 	if waitStarted != nil || satisfied != 1 {
@@ -273,10 +273,10 @@ func TestWorkerStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 			return None{}, nil
 		}),
 		Handle(child, func(_ context.Context, work *Work[None]) (None, error) {
-			if _, err := ReadEvent(work, first, "first"); err != nil {
+			if _, err := GetEventValue(work, first, "first"); err != nil {
 				return None{}, err
 			}
-			if _, err := ReadEvent(work, second, "second"); err != nil {
+			if _, err := GetEventValue(work, second, "second"); err != nil {
 				return None{}, err
 			}
 			childCalls.Add(1)
@@ -287,7 +287,7 @@ func TestWorkerStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	handle, err := parent.With(runtime).Execute(ctx, "multiple", None{})
+	exec, err := parent.With(runtime).Execute(ctx, "multiple", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestWorkerStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 		var state string
 		var unsatisfied int
 		err := database.DB.Conn.QueryRow(ctx, `SELECT state,unsatisfied_waits FROM `+
-			pgschema.Table(database.Schema, "flow_commands")+` WHERE execution_id=$1 AND command_key='child'`, handle.ID).
+			pgschema.Table(database.Schema, "flow_commands")+` WHERE execution_id=$1 AND command_key='child'`, exec.ID).
 			Scan(&state, &unsatisfied)
 		if err == nil && state == "pending" && unsatisfied == 1 {
 			break
@@ -306,21 +306,21 @@ func TestWorkerStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if err := wrong.Emit(ctx, runtime, handle.ID, "second", None{}); err != nil {
+	if err := wrong.Emit(ctx, runtime, exec.ID, "second", None{}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if childCalls.Load() != 0 {
 		t.Fatalf("wrong event name released child, calls=%d", childCalls.Load())
 	}
-	if err := second.Emit(ctx, runtime, handle.ID, "second", None{}); err != nil {
+	if err := second.Emit(ctx, runtime, exec.ID, "second", None{}); err != nil {
 		t.Fatal(err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	if childCalls.Load() != 1 {
 		t.Fatalf("child calls=%d", childCalls.Load())
 	}
-	assertReplayMatches(t, runtime, handle.ID)
+	assertReplayMatches(t, runtime, exec.ID)
 }
 
 func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
@@ -357,12 +357,12 @@ func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	handle, err := parent.With(runtime).Execute(ctx, "required-failure", None{})
+	exec, err := parent.With(runtime).Execute(ctx, "required-failure", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 5*time.Second)
-	trace, err := Trace(ctx, runtime, handle.ID)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
+	trace, err := Trace(ctx, runtime, exec.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,24 +398,24 @@ func TestWaitCanExpireWhileInitialDelayIsPending(t *testing.T) {
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	handle, err := command.With(runtime).Execute(ctx, "expiry", None{},
+	exec, err := command.With(runtime).Execute(ctx, "expiry", None{},
 		WaitFor(event, "missing"), Within(40*time.Millisecond), WithStartDelay(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 5*time.Second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
 	if calls.Load() != 0 {
 		t.Fatalf("expired delayed command ran %d times", calls.Load())
 	}
-	trace, err := Trace(ctx, runtime, handle.ID)
+	trace, err := Trace(ctx, runtime, exec.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(trace.Commands) != 1 || trace.Commands[0].State != string(StatusExpired) || trace.Commands[0].FailureCode != "wait_expired" {
 		t.Fatalf("expired gate trace=%+v", trace.Commands)
 	}
-	if err := event.Emit(ctx, runtime, handle.ID, "missing", None{}); !errors.Is(err, ErrTerminal) {
+	if err := event.Emit(ctx, runtime, exec.ID, "missing", None{}); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("late event error=%v, want ErrTerminal", err)
 	}
-	assertReplayMatches(t, runtime, handle.ID)
+	assertReplayMatches(t, runtime, exec.ID)
 }

@@ -77,7 +77,7 @@ flow.Execute(work, "report/join", JoinReport, JoinArgs{Parts: parts}).
 Each predecessor emits its application event as part of successful settlement. The waiting worker reads those declared inputs:
 
 ```go
-part, err := flow.ReadEvent(work, PartAnalyzed, "part/0")
+part, err := flow.GetEventValue(work, PartAnalyzed, "part/0")
 ```
 
 There are no hidden graph edges, dependency groups, forward references, result snapshots from arbitrary commands, or re-evaluation scheduler. The wait rows already required for exact events remain the complete readiness mechanism.
@@ -163,7 +163,7 @@ There is no compatibility alias for any removed symbol.
 The only execution start is:
 
 ```go
-handle, err := command.With(client).Execute(ctx, executionKey, args, opts...)
+execution, err := command.With(client).Execute(ctx, executionKey, args, opts...)
 ```
 
 Execution options remain:
@@ -239,32 +239,32 @@ func (*Node) Within(time.Duration) *Node
 
 Once a command declaration is durable, its fingerprint is immutable. A later worker decision that redeclares the key with any added, removed, or changed wait conflicts exactly as it does today. Flow does not support durable declaration amendment, and there is no race in which waits can be added after a command becomes ready, claimed, or terminal.
 
-### 4.6 Read declared event inputs
+### 4.6 Get declared event values
 
-Add one narrow typed read:
+Add one narrow typed accessor:
 
 ```go
-func ReadEvent[W, T any](
+func GetEventValue[W, T any](
     work *Work[W],
     event Event[T],
     key string,
 ) (T, error)
 ```
 
-`ReadEvent` is not an execution-wide event query. It may read only an exact `(event name,event key)` gate declared on the currently executing command.
+`GetEventValue` is not an execution-wide event query. It returns the value only for an exact `(event name,event key)` gate declared on the currently executing command.
 
 Rules:
 
 1. Every declared wait is satisfied before worker invocation.
 2. The runtime loads the canonical event payload at the recorded satisfying journal position before releasing its database connection.
-3. `ReadEvent` performs an in-memory typed lookup and no SQL.
+3. `GetEventValue` performs an in-memory typed lookup and no SQL.
 4. Calling it for an undeclared selector, invalid event, or missing snapshot returns `ErrInvalid`/`ErrInvalidState` and poisons the worker decision.
-5. Repeated reads return the same immutable value.
+5. Repeated calls return the same immutable value.
 6. Retries and lease takeover receive the same event identities and canonical payloads.
 7. Event arrival order does not affect the normalized input snapshot.
 8. The event may have been recorded before command declaration, after declaration, or in the same accepted parent decision that created the command.
 
-This is the only durable cross-command input read. There is no command result lookup inside a worker.
+This is the only durable cross-command value accessor. There is no command result lookup inside a worker.
 
 ### 4.7 Results and terminal inspection
 
@@ -337,7 +337,7 @@ for _, part := range parts {
 }
 ```
 
-Each analysis worker emits `PartAnalyzed` with the same stable key. The join worker uses `ReadEvent` for the keys listed in its arguments and performs the aggregation.
+Each analysis worker emits `PartAnalyzed` with the same stable key. The join worker uses `GetEventValue` for the keys listed in its arguments and performs the aggregation.
 
 The command tree records provenance; exact waits provide the cross-sibling synchronization. No command-dependency rows are introduced.
 
@@ -373,13 +373,13 @@ An open-ended workflow engine is not a Flow goal. Long-lived interactions must a
 A root or child command can wait for an event published by another process:
 
 ```go
-handle, err := Confirm.With(runtime).Execute(ctx, "bridge/42", args,
+execution, err := Confirm.With(runtime).Execute(ctx, "bridge/42", args,
     flow.WaitFor(BridgeDelivered, "delivery/42"),
     flow.Within(30*time.Minute),
 )
 ```
 
-The worker may call `ReadEvent` to decode `BridgeDelivered`. External publishers need only an event definition and a client; they register no handlers and do not call `Run`.
+The worker may call `GetEventValue` to decode `BridgeDelivered`. External publishers need only an event definition and a client; they register no handlers and do not call `Run`.
 
 Plan 4 extends this retained ingress model with targeted `Event.Deliver` for application code that deliberately records an event in another known execution, including from inside an active worker. It does not restore coordinator state or another scheduler.
 
@@ -437,7 +437,7 @@ Add these limits:
 
 The wait-count limit is validated when a direct root or staged command is declared. Applications with larger joins build a tree of join commands or place aggregate data behind stable references.
 
-The runtime must not hold a PostgreSQL connection while the handler processes the snapshot. `ReadEvent` is O(1) over a normalized in-memory map.
+The runtime must not hold a PostgreSQL connection while the handler processes the snapshot. `GetEventValue` is O(1) over a normalized in-memory map.
 
 ## 7. Remove the coordinator public surface
 
@@ -587,7 +587,7 @@ When materializing a claimed command, load all wait rows and join their satisfyi
 - event name/key match the wait row;
 - the journal body/hash is valid;
 - total rows do not exceed 256;
-- payload codecs match only when application code calls `ReadEvent`.
+- payload codecs match only when application code calls `GetEventValue`.
 
 No new event-input or event-payload table is added.
 
@@ -648,7 +648,7 @@ flowtest.RunWorker(...,
 )
 ```
 
-The helper must use production canonical codecs and `ReadEvent` behavior. It validates exact selector identity, duplicate/conflicting fixture values, wait bounds, typed decode errors, scope poisoning, and deterministic repeated reads.
+The helper must use production canonical codecs and `GetEventValue` behavior. It validates exact selector identity, duplicate/conflicting fixture values, wait bounds, typed decode errors, scope poisoning, and deterministic repeated calls.
 
 `flowtest.StagedCommand` continues to expose key, arguments, optionality, delay, waits, and `Within` so multi-phase command composition can be asserted without PostgreSQL.
 
@@ -662,7 +662,7 @@ No behavioral change. It remains the smallest command/worker example.
 
 ### 12.2 `examples/monitor`
 
-Keep the direct root gated on an externally emitted exact event. Update its worker to call `ReadEvent` and demonstrate that a gated command can consume the typed payload, not only wake on it.
+Keep the direct root gated on an externally emitted exact event. Update its worker to call `GetEventValue` and demonstrate that a gated command can consume the typed payload, not only wake on it.
 
 ### 12.3 `examples/fanout`
 
@@ -703,7 +703,7 @@ Use self-composing commands:
 1. a root `think` command receives turn state in its arguments;
 2. if tools are required, it stages tool commands and the next `think` command;
 3. each tool emits a typed `ToolCompleted` event with a stable output reference;
-4. the next `think` command waits for those exact tool events and reads them with `ReadEvent`;
+4. the next `think` command waits for those exact tool events and gets their values with `GetEventValue`;
 5. an external user message is another exact gated event when required;
 6. a final turn emits `AgentCompleted` and stages no continuation.
 
@@ -719,7 +719,7 @@ Update:
 - `project_overview.md` to remove the two-mode distinction;
 - `functional_spec.md` to define composable commands and declared event inputs;
 - `architecture.md` to remove coordinator scheduling/state/delivery;
-- `components/engine.md` to describe worker-only decisions and `ReadEvent`;
+- `components/engine.md` to describe worker-only decisions and `GetEventValue`;
 - `components/runtime.md` to describe one command scheduler;
 - `components/schema.md` to describe six tables;
 - `implementation_plan.md`, phase plans, acceptance evidence, and benchmark evidence;
@@ -732,7 +732,7 @@ Historical review files remain source material. Historical completed plans may r
 ### Phase 1: prove event payload inputs and command-only examples
 
 - [x] Add bounded declared event snapshots to command claims and worker scopes.
-- [x] Add `ReadEvent` with exact declared-gate enforcement and deterministic retry behavior.
+- [x] Add `GetEventValue` with exact declared-gate enforcement and deterministic retry behavior.
 - [x] Add wait-count validation and trace satisfaction positions.
 - [x] Extend `flowtest` worker fixtures for declared event inputs.
 - [x] Rewrite fan-out as two command-owned fan-out/join phases.
@@ -780,7 +780,7 @@ Historical review files remain source material. Historical completed plans may r
 - repeated declarations within one decision reject different arguments, delay, optionality, or `Within` values;
 - a later decision cannot add, remove, or change waits on an already-durable command key;
 - an attempted durable redeclaration conflicts whether the original command is pending, ready, running, or terminal;
-- `ReadEvent` returns the correct typed payload for each exact name/key;
+- `GetEventValue` returns the correct typed payload for each exact name/key;
 - repeated reads return identical values;
 - undeclared selector reads poison the worker decision;
 - wrong event definition/type fails deterministically;
@@ -851,7 +851,7 @@ The refactor must demonstrate structural simplification:
 - claim materialization at 256 maximum-size 64 KiB payloads is measured under representative worker concurrency, including peak heap and allocation volume;
 - repeated fan-out/join is measured without a single serialized workflow-state row.
 
-Remove `BenchmarkCoordinatorSparseOutcomeScan10K`. Add retained benchmarks for event snapshot materialization, join readiness, and `ReadEvent` lookup.
+Remove `BenchmarkCoordinatorSparseOutcomeScan10K`. Add retained benchmarks for event snapshot materialization, join readiness, and `GetEventValue` lookup.
 
 ## 17. Non-goals
 

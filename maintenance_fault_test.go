@@ -29,12 +29,12 @@ func TestMaintenanceFaultLeavesDeadlineRecoverableByAnotherRuntime(t *testing.T)
 		return nil
 	})
 	cancelFirst, firstResult := startRuntime(t, first)
-	handle, err := command.With(first).Execute(ctx, "maintenance/fault", None{}, WithExecutionDeadline(40*time.Millisecond))
+	exec, err := command.With(first).Execute(ctx, "maintenance/fault", None{}, WithExecutionDeadline(40*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(120 * time.Millisecond)
-	execution, err := GetExecution(ctx, first, handle.ID)
+	execution, err := GetExecution(ctx, first, exec.ID)
 	if err != nil || execution.Status != "running" {
 		t.Fatalf("faulted maintenance execution = %#v, %v", execution, err)
 	}
@@ -45,9 +45,9 @@ func TestMaintenanceFaultLeavesDeadlineRecoverableByAnotherRuntime(t *testing.T)
 		t.Fatal(err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "expired", 3*time.Second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "expired", 3*time.Second)
 	stopRuntime(t, cancelSecond, secondResult)
-	trace, err := Trace(ctx, mustReader(t, database), handle.ID)
+	trace, err := Trace(ctx, mustReader(t, database), exec.ID)
 	if err != nil || trace.Execution.Status != "expired" || trace.Execution.OpenCommands != 0 {
 		t.Fatalf("recovered maintenance trace = %#v, %v", trace, err)
 	}

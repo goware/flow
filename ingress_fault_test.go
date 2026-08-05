@@ -52,12 +52,12 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 	}
 
 	runtime.faults = fault.None{}
-	handle, err := command.With(runtime).Execute(ctx, "observed", ingressArgs{})
+	exec, err := command.With(runtime).Execute(ctx, "observed", ingressArgs{})
 	if err != nil {
 		t.Fatalf("Execute(observed) error = %v", err)
 	}
 	observations := waitForObservations(t, observer, 1)
-	if len(observations) != 1 || observations[0].ExecutionID != handle.ID || observations[0].Operation != "start" {
+	if len(observations) != 1 || observations[0].ExecutionID != exec.ID || observations[0].Operation != "start" {
 		t.Fatalf("observations = %#v", observations)
 	}
 
@@ -77,7 +77,7 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 	}
 
 	observer.panic = true
-	if err := CancelExecution(ctx, runtime, handle.ID, "safe observer panic"); err != nil {
+	if err := CancelExecution(ctx, runtime, exec.ID, "safe observer panic"); err != nil {
 		t.Fatalf("CancelExecution() with panicking observer error = %v", err)
 	}
 }

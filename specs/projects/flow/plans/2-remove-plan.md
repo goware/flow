@@ -94,7 +94,7 @@ The child and parent success remain one atomic settlement. A failed, panicked, c
 A direct root command may be created in a pending state and released by exact facts emitted into that execution:
 
 ```go
-handle, err := ConfirmBridge.Execute(
+execution, err := ConfirmBridge.Execute(
     ctx,
     "bridge/example",
     flow.None{},
@@ -103,13 +103,13 @@ handle, err := ConfirmBridge.Execute(
 )
 ```
 
-After `Execute` returns the handle, another process can call:
+After `Execute` returns the `Execution` snapshot, another process can call:
 
 ```go
 err := BridgeDelivered.Emit(
     ctx,
     publisher,
-    handle.ID,
+    execution.ID,
     "delivery/example",
     delivery,
 )
@@ -535,7 +535,7 @@ Keep the coordinator-based agent. Remove only plan-related runtime configuration
 Replace `bridgePlan` with a direct event-gated `confirmBridge` execution:
 
 ```go
-handle, err := confirmBridge.With(runtime).Execute(
+execution, err := confirmBridge.With(runtime).Execute(
     ctx,
     "bridge/example",
     flow.None{},
@@ -642,7 +642,7 @@ Searches for removed vocabulary must distinguish historical prose intentionally 
 
 - event recorded before staged command creation satisfies immediately;
 - event recorded after command creation releases the pending command;
-- direct root returns a handle while its command is pending;
+- direct root returns an `Execution` snapshot while its command is pending;
 - multiple waits use AND semantics;
 - an event with a non-matching key or event name does not release the gate;
 - identical duplicate waits coalesce;

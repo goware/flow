@@ -67,11 +67,11 @@ func main() {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	handle, trace, err := runExampleCommand(ctx, runtime, monitor)
+	exec, trace, err := runExampleCommand(ctx, runtime, monitor)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("execution %s completed with %d journal entries\n", handle.ID, len(trace.History))
+	fmt.Printf("execution %s completed with %d journal entries\n", exec.ID, len(trace.History))
 }
 
 func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
@@ -124,30 +124,30 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 
 // runExampleCommand creates a direct command gated on an independently
 // published event and returns its terminal trace.
-func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *externalMonitor) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	handle, err := confirmBridge.With(runtime).Execute(ctx, "bridge/example", flow.None{},
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *externalMonitor) (flow.Execution, flow.ExecutionTrace, error) {
+	exec, err := confirmBridge.With(runtime).Execute(ctx, "bridge/example", flow.None{},
 		flow.WaitFor(bridgeDelivered, "delivery/example"),
 		flow.Within(2*time.Second),
 	)
 	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return flow.Execution{}, flow.ExecutionTrace{}, err
 	}
 	monitorResult := make(chan error, 1)
-	go func() { monitorResult <- monitor.observeBridgeDelivery(ctx, handle.ID) }()
+	go func() { monitorResult <- monitor.observeBridgeDelivery(ctx, exec.ID) }()
 
-	trace, err := waitForTerminal(ctx, runtime, handle.ID, 8*time.Second)
+	trace, err := waitForTerminal(ctx, runtime, exec.ID, 8*time.Second)
 	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return flow.Execution{}, flow.ExecutionTrace{}, err
 	}
 	if err := <-monitorResult; err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return flow.Execution{}, flow.ExecutionTrace{}, err
 	}
-	return handle, trace, nil
+	return exec, trace, nil
 }
 
 // confirmBridge is the worker handler.
 func (example *monitorExample) confirmBridge(_ context.Context, work *flow.Work[flow.None]) (confirmBridgeResult, error) {
-	delivery, err := flow.ReadEvent(work, bridgeDelivered, "delivery/example")
+	delivery, err := flow.GetEventValue(work, bridgeDelivered, "delivery/example")
 	if err != nil {
 		return confirmBridgeResult{}, err
 	}

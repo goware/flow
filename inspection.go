@@ -184,7 +184,7 @@ func AwaitExecution(ctx context.Context, c Client, id ExecutionID) (Execution, e
 }
 
 func executionFromStore(row store.ExecutionRow) Execution {
-	return Execution{
+	exec := Execution{
 		ID: ExecutionID(row.ID.String()), Type: row.DefinitionName, Version: row.DefinitionVersion,
 		Key: row.Key, Status: row.Status, FailFast: row.FailFast, MaxCommands: row.MaxCommands,
 		CommandCount: row.CommandCount, OpenCommands: row.OpenCommands,
@@ -193,6 +193,10 @@ func executionFromStore(row store.ExecutionRow) Execution {
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StatusAt: row.StatusAt,
 		FinishedAt: cloneTimePointer(row.FinishedAt), Metadata: json.RawMessage(append([]byte(nil), row.Metadata...)),
 	}
+	if row.RootCommandID != nil {
+		exec.RootCommandID = CommandID(row.RootCommandID.String())
+	}
+	return exec
 }
 
 func validateExecutionStatuses(values []string) ([]string, error) {

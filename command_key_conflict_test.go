@@ -53,12 +53,12 @@ func TestCrossDecisionCommandKeyReuseIsAConflict(t *testing.T) {
 			}
 			cancel, runResult := startRuntime(t, runtime)
 			defer stopRuntime(t, cancel, runResult)
-			handle, err := root.With(runtime).Execute(ctx, "key-conflict/"+test.name, None{})
+			exec, err := root.With(runtime).Execute(ctx, "key-conflict/"+test.name, None{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
-			trace, err := Trace(ctx, runtime, handle.ID)
+			waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+			trace, err := Trace(ctx, runtime, exec.ID)
 			if err != nil {
 				t.Fatal(err)
 			}

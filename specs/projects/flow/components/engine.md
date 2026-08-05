@@ -29,7 +29,7 @@ Durable arguments, results, event payloads, metadata, retry settings, and journa
 
 Distinct waits on a repeated same-decision declaration merge as AND gates. Other disagreement poisons the decision. Nodes are valid only during their owning worker invocation.
 
-Before a worker runs, the runtime supplies immutable canonical snapshots for every declared wait. `ReadEvent` checks exact name/key declaration, decodes the typed payload from memory, and records misuse as a decision defect. It performs no database query. At most 256 waits may exist on one command.
+Before a worker runs, the runtime supplies immutable canonical snapshots for every declared wait. `GetEventValue` checks the exact name/key declaration and returns the typed value from memory. Misuse becomes a decision defect. The function does not wait or query the database. At most 256 waits may exist on one command.
 
 ## Normalization and failure
 

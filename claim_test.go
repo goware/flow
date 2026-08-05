@@ -24,7 +24,7 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	command := DefineCommand[runtimeArgs, runtimeResult]("claim.handled", 1)
-	handle, err := command.With(runtime).Execute(ctx, "locked", runtimeArgs{})
+	exec, err := command.With(runtime).Execute(ctx, "locked", runtimeArgs{})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -39,7 +39,7 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 		t.Fatalf("BeginTx() error = %v", err)
 	}
 	if _, err := lockTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
-		WHERE execution_id=$1 FOR UPDATE`, handle.ID); err != nil {
+		WHERE execution_id=$1 FOR UPDATE`, exec.ID); err != nil {
 		t.Fatalf("lock execution: %v", err)
 	}
 	started := time.Now()
@@ -54,7 +54,7 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 		t.Fatalf("BeginTx(queue) error = %v", err)
 	}
 	if _, err := lockTx.Exec(ctx, `SELECT command_id FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE command_id=$1 FOR UPDATE`, handle.RootCommandID); err != nil {
+		WHERE command_id=$1 FOR UPDATE`, exec.RootCommandID); err != nil {
 		t.Fatalf("lock queue: %v", err)
 	}
 	started = time.Now()
@@ -63,7 +63,7 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 		t.Fatalf("queue-locked claim = %#v, %v in %s", claim, err, time.Since(started))
 	}
 	_ = lockTx.Rollback(ctx)
-	if err := CancelExecution(ctx, runtime, handle.ID, "claim lock test complete"); err != nil {
+	if err := CancelExecution(ctx, runtime, exec.ID, "claim lock test complete"); err != nil {
 		t.Fatalf("CancelExecution() error = %v", err)
 	}
 

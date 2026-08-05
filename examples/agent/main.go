@@ -79,12 +79,12 @@ func main() {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	handle, trace, err := runExampleCommand(ctx, runtime)
+	exec, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("agent execution %s completed with %d commands and %d journal entries\n",
-		handle.ID, len(trace.Commands), len(trace.History))
+		exec.ID, len(trace.Commands), len(trace.History))
 }
 
 func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
@@ -121,18 +121,18 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 
 // runExampleCommand starts a bounded command chain. The root is declared
 // before an external user message exists, so the exact gate keeps it live.
-func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	handle, err := agentThink.With(runtime).Execute(ctx, "agent/example", thinkArgs{
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Execution, flow.ExecutionTrace, error) {
+	exec, err := agentThink.With(runtime).Execute(ctx, "agent/example", thinkArgs{
 		Turn: 1, UserMessageKey: "message/1",
 	}, flow.WaitFor(agentUserMessage, "message/1"), flow.Within(2*time.Second))
 	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return flow.Execution{}, flow.ExecutionTrace{}, err
 	}
-	if err = agentUserMessage.Emit(ctx, runtime, handle.ID, "message/1", agentMessage{Text: "focus on durability"}); err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+	if err = agentUserMessage.Emit(ctx, runtime, exec.ID, "message/1", agentMessage{Text: "focus on durability"}); err != nil {
+		return flow.Execution{}, flow.ExecutionTrace{}, err
 	}
-	trace, err := waitForTerminal(ctx, runtime, handle.ID, 8*time.Second)
-	return handle, trace, err
+	trace, err := waitForTerminal(ctx, runtime, exec.ID, 8*time.Second)
+	return exec, trace, err
 }
 
 // agentThink owns the entire agent transition: it reads only declared event
@@ -145,7 +145,7 @@ func (example *agentExample) agentThink(ctx context.Context, work *flow.Work[thi
 	case <-time.After(15 * time.Millisecond):
 	}
 	if work.Args.Turn == 1 {
-		message, err := flow.ReadEvent(work, agentUserMessage, work.Args.UserMessageKey)
+		message, err := flow.GetEventValue(work, agentUserMessage, work.Args.UserMessageKey)
 		if err != nil {
 			return thinkResult{}, err
 		}
@@ -164,7 +164,7 @@ func (example *agentExample) agentThink(ctx context.Context, work *flow.Work[thi
 		return thinkResult{Tools: tools}, nil
 	}
 	for _, key := range work.Args.ToolKeys {
-		if _, err := flow.ReadEvent(work, toolCompleted, key); err != nil {
+		if _, err := flow.GetEventValue(work, toolCompleted, key); err != nil {
 			return thinkResult{}, err
 		}
 	}

@@ -171,29 +171,29 @@ func Within(duration time.Duration) ExecutionOption {
 	})
 }
 
-func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (ExecutionHandle, error) {
+func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (Execution, error) {
 	var definitionError error
 	if cmd.def == nil {
 		definitionError = errors.New("zero definition")
 	}
 	if err := errors.Join(cmd.err, definitionError, validateBoundClient(cmd.client)); err != nil {
-		return ExecutionHandle{}, newError(ErrInvalid, "execute", "command", cmd.Name(), err.Error())
+		return Execution{}, newError(ErrInvalid, "execute", "command", cmd.Name(), err.Error())
 	}
 	input, err := encodeDefinitionValue(cmd.def.Args, args, maxCommandArgumentBytes, "command arguments")
 	if err != nil {
-		return ExecutionHandle{}, err
+		return Execution{}, err
 	}
 	client, err := resolveClient(cmd.client)
 	if err != nil {
-		return ExecutionHandle{}, err
+		return Execution{}, err
 	}
 	options, metadata, fingerprint, err := prepareStartOptions(cmd.Name(), cmd.Version(), key, input, opts...)
 	if err != nil {
-		return ExecutionHandle{}, err
+		return Execution{}, err
 	}
 	root, err := prepareCommand(uuid.New(), "root", cmd.def, cmd.defaults, input)
 	if err != nil {
-		return ExecutionHandle{}, err
+		return Execution{}, err
 	}
 	if options.startDelay > 0 {
 		root.InitialDelay = options.startDelay
@@ -204,7 +204,7 @@ func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts .
 	root.Within = options.within
 	root.DeclarationFingerprint, err = commandDeclarationFingerprint(root)
 	if err != nil {
-		return ExecutionHandle{}, err
+		return Execution{}, err
 	}
 	request := store.StartRequest{
 		ID: uuid.New(), DefinitionName: cmd.Name(), DefinitionVersion: cmd.Version(), Key: key,
@@ -214,7 +214,7 @@ func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts .
 	return executeStart(ctx, client, request)
 }
 
-func executeStart(ctx context.Context, client resolvedClient, request store.StartRequest) (ExecutionHandle, error) {
+func executeStart(ctx context.Context, client resolvedClient, request store.StartRequest) (Execution, error) {
 	var result store.StartResult
 	err := client.inTransaction(ctx, func(tx pgx.Tx) error {
 		if err := client.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
@@ -225,22 +225,18 @@ func executeStart(ctx context.Context, client resolvedClient, request store.Star
 		return err
 	})
 	if err != nil {
-		return ExecutionHandle{}, err
+		return Execution{}, err
 	}
-	handle := ExecutionHandle{
-		ID: ExecutionID(result.ExecutionID.String()), Type: request.DefinitionName, Key: request.Key, Created: result.Created,
-	}
-	if result.RootCommandID != nil {
-		handle.RootCommandID = CommandID(result.RootCommandID.String())
-	}
+	exec := executionFromStore(result.Row)
+	exec.Created = result.Created
 	if client.tx == nil && result.Created {
 		client.runtime.wakeCommands()
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationExecution, Operation: "start", Outcome: "created",
-			ExecutionID: handle.ID, Name: request.DefinitionName, Version: request.DefinitionVersion,
+			ExecutionID: exec.ID, Name: request.DefinitionName, Version: request.DefinitionVersion,
 		})
 	}
-	return handle, nil
+	return exec, nil
 }
 
 func (event Event[T]) Emit(ctx context.Context, c Client, id ExecutionID, key string, payload T) error {

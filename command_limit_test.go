@@ -33,12 +33,12 @@ func TestCommandCeilingRejectsWorkerBatchAtomically(t *testing.T) {
 			t.Fatal(err)
 		}
 		cancel, result := startRuntime(t, runtime)
-		handle, err := parent.With(runtime).Execute(ctx, "ceiling/worker", None{})
+		exec, err := parent.With(runtime).Execute(ctx, "ceiling/worker", None{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 5*time.Second)
-		trace, err := Trace(ctx, runtime, handle.ID)
+		waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
+		trace, err := Trace(ctx, runtime, exec.ID)
 		if err != nil {
 			t.Fatal(err)
 		}

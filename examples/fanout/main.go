@@ -107,12 +107,12 @@ func main() {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	handle, trace, err := runExampleCommand(ctx, runtime)
+	exec, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("execution %s completed with %d commands and %d journal entries\n",
-		handle.ID, len(trace.Commands), len(trace.History))
+		exec.ID, len(trace.Commands), len(trace.History))
 }
 
 func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
@@ -152,13 +152,13 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 }
 
 // runExampleCommand executes two command-owned fan-out/join phases.
-func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	handle, err := prepareReport.With(runtime).Execute(ctx, "report/example", prepareReportArgs{Parts: []int{0, 1, 2}})
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Execution, flow.ExecutionTrace, error) {
+	exec, err := prepareReport.With(runtime).Execute(ctx, "report/example", prepareReportArgs{Parts: []int{0, 1, 2}})
 	if err != nil {
-		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
+		return flow.Execution{}, flow.ExecutionTrace{}, err
 	}
-	trace, err := waitForTerminal(ctx, runtime, handle.ID, 8*time.Second)
-	return handle, trace, err
+	trace, err := waitForTerminal(ctx, runtime, exec.ID, 8*time.Second)
+	return exec, trace, err
 }
 
 // prepareReport discovers the stable part list and atomically stages every
@@ -197,7 +197,7 @@ func (example *fanoutExample) joinAnalysis(_ context.Context, work *flow.Work[jo
 	join := flow.Execute(work, "enrichment/join", joinEnrichment, joinEnrichmentArgs{Parts: work.Args.Parts})
 	for _, part := range work.Args.Parts {
 		analysisKey := fmt.Sprintf("analysis/%d", part)
-		analyzed, err := flow.ReadEvent(work, partAnalyzed, analysisKey)
+		analyzed, err := flow.GetEventValue(work, partAnalyzed, analysisKey)
 		if err != nil {
 			return joinAnalysisResult{}, err
 		}
@@ -217,7 +217,7 @@ func (example *fanoutExample) enrichPart(_ context.Context, work *flow.Work[enri
 func (example *fanoutExample) joinEnrichment(_ context.Context, work *flow.Work[joinEnrichmentArgs]) (joinEnrichmentResult, error) {
 	total := 0
 	for _, part := range work.Args.Parts {
-		value, err := flow.ReadEvent(work, partEnriched, fmt.Sprintf("enrichment/%d", part))
+		value, err := flow.GetEventValue(work, partEnriched, fmt.Sprintf("enrichment/%d", part))
 		if err != nil {
 			return joinEnrichmentResult{}, err
 		}

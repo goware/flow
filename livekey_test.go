@@ -151,9 +151,9 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 
 	const delay = 400 * time.Millisecond
 	startedAt := time.Now()
-	handle, err := command.With(runtime).Execute(ctx, "delayed/1", liveKeyArgs{Value: "later"}, WithLiveKey(), WithStartDelay(delay))
-	if err != nil || !handle.Created {
-		t.Fatalf("delayed start = %#v, %v", handle, err)
+	exec, err := command.With(runtime).Execute(ctx, "delayed/1", liveKeyArgs{Value: "later"}, WithLiveKey(), WithStartDelay(delay))
+	if err != nil || !exec.Created {
+		t.Fatalf("delayed start = %#v, %v", exec, err)
 	}
 
 	depth, err := GetQueueDepth(ctx, runtime, "livekey.lane")
@@ -168,7 +168,7 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 	defer stop()
 	go runtime.Run(runCtx) //nolint:errcheck // returns nil on cancel
 
-	execution, err := AwaitExecution(ctx, runtime, handle.ID)
+	execution, err := AwaitExecution(ctx, runtime, exec.ID)
 	if err != nil {
 		t.Fatalf("AwaitExecution() error = %v", err)
 	}
