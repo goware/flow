@@ -11,9 +11,9 @@ The engine owns typed contracts and deterministic worker decisions. It transform
 
 ## Definitions and worker decisions
 
-Commands retain name/version, argument/result codecs, retry policy, attempt timeout, and queue. Events retain a name and payload codec. Definitions are immutable; invalid names/versions/options and nil workers fail validation.
+Commands retain name/version, argument/result codecs, retry policy, attempt timeout, and queue. Events retain a name and payload codec. `Event.Emit` is guarded external ingress; `Event.Deliver` is deliberately detached targeted ingress, including from a worker attempt. Definitions are immutable; invalid names/versions/options and nil workers fail validation.
 
-`Work[A]` exposes typed `Args` and immutable `CommandInfo`. Its private state records the first defect, staged events, staged sub-commands, declared event snapshots, and stable insertion order. `Execute` and `Emit` accept only `*Work`.
+`Work[A]` exposes typed `Args` and immutable `CommandInfo`. Its private state records the first defect, staged events, staged sub-commands, declared event snapshots, and stable insertion order. Worker-scoped `Execute` and `Emit` accept only `*Work`; `Event.Deliver` requires only a client and target execution ID because it is not part of the decision.
 
 Durable arguments, results, event payloads, metadata, retry settings, and journal bodies use bounded canonical JSON and hashes. A command fingerprint covers definition, key, arguments, parent, required flag, exact waits, delay, wait budget, queue, timeout, and retry policy.
 

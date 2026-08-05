@@ -32,7 +32,7 @@ Flow deliberately does not implement first-of-N races, quorum gates, reactions t
 
 Every semantic mutation locks the execution row, allocates gap-free journal positions, appends immutable journal entries, and updates projections in one PostgreSQL transaction. Command invocation is at-least-once; lease fencing guarantees that only a valid settlement commits durable progress.
 
-The six owned tables are executions, commands, command queue, command event waits, journal, and schema migrations. Application events are immutable journal facts identified by `(execution ID, event name, event key)`.
+The six owned tables are executions, commands, command queue, command event waits, journal, and schema migrations. Application events are immutable journal facts identified by `(execution ID, event name, event key)`. External code uses `Event.Emit`; application code that deliberately targets another known execution, including from an active worker, uses detached `Event.Deliver`. A transaction-bound client makes that ingress atomic with caller-owned application writes.
 
 ## Runtime and operations
 

@@ -27,7 +27,7 @@ Equivalent duplicate declarations coalesce. Repeated declarations of one key wit
 
 ## Exact event inputs
 
-Event identity is `(execution ID, event name, event key)`. Events are immutable; equivalent publication is idempotent and conflicting content is rejected. External publishers use `Event.Emit`.
+Event identity is `(execution ID, event name, event key)`. Events are immutable; equivalent publication is idempotent and conflicting content is rejected. External publishers use `Event.Emit`. Application code, including an active worker, may use `Event.Deliver` for deliberately detached ingress into a known execution. `runtime.InTx(tx)` joins delivery to caller-owned writes; a regular client commits it independently. Committed delivery survives source failure and retry, while ordinary same-execution worker events remain staged through `flow.Emit`.
 
 All waits are exact AND conditions. A command is claimable only after every wait is satisfied and its initial delay has elapsed. `Within` begins at command creation; expiry is terminal and late events cannot resurrect the command.
 

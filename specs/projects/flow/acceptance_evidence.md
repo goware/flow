@@ -17,6 +17,9 @@ This matrix records evidence for the command/worker/event architecture. PostgreS
 | Dynamic two-stage fan-out/fan-in needs no second state machine | `examples/fanout/main.go`, `examples/fanout/main_test.go` |
 | Bounded self-composition implements the agent loop | `examples/agent/main.go`, `examples/agent/main_test.go` |
 | External gating supplies typed payloads | `examples/monitor/main.go`, event-gate tests |
+| Active workers can deliver detached events to a separate gated execution | `TestDeliverFromActiveWorker` |
+| Delivery preserves target-local identity/lifecycle rules and external-emit gate behavior | `TestDeliverIdentityLifecycleAndGateParity` |
+| Independent producer executions satisfy a command-owned exact AND join | `TestDeliverMultiProducerFanIn` |
 
 ## Exact event inputs
 
@@ -43,6 +46,7 @@ This matrix records evidence for the command/worker/event architecture. PostgreS
 | Fenced settlement, retries, takeover, cancellation, and reduced fail-fast | command runtime/store integration tests |
 | Journal replay matches live command-only projections | `internal/replay` and inspection conformance tests |
 | Caller transactions preserve lock/commit ownership | transaction integration tests |
+| Application writes and delivered events commit or roll back together | `TestDeliverInCallerTransaction` |
 | Notifications are hints and polling recovers | distributed notification/reconnect tests |
 | Baseline migrations own exactly six tables | migration inventory and schema-constraint tests |
 | Removed public/runtime/storage symbols do not remain | compile contract plus repository scans |

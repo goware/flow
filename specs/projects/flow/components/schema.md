@@ -36,7 +36,7 @@ Journal kinds are `execution_started`, `execution_failing`, `command_created`, `
 
 Start creates one execution and root command. Success settlement accepts the application commit callback, result, staged events/sub-commands, attempt conclusion, wait resolution, and completion progression atomically. Failure settlement applies retry classification or terminal/fail-fast transitions.
 
-External event ingress enforces exact identity, appends the event, records satisfying positions, and recalculates readiness. Equivalent repeats are idempotent; conflicting repeats fail; terminal executions cannot be reopened.
+External event ingress through `Event.Emit` or `Event.Deliver` enforces exact target-local identity, appends the event, records satisfying positions, and recalculates readiness. Equivalent repeats are idempotent; conflicting repeats fail; terminal executions cannot be reopened. Delivery adds no source identity or storage shape and uses a caller transaction unchanged when supplied.
 
 Bounded indexed maintenance recovers command leases, expires unresolved waits, and enforces execution deadlines. Inspection uses indexed lookup/keyset pagination. Trace folds the journal under repeatable read and overlays bounded operational command data.
 

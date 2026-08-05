@@ -249,6 +249,20 @@ func (event Event[T]) Emit(ctx context.Context, c Client, id ExecutionID, key st
 		state.poison(err)
 		return err
 	}
+	return event.emitExternal(ctx, c, id, key, payload)
+}
+
+// Deliver records an event in a known execution, including from inside an
+// active worker attempt. Delivery is detached from that attempt: pass a
+// Runtime.InTx client to join a caller-owned transaction. Once committed, the
+// event is not retracted if the source attempt fails or retries; equivalent
+// repeats retain ordinary event idempotency. Use Emit(work, ...) for
+// same-execution events that must settle atomically with the worker decision.
+func (event Event[T]) Deliver(ctx context.Context, client Client, target ExecutionID, key string, payload T) error {
+	return event.emitExternal(ctx, client, target, key, payload)
+}
+
+func (event Event[T]) emitExternal(ctx context.Context, c Client, id ExecutionID, key string, payload T) error {
 	if event.err != nil || event.def == nil || event.def.Namespace != "application" {
 		return newError(ErrInvalid, "emit", "event", eventName(event.def), "invalid event definition")
 	}
