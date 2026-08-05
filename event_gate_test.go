@@ -18,14 +18,20 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	event := DefineEvent[None]("gate.direct_ready")
+	event := DefineEvent[string]("gate.direct_ready")
 	command := DefineCommand[None, None]("gate.direct", 1)
 	var calls atomic.Int32
+	var received atomic.Value
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+	if err := runtime.Register(Handle(command, func(_ context.Context, work *Work[None]) (None, error) {
+		payload, err := ReadEvent(work, event, "ready")
+		if err != nil {
+			return None{}, err
+		}
+		received.Store(payload)
 		calls.Add(1)
 		return None{}, nil
 	})); err != nil {
@@ -66,21 +72,104 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	if err := event.Emit(ctx, runtime, handle.ID, "not-ready", None{}); err != nil {
+	if err := event.Emit(ctx, runtime, handle.ID, "not-ready", "ignored"); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if calls.Load() != 0 {
 		t.Fatalf("non-matching event released root, calls=%d", calls.Load())
 	}
-	if err := event.Emit(ctx, runtime, handle.ID, "ready", None{}); err != nil {
+	if err := event.Emit(ctx, runtime, handle.ID, "ready", "approved"); err != nil {
 		t.Fatal(err)
 	}
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
 	if calls.Load() != 1 {
 		t.Fatalf("worker calls=%d", calls.Load())
 	}
+	if value, _ := received.Load().(string); value != "approved" {
+		t.Fatalf("ReadEvent payload=%q", value)
+	}
+	trace, err := Trace(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Commands) != 1 || len(trace.Commands[0].Waits) != 1 || trace.Commands[0].Waits[0].SatisfiedPosition == nil {
+		t.Fatalf("trace wait satisfaction=%+v", trace.Commands)
+	}
 	assertReplayMatches(t, runtime, handle.ID)
+}
+
+func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	event := DefineEvent[None]("gate.optional")
+	parent := DefineCommand[bool, None]("gate.optional_parent", 1)
+	child := DefineCommand[None, None]("gate.optional_child", 1)
+	var calls atomic.Int32
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(parent, func(_ context.Context, work *Work[bool]) (None, error) {
+			node := Execute(work, "optional", child, None{}).Optional().WaitFor(event, "ready")
+			if work.Args {
+				node.Within(40 * time.Millisecond)
+			}
+			return None{}, nil
+		}),
+		Handle(child, func(context.Context, *Work[None]) (None, error) {
+			calls.Add(1)
+			return None{}, nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, runResult)
+
+	open, err := parent.With(runtime).Execute(ctx, "optional/open", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	execution, err := GetExecution(ctx, runtime, open.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.Status != "running" {
+		t.Fatalf("optional command without Within status=%s, want running", execution.Status)
+	}
+	if err := event.Emit(ctx, runtime, open.ID, "ready", None{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, open.ID, "succeeded", 5*time.Second)
+
+	expiring, err := parent.With(runtime).Execute(ctx, "optional/expiring", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, expiring.ID, "succeeded", 5*time.Second)
+	trace, err := Trace(ctx, runtime, expiring.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var optionalState string
+	for _, command := range trace.Commands {
+		if command.Key == "optional" {
+			optionalState = command.State
+		}
+	}
+	if len(trace.Commands) != 2 || optionalState != string(StatusExpired) {
+		t.Fatalf("optional expiry trace=%+v", trace.Commands)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("optional child calls=%d, want 1", calls.Load())
+	}
 }
 
 func TestWorkerEventSatisfiesNewChildGateInSameDecision(t *testing.T) {
@@ -136,50 +225,50 @@ func TestWorkerEventSatisfiesNewChildGateInSameDecision(t *testing.T) {
 	}
 }
 
-func TestCoordinatorStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
+func TestWorkerStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 	t.Parallel()
 	database := testpg.Open(t)
 	ctx := context.Background()
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	first := DefineEvent[None]("gate.coordinator_first")
-	second := DefineEvent[None]("gate.coordinator_second")
-	wrong := DefineEvent[None]("gate.coordinator_wrong")
-	child := DefineCommand[None, None]("gate.coordinator_child", 1)
-	coordinator := DefineCoordinator[None]("gate.coordinator", 1,
-		OnStart(func(_ context.Context, coordination *Coordination[None]) error {
-			if err := Emit(coordination, first, "first", None{}); err != nil {
-				return err
-			}
-			Execute(coordination, "child", child, None{}).
-				WaitFor(first, "first").
-				WaitFor(second, "second").
-				Within(time.Second)
-			return nil
-		}),
-		OnOutcome(child, func(_ context.Context, coordination *Coordination[None], received Received[Outcome[None]]) error {
-			if received.Payload.Status != StatusSucceeded {
-				return errors.New("gated child did not succeed")
-			}
-			coordination.Succeed()
-			return nil
-		}),
-	)
+	first := DefineEvent[None]("gate.worker_first")
+	second := DefineEvent[None]("gate.worker_second")
+	wrong := DefineEvent[None]("gate.worker_wrong")
+	parent := DefineCommand[None, None]("gate.worker_parent", 1)
+	child := DefineCommand[None, None]("gate.worker_child", 1)
 	var childCalls atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register(coordinator, Handle(child, func(context.Context, *Work[None]) (None, error) {
-		childCalls.Add(1)
-		return None{}, nil
-	})); err != nil {
+	if err := runtime.Register(
+		Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
+			if err := Emit(work, first, "first", None{}); err != nil {
+				return None{}, err
+			}
+			Execute(work, "child", child, None{}).
+				WaitFor(first, "first").
+				WaitFor(second, "second").
+				Within(time.Second)
+			return None{}, nil
+		}),
+		Handle(child, func(_ context.Context, work *Work[None]) (None, error) {
+			if _, err := ReadEvent(work, first, "first"); err != nil {
+				return None{}, err
+			}
+			if _, err := ReadEvent(work, second, "second"); err != nil {
+				return None{}, err
+			}
+			childCalls.Add(1)
+			return None{}, nil
+		}),
+	); err != nil {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	handle, err := coordinator.With(runtime).Execute(ctx, "multiple", None{})
+	handle, err := parent.With(runtime).Execute(ctx, "multiple", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +283,7 @@ func TestCoordinatorStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("gated coordinator child did not become pending: state=%q waits=%d err=%v", state, unsatisfied, err)
+			t.Fatalf("gated child did not become pending: state=%q waits=%d err=%v", state, unsatisfied, err)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

@@ -18,7 +18,6 @@ import (
 type Execution struct {
 	Initialized       bool
 	ID                uuid.UUID
-	DriverMode        store.DriverMode
 	DefinitionName    string
 	DefinitionVersion int
 	ExecutionKey      string
@@ -40,7 +39,6 @@ type Execution struct {
 	DeadlineAt        *time.Time
 	Commands          map[uuid.UUID]Command
 	Events            []Event
-	Coordinator       *Coordinator
 }
 
 type Command struct {
@@ -48,7 +46,6 @@ type Command struct {
 	Key              string
 	Name             string
 	Version          int
-	Origin           string
 	ParentCommandID  *uuid.UUID
 	Required         bool
 	State            string
@@ -95,22 +92,6 @@ type Event struct {
 	Body           []byte
 }
 
-type Coordinator struct {
-	ID            uuid.UUID
-	Name          string
-	Version       int
-	Status        string
-	State         []byte
-	StatePosition int64
-	StateRevision int64
-	StartPending  bool
-	DeliveryState string
-	DeliveryKey   string
-	RetryPolicy   []byte
-	InboxPosition int64
-	Attempts      []Attempt
-}
-
 func New() Execution { return Execution{Commands: make(map[uuid.UUID]Command)} }
 
 func Fold(rows []store.JournalRow) (Execution, error) {
@@ -153,7 +134,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		}
 		state.Initialized = true
 		state.ID = id
-		state.DriverMode = store.DriverMode(body.DriverMode)
 		state.DefinitionName = body.DefinitionName
 		state.DefinitionVersion = body.DefinitionVersion
 		state.ExecutionKey = body.ExecutionKey
@@ -165,18 +145,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Input = slices.Clone(body.Input)
 		state.Metadata = slices.Clone(body.Metadata)
 		state.DeadlineAt = pointerClone(body.DeadlineAt)
-		if state.DriverMode == store.DriverCoordinator {
-			coordinatorID, err := uuid.Parse(body.CoordinatorID)
-			if err != nil || len(body.CoordinatorPolicy) == 0 {
-				return errors.New("coordinator ExecutionStarted record is incomplete")
-			}
-			state.Coordinator = &Coordinator{
-				ID: coordinatorID, Name: body.DefinitionName, Version: body.DefinitionVersion,
-				Status: "active", State: slices.Clone(body.Input), StatePosition: row.Position,
-				StartPending: true, DeliveryState: "ready", DeliveryKey: "start",
-				RetryPolicy: slices.Clone(body.CoordinatorPolicy),
-			}
-		}
 
 	case store.CommandCreated:
 		if !state.Initialized || row.CommandID == nil {
@@ -198,7 +166,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		}
 		state.Commands[bodyID] = Command{
 			ID: bodyID, Key: body.CommandKey, Name: body.Name, Version: body.Version,
-			Origin: body.Origin, Required: body.Required, State: body.InitialState,
+			Required: body.Required, State: body.InitialState,
 			Args: slices.Clone(body.Args), Queue: body.Queue, RetryPolicy: slices.Clone(body.RetryPolicy),
 			AttemptTimeoutMS: pointerClone(body.AttemptTimeoutMS), CreatedPosition: row.Position,
 			InitialDelayMS:  pointerClone(body.InitialDelayMS),
@@ -213,32 +181,15 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			command := state.Commands[bodyID]
 			command.ParentCommandID = &parentID
 			state.Commands[bodyID] = command
+		} else {
+			if state.RootCommandID != nil {
+				return errors.New("execution has more than one root command")
+			}
+			state.RootCommandID = pointer(bodyID)
 		}
 		state.CommandCount++
 		state.OpenCommands++
-		if state.DriverMode == store.DriverDirect && body.CommandKey == "root" {
-			state.RootCommandID = pointer(bodyID)
-		}
-
 	case store.AttemptStarted:
-		if row.CoordinatorID != nil {
-			if state.Coordinator == nil || state.Coordinator.ID != *row.CoordinatorID || row.AttemptID == nil {
-				return errors.New("coordinator AttemptStarted has invalid subject")
-			}
-			body, err := journalcodec.Decode[journalcodec.AttemptStartedBody](row.Body)
-			if err != nil {
-				return err
-			}
-			attemptID, err := uuid.Parse(body.AttemptID)
-			if err != nil || attemptID != *row.AttemptID || body.CoordinatorID != row.CoordinatorID.String() {
-				return errors.New("coordinator AttemptStarted identity differs")
-			}
-			state.Coordinator.Attempts = append(state.Coordinator.Attempts, Attempt{ID: attemptID, Ordinal: body.Attempt,
-				StartedAt: body.StartedAt, Worker: body.Worker, ConsumedAttempts: body.ConsumedAttempts})
-			state.Coordinator.DeliveryState = "running"
-			state.Coordinator.DeliveryKey = body.DeliveryKey
-			break
-		}
 		if row.CommandID == nil || row.AttemptID == nil {
 			return errors.New("AttemptStarted has no command or attempt")
 		}
@@ -267,40 +218,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Commands[*row.CommandID] = command
 
 	case store.AttemptConcluded:
-		if row.CoordinatorID != nil {
-			if state.Coordinator == nil || state.Coordinator.ID != *row.CoordinatorID || row.AttemptID == nil {
-				return errors.New("coordinator AttemptConcluded has invalid subject")
-			}
-			body, err := journalcodec.Decode[journalcodec.AttemptConcludedBody](row.Body)
-			if err != nil {
-				return err
-			}
-			attemptID, err := uuid.Parse(body.AttemptID)
-			if err != nil || attemptID != *row.AttemptID {
-				return errors.New("coordinator AttemptConcluded identity differs")
-			}
-			found := false
-			for i := range state.Coordinator.Attempts {
-				if state.Coordinator.Attempts[i].ID != attemptID {
-					continue
-				}
-				state.Coordinator.Attempts[i].FinishedAt = pointer(body.FinishedAt)
-				state.Coordinator.Attempts[i].Classification = body.Classification
-				state.Coordinator.Attempts[i].ConsumedBudget = body.ConsumedBudget
-				state.Coordinator.Attempts[i].ConsumedAttempts = body.ConsumedAttempts
-				state.Coordinator.Attempts[i].NextAttemptAt = pointerClone(body.NextAttemptAt)
-				state.Coordinator.Attempts[i].ErrorCode, state.Coordinator.Attempts[i].ErrorMessage = body.ErrorCode, body.ErrorMessage
-				found = true
-				break
-			}
-			if !found {
-				return errors.New("coordinator AttemptConcluded references unknown attempt")
-			}
-			if body.NextAttemptAt != nil {
-				state.Coordinator.DeliveryState = "retry_wait"
-			}
-			break
-		}
 		if row.CommandID == nil || row.AttemptID == nil {
 			return errors.New("AttemptConcluded has no command or attempt")
 		}
@@ -346,27 +263,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Status = "failing"
 		state.StatusAt = row.RecordedAt
 
-	case store.CoordinatorTransition:
-		if state.Coordinator == nil || row.CoordinatorID == nil || *row.CoordinatorID != state.Coordinator.ID {
-			return errors.New("CoordinatorTransition has invalid subject")
-		}
-		body, err := journalcodec.Decode[journalcodec.CoordinatorTransitionBody](row.Body)
-		if err != nil {
-			return err
-		}
-		if body.PriorStateRevision != state.Coordinator.StateRevision || body.StateRevision != body.PriorStateRevision+1 {
-			return errors.New("CoordinatorTransition revision is not contiguous")
-		}
-		state.Coordinator.State = slices.Clone(body.State)
-		state.Coordinator.StateRevision = body.StateRevision
-		state.Coordinator.StatePosition = row.Position
-		state.Coordinator.StartPending = false
-		state.Coordinator.DeliveryState = "idle"
-		state.Coordinator.DeliveryKey = ""
-		if body.HandledPosition != nil {
-			state.Coordinator.InboxPosition = *body.HandledPosition
-		}
-
 	case store.EventRecorded:
 		if row.EventClass == nil {
 			return errors.New("EventRecorded has no class")
@@ -388,8 +284,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Events = append(state.Events, event)
 		switch *row.EventClass {
 		case "application":
-			// Application facts affect exact command gates and coordinators;
-			// those readiness projections are reconstructed from retained rows.
+			// Exact wait readiness is projected operationally from retained rows.
 		case "command_terminal":
 			if row.CommandID == nil || row.TerminalStatus == nil {
 				return errors.New("command terminal event has no subject or status")
@@ -436,19 +331,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 					state.FailureCode = *row.TerminalStatus
 				}
 				state.FailureMessage = body.Reason
-			}
-			if state.Coordinator != nil {
-				switch *row.TerminalStatus {
-				case "succeeded":
-					state.Coordinator.Status = "completed"
-				case "cancelled":
-					state.Coordinator.Status = "cancelled"
-				default:
-					state.Coordinator.Status = "failed"
-				}
-				state.Coordinator.StartPending = false
-				state.Coordinator.DeliveryState = "idle"
-				state.Coordinator.DeliveryKey = ""
 			}
 		}
 	}

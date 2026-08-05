@@ -1,9 +1,7 @@
 package flow
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"sort"
 	"strings"
@@ -23,10 +21,6 @@ type ingressArgs struct {
 
 type ingressResult struct {
 	Value string `json:"value"`
-}
-
-type ingressState struct {
-	Count int `json:"count"`
 }
 
 func TestExecutionStartsAndEventEmit(t *testing.T) {
@@ -50,7 +44,7 @@ func TestExecutionStartsAndEventEmit(t *testing.T) {
 	if !direct.Created || direct.RootCommandID == "" || direct.Type != command.Name() {
 		t.Fatalf("direct handle = %#v", direct)
 	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, direct, "direct", 1, 1)
+	assertExecutionShape(t, database.Schema, database.DB.Conn, direct, 1, 1)
 
 	repeated, err := command.With(runtime).Execute(ctx, "direct/1", ingressArgs{Value: "a"}, WithMetadata(map[string]string{"tenant": "one"}))
 	if err != nil || repeated.Created || repeated.ID != direct.ID || repeated.RootCommandID != direct.RootCommandID {
@@ -73,36 +67,6 @@ func TestExecutionStartsAndEventEmit(t *testing.T) {
 	if err := event.Emit(ctx, runtime, direct.ID, "fact/1", ingressArgs{Value: "changed"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting Emit() error = %v", err)
 	}
-
-	coordinatorCalled := false
-	coordinator := DefineCoordinator[ingressState]("ingress.coordinator", 1, OnStart(func(context.Context, *Coordination[ingressState]) error {
-		coordinatorCalled = true
-		return nil
-	}))
-	coordinated, err := coordinator.With(runtime).Execute(ctx, "coordinator/1", ingressState{Count: 2})
-	if err != nil {
-		t.Fatalf("Coordinator.Execute() error = %v", err)
-	}
-	if coordinatorCalled {
-		t.Fatal("Coordinator.Execute invoked OnStart inline")
-	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, coordinated, "coordinator", 0, 0)
-	var deliveryState, deliveryKey string
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT delivery_state,delivery_key FROM `+
-		pgschema.Table(database.Schema, "flow_coordinators")+` WHERE execution_id=$1`, coordinated.ID).
-		Scan(&deliveryState, &deliveryKey); err != nil {
-		t.Fatalf("read coordinator: %v", err)
-	}
-	if deliveryState != "ready" || deliveryKey != "start" {
-		t.Fatalf("coordinator delivery = %s/%s", deliveryState, deliveryKey)
-	}
-	if err := CancelExecution(ctx, runtime, coordinated.ID, "stop coordinator"); err != nil {
-		t.Fatalf("CancelExecution(coordinator) error = %v", err)
-	}
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT status FROM `+pgschema.Table(database.Schema, "flow_coordinators")+` WHERE execution_id=$1`, coordinated.ID).Scan(&deliveryState); err != nil || deliveryState != "cancelled" {
-		t.Fatalf("cancelled coordinator status = %q, %v", deliveryState, err)
-	}
-	assertReplayMatches(t, runtime, coordinated.ID)
 }
 
 func TestCallerOwnedTransactionCommitAndRollback(t *testing.T) {
@@ -165,7 +129,7 @@ func TestCallerOwnedTransactionCommitAndRollback(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, committed, "direct", 1, 1)
+	assertExecutionShape(t, database.Schema, database.DB.Conn, committed, 1, 1)
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "app_records")).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("committed application count = %d, %v", count, err)
 	}
@@ -215,7 +179,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if created != 1 {
 		t.Fatalf("created handles = %d, want 1", created)
 	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, handles[0], "direct", 1, 1)
+	assertExecutionShape(t, database.Schema, database.DB.Conn, handles[0], 1, 1)
 
 	changedRuntime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(99))
 	if err != nil {
@@ -454,13 +418,12 @@ type queryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func assertExecutionShape(t *testing.T, schema string, db queryRower, handle ExecutionHandle, mode string, commands, open int) {
+func assertExecutionShape(t *testing.T, schema string, db queryRower, handle ExecutionHandle, commands, open int) {
 	t.Helper()
-	var gotMode string
 	var gotCommands, gotOpen, journalCount, queueCount int
-	if err := db.QueryRow(context.Background(), `SELECT driver_mode,command_count,open_commands FROM `+
+	if err := db.QueryRow(context.Background(), `SELECT command_count,open_commands FROM `+
 		pgschema.Table(schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).
-		Scan(&gotMode, &gotCommands, &gotOpen); err != nil {
+		Scan(&gotCommands, &gotOpen); err != nil {
 		t.Fatalf("read execution: %v", err)
 	}
 	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM `+pgschema.Table(schema, "flow_journal")+` WHERE execution_id=$1`, handle.ID).Scan(&journalCount); err != nil {
@@ -470,10 +433,9 @@ func assertExecutionShape(t *testing.T, schema string, db queryRower, handle Exe
 		t.Fatalf("count queue: %v", err)
 	}
 	wantJournal := 1 + commands
-	if gotMode != mode || gotCommands != commands || gotOpen != open || journalCount != wantJournal || queueCount != commands {
-		t.Fatalf("execution shape = mode=%s commands=%d open=%d journal=%d queue=%d; want %s/%d/%d/%d/%d",
-			gotMode, gotCommands, gotOpen, journalCount, queueCount,
-			mode, commands, open, wantJournal, commands)
+	if gotCommands != commands || gotOpen != open || journalCount != wantJournal || queueCount != commands {
+		t.Fatalf("execution shape = commands=%d open=%d journal=%d queue=%d; want %d/%d/%d/%d",
+			gotCommands, gotOpen, journalCount, queueCount, commands, open, wantJournal, commands)
 	}
 }
 
@@ -520,37 +482,8 @@ func assertReplayMatches(t *testing.T, runtime *Runtime, id ExecutionID) {
 			t.Fatalf("replayed command %s differs: %#v live=%s/%d/%v", commandID, replayed, liveState, created, terminal)
 		}
 	}
-	if state.Coordinator != nil {
-		var liveID string
-		var liveStatus, liveDeliveryState string
-		var liveState, liveRetryHash []byte
-		var liveStatePosition, liveStateRevision int64
-		var liveStartPending bool
-		var liveDeliveryKey *string
-		if err := runtime.db.Conn.QueryRow(context.Background(), `SELECT coordinator_id::text,status,state,state_position,
-			state_revision,start_pending,delivery_state,delivery_key,retry_policy_hash FROM `+
-			pgschema.Table(runtime.schema, "flow_coordinators")+` WHERE execution_id=$1`, parsed).
-			Scan(&liveID, &liveStatus, &liveState, &liveStatePosition, &liveStateRevision, &liveStartPending,
-				&liveDeliveryState, &liveDeliveryKey, &liveRetryHash); err != nil {
-			t.Fatalf("read live coordinator: %v", err)
-		}
-		replayRetryHash := sha256.Sum256(state.Coordinator.RetryPolicy)
-		if state.Coordinator.ID.String() != liveID || state.Coordinator.Status != liveStatus ||
-			!bytes.Equal(state.Coordinator.State, liveState) || state.Coordinator.StatePosition != liveStatePosition ||
-			state.Coordinator.StateRevision != liveStateRevision || state.Coordinator.StartPending != liveStartPending ||
-			state.Coordinator.DeliveryState != liveDeliveryState || !equalStringPointer(state.Coordinator.DeliveryKey, liveDeliveryKey) ||
-			!bytes.Equal(replayRetryHash[:], liveRetryHash) {
-			t.Fatalf("replayed coordinator differs: replay=%#v live=%s/%s/%q/%d/%d/%v/%s/%v/%x",
-				*state.Coordinator, liveID, liveStatus, liveState, liveStatePosition, liveStateRevision,
-				liveStartPending, liveDeliveryState, liveDeliveryKey, liveRetryHash)
-		}
-	}
 }
 
 func equalInt64Pointer(a, b *int64) bool {
 	return a == nil && b == nil || a != nil && b != nil && *a == *b
-}
-
-func equalStringPointer(value string, pointer *string) bool {
-	return value == "" && pointer == nil || pointer != nil && value == *pointer
 }

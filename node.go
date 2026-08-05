@@ -1,9 +1,12 @@
 package flow
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
-// Node is an ephemeral builder for a command staged by a worker or
-// coordinator decision. It is valid only for the duration of that decision.
+// Node is an ephemeral builder for a command staged by a worker decision. It
+// is valid only for the duration of that decision.
 type Node struct {
 	scope *scopeState
 	key   string
@@ -26,6 +29,10 @@ func (node *Node) WaitFor(event EventRef, key string) *Node {
 		return node
 	}
 	if command, ok := node.decisionCommand("wait for"); ok {
+		if !slices.Contains(command.waits, wait) && len(command.waits) >= maxCommandEventWaits {
+			node.scope.poison(newError(ErrInvalid, "execute", "wait", node.key, "command exceeds the 256 event-wait limit"))
+			return node
+		}
 		command.waits = addCommandEventWait(command.waits, wait)
 		node.scope.decision.commands[node.key] = command
 	}
@@ -92,10 +99,6 @@ func (node *Node) Optional() *Node {
 
 func (node *Node) decisionCommand(operation string) (stagedCommand, bool) {
 	if node.scope == nil || node.scope.firstError != nil {
-		return stagedCommand{}, false
-	}
-	if node.scope.terminal != nil {
-		node.scope.poison(newError(ErrInvalidState, "execute", operation, node.key, "coordinator is already terminal"))
 		return stagedCommand{}, false
 	}
 	command, ok := node.scope.decision.commands[node.key]

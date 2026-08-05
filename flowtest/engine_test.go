@@ -14,8 +14,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-type stagedEventState struct{}
-
 func TestStagedEventsAreRecordedDeterministically(t *testing.T) {
 	event := flow.DefineEvent[testFact]("flowtest.worker_event")
 	command := flow.DefineCommand[testArgs, testResult]("flowtest.event_worker", 1)
@@ -78,25 +76,30 @@ func TestStagedEventDefectsPoisonDecisions(t *testing.T) {
 	}
 }
 
-func TestCoordinatorCanStageEventsWithTerminalDecision(t *testing.T) {
-	event := flow.DefineEvent[testFact]("flowtest.coordinator_event")
-	coordinator := flow.DefineCoordinator[stagedEventState]("flowtest.event_coordinator", 1,
-		flow.OnStart(func(_ context.Context, coordination *flow.Coordination[stagedEventState]) error {
-			if err := flow.Emit(coordination, event, "finished", testFact{Value: "yes"}); err != nil {
-				return err
-			}
-			coordination.Succeed()
-			return nil
-		}))
-	decision, err := flowtest.RunCoordinator(context.Background(), coordinator, stagedEventState{}, flowtest.Start())
-	if err != nil {
-		t.Fatal(err)
+func TestRunWorkerReadsDeclaredEventInputs(t *testing.T) {
+	event := flow.DefineEvent[testFact]("flowtest.worker_input")
+	command := flow.DefineCommand[testArgs, testResult]("flowtest.input_worker", 1)
+	registration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		first, err := flow.ReadEvent(work, event, "input/1")
+		if err != nil {
+			return testResult{}, err
+		}
+		second, err := flow.ReadEvent(work, event, "input/1")
+		if err != nil {
+			return testResult{}, err
+		}
+		return testResult{Value: first.Value + "/" + second.Value}, nil
+	})
+	decision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), registration, testArgs{},
+		flowtest.WithEvent(event, "input/1", testFact{Value: "stable"}))
+	if err != nil || decision.Err != nil || decision.Result.Value != "stable/stable" {
+		t.Fatalf("declared event decision=%+v err=%v", decision, err)
 	}
-	if decision.Err != nil || decision.Terminal != "succeeded" || len(decision.Events) != 1 || decision.Events[0].Key != "finished" {
-		t.Fatalf("decision=%+v", decision)
+	missing, err := flowtest.RunWorker[testArgs, testResult](context.Background(), registration, testArgs{})
+	if err != nil || !errors.Is(missing.Err, flow.ErrInvalidState) {
+		t.Fatalf("missing event decision=%+v err=%v", missing, err)
 	}
 }
-
 func TestExternalEventIngressIsRejectedInsideAttempt(t *testing.T) {
 	event := flow.DefineEvent[testFact]("flowtest.external_in_attempt")
 	command := flow.DefineCommand[testArgs, testResult]("flowtest.external_in_attempt_worker", 1)
@@ -174,10 +177,13 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	root := flow.DefineCommand[testArgs, testResult]("flowtest.root", 1)
 	rootRegistration := flow.Handle(root, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
 		_ = flow.Emit(work, directEvent, "shared", testFact{Value: "same"})
-		flow.Execute(work, "leaf", child, testArgs{Value: "leaf"})
+		flow.Execute(work, "leaf", child, testArgs{Value: "leaf"}).WaitFor(directEvent, "shared")
 		return testResult{Value: "root"}, nil
 	})
 	childRegistration := flow.Handle(child, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		if _, err := flow.ReadEvent(work, directEvent, "shared"); err != nil {
+			return testResult{}, err
+		}
 		_ = flow.Emit(work, directEvent, "shared", testFact{Value: "same"})
 		return testResult{Value: work.Args.Value + "/done"}, nil
 	})
@@ -195,41 +201,6 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	if _, err := flowtest.RunDirect[testArgs, testResult](context.Background(), rootRegistration,
 		testArgs{}, 10, func(string, int) (flow.Registration, bool) { return conflictingChild, true }); err == nil {
 		t.Fatal("RunDirect accepted conflicting staged event identities")
-	}
-}
-
-func TestRunCoordinatorHandlesMixedOutcomes(t *testing.T) {
-	task := flow.DefineCommand[testArgs, testResult]("flowtest.tool", 1)
-	type state struct {
-		Pending int `json:"pending"`
-		Failed  int `json:"failed"`
-	}
-	coordinator := flow.DefineCoordinator[state]("flowtest.agent", 1,
-		flow.OnStart(func(_ context.Context, coordination *flow.Coordination[state]) error {
-			coordination.State.Pending = 1
-			flow.Execute(coordination, "tool/1", task, testArgs{Value: "search"}).Optional()
-			return nil
-		}),
-		flow.OnOutcome(task, func(_ context.Context, coordination *flow.Coordination[state], received flow.Received[flow.Outcome[testResult]]) error {
-			coordination.State.Pending--
-			if received.Payload.Status != flow.StatusSucceeded {
-				coordination.State.Failed++
-			}
-			coordination.Succeed()
-			return nil
-		}),
-	)
-	started, err := flowtest.RunCoordinator(context.Background(), coordinator, state{}, flowtest.Start())
-	if err != nil || started.Err != nil || started.State.Pending != 1 || len(started.Commands) != 1 || started.Commands[0].Required {
-		t.Fatalf("coordinator start = %#v, %v", started, err)
-	}
-	failed := flow.Outcome[testResult]{Status: flow.StatusFailed,
-		Failure: &flow.CommandFailure{Code: "tool_timeout", Message: "timed out"}}
-	finished, err := flowtest.RunCoordinator(context.Background(), coordinator, started.State,
-		flowtest.DeliverOutcome(5, task, "tool/1", time.Now(), failed))
-	if err != nil || finished.Err != nil || finished.State.Pending != 0 || finished.State.Failed != 1 ||
-		finished.Terminal != "succeeded" {
-		t.Fatalf("coordinator outcome = %#v, %v", finished, err)
 	}
 }
 

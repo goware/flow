@@ -39,8 +39,8 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	).Scan(&tables); err != nil {
 		t.Fatalf("count tables: %v", err)
 	}
-	if tables != 7 {
-		t.Fatalf("Flow table count = %d, want 7", tables)
+	if tables != 6 {
+		t.Fatalf("Flow table count = %d, want 6", tables)
 	}
 	if err := database.DB.Conn.QueryRow(ctx,
 		`SELECT count(*) FROM pg_catalog.pg_indexes WHERE schemaname=$1 AND indexname LIKE 'flow_%'`,
@@ -212,6 +212,23 @@ func TestCheckSchemaDetectsMissingTable(t *testing.T) {
 	}
 	if _, err := database.DB.Conn.Exec(ctx, `DROP TABLE `+quoteIdentifier(database.Schema)+`.flow_command_event_waits`); err != nil {
 		t.Fatalf("drop Flow table: %v", err)
+	}
+	if _, err := CheckSchema(ctx, database.DB, option); !errors.Is(err, ErrSchema) {
+		t.Fatalf("CheckSchema() error = %v, want ErrSchema", err)
+	}
+}
+
+func TestCheckSchemaDetectsUnexpectedFlowTable(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	option := WithSchema(database.Schema)
+	if err := Migrate(ctx, database.DB, option); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, `CREATE TABLE `+quoteIdentifier(database.Schema)+`.flow_unexpected (id integer)`); err != nil {
+		t.Fatalf("create unexpected Flow table: %v", err)
 	}
 	if _, err := CheckSchema(ctx, database.DB, option); !errors.Is(err, ErrSchema) {
 		t.Fatalf("CheckSchema() error = %v, want ErrSchema", err)

@@ -729,43 +729,43 @@ Historical review files remain source material. Historical completed plans may r
 
 ### Phase 1: prove event payload inputs and command-only examples
 
-- [ ] Add bounded declared event snapshots to command claims and worker scopes.
-- [ ] Add `ReadEvent` with exact declared-gate enforcement and deterministic retry behavior.
-- [ ] Add wait-count validation and trace satisfaction positions.
-- [ ] Extend `flowtest` worker fixtures for declared event inputs.
-- [ ] Rewrite fan-out as two command-owned fan-out/join phases.
-- [ ] Rewrite agent as a bounded self-composing command loop.
-- [ ] Update monitor to consume its exact event payload.
-- [ ] Run database-free and PostgreSQL example tests before deleting coordinators.
-- [ ] Confirm the rewritten agent and target applications require no failure subscription, first-of-N, quorum, race, or open-ended handler state; stop before Phase 2 if they do.
+- [x] Add bounded declared event snapshots to command claims and worker scopes.
+- [x] Add `ReadEvent` with exact declared-gate enforcement and deterministic retry behavior.
+- [x] Add wait-count validation and trace satisfaction positions.
+- [x] Extend `flowtest` worker fixtures for declared event inputs.
+- [x] Rewrite fan-out as two command-owned fan-out/join phases.
+- [x] Rewrite agent as a bounded self-composing command loop.
+- [x] Update monitor to consume its exact event payload.
+- [x] Run database-free and PostgreSQL example tests before deleting coordinators.
+- [x] Confirm the rewritten agent and target applications require no failure subscription, first-of-N, quorum, race, or open-ended handler state; stop before Phase 2 if they do.
 
 ### Phase 2: remove the complete coordinator public/runtime vertical
 
-- [ ] Delete coordinator definitions, handlers, state, outcomes, received envelopes, and IDs.
-- [ ] Remove `Scope` and make worker-only `Execute`/`Emit` signatures explicit.
-- [ ] Bind `ResultOf` directly to `ExecutionTrace`; remove `Outcome`, `OutcomeOf`, and `ResultSource`.
-- [ ] Delete coordinator registration, scheduler, scan, claim, lease, retry, settlement, recovery, wake, observation, and fault code.
-- [ ] Delete coordinator runtime/unit/integration tests and benchmarks.
-- [ ] Reduce runtime lifecycle and capacity to command work plus maintenance.
+- [x] Delete coordinator definitions, handlers, state, outcomes, received envelopes, and IDs.
+- [x] Remove `Scope` and make worker-only `Execute`/`Emit` signatures explicit.
+- [x] Bind `ResultOf` directly to `ExecutionTrace`; remove `Outcome`, `OutcomeOf`, and `ResultSource`.
+- [x] Delete coordinator registration, scheduler, scan, claim, lease, retry, settlement, recovery, wake, observation, and fault code.
+- [x] Delete coordinator runtime/unit/integration tests and benchmarks.
+- [x] Reduce runtime lifecycle and capacity to command work plus maintenance.
 
 ### Phase 3: rewrite storage and replay
 
-- [ ] Rewrite baseline migrations to six tables.
-- [ ] Delete coordinator storage/indexes and journal representation.
-- [ ] Remove execution driver mode and command origin columns/types.
-- [ ] Simplify key uniqueness, start fingerprints, journal bodies, inspection queries, and constraints.
-- [ ] Remove coordinator replay/history/trace/observer/test-helper projections.
-- [ ] Retain live-versus-replay conformance for direct command executions.
-- [ ] Recreate development/test Flow schemas rather than migrating coordinator data.
+- [x] Rewrite baseline migrations to six tables.
+- [x] Delete coordinator storage/indexes and journal representation.
+- [x] Remove execution driver mode and command origin columns/types.
+- [x] Simplify key uniqueness, start fingerprints, journal bodies, inspection queries, and constraints.
+- [x] Remove coordinator replay/history/trace/observer/test-helper projections.
+- [x] Retain live-versus-replay conformance for direct command executions.
+- [x] Recreate development/test Flow schemas rather than migrating coordinator data.
 
 ### Phase 4: synchronize and harden
 
-- [ ] Apply section 13 to all active documentation.
-- [ ] Replace coordinator sparse-scan benchmarks with event-gated fan-in workloads.
-- [ ] Run formatting, static analysis, package tests, PostgreSQL tests, race tests, examples, and migration checks.
-- [ ] Run public API and removed-symbol scans.
-- [ ] Record six-table acceptance and retained benchmark evidence.
-- [ ] Mark this plan and synchronized active artifacts `complete`.
+- [x] Apply section 13 to all active documentation.
+- [x] Replace coordinator sparse-scan benchmarks with event-gated fan-in workloads.
+- [x] Run formatting, static analysis, package tests, PostgreSQL tests, race tests, examples, and migration checks.
+- [x] Run public API and removed-symbol scans.
+- [x] Record six-table acceptance and retained benchmark evidence.
+- [x] Mark this plan and synchronized active artifacts `complete`.
 
 ## 15. Required test matrix
 

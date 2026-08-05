@@ -183,13 +183,12 @@ func (tx *SemanticTx) ExecutionID() uuid.UUID {
 type EntryKind string
 
 const (
-	ExecutionStarted      EntryKind = "execution_started"
-	ExecutionFailing      EntryKind = "execution_failing"
-	CommandCreated        EntryKind = "command_created"
-	AttemptStarted        EntryKind = "attempt_started"
-	AttemptConcluded      EntryKind = "attempt_concluded"
-	EventRecorded         EntryKind = "event_recorded"
-	CoordinatorTransition EntryKind = "coordinator_transition"
+	ExecutionStarted EntryKind = "execution_started"
+	ExecutionFailing EntryKind = "execution_failing"
+	CommandCreated   EntryKind = "command_created"
+	AttemptStarted   EntryKind = "attempt_started"
+	AttemptConcluded EntryKind = "attempt_concluded"
+	EventRecorded    EntryKind = "event_recorded"
 )
 
 type JournalEntry struct {
@@ -199,7 +198,6 @@ type JournalEntry struct {
 	CausationBatchIndex *int
 	CommandID           *uuid.UUID
 	AttemptID           *uuid.UUID
-	CoordinatorID       *uuid.UUID
 	EventID             *uuid.UUID
 	EventNamespace      *string
 	EventName           *string
@@ -357,7 +355,6 @@ type JournalRow struct {
 	CausationPosition *int64
 	CommandID         *uuid.UUID
 	AttemptID         *uuid.UUID
-	CoordinatorID     *uuid.UUID
 	EventID           *uuid.UUID
 	EventNamespace    *string
 	EventName         *string
@@ -370,7 +367,7 @@ type JournalRow struct {
 
 var journalColumns = []string{
 	"execution_id", "position", "entry_id", "entry_kind", "recorded_at", "causation_position",
-	"command_id", "attempt_id", "coordinator_id",
+	"command_id", "attempt_id",
 	"event_id", "event_namespace", "event_name", "event_key", "event_class", "terminal_status",
 	"body", "body_hash",
 }
@@ -380,8 +377,7 @@ func rowFromEntry(executionID uuid.UUID, position int64, recordedAt time.Time, c
 		ExecutionID: executionID, Position: position, EntryID: entry.EntryID, Kind: entry.Kind,
 		RecordedAt: recordedAt, CausationPosition: clonePointer(causation),
 		CommandID: clonePointer(entry.CommandID), AttemptID: clonePointer(entry.AttemptID),
-		CoordinatorID: clonePointer(entry.CoordinatorID),
-		EventID:       clonePointer(entry.EventID), EventNamespace: clonePointer(entry.EventNamespace),
+		EventID: clonePointer(entry.EventID), EventNamespace: clonePointer(entry.EventNamespace),
 		EventName: clonePointer(entry.EventName),
 		EventKey:  clonePointer(entry.EventKey), EventClass: clonePointer(entry.EventClass),
 		TerminalStatus: clonePointer(entry.TerminalStatus), Body: entry.Body.BytesCopy(), BodyHash: entry.Body.Digest,
@@ -391,7 +387,7 @@ func rowFromEntry(executionID uuid.UUID, position int64, recordedAt time.Time, c
 func (row JournalRow) copyValues() []any {
 	return []any{
 		row.ExecutionID, row.Position, row.EntryID, string(row.Kind), row.RecordedAt, row.CausationPosition,
-		row.CommandID, row.AttemptID, row.CoordinatorID,
+		row.CommandID, row.AttemptID,
 		row.EventID, row.EventNamespace, row.EventName, row.EventKey, row.EventClass, row.TerminalStatus,
 		row.Body, row.BodyHash[:],
 	}
@@ -445,7 +441,7 @@ func scanJournalRow(row pgx.Row) (JournalRow, error) {
 	var bodyHash []byte
 	if err := row.Scan(
 		&result.ExecutionID, &result.Position, &result.EntryID, &kind, &result.RecordedAt, &result.CausationPosition,
-		&result.CommandID, &result.AttemptID, &result.CoordinatorID,
+		&result.CommandID, &result.AttemptID,
 		&result.EventID, &result.EventNamespace, &result.EventName, &result.EventKey,
 		&result.EventClass, &result.TerminalStatus, &result.Body, &bodyHash,
 	); err != nil {
@@ -487,7 +483,7 @@ func validateJournalBatch(entries []JournalEntry) error {
 func validEntryKind(kind EntryKind) bool {
 	switch kind {
 	case ExecutionStarted, ExecutionFailing, CommandCreated, AttemptStarted,
-		AttemptConcluded, EventRecorded, CoordinatorTransition:
+		AttemptConcluded, EventRecorded:
 		return true
 	default:
 		return false

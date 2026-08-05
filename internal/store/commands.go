@@ -90,6 +90,7 @@ type ClaimedCommand struct {
 	Version                int
 	Queue                  string
 	Args                   []byte
+	EventInputs            []ClaimedEventInput
 	RetryMaxElapsed        *time.Duration
 	AttemptTimeout         time.Duration
 	CreatedAt              time.Time
@@ -102,6 +103,13 @@ type ClaimedCommand struct {
 	DBNow                  time.Time
 	LeaseExpiresAt         time.Time
 	AttemptStartedPosition int64
+}
+
+type ClaimedEventInput struct {
+	Name     string
+	Key      string
+	Position int64
+	Payload  []byte
 }
 
 type ClaimResult struct {
@@ -261,6 +269,10 @@ func (s *Store) claimCommandLocked(
 		semantic.DBNow().Before(nextRunAt) {
 		return nil, true, nil
 	}
+	eventInputs, err := s.loadClaimedEventInputs(ctx, semantic, candidate.CommandID)
+	if err != nil {
+		return nil, false, err
+	}
 	policy, err := retrypolicy.PublicFromCanonical(policyBytes)
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: stored retry policy is invalid", flowerr.ErrInvalidState)
@@ -311,13 +323,61 @@ func (s *Store) claimCommandLocked(
 	}
 	return &ClaimedCommand{
 		CommandID: candidate.CommandID, ExecutionID: candidate.ExecutionID, CommandKey: key,
-		Name: name, Version: version, Queue: queue, Args: slices.Clone(args),
+		Name: name, Version: version, Queue: queue, Args: slices.Clone(args), EventInputs: eventInputs,
 		RetryMaxElapsed: clonePointer(policyValue.MaxElapsed),
 		AttemptTimeout:  attemptTimeout, CreatedAt: createdAt, BudgetStartedAt: budgetStartedAt,
 		ExecutionDeadline: clonePointer(executionDeadline), Attempt: ordinal + 1, ConsumedAttempts: consumed,
 		AttemptID: attemptID, LeaseToken: token, DBNow: semantic.DBNow(), LeaseExpiresAt: leaseExpiresAt,
 		AttemptStartedPosition: journal.Journal[0].Position,
 	}, false, nil
+}
+
+func (s *Store) loadClaimedEventInputs(ctx context.Context, semantic *SemanticTx, commandID uuid.UUID) ([]ClaimedEventInput, error) {
+	rows, err := semantic.PGX().Query(ctx, `SELECT w.event_name,w.event_key,w.satisfied_position,
+		j.event_namespace,j.event_name,j.event_key,j.event_class,j.body,j.body_hash
+		FROM `+pgschema.Table(s.schema, "flow_command_event_waits")+` w
+		LEFT JOIN `+pgschema.Table(s.schema, "flow_journal")+` j
+		  ON j.execution_id=w.execution_id AND j.position=w.satisfied_position
+		WHERE w.command_id=$1
+		ORDER BY w.event_name,w.event_key`, commandID)
+	if err != nil {
+		return nil, MapError("load claimed event inputs", err)
+	}
+	defer rows.Close()
+	inputs := make([]ClaimedEventInput, 0, 8)
+	for rows.Next() {
+		var name, key string
+		var position *int64
+		var namespace, journalName, journalKey, class *string
+		var body, bodyHash []byte
+		if err := rows.Scan(&name, &key, &position, &namespace, &journalName, &journalKey, &class, &body, &bodyHash); err != nil {
+			return nil, MapError("scan claimed event input", err)
+		}
+		if len(inputs) >= MaxCommandEventWaits {
+			return nil, fmt.Errorf("%w: claimed command exceeds event-wait limit", flowerr.ErrInvalidState)
+		}
+		if position == nil || namespace == nil || journalName == nil || journalKey == nil || class == nil ||
+			*namespace != "application" || *class != "application" || *journalName != name || *journalKey != key {
+			return nil, fmt.Errorf("%w: command event input has an invalid satisfying journal row", flowerr.ErrInvalidState)
+		}
+		canonicalBody, err := canonical.Canonicalize(body, 0)
+		if err != nil || !bytes.Equal(canonicalBody.Digest[:], bodyHash) {
+			return nil, fmt.Errorf("%w: command event input body is invalid", flowerr.ErrInvalidState)
+		}
+		decoded, err := journalcodec.Decode[journalcodec.ApplicationEventBody](canonicalBody.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("%w: command event input body cannot be decoded", flowerr.ErrInvalidState)
+		}
+		payload, err := canonical.Canonicalize(decoded.Payload, 64<<10)
+		if err != nil {
+			return nil, fmt.Errorf("%w: command event input payload is invalid", flowerr.ErrInvalidState)
+		}
+		inputs = append(inputs, ClaimedEventInput{Name: name, Key: key, Position: *position, Payload: payload.BytesCopy()})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, MapError("read claimed event inputs", err)
+	}
+	return inputs, nil
 }
 
 func (s *Store) failBeforeClaimLocked(
@@ -374,7 +434,7 @@ func (s *Store) failBeforeClaimLocked(
 	entries = append(entries, cancelledEntries...)
 	executionFailed := required || head.Status == "failing"
 	effectiveOpen := head.OpenCommands - 1 - len(failureEffects.cancelled)
-	terminalExecution := head.Mode == DriverDirect && effectiveOpen == 0
+	terminalExecution := effectiveOpen == 0
 	if terminalExecution {
 		status, eventName, reason := "succeeded", "flow.execution_succeeded", ""
 		if executionFailed {
@@ -714,7 +774,7 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		effectiveChildren = 0
 	}
 	effectiveOpen := fence.Head.OpenCommands - 1 + effectiveChildren
-	terminalExecution := fence.Head.Mode == DriverDirect && effectiveOpen == 0
+	terminalExecution := effectiveOpen == 0
 	terminalStatus := "succeeded"
 	terminalName := "flow.execution_succeeded"
 	if fence.Head.Status == "failing" {
@@ -818,7 +878,7 @@ func (s *Store) validateSuccessfulDecision(ctx context.Context, semantic *Semant
 		}
 		keys := make([]string, len(request.Children))
 		for index, child := range request.Children {
-			if child.ParentCommandID == nil || *child.ParentCommandID != request.Claim.CommandID || child.Origin != "worker_child" {
+			if child.ParentCommandID == nil || *child.ParentCommandID != request.Claim.CommandID {
 				return fmt.Errorf("%w: invalid worker-spawned child", flowerr.ErrInvalid)
 			}
 			keys[index] = child.Key
@@ -940,7 +1000,7 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		}
 		entries = append(entries, cancelledEntries...)
 		effectiveOpen := fence.Head.OpenCommands - 1 - len(failureEffects.cancelled)
-		terminalExecution = fence.Head.Mode == DriverDirect && effectiveOpen == 0
+		terminalExecution = effectiveOpen == 0
 		if terminalExecution {
 			status, eventName, reason := "succeeded", "flow.execution_succeeded", ""
 			if executionFailed {
@@ -1036,9 +1096,6 @@ func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, clai
 	}
 	if head.Status != "running" && head.Status != "failing" {
 		return commandFence{}, fmt.Errorf("%w: execution is terminal", flowerr.ErrTerminal)
-	}
-	if err := s.lockCoordinatorForExecution(ctx, semantic); err != nil {
-		return commandFence{}, err
 	}
 	var result commandFence
 	result.Head = head
@@ -1158,9 +1215,6 @@ func (s *Store) expireExecutionLocked(ctx context.Context, semantic *SemanticTx,
 	if head.Status != "running" && head.Status != "failing" {
 		return nil
 	}
-	if err := s.lockCoordinatorForExecution(ctx, semantic); err != nil {
-		return err
-	}
 	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,state,attempt_ordinal,consumed_attempts,created_position
 		FROM `+pgschema.Table(s.schema, "flow_commands")+`
 		WHERE execution_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired')
@@ -1265,12 +1319,6 @@ func (s *Store) expireExecutionLocked(ctx context.Context, semantic *SemanticTx,
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE execution_id=$1`, semantic.ExecutionID()); err != nil {
 		return MapError("remove expired execution deliveries", err)
 	}
-	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_coordinators")+`
-		SET status='cancelled',start_pending=false,delivery_state='idle',delivery_key=NULL,delivery_position=NULL,
-		    active_attempt_id=NULL,lease_token=NULL,lease_owner=NULL,lease_started_at=NULL,lease_expires_at=NULL,
-		    finished_at=$2,updated_at=$2 WHERE execution_id=$1 AND status='active'`, semantic.ExecutionID(), semantic.DBNow()); err != nil {
-		return MapError("expire coordinator", err)
-	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
 		SET status='expired',open_commands=0,failure=$2::jsonb,finished_at=$3,updated_at=$3,status_at=$3
 		WHERE execution_id=$1`, semantic.ExecutionID(),
@@ -1337,9 +1385,6 @@ func (s *Store) RecoverExpiredCommandLease(ctx context.Context, candidate Expire
 			return false, err
 		}
 		return true, nil
-	}
-	if err := s.lockCoordinatorForExecution(ctx, semantic); err != nil {
-		return false, err
 	}
 	var key, commandState, queueState string
 	var attempt, consumed int

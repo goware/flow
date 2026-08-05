@@ -1,132 +1,66 @@
 ---
 status: complete
+completed_at: 2026-08-04
 ---
 
 # Architecture: flow
 
 ## Objective
 
-Flow presents a small typed API over a PostgreSQL-backed durable execution engine. Commands and coordinators are the only execution drivers. Workers and coordinators record deterministic decisions; the store accepts them atomically; schedulers deliver eligible work across replicas.
+Flow is a typed API over a PostgreSQL-backed durable command engine. Commands are the only execution drivers. Workers record deterministic decisions; the store accepts them atomically; one scheduler delivers eligible work across replicas.
 
 ## Package layout
 
 ```text
 flow/
-├── definitions.go          command, event, coordinator definitions
+├── definitions.go          command and event definitions
 ├── execute.go              execution starts, external events, cancellation
-├── worker.go / node.go      worker decisions and staged command builder
-├── coordinator.go           durable state handlers and terminal decisions
-├── runtime*.go              registration, scheduling, leases, shutdown
-├── inspection.go            execution queries
-├── history.go / trace.go    journal and reconstructed diagnostics
-├── flowtest/                database-free decision harness
+├── worker.go / node.go     worker decisions, ReadEvent, child builder
+├── runtime*.go             registration, command scheduling, shutdown
+├── inspection.go           execution queries
+├── history.go / trace.go   journal and reconstructed diagnostics
+├── flowtest/               database-free worker harness
 └── internal/
-    ├── canonical/           bounded canonical JSON
-    ├── definition/          erased codecs and identities
-    ├── replay/              pure journal reducer
-    ├── retry/               retry policy and classification
-    └── store/               migrations and PostgreSQL transitions
+    ├── canonical/          bounded canonical JSON
+    ├── definition/         erased codecs and identities
+    ├── replay/             pure journal reducer
+    ├── retry/              retry policy and classification
+    └── store/              migrations and PostgreSQL transitions
 ```
 
-## Layer boundaries
+The typed layer validates command/event definitions and erases worker types behind codecs. The decision engine records events and child commands without SQL. The store owns lock ordering, journal batches, projections, readiness, and fences. The runtime claims registered command versions and invokes workers without holding a connection.
 
-### Typed API
+## Transaction and command model
 
-Generics exist at definition, handler, event, and outcome boundaries. Registration erases these types only after validation and retains codecs for durable decoding.
-
-### Decision engine
-
-Worker and coordinator handlers receive private scope state. `Execute` and `Emit` only mutate that state. The recorder validates sizes, keys, owner scope, duplicate identities, modifier consistency, and coordinator terminality before any store call.
-
-### Store
-
-Store operations accept canonical values and normalized change sets. Each semantic operation owns its transaction shape, lock ordering, journal batch, projection changes, readiness resolution, and wake hints.
-
-### Runtime
-
-Schedulers discover only work for exact registered definitions, claim with bounded concurrency, execute handlers without holding database connections, and settle through fenced store calls. Maintenance handles wait expiry, execution deadlines, and expired leases.
-
-## Durable transaction model
-
-Every semantic write belongs to one execution and locks `flow_executions` first. Under that lock the store:
-
-1. reads the relevant projection state;
-2. validates the requested transition;
-3. allocates consecutive journal positions;
-4. writes canonical immutable entries;
-5. mutates projections and readiness;
-6. emits a transactional notification hint.
-
-This produces a gap-free, commit-ordered journal per execution. Queue claims are deliberately no-wait and perform their semantic attempt-start transaction only after obtaining an eligible candidate.
-
-Caller-owned transactions follow the same lock order. Flow never commits or rolls back the caller transaction.
-
-## Command lifecycle
+Every semantic write belongs to one execution and locks `flow_executions` first. The transaction validates state, allocates consecutive journal positions, appends canonical entries, updates projections/readiness, and optionally sends a notification hint.
 
 ```text
 created
-  ├─ unresolved waits → pending
-  └─ gates resolved  → ready/retry_wait → running
+  ├─ unresolved waits -> pending
+  └─ gates resolved  -> ready/retry_wait -> running
 
-running → succeeded | failed | retry_wait
-pending/ready/retry_wait → cancelled | expired
+running -> succeeded | failed | retry_wait
+pending/ready/retry_wait -> cancelled | expired
 ```
 
-Initial delay controls `next_attempt_at`. Event waits control `unsatisfied_waits`. Both conditions must be clear before a command is claimable.
+Initial delay and exact event waits are independent prerequisites. Claims install attempt/lease fences. A reclaimed stale invocation may finish locally but cannot settle.
 
-Claims install an attempt ID, lease token, owner, and expiry. Renewals and settlement require the same fenced identity. A reclaimed stale invocation can finish locally but cannot commit durable progress.
+Worker success may atomically include application commit SQL, a result, events, child commands and waits, parent terminal facts, readiness changes, and execution progression. Duplicate declarations compare canonical fingerprints; same-decision repeats may add distinct waits but may not change singleton declaration fields.
 
-## Decision acceptance
+## Event-input architecture
 
-Worker success acceptance can include:
+Application events live in the journal. `flow_command_event_waits` is the reverse readiness index and records each satisfying journal position. Command claim loads all declared wait rows plus the referenced application-event bodies in one bounded query. The connection is released before invocation; `ReadEvent` decodes from an immutable in-memory selector map.
 
-- application `WithCommit` SQL;
-- result and hash;
-- ordered staged events;
-- ordered child commands and event waits;
-- parent attempt conclusion and terminal event;
-- exact-wait resolution and command readiness;
-- failure/completion progression.
+This mechanism supports sibling and cross-branch joins without a second state machine or scheduler. Commands form ownership/provenance trees; events provide synchronization.
 
-Coordinator acceptance can include:
+## Failure, replay, and scaling
 
-- new typed state and state hash;
-- ordered staged events and commands;
-- accepted inbox delivery position;
-- retry counters or terminal selection;
-- coordinator transition and terminal events;
-- execution progression.
+Required failure can enter execution `failing`, cancelling work without live attempts. Running attempts retain their fences; accepted events/results remain durable, while newly staged children are recorded cancelled.
 
-Duplicate command declarations are compared by canonical fingerprint. Same-decision repeats merge waits additively and reject singleton conflicts.
+The journal is semantic history. Replay folds it without callbacks. Trace adds current operational command data and wait satisfaction positions. Queue and lease churn remain projection-only except for attempt boundaries.
 
-## Event delivery architecture
-
-Application events are journal entries and the journal is their retention store. Exact command waits use `flow_command_event_waits` as a reverse index. On command creation, retained journal events are checked; on event ingress, unresolved wait rows are updated.
-
-Coordinators scan retained journal positions monotonically. Selectors match application event name or command name/version terminal outcome. The durable inbox/delivery fields guarantee accepted-at-most-once state transition even though invocation can repeat.
-
-## Failure architecture
-
-Required failure with fail-fast enabled enters an execution-level `failing` phase. The transition cancels work without active attempts. It intentionally leaves running attempts fenced and settleable.
-
-If a surviving attempt succeeds and stages children after failing began, those children are recorded for audit but immediately cancelled. The accepted result, commit hook, and events are preserved. This avoids revoking in-flight work while preventing new execution work from escaping fail-fast.
-
-## Replay and inspection
-
-The journal is the semantic history. `internal/replay` folds it without application callbacks. `Trace` performs a repeatable-read journal fold and overlays operational fields such as current leases and next-attempt times. Public result lookup is derived from that trace snapshot.
-
-Projection conformance tests cover every semantic journal path. Queue/lease churn is operational and not represented as new semantic journal kinds beyond attempt boundaries.
-
-## Concurrency and scaling
-
-Command handlers, coordinator handlers, and queue lanes have independent process-local bounds. PostgreSQL is the cross-process authority; there is no required leader and no unbounded in-memory queue.
-
-`LISTEN/NOTIFY` reduces latency but carries no correctness state. Polling discovers all eligible work after dropped notifications or listener reconnects. Unknown versions remain unclaimed for compatible future replicas.
-
-## Security and data handling
-
-Definition names, keys, canonical JSON size, metadata, queue names, schema identifiers, and cursor values are validated at boundaries. SQL identifiers come only from validated schema configuration. Durable bodies are hashed; secrets belong in application secret stores rather than command arguments or metadata.
+Worker and named-queue concurrency are process-local bounds. PostgreSQL is the cross-process authority. `LISTEN/NOTIFY` reduces latency, while polling guarantees discovery after lost notifications or reconnects. Unknown command versions remain durable for compatible replicas.
 
 ## Deliberate omissions
 
-There is no graph evaluator, dependency table, workflow reconciliation scheduler, automatic worker result lookup, or fact-query DSL. Dynamic coordination is ordinary typed coordinator code, making durable behavior visible to the application rather than implicit in a second orchestration engine.
+There is no coordinator/state-machine object, graph evaluator, outcome subscription, workflow reconciliation loop, arbitrary result lookup inside workers, OR/quorum/race gate, or event-triggered callback. Events only release commands declared in advance.

@@ -12,9 +12,8 @@ import (
 type Kind string
 
 const (
-	CommandKind     Kind = "command"
-	EventKind       Kind = "event"
-	CoordinatorKind Kind = "coordinator"
+	CommandKind Kind = "command"
+	EventKind   Kind = "event"
 )
 
 type Codec struct {
@@ -66,11 +65,6 @@ type Event struct {
 	Name      string
 	Namespace string
 	Payload   Codec
-}
-
-type Coordinator struct {
-	Base
-	State Codec
 }
 
 func ValidateName(name string) error {

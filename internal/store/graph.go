@@ -252,7 +252,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	}
 	entries = append(entries, cancelledEntries...)
 	effectiveOpen := head.OpenCommands - 1 - len(failureEffects.cancelled)
-	terminalExecution := head.Mode == DriverDirect && effectiveOpen == 0
+	terminalExecution := effectiveOpen == 0
 	if terminalExecution {
 		status, name, reason := "succeeded", "flow.execution_succeeded", ""
 		if executionFailed {

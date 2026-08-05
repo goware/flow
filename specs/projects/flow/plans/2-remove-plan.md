@@ -1,9 +1,13 @@
 ---
 status: complete
 completed_at: 2026-08-04
+historical: true
+superseded_by: 3-remove-coordinator.md
 ---
 
 # Plan: remove plans and make event-gated commands first-class
+
+> Historical record: `3-remove-coordinator.md` subsequently removed the retained coordinator model. This file describes the intermediate architecture only.
 
 ## 1. Purpose
 

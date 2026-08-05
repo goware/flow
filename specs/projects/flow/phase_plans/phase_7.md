@@ -1,7 +1,7 @@
 ---
 status: complete
 historical: true
-superseded_by: ../plans/2-remove-plan.md
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Phase 7: Coordinators and durable agents

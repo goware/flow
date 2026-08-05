@@ -22,15 +22,15 @@ import (
 
 const (
 	maxCommandArgumentBytes   = 256 << 10
-	maxCoordinatorStateBytes  = 256 << 10
 	maxApplicationEventBytes  = 64 << 10
+	maxCommandEventWaits      = 256
 	maxExecutionMetadataBytes = 16 << 10
 	maxExecutionKeyBytes      = 1024
 	maxCommandKeyBytes        = 1024
 	defaultExecutionDeadline  = 30 * 24 * time.Hour
 )
 
-// ExecutionOption is a sealed start option shared by all execution modes.
+// ExecutionOption is a sealed command execution option.
 type ExecutionOption interface {
 	applyExecution(*executionOptions)
 }
@@ -121,9 +121,8 @@ func WithLiveKey() ExecutionOption {
 	})
 }
 
-// WithStartDelay schedules a direct execution's root command to become
-// deliverable after the delay instead of immediately, mirroring StartAfter
-// for spawned children. Coordinator starts reject it.
+// WithStartDelay schedules an execution's root command to become deliverable
+// after the delay instead of immediately, mirroring Delay for child commands.
 func WithStartDelay(delay time.Duration) ExecutionOption {
 	return executionOptionFunc(func(options *executionOptions) {
 		if options.startDelaySet {
@@ -139,9 +138,9 @@ func WithStartDelay(delay time.Duration) ExecutionOption {
 	})
 }
 
-// WaitFor gates a direct root command on one exact application event inside
-// the execution it creates. Multiple waits are AND conditions. Worker and
-// coordinator decisions use the matching Node.WaitFor method.
+// WaitFor gates a root command on one exact application event inside the
+// execution it creates. Multiple waits are AND conditions. Worker decisions
+// use the matching Node.WaitFor method.
 func WaitFor(event EventRef, key string) ExecutionOption {
 	return executionOptionFunc(func(options *executionOptions) {
 		wait, err := makeCommandEventWait(event, key)
@@ -188,11 +187,11 @@ func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts .
 	if err != nil {
 		return ExecutionHandle{}, err
 	}
-	options, metadata, fingerprint, err := prepareStartOptions(store.DriverDirect, cmd.Name(), cmd.Version(), key, input, opts...)
+	options, metadata, fingerprint, err := prepareStartOptions(cmd.Name(), cmd.Version(), key, input, opts...)
 	if err != nil {
 		return ExecutionHandle{}, err
 	}
-	root, err := prepareCommand(uuid.New(), "root", cmd.def, cmd.defaults, input, "direct_root")
+	root, err := prepareCommand(uuid.New(), "root", cmd.def, cmd.defaults, input)
 	if err != nil {
 		return ExecutionHandle{}, err
 	}
@@ -208,46 +207,9 @@ func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts .
 		return ExecutionHandle{}, err
 	}
 	request := store.StartRequest{
-		ID: uuid.New(), Mode: store.DriverDirect, DefinitionName: cmd.Name(), DefinitionVersion: cmd.Version(), Key: key,
+		ID: uuid.New(), DefinitionName: cmd.Name(), DefinitionVersion: cmd.Version(), Key: key,
 		KeyScope: options.keyScope, StartFingerprint: fingerprint, Input: input, Metadata: metadata,
 		FailFast: options.failFast, Deadline: options.deadline, MaxCommands: client.runtime.maxCommands, Root: &root,
-	}
-	return executeStart(ctx, client, request)
-}
-
-func (coordinator Coordinator[S]) Execute(ctx context.Context, key string, initial S, opts ...ExecutionOption) (ExecutionHandle, error) {
-	var definitionError error
-	if coordinator.def == nil {
-		definitionError = errors.New("zero definition")
-	}
-	if err := errors.Join(coordinator.err, definitionError, validateBoundClient(coordinator.client)); err != nil {
-		return ExecutionHandle{}, newError(ErrInvalid, "execute", "coordinator", coordinatorDefinitionName(coordinator.def), err.Error())
-	}
-	input, err := encodeDefinitionValue(coordinator.def.State, initial, maxCoordinatorStateBytes, "coordinator state")
-	if err != nil {
-		return ExecutionHandle{}, err
-	}
-	client, err := resolveClient(coordinator.client)
-	if err != nil {
-		return ExecutionHandle{}, err
-	}
-	options, metadata, fingerprint, err := prepareStartOptions(store.DriverCoordinator, coordinator.def.Name, coordinator.def.Version, key, input, opts...)
-	if err != nil {
-		return ExecutionHandle{}, err
-	}
-	if options.startDelay > 0 {
-		return ExecutionHandle{}, newError(ErrInvalid, "execute", "coordinator", coordinator.def.Name, "coordinator starts do not accept a start delay")
-	}
-	policy, err := retrypolicy.CanonicalPublic(defaultRetryPolicy())
-	if err != nil {
-		return ExecutionHandle{}, newError(ErrInvalid, "execute", "coordinator", coordinator.def.Name, "invalid default retry policy")
-	}
-	request := store.StartRequest{
-		ID: uuid.New(), Mode: store.DriverCoordinator, DefinitionName: coordinator.def.Name,
-		DefinitionVersion: coordinator.def.Version, Key: key, KeyScope: options.keyScope, StartFingerprint: fingerprint,
-		Input: input, Metadata: metadata, FailFast: options.failFast, Deadline: options.deadline,
-		MaxCommands: client.runtime.maxCommands,
-		Coordinator: &store.CoordinatorCreate{ID: uuid.New(), State: input, RetryPolicy: policy},
 	}
 	return executeStart(ctx, client, request)
 }
@@ -411,7 +373,7 @@ func CancelExecution(ctx context.Context, c Client, id ExecutionID, reason strin
 	return nil
 }
 
-func prepareStartOptions(mode store.DriverMode, name string, version int, key string, input canonical.Value, supplied ...ExecutionOption) (executionOptions, canonical.Value, [32]byte, error) {
+func prepareStartOptions(name string, version int, key string, input canonical.Value, supplied ...ExecutionOption) (executionOptions, canonical.Value, [32]byte, error) {
 	if len(key) > maxExecutionKeyBytes || !utf8.ValidString(key) {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "key", "", "execution key is invalid or too long")
 	}
@@ -435,8 +397,8 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	if options.withinSet && len(options.waits) == 0 {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "within", "", "Within requires WaitFor")
 	}
-	if mode != store.DriverDirect && (len(options.waits) > 0 || options.withinSet) {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "options", "", "WaitFor and Within are accepted only by direct command starts")
+	if len(options.waits) > maxCommandEventWaits {
+		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "wait", "", "command exceeds the 256 event-wait limit")
 	}
 	if err := validateMetadata(options.metadata); err != nil {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, err
@@ -449,7 +411,6 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	// starts that predate these options remain rediscoverable.
 	fingerprintRecord := struct {
 		V                 int                      `json:"v"`
-		DriverMode        string                   `json:"driver_mode"`
 		DefinitionName    string                   `json:"definition_name"`
 		DefinitionVersion int                      `json:"definition_version"`
 		ExecutionKey      string                   `json:"execution_key"`
@@ -463,7 +424,7 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 		WithinMS          int64                    `json:"within_ms,omitempty"`
 		Metadata          json.RawMessage          `json:"metadata"`
 	}{
-		V: 1, DriverMode: string(mode), DefinitionName: name, DefinitionVersion: version,
+		V: 1, DefinitionName: name, DefinitionVersion: version,
 		ExecutionKey: key, KeyScope: options.keyScope, Input: json.RawMessage(input.BytesCopy()),
 		DeadlineMode: options.deadline.Mode, DeadlineDuration: int64(options.deadline.Duration),
 		FailFast: options.failFast, StartDelayMS: options.startDelay.Milliseconds(),
@@ -477,7 +438,7 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	return options, metadata, fingerprint.Digest, nil
 }
 
-func prepareCommand(id uuid.UUID, key string, command *definition.Command, defaults commandDefaults, args canonical.Value, origin string) (store.CommandCreate, error) {
+func prepareCommand(id uuid.UUID, key string, command *definition.Command, defaults commandDefaults, args canonical.Value) (store.CommandCreate, error) {
 	if id == uuid.Nil || command == nil {
 		return store.CommandCreate{}, newError(ErrInvalid, "create", "command", key, "incomplete command definition")
 	}
@@ -494,15 +455,14 @@ func prepareCommand(id uuid.UUID, key string, command *definition.Command, defau
 		Name     string          `json:"name"`
 		Version  int             `json:"version"`
 		Args     json.RawMessage `json:"args"`
-		Origin   string          `json:"origin"`
 		Required bool            `json:"required"`
-	}{V: 1, Key: key, Name: command.Name, Version: command.Version, Args: json.RawMessage(args.BytesCopy()), Origin: origin, Required: true}, 0)
+	}{V: 1, Key: key, Name: command.Name, Version: command.Version, Args: json.RawMessage(args.BytesCopy()), Required: true}, 0)
 	if err != nil {
 		return store.CommandCreate{}, newError(ErrInvalid, "create", "command", key, "cannot canonicalize declaration")
 	}
 	return store.CommandCreate{
 		ID: id, Key: key, Name: command.Name, Version: command.Version, Args: args,
-		DeclarationFingerprint: declaration.Digest, Origin: origin, Required: true,
+		DeclarationFingerprint: declaration.Digest, Required: true,
 		Queue: defaults.queue, AttemptTimeout: defaults.attemptTimeout, RetryPolicy: policy,
 	}, nil
 }
@@ -565,7 +525,6 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 		Name         string                   `json:"name"`
 		Version      int                      `json:"version"`
 		Args         json.RawMessage          `json:"args"`
-		Origin       string                   `json:"origin"`
 		Parent       string                   `json:"parent,omitempty"`
 		Required     bool                     `json:"required"`
 		StartAfterMS int64                    `json:"start_after_ms,omitempty"`
@@ -573,7 +532,7 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 		WithinMS     int64                    `json:"within_ms,omitempty"`
 	}{
 		V: 1, Key: command.Key, Name: command.Name, Version: command.Version,
-		Args: json.RawMessage(command.Args.BytesCopy()), Origin: command.Origin, Parent: parent,
+		Args: json.RawMessage(command.Args.BytesCopy()), Parent: parent,
 		Required: command.Required, StartAfterMS: command.InitialDelay.Milliseconds(),
 		Waits: waits, WithinMS: command.Within.Milliseconds(),
 	}, 0)
@@ -634,13 +593,6 @@ func cloneStringMap(input map[string]string) map[string]string {
 		result[key] = value
 	}
 	return result
-}
-
-func coordinatorDefinitionName(coordinator *definition.Coordinator) string {
-	if coordinator == nil {
-		return ""
-	}
-	return coordinator.Name
 }
 
 func eventName(event *definition.Event) string {

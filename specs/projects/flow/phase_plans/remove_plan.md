@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Command/event/coordinator reduction
+
+> Historical delivery record for the intermediate architecture. The command-only replacement is specified by `../plans/3-remove-coordinator.md`.
 
 This vertical delivery implements `../plans/2-remove-plan.md`:
 

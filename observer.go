@@ -10,19 +10,18 @@ import (
 type ObservationKind string
 
 const (
-	ObservationExecution   ObservationKind = "execution"
-	ObservationCommand     ObservationKind = "command"
-	ObservationEvent       ObservationKind = "event"
-	ObservationAttempt     ObservationKind = "attempt"
-	ObservationClaim       ObservationKind = "claim"
-	ObservationLease       ObservationKind = "lease"
-	ObservationWait        ObservationKind = "wait"
-	ObservationCoordinator ObservationKind = "coordinator"
-	ObservationRuntime     ObservationKind = "runtime"
+	ObservationExecution ObservationKind = "execution"
+	ObservationCommand   ObservationKind = "command"
+	ObservationEvent     ObservationKind = "event"
+	ObservationAttempt   ObservationKind = "attempt"
+	ObservationClaim     ObservationKind = "claim"
+	ObservationLease     ObservationKind = "lease"
+	ObservationWait      ObservationKind = "wait"
+	ObservationRuntime   ObservationKind = "runtime"
 )
 
 // Observation contains only bounded operational metadata. It intentionally
-// has no payload, result, coordinator state, raw SQL, connection, or lease
+// has no payload, result, raw SQL, connection, or lease
 // token field.
 type Observation struct {
 	Kind        ObservationKind

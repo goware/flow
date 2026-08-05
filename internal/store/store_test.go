@@ -303,11 +303,11 @@ func TestSchemaConstraints(t *testing.T) {
 	db, schema, _ := setupStore(t)
 	ctx := context.Background()
 	validID := seedExecution(t, db, schema, "duplicate")
-	_, err := db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "direct", "test", 1, "duplicate", "running", nil)
+	_, err := db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "test", 1, "duplicate", "running", nil)
 	assertConstraint(t, err, "flow_executions_idempotency_uq")
-	_, err = db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "direct", "test", 1, "invalid-status", "unknown", nil)
+	_, err = db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "test", 1, "invalid-status", "unknown", nil)
 	assertConstraint(t, err, "flow_executions_status_ck")
-	_, err = db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "direct", "test", 1, "bad-terminal", "succeeded", nil)
+	_, err = db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "test", 1, "bad-terminal", "succeeded", nil)
 	assertConstraint(t, err, "flow_executions_terminal_shape_ck")
 
 	commandID := seedCommand(t, db, schema, validID, "command")
@@ -327,12 +327,6 @@ func TestSchemaConstraints(t *testing.T) {
 		VALUES ($1,1,$2,'execution_started',clock_timestamp(),$3,'application','event','key','application','{}'::text::bytea,decode(repeat('00',32),'hex'))`,
 		validID, uuid.New(), uuid.New())
 	assertConstraint(t, err, "flow_journal_event_shape_ck")
-
-	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_coordinators")+`
-		(coordinator_id,execution_id,name,version,state,state_hash,state_position,delivery_state,delivery_key,retry_policy,retry_policy_hash,created_at,updated_at)
-		VALUES ($1,$2,'coord',1,'{}'::text::bytea,decode(repeat('00',32),'hex'),1,'running','start','{}',decode(repeat('00',32),'hex'),clock_timestamp(),clock_timestamp())`,
-		uuid.New(), validID)
-	assertConstraint(t, err, "flow_coordinators_delivery_shape_ck")
 	if validID == uuid.Nil {
 		t.Fatal("seed execution returned nil")
 	}
@@ -342,10 +336,10 @@ func seedCommand(t *testing.T, db *pgkit.DB, schema string, executionID uuid.UUI
 	t.Helper()
 	id := uuid.New()
 	_, err := db.Conn.Exec(context.Background(), `INSERT INTO `+pgschema.Table(schema, "flow_commands")+` (
-		command_id,execution_id,command_key,name,version,origin,args,args_hash,declaration_fingerprint,
+		command_id,execution_id,command_key,name,version,args,args_hash,declaration_fingerprint,
 		state,queue,retry_policy,retry_policy_hash,budget_started_at,next_attempt_at,
 		created_position,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,'work',1,'coordinator_command','{}'::text::bytea,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),
+	) VALUES ($1,$2,$3,'work',1,'{}'::text::bytea,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),
 		'ready','default','{}'::jsonb,decode(repeat('00',32),'hex'),clock_timestamp(),clock_timestamp(),
 		1,clock_timestamp(),clock_timestamp(),clock_timestamp())`, id, executionID, key)
 	if err != nil {
@@ -370,7 +364,7 @@ func setupStore(t *testing.T) (*pgkit.DB, string, *store.Store) {
 func seedExecution(t *testing.T, db *pgkit.DB, schema, key string) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	if _, err := db.Conn.Exec(context.Background(), executionInsertSQL(schema), id, "direct", "test", 1, key, "running", nil); err != nil {
+	if _, err := db.Conn.Exec(context.Background(), executionInsertSQL(schema), id, "test", 1, key, "running", nil); err != nil {
 		t.Fatalf("seed execution: %v", err)
 	}
 	return id
@@ -378,13 +372,13 @@ func seedExecution(t *testing.T, db *pgkit.DB, schema, key string) uuid.UUID {
 
 func executionInsertSQL(schema string) string {
 	return `INSERT INTO ` + pgschema.Table(schema, "flow_executions") + ` (
-		execution_id, driver_mode, definition_name, definition_version, execution_key, status,
+		execution_id, definition_name, definition_version, execution_key, status,
 		start_fingerprint, input, input_hash, metadata, metadata_canonical, metadata_hash,
 		max_commands, created_at, updated_at, status_at, finished_at
-	) VALUES ($1,$2,$3,$4,$5,$6,
+	) VALUES ($1,$2,$3,$4,$5,
 		decode(repeat('00',32),'hex'), '{}'::text::bytea, decode(repeat('00',32),'hex'),
 		'{}'::jsonb, '{}'::text::bytea, decode(repeat('00',32),'hex'),
-		100, clock_timestamp(), clock_timestamp(), clock_timestamp(), $7)`
+		100, clock_timestamp(), clock_timestamp(), clock_timestamp(), $6)`
 }
 
 func assertConstraint(t *testing.T, err error, constraint string) {

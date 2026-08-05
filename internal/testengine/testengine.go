@@ -13,9 +13,8 @@ import (
 type Operation string
 
 const (
-	Worker      Operation = "worker"
-	Commit      Operation = "commit"
-	Coordinator Operation = "coordinator"
+	Worker Operation = "worker"
+	Commit Operation = "commit"
 )
 
 type Info struct {
@@ -31,26 +30,20 @@ type Info struct {
 }
 
 type Request struct {
-	Operation Operation
-	Context   context.Context
-	Args      json.RawMessage
-	Result    json.RawMessage
-	Info      Info
-	Tx        any
+	Operation   Operation
+	Context     context.Context
+	Args        json.RawMessage
+	Result      json.RawMessage
+	Info        Info
+	Tx          any
+	EventInputs []EventInput
+}
 
-	State                  json.RawMessage
-	DeliveryKind           string
-	DeliveryNamespace      string
-	DeliveryName           string
-	DeliveryCommandVersion int
-	DeliveryKey            string
-	DeliveryPosition       int64
-	DeliveryRecordedAt     time.Time
-	DeliveryPayload        json.RawMessage
-	DeliveryStatus         string
-	DeliveryResult         json.RawMessage
-	DeliveryFailureCode    string
-	DeliveryFailureMessage string
+type EventInput struct {
+	Name     string
+	Key      string
+	Position int64
+	Payload  json.RawMessage
 }
 
 type StagedCommand struct {
@@ -76,14 +69,11 @@ type StagedEvent struct {
 }
 
 type Result struct {
-	Value          json.RawMessage
-	HandlerError   error
-	Panicked       bool
-	Commands       []StagedCommand
-	Events         []StagedEvent
-	State          json.RawMessage
-	Terminal       string
-	TerminalReason string
+	Value        json.RawMessage
+	HandlerError error
+	Panicked     bool
+	Commands     []StagedCommand
+	Events       []StagedEvent
 }
 
 var Run func(any, Request) (Result, error)

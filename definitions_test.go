@@ -39,11 +39,6 @@ func TestDefinitionIdentityAndBinding(t *testing.T) {
 		t.Fatal("With changed durable definition identity")
 	}
 
-	coord := DefineCoordinator("receipt_agent", 1, OnStart(func(context.Context, *Coordination[testArgs]) error { return nil }))
-	if coord.With(clientA).client != clientA || coord.client != nil {
-		t.Fatal("coordinator binding is not immutable")
-	}
-
 	encoded, err := cmd.def.Args.Encode(testArgs{ID: "42"}, 0)
 	if err != nil {
 		t.Fatalf("args Encode() error = %v", err)
@@ -91,52 +86,6 @@ func TestRegistrationValidation(t *testing.T) {
 	if Handle(cmd, nil).flowRegistration().validation == nil {
 		t.Fatal("nil worker was accepted")
 	}
-
-	event := DefineEvent[string]("noticed")
-	handler := func(context.Context, *Coordination[int], Received[string]) error { return nil }
-	duplicate := DefineCoordinator("duplicate", 1, OnEvent(event, handler), OnEvent(event, handler))
-	if duplicate.err == nil {
-		t.Fatal("duplicate coordinator event selector was accepted")
-	}
-	starts := DefineCoordinator("starts", 1,
-		OnStart(func(context.Context, *Coordination[int]) error { return nil }),
-		OnStart(func(context.Context, *Coordination[int]) error { return nil }),
-	)
-	if starts.err == nil {
-		t.Fatal("duplicate start handler was accepted")
-	}
-	if DefineCoordinator("zero-event", 1, OnEvent[int](Event[string]{}, handler)).err == nil {
-		t.Fatal("zero event handler was accepted")
-	}
-	if DefineCoordinator("zero-command", 1,
-		OnOutcome(Command[testArgs, testResult]{}, func(context.Context, *Coordination[int], Received[Outcome[testResult]]) error { return nil }),
-	).err == nil {
-		t.Fatal("zero command outcome handler was accepted")
-	}
-}
-
-func TestCoordinatorTerminalDecision(t *testing.T) {
-	t.Parallel()
-
-	scope := &Coordination[int]{scope: &scopeState{}}
-	scope.Succeed()
-	scope.Succeed()
-	if scope.scope.firstError != nil {
-		t.Fatalf("equivalent terminal decision poison = %v", scope.scope.firstError)
-	}
-	scope.State++
-	scope.Succeed()
-	if !errors.Is(scope.scope.firstError, ErrConflict) {
-		t.Fatalf("state-after-terminal poison = %v", scope.scope.firstError)
-	}
-
-	scope = &Coordination[int]{scope: &scopeState{}}
-	scope.Succeed()
-	scope.Fail(errors.New("failed"))
-	if !errors.Is(scope.scope.firstError, ErrConflict) {
-		t.Fatalf("scope poison = %v", scope.scope.firstError)
-	}
-	(*Coordination[int])(nil).Fail(errors.New("ignored"))
 }
 
 func TestErasedWorkerRegistration(t *testing.T) {
@@ -156,7 +105,7 @@ func TestErasedWorkerRegistration(t *testing.T) {
 			return nil
 		}),
 	).flowRegistration()
-	if registration.validation != nil || registration.kind != workerRegistrationKind {
+	if registration.validation != nil {
 		t.Fatalf("registration = %#v", registration)
 	}
 	erased := registration.value.(erasedWorker)
@@ -190,67 +139,5 @@ func TestErasedWorkerRegistration(t *testing.T) {
 	}
 	if Handle(cmd, func(context.Context, *Work[testArgs]) (testResult, error) { return testResult{}, nil }, WithCommit[testArgs, testResult](nil)).flowRegistration().validation == nil {
 		t.Fatal("nil commit function was accepted")
-	}
-}
-
-func TestErasedCoordinatorRegistration(t *testing.T) {
-	t.Parallel()
-
-	event := DefineEvent[string]("notice")
-	cmd := DefineCommand[testArgs, testResult]("erase_outcome", 1)
-	coordinator := DefineCoordinator("erase_coordinator", 3,
-		OnStart(func(_ context.Context, coordination *Coordination[int]) error {
-			coordination.State++
-			return nil
-		}),
-		OnEvent(event, func(_ context.Context, coordination *Coordination[int], received Received[string]) error {
-			coordination.State += len(received.Payload)
-			return nil
-		}),
-		OnOutcome(cmd, func(_ context.Context, coordination *Coordination[int], received Received[Outcome[testResult]]) error {
-			if received.Payload.Status == StatusSucceeded {
-				coordination.State += 10
-			}
-			return nil
-		}),
-	)
-	if coordinator.def.Name != "erase_coordinator" || coordinator.def.Version != 3 {
-		t.Fatalf("coordinator identity = %s/%d", coordinator.def.Name, coordinator.def.Version)
-	}
-	registration := coordinator.flowRegistration()
-	if registration.validation != nil || registration.kind != coordinatorRegistrationKind {
-		t.Fatalf("registration = %#v", registration)
-	}
-	erased := registration.value.(erasedCoordinator)
-	scope := &coordinatorScope{state: 0}
-	for key, payload := range map[string]any{
-		"start":                    nil,
-		"event:application:notice": Received[string]{Payload: "abc"},
-		"outcome:command_terminal:erase_outcome:1": Received[Outcome[testResult]]{Payload: Outcome[testResult]{Status: StatusSucceeded}},
-	} {
-		handler, ok := erased.handlers[key]
-		if !ok {
-			t.Fatalf("missing erased handler %q; have %#v", key, erased.handlers)
-		}
-		if err := handler.invoke(context.Background(), scope, payload); err != nil {
-			t.Fatalf("handler %q error = %v", key, err)
-		}
-	}
-	if scope.state != 14 {
-		t.Fatalf("coordinator state = %v, want 14", scope.state)
-	}
-	start := erased.handlers["start"]
-	if err := start.invoke(context.Background(), &coordinatorScope{state: "wrong"}, nil); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("state type error = %v", err)
-	}
-	eventHandler := erased.handlers["event:application:notice"]
-	if err := eventHandler.invoke(context.Background(), scope, Received[int]{Payload: 1}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("payload type error = %v", err)
-	}
-	if DefineCoordinator[int]("nil_handlers", 1, OnStart[int](nil), OnEvent[int](event, nil), OnOutcome[int](cmd, nil)).err == nil {
-		t.Fatal("nil coordinator handlers were accepted")
-	}
-	if (Coordinator[int]{}).flowRegistration().validation == nil {
-		t.Fatal("zero coordinator registration was accepted")
 	}
 }

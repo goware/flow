@@ -341,17 +341,31 @@ func verifyAppliedMigrations(applied map[int]appliedMigration, units []migration
 func verifyFlowTables(ctx context.Context, db queryer, schema string) error {
 	expected := []string{
 		"flow_executions", "flow_commands", "flow_command_queue",
-		"flow_command_event_waits", "flow_journal", "flow_coordinators",
-		"flow_schema_migrations",
+		"flow_command_event_waits", "flow_journal", "flow_schema_migrations",
 	}
-	var count int
-	if err := db.QueryRow(ctx, `
-		SELECT count(*) FROM pg_catalog.pg_tables
-		WHERE schemaname = $1 AND tablename = ANY($2)`, schema, expected).Scan(&count); err != nil {
+	rows, err := db.Query(ctx, `
+		SELECT tablename FROM pg_catalog.pg_tables
+		WHERE schemaname = $1 AND left(tablename, 5) = 'flow_'
+		ORDER BY tablename`, schema)
+	if err != nil {
 		return store.MapError("check migration tables", err)
 	}
-	if count != len(expected) {
-		return newError(ErrSchema, "check", "schema", schema, "one or more Flow tables are missing")
+	defer rows.Close()
+	actual := make([]string, 0, len(expected))
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return store.MapError("scan migration tables", err)
+		}
+		actual = append(actual, table)
+	}
+	if err := rows.Err(); err != nil {
+		return store.MapError("read migration tables", err)
+	}
+	slices.Sort(expected)
+	if !slices.Equal(actual, expected) {
+		return newError(ErrSchema, "check", "schema", schema,
+			fmt.Sprintf("Flow table inventory is %v, want %v", actual, expected))
 	}
 	return nil
 }

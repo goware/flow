@@ -19,7 +19,6 @@ const MaxExecutionListLimit = 201
 
 type ExecutionRow struct {
 	ID                uuid.UUID
-	Mode              string
 	DefinitionName    string
 	DefinitionVersion int
 	Key               string
@@ -125,7 +124,7 @@ func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter Execut
 	return s.queryExecutions(ctx, tx, query, args...)
 }
 
-const executionSelectColumns = `SELECT execution_id,driver_mode,definition_name,definition_version,execution_key,status,
+const executionSelectColumns = `SELECT execution_id,definition_name,definition_version,execution_key,status,
 	fail_fast,max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
 	finished_at,metadata FROM `
 
@@ -163,7 +162,7 @@ func scanExecution(row pgx.Row) (ExecutionRow, error) {
 	var value ExecutionRow
 	var failure, metadata []byte
 	if err := row.Scan(
-		&value.ID, &value.Mode, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
+		&value.ID, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
 		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.DeadlineAt,
 		&failure, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
 	); err != nil {

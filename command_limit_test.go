@@ -8,7 +8,7 @@ import (
 	"github.com/goware/flow/internal/testpg"
 )
 
-func TestCommandCeilingRejectsWorkerAndCoordinatorBatchesAtomically(t *testing.T) {
+func TestCommandCeilingRejectsWorkerBatchAtomically(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -45,38 +45,6 @@ func TestCommandCeilingRejectsWorkerAndCoordinatorBatchesAtomically(t *testing.T
 		stopRuntime(t, cancel, result)
 		if len(trace.Commands) != 1 || trace.Execution.CommandCount != 1 || trace.Commands[0].FailureCode != "invalid_decision" {
 			t.Fatalf("worker ceiling trace = %#v", trace)
-		}
-	})
-
-	t.Run("coordinator", func(t *testing.T) {
-		coordinator := DefineCoordinator[None]("ceiling.batch.coordinator", 1,
-			OnStart(func(_ context.Context, coordination *Coordination[None]) error {
-				Execute(coordination, "child/1", child, None{})
-				Execute(coordination, "child/2", child, None{})
-				return nil
-			}),
-		)
-		runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(1),
-			WithNotifications(false), WithPollInterval(5*time.Millisecond))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := runtime.Register(coordinator); err != nil {
-			t.Fatal(err)
-		}
-		cancel, result := startRuntime(t, runtime)
-		handle, err := coordinator.With(runtime).Execute(ctx, "ceiling/coordinator", None{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 5*time.Second)
-		trace, err := Trace(ctx, runtime, handle.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		stopRuntime(t, cancel, result)
-		if len(trace.Commands) != 0 || trace.Execution.CommandCount != 0 || trace.Execution.FailureCode != "invalid_decision" {
-			t.Fatalf("coordinator ceiling trace = %#v", trace)
 		}
 	})
 }

@@ -146,8 +146,12 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *exte
 }
 
 // confirmBridge is the worker handler.
-func (example *monitorExample) confirmBridge(_ context.Context, _ *flow.Work[flow.None]) (confirmBridgeResult, error) {
-	fmt.Fprintln(example.output, "bridge delivery confirmed")
+func (example *monitorExample) confirmBridge(_ context.Context, work *flow.Work[flow.None]) (confirmBridgeResult, error) {
+	delivery, err := flow.ReadEvent(work, bridgeDelivered, "delivery/example")
+	if err != nil {
+		return confirmBridgeResult{}, err
+	}
+	fmt.Fprintf(example.output, "bridge delivery %s confirmed\n", delivery.TransactionHash)
 	return confirmBridgeResult{Confirmed: true}, nil
 }
 

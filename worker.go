@@ -48,12 +48,6 @@ func (w *Work[A]) flowScope() *scopeState {
 	return w.scope
 }
 
-func (w *Work[A]) flowExecuteScope() {}
-
-type Scope interface {
-	flowExecuteScope()
-}
-
 type attemptScopeContextKey struct{}
 
 func withAttemptScope(ctx context.Context, state *scopeState) context.Context {
@@ -66,10 +60,6 @@ func attemptScope(ctx context.Context) *scopeState {
 	}
 	state, _ := ctx.Value(attemptScopeContextKey{}).(*scopeState)
 	return state
-}
-
-type ResultSource interface {
-	flowResultSource() *resultSourceState
 }
 
 type WorkerOption[A, R any] interface {
@@ -105,15 +95,7 @@ type Registration interface {
 	flowRegistration() registrationData
 }
 
-type registrationKind string
-
-const (
-	workerRegistrationKind      registrationKind = "worker"
-	coordinatorRegistrationKind registrationKind = "coordinator"
-)
-
 type registrationData struct {
-	kind       registrationKind
 	name       string
 	version    int
 	value      any
@@ -187,7 +169,6 @@ func Handle[A, R any](
 		name, version = cmd.def.Name, cmd.def.Version
 	}
 	return workerRegistration{data: registrationData{
-		kind:       workerRegistrationKind,
 		name:       name,
 		version:    version,
 		value:      erased,
@@ -196,21 +177,14 @@ func Handle[A, R any](
 }
 
 type scopeState struct {
-	firstError error
-	terminal   *coordinatorTerminal
-	decision   decisionState
+	firstError  error
+	decision    decisionState
+	eventInputs map[string]eventInputSnapshot
 }
 
-type resultSourceState struct {
-	values map[string]resultSourceValue
-}
-
-type resultSourceValue struct {
-	name    string
-	version int
-	status  CommandStatus
-	result  []byte
-	failure *CommandFailure
+type eventInputSnapshot struct {
+	position int64
+	payload  []byte
 }
 
 type stagedEvent struct {
@@ -248,17 +222,12 @@ func (s *scopeState) poison(err error) {
 	}
 }
 
-// Emit stages an application event in a worker or coordinator decision. It
+// Emit stages an application event in a worker decision. It
 // performs no database work and becomes durable only when the enclosing
 // decision settles successfully.
-func Emit[T any](scope Scope, event Event[T], key string, payload T) error {
-	state, err := usableDecisionScope(scope, "emit")
+func Emit[W, T any](work *Work[W], event Event[T], key string, payload T) error {
+	state, err := usableWork(work, "emit")
 	if err != nil {
-		return err
-	}
-	if state.terminal != nil {
-		err = newError(ErrInvalidState, "emit", "event", key, "coordinator is already terminal")
-		state.poison(err)
 		return err
 	}
 	if event.def == nil || event.def.Namespace != "application" || event.err != nil {
@@ -292,16 +261,12 @@ func Emit[T any](scope Scope, event Event[T], key string, payload T) error {
 	return nil
 }
 
-// Execute requests a command from a worker or coordinator. It never invokes
+// Execute requests a command from a worker. It never invokes
 // the worker inline; the command is staged in the enclosing durable decision.
-func Execute[A, R any](scope Scope, key string, cmd Command[A, R], args A) *Node {
-	state, err := usableDecisionScope(scope, "execute")
+func Execute[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) *Node {
+	state, err := usableWork(work, "execute")
 	node := &Node{scope: state, key: key}
 	if err != nil {
-		return node
-	}
-	if state.terminal != nil {
-		state.poison(newError(ErrInvalidState, "execute", "command", key, "coordinator is already terminal"))
 		return node
 	}
 	if cmd.def == nil || cmd.err != nil {
@@ -347,17 +312,11 @@ func equivalentStagedCommandIdentity(a, b stagedCommand) bool {
 	return equivalentStagedCommand(left, right)
 }
 
-type decisionScope interface {
-	Scope
-	flowScope() *scopeState
-}
-
-func usableDecisionScope(scope Scope, operation string) (*scopeState, error) {
-	value, ok := scope.(decisionScope)
-	if !ok || value == nil || value.flowScope() == nil {
-		return nil, newError(ErrInvalidState, operation, "scope", "", "scope is unavailable")
+func usableWork[W any](work *Work[W], operation string) (*scopeState, error) {
+	if work == nil || work.flowScope() == nil {
+		return nil, newError(ErrInvalidState, operation, "work", "", "work is unavailable")
 	}
-	state := value.flowScope()
+	state := work.flowScope()
 	if state.firstError != nil {
 		return state, state.firstError
 	}
@@ -408,6 +367,9 @@ func validateDecisionCommands(state decisionState) error {
 		if command.within > 0 && len(command.waits) == 0 {
 			return newError(ErrInvalid, "execute", "within", command.key, "Within requires WaitFor")
 		}
+		if len(command.waits) > maxCommandEventWaits {
+			return newError(ErrInvalid, "execute", "wait", command.key, "command exceeds the 256 event-wait limit")
+		}
 	}
 	return nil
 }
@@ -438,13 +400,51 @@ func (state *decisionState) orderedCommands() []stagedCommand {
 	return result
 }
 
-func ResultOf[A, R any](source ResultSource, key string, cmd Command[A, R]) (R, error) {
+// ReadEvent returns the immutable payload for an exact event gate declared by
+// the currently executing command. The lookup is in-memory and performs no SQL.
+func ReadEvent[W, T any](work *Work[W], event Event[T], key string) (T, error) {
+	var zero T
+	state, err := usableWork(work, "read event")
+	if err != nil {
+		return zero, err
+	}
+	if event.def == nil || event.def.Namespace != "application" || event.err != nil {
+		err = newError(ErrInvalid, "read", "event", key, "invalid application event definition")
+		state.poison(err)
+		return zero, err
+	}
+	if err = validateStableKey(key, maxCommandKeyBytes, "event"); err != nil {
+		state.poison(err)
+		return zero, err
+	}
+	input, ok := state.eventInputs[event.def.Name+"\x00"+key]
+	if !ok {
+		err = newError(ErrInvalidState, "read", "event", key, "event was not declared as an input to this command")
+		state.poison(err)
+		return zero, err
+	}
+	decoded, err := event.def.Payload.Decode(input.payload)
+	if err != nil {
+		err = newError(ErrInvalidState, "read", "event", key, "stored event payload cannot be decoded")
+		state.poison(err)
+		return zero, err
+	}
+	result, ok := decoded.(T)
+	if !ok {
+		err = newError(ErrInvalidState, "read", "event", key, "stored event payload has an incompatible type")
+		state.poison(err)
+		return zero, err
+	}
+	return result, nil
+}
+
+func ResultOf[A, R any](trace ExecutionTrace, key string, cmd Command[A, R]) (R, error) {
 	var zero R
-	value, err := lookupResultSource(source, key, cmd.def, true)
+	value, err := lookupTraceResult(trace, key, cmd.def)
 	if err != nil {
 		return zero, Permanent(err)
 	}
-	decoded, err := cmd.def.Result.Decode(value.result)
+	decoded, err := cmd.def.Result.Decode(value.Result)
 	if err != nil {
 		return zero, Permanent(newError(ErrInvalidState, "result", "command", key, "stored result cannot be decoded"))
 	}
@@ -455,47 +455,21 @@ func ResultOf[A, R any](source ResultSource, key string, cmd Command[A, R]) (R, 
 	return result, nil
 }
 
-func OutcomeOf[A, R any](source ResultSource, key string, cmd Command[A, R]) (Outcome[R], error) {
-	var result Outcome[R]
-	value, err := lookupResultSource(source, key, cmd.def, false)
-	if err != nil {
-		return result, Permanent(err)
-	}
-	result.Status = value.status
-	if value.failure != nil {
-		copy := *value.failure
-		result.Failure = &copy
-	}
-	if value.status == StatusSucceeded {
-		decoded, decodeErr := cmd.def.Result.Decode(value.result)
-		if decodeErr != nil {
-			return Outcome[R]{}, Permanent(newError(ErrInvalidState, "outcome", "command", key, "stored result cannot be decoded"))
-		}
-		result.Result = decoded.(R)
-	}
-	return result, nil
-}
-
-func lookupResultSource(source ResultSource, key string, command *definition.Command, successOnly bool) (resultSourceValue, error) {
-	if source == nil || source.flowResultSource() == nil {
-		return resultSourceValue{}, newError(ErrInvalidState, "read", "result source", key, "result source is unavailable")
-	}
+func lookupTraceResult(trace ExecutionTrace, key string, command *definition.Command) (TraceCommand, error) {
 	if command == nil {
-		return resultSourceValue{}, newError(ErrInvalid, "read", "command", key, "invalid command definition")
+		return TraceCommand{}, newError(ErrInvalid, "read", "command", key, "invalid command definition")
 	}
-	state := source.flowResultSource()
-	value, exists := state.values[key]
-	if !exists {
-		return resultSourceValue{}, newError(ErrNotFound, "read", "command", key, "command does not exist in the snapshot")
+	for _, value := range trace.Commands {
+		if value.Key != key {
+			continue
+		}
+		if value.Name != command.Name || value.Version != command.Version {
+			return TraceCommand{}, newError(ErrConflict, "read", "command", key, fmt.Sprintf("definition differs from %s/%d", value.Name, value.Version))
+		}
+		if commandStatus(value.State) != StatusSucceeded {
+			return TraceCommand{}, newError(ErrInvalidState, "read", "command", key, "command has no successful result")
+		}
+		return value, nil
 	}
-	if value.name != command.Name || value.version != command.Version {
-		return resultSourceValue{}, newError(ErrConflict, "read", "command", key, fmt.Sprintf("definition differs from %s/%d", value.name, value.version))
-	}
-	if value.status == "" {
-		return resultSourceValue{}, newError(ErrInvalidState, "read", "command", key, "command is not terminal")
-	}
-	if successOnly && value.status != StatusSucceeded {
-		return resultSourceValue{}, newError(ErrInvalidState, "read", "command", key, "command has no successful result")
-	}
-	return value, nil
+	return TraceCommand{}, newError(ErrNotFound, "read", "command", key, "command does not exist in the trace")
 }

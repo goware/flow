@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -259,6 +260,19 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		Attempt: claim.Attempt, AttemptStartedAt: claim.DBNow,
 	}
 	scope := &workScope{args: args, info: info}
+	if len(claim.EventInputs) > 0 {
+		scope.state.eventInputs = make(map[string]eventInputSnapshot, len(claim.EventInputs))
+		for _, input := range claim.EventInputs {
+			identity := input.Name + "\x00" + input.Key
+			if _, duplicate := scope.state.eventInputs[identity]; duplicate {
+				r.concludeClaim(workerCtx, claim, classifiedConclusion{
+					class: retrypolicy.ClassPermanent, code: "event_input_decode", message: "claimed command contains duplicate event inputs",
+				})
+				return
+			}
+			scope.state.eventInputs[identity] = eventInputSnapshot{position: input.Position, payload: slices.Clone(input.Payload)}
+		}
+	}
 	workerCtx = withAttemptScope(workerCtx, &scope.state)
 	if err := r.faults.Hit(workerCtx, fault.HandlerStart); err != nil {
 		r.concludeClaim(workerCtx, claim, classifiedConclusion{class: retrypolicy.ClassInterrupted, code: "handler_start_interrupted", message: "handler start was interrupted"})
@@ -391,7 +405,7 @@ func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]stor
 	stagedCommands := scope.state.decision.orderedCommands()
 	children := make([]store.CommandCreate, 0, len(stagedCommands))
 	for _, staged := range stagedCommands {
-		child, err := prepareCommand(uuid.New(), staged.key, staged.definition, staged.defaults, staged.args, "worker_child")
+		child, err := prepareCommand(uuid.New(), staged.key, staged.definition, staged.defaults, staged.args)
 		if err != nil {
 			return nil, nil, err
 		}

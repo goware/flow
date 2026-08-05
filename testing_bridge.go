@@ -2,10 +2,8 @@ package flow
 
 import (
 	"encoding/json"
+	"slices"
 
-	"github.com/google/uuid"
-	"github.com/goware/flow/internal/canonical"
-	"github.com/goware/flow/internal/store/journalcodec"
 	"github.com/goware/flow/internal/testengine"
 )
 
@@ -23,22 +21,16 @@ func runTestEngine(value any, request testengine.Request) (testengine.Result, er
 	switch request.Operation {
 	case testengine.Worker:
 		worker, ok := data.value.(erasedWorker)
-		if !ok || data.kind != workerRegistrationKind {
+		if !ok {
 			return testengine.Result{}, newError(ErrInvalid, "test", "worker", data.name, "registration is not a worker")
 		}
 		return testWorker(worker, request)
 	case testengine.Commit:
 		worker, ok := data.value.(erasedWorker)
-		if !ok || data.kind != workerRegistrationKind {
+		if !ok {
 			return testengine.Result{}, newError(ErrInvalid, "test", "commit", data.name, "registration is not a worker")
 		}
 		return testCommit(worker, request)
-	case testengine.Coordinator:
-		coordinator, ok := data.value.(erasedCoordinator)
-		if !ok || data.kind != coordinatorRegistrationKind {
-			return testengine.Result{}, newError(ErrInvalid, "test", "coordinator", data.name, "registration is not a coordinator")
-		}
-		return testCoordinator(coordinator, request)
 	default:
 		return testengine.Result{}, newError(ErrInvalid, "test", "operation", string(request.Operation), "unknown test operation")
 	}
@@ -50,6 +42,25 @@ func testWorker(worker erasedWorker, request testengine.Request) (testengine.Res
 		return testengine.Result{}, newError(ErrInvalid, "test", "worker arguments", worker.command.Name, "arguments do not match definition")
 	}
 	scope := &workScope{args: args, info: testCommandInfo(request.Info)}
+	if len(request.EventInputs) > maxCommandEventWaits {
+		return testengine.Result{}, newError(ErrInvalid, "test", "event inputs", worker.command.Name, "command exceeds the 256 event-wait limit")
+	}
+	if len(request.EventInputs) > 0 {
+		scope.state.eventInputs = make(map[string]eventInputSnapshot, len(request.EventInputs))
+		for _, input := range request.EventInputs {
+			if input.Name == "" || input.Key == "" || input.Position < 1 {
+				return testengine.Result{}, newError(ErrInvalid, "test", "event input", input.Key, "event input is incomplete")
+			}
+			identity := input.Name + "\x00" + input.Key
+			if prior, exists := scope.state.eventInputs[identity]; exists {
+				if slices.Equal(prior.payload, input.Payload) {
+					continue
+				}
+				return testengine.Result{}, newError(ErrConflict, "test", "event input", input.Key, "event input identity differs")
+			}
+			scope.state.eventInputs[identity] = eventInputSnapshot{position: input.Position, payload: slices.Clone(input.Payload)}
+		}
+	}
 	value, handlerErr, panicked := invokeWorker(withAttemptScope(request.Context, &scope.state), worker, scope)
 	if handlerErr == nil && !panicked {
 		handlerErr = validateDecisionCommands(scope.state.decision)
@@ -92,79 +103,6 @@ func testCommit(worker erasedWorker, request testengine.Request) (testengine.Res
 		return testengine.Result{}, scope.firstError
 	}
 	return testengine.Result{}, err
-}
-
-func testCoordinator(definition erasedCoordinator, request testengine.Request) (testengine.Result, error) {
-	state, err := definition.stateDef.State.Decode(request.State)
-	if err != nil {
-		return testengine.Result{}, newError(ErrInvalid, "test", "coordinator state", definition.name, "state does not match definition")
-	}
-	scope := &coordinatorScope{state: state}
-	selector := coordinatorSelector{kind: coordinatorStart}
-	var received any
-	if request.DeliveryKind != "start" {
-		kind := coordinatorEvent
-		if request.DeliveryKind == "outcome" {
-			kind = coordinatorOutcome
-		}
-		selector = coordinatorSelector{kind: kind, namespace: request.DeliveryNamespace,
-			name: request.DeliveryName}
-		if kind == coordinatorOutcome {
-			selector.version = request.DeliveryCommandVersion
-		}
-		handler, ok := definition.handlers[selector.key()]
-		if !ok {
-			return testengine.Result{}, newError(ErrNotFound, "test", "coordinator handler", selector.key(), "handler is not registered")
-		}
-		var body canonical.Value
-		if kind == coordinatorOutcome && request.DeliveryStatus == string(StatusSucceeded) {
-			body, err = canonical.Marshal(journalcodec.CommandSucceededBody{V: 1, CommandKey: request.DeliveryKey,
-				Result: request.DeliveryResult}, 0)
-		} else {
-			body, err = canonical.Marshal(journalcodec.ApplicationEventBody{V: 1, Payload: request.DeliveryPayload}, 0)
-		}
-		if err != nil {
-			return testengine.Result{}, err
-		}
-		failureBytes, _ := json.Marshal(CommandFailure{Code: request.DeliveryFailureCode, Message: request.DeliveryFailureMessage})
-		received, err = handler.decode(coordinatorReceivedData{
-			eventID: EventID(uuid.NewString()), key: request.DeliveryKey,
-			position: JournalPosition(request.DeliveryPosition), recordedAt: request.DeliveryRecordedAt,
-			body: body.Bytes, status: CommandStatus(request.DeliveryStatus), result: request.DeliveryResult,
-			failure: failureBytes,
-		})
-		if err != nil {
-			return testengine.Result{}, err
-		}
-	}
-	handler, ok := definition.handlers[selector.key()]
-	if !ok {
-		if request.DeliveryKind == "start" {
-			return testengine.Result{State: append([]byte(nil), request.State...)}, nil
-		}
-		return testengine.Result{}, newError(ErrNotFound, "test", "coordinator handler", selector.key(), "handler is not registered")
-	}
-	handlerErr, panicked := invokeCoordinator(withAttemptScope(request.Context, &scope.scope), handler, scope, received)
-	if handlerErr == nil && !panicked {
-		handlerErr = validateDecisionCommands(scope.scope.decision)
-	}
-	if scope.scope.firstError != nil {
-		handlerErr = scope.scope.firstError
-	}
-	encoded, encodeErr := definition.stateDef.State.Encode(scope.state, maxCoordinatorStateBytes)
-	if encodeErr != nil {
-		return testengine.Result{}, encodeErr
-	}
-	result := testengine.Result{State: json.RawMessage(encoded.BytesCopy()), HandlerError: handlerErr, Panicked: panicked}
-	result.Commands = testDecision(scope.scope.decision)
-	result.Events = testEvents(scope.scope.decision)
-	if terminal := scope.scope.terminal; terminal != nil {
-		result.Terminal = string(terminal.kind)
-		if terminal.reason != nil {
-			result.TerminalReason = terminal.reason.Error()
-		}
-	}
-	return result, nil
 }
 
 func testCommandInfo(value testengine.Info) CommandInfo {

@@ -38,7 +38,9 @@ type StagedEvent struct {
 type WorkerOption interface{ applyWorker(*workerOptions) }
 
 type workerOptions struct {
-	info flow.CommandInfo
+	info   flow.CommandInfo
+	events []testengine.EventInput
+	errs   []error
 }
 
 type workerOptionFunc func(*workerOptions)
@@ -47,6 +49,40 @@ func (f workerOptionFunc) applyWorker(options *workerOptions) { f(options) }
 
 func WithCommandInfo(info flow.CommandInfo) WorkerOption {
 	return workerOptionFunc(func(options *workerOptions) { options.info = info })
+}
+
+// WithEvent supplies one exact declared event input to a database-free worker
+// decision. It uses Flow's production canonical payload encoding.
+func WithEvent[T any](event flow.Event[T], key string, payload T) WorkerOption {
+	return workerOptionFunc(func(options *workerOptions) {
+		encoded, err := canonical.Marshal(payload, 64<<10)
+		if err != nil {
+			options.errs = append(options.errs, fmt.Errorf("encode event %s/%s: %w", event.Name(), key, err))
+			return
+		}
+		if event.Name() == "" || key == "" {
+			options.errs = append(options.errs, errors.New("event input requires a valid event and key"))
+			return
+		}
+		identity := event.Name() + "\x00" + key
+		for _, prior := range options.events {
+			if prior.Name+"\x00"+prior.Key != identity {
+				continue
+			}
+			if bytes.Equal(prior.Payload, encoded.Bytes) {
+				return
+			}
+			options.errs = append(options.errs, fmt.Errorf("conflicting event input %s/%s", event.Name(), key))
+			return
+		}
+		if len(options.events) >= 256 {
+			options.errs = append(options.errs, errors.New("event input limit exceeded"))
+			return
+		}
+		options.events = append(options.events, testengine.EventInput{
+			Name: event.Name(), Key: key, Position: int64(len(options.events) + 1), Payload: encoded.BytesCopy(),
+		})
+	})
 }
 
 type WorkerResult[R any] struct {
@@ -67,12 +103,15 @@ func RunWorker[A, R any](ctx context.Context, registration flow.Registration, ar
 		}
 		option.applyWorker(&options)
 	}
+	if err := errors.Join(options.errs...); err != nil {
+		return WorkerResult[R]{}, fmt.Errorf("flowtest: worker options: %w", err)
+	}
 	encoded, err := canonical.Marshal(args, 256<<10)
 	if err != nil {
 		return WorkerResult[R]{}, fmt.Errorf("flowtest: encode worker arguments: %w", err)
 	}
 	result, err := testengine.Invoke(registration, testengine.Request{Operation: testengine.Worker, Context: ctx,
-		Args: encoded.BytesCopy(), Info: bridgeInfo(options.info)})
+		Args: encoded.BytesCopy(), Info: bridgeInfo(options.info), EventInputs: options.events})
 	if err != nil {
 		return WorkerResult[R]{}, err
 	}
@@ -103,75 +142,6 @@ func RunCommit[A, R any](ctx context.Context, registration flow.Registration, tx
 	return err
 }
 
-type CoordinatorDelivery struct {
-	kind           string
-	namespace      string
-	name           string
-	version        int
-	key            string
-	position       int64
-	recordedAt     time.Time
-	payload        json.RawMessage
-	status         string
-	result         json.RawMessage
-	failureCode    string
-	failureMessage string
-}
-
-func Start() CoordinatorDelivery { return CoordinatorDelivery{kind: "start"} }
-
-func DeliverEvent[T any](position int64, event flow.Event[T], key string, recordedAt time.Time, payload T) CoordinatorDelivery {
-	encoded, _ := canonical.Marshal(payload, 64<<10)
-	return CoordinatorDelivery{kind: "event", namespace: "application", name: event.Name(),
-		key: key, position: position, recordedAt: recordedAt, payload: encoded.BytesCopy()}
-}
-
-func DeliverOutcome[A, R any](position int64, command flow.Command[A, R], key string, recordedAt time.Time,
-	outcome flow.Outcome[R]) CoordinatorDelivery {
-	result, _ := canonical.Marshal(outcome.Result, 256<<10)
-	delivery := CoordinatorDelivery{kind: "outcome", namespace: "command_terminal", name: command.Name(),
-		version: command.Version(), key: key, position: position, recordedAt: recordedAt,
-		status: string(outcome.Status), result: result.BytesCopy()}
-	if outcome.Failure != nil {
-		delivery.failureCode, delivery.failureMessage = outcome.Failure.Code, outcome.Failure.Message
-	}
-	return delivery
-}
-
-type CoordinatorResult[S any] struct {
-	State          S
-	Err            error
-	Panicked       bool
-	Commands       []StagedCommand
-	Events         []StagedEvent
-	Terminal       string
-	TerminalReason string
-}
-
-func RunCoordinator[S any](ctx context.Context, coordinator flow.Coordinator[S], state S,
-	delivery CoordinatorDelivery) (CoordinatorResult[S], error) {
-	stateBytes, err := canonical.Marshal(state, 256<<10)
-	if err != nil {
-		return CoordinatorResult[S]{}, err
-	}
-	result, err := testengine.Invoke(coordinator, testengine.Request{Operation: testengine.Coordinator, Context: ctx,
-		State: stateBytes.BytesCopy(), DeliveryKind: delivery.kind, DeliveryNamespace: delivery.namespace,
-		DeliveryName: delivery.name, DeliveryCommandVersion: delivery.version, DeliveryKey: delivery.key,
-		DeliveryPosition: delivery.position, DeliveryRecordedAt: delivery.recordedAt, DeliveryPayload: delivery.payload,
-		DeliveryStatus: delivery.status, DeliveryResult: delivery.result,
-		DeliveryFailureCode: delivery.failureCode, DeliveryFailureMessage: delivery.failureMessage})
-	if err != nil {
-		return CoordinatorResult[S]{}, err
-	}
-	output := CoordinatorResult[S]{Err: result.HandlerError, Panicked: result.Panicked,
-		Commands: publicCommands(result.Commands), Events: publicEvents(result.Events), Terminal: result.Terminal,
-		TerminalReason: result.TerminalReason}
-	if err := canonical.Decode(result.State, &output.State); err != nil {
-		return CoordinatorResult[S]{}, err
-	}
-	return output, nil
-}
-
 type DirectResult[R any] struct {
 	Result   R
 	Commands map[string]json.RawMessage
@@ -190,20 +160,42 @@ func RunDirect[A, R any](ctx context.Context, root flow.Registration, args A, ma
 		return DirectResult[R]{}, err
 	}
 	type item struct {
-		key  string
-		reg  flow.Registration
-		args json.RawMessage
-		root bool
+		key   string
+		reg   flow.Registration
+		args  json.RawMessage
+		waits []testengine.EventWait
+		root  bool
 	}
 	queue := []item{{key: "root", reg: root, args: rootArgs.BytesCopy(), root: true}}
 	seen := map[string]struct{}{"root": {}}
 	output := DirectResult[R]{Commands: make(map[string]json.RawMessage)}
-	seenEvents := make(map[string]StagedEvent)
+	seenEvents := make(map[string]testengine.EventInput)
 	for len(queue) != 0 {
-		current := queue[0]
-		queue = queue[1:]
+		readyIndex := -1
+		for index, candidate := range queue {
+			ready := true
+			for _, wait := range candidate.waits {
+				if _, exists := seenEvents[wait.Name+"\x00"+wait.Key]; !exists {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				readyIndex = index
+				break
+			}
+		}
+		if readyIndex < 0 {
+			return DirectResult[R]{}, errors.New("flowtest: command tree is waiting for an event that was not emitted")
+		}
+		current := queue[readyIndex]
+		queue = append(queue[:readyIndex], queue[readyIndex+1:]...)
+		inputs := make([]testengine.EventInput, 0, len(current.waits))
+		for _, wait := range current.waits {
+			inputs = append(inputs, seenEvents[wait.Name+"\x00"+wait.Key])
+		}
 		decision, err := testengine.Invoke(current.reg, testengine.Request{Operation: testengine.Worker, Context: ctx,
-			Args: current.args, Info: testengine.Info{CommandKey: current.key}})
+			Args: current.args, Info: testengine.Info{CommandKey: current.key}, EventInputs: inputs})
 		if err != nil {
 			return DirectResult[R]{}, err
 		}
@@ -222,7 +214,9 @@ func RunDirect[A, R any](ctx context.Context, root flow.Registration, args A, ma
 				}
 				return DirectResult[R]{}, fmt.Errorf("flowtest: conflicting event identity %s/%s", event.Name, event.Key)
 			}
-			seenEvents[identity] = event
+			seenEvents[identity] = testengine.EventInput{
+				Name: event.Name, Key: event.Key, Position: int64(len(output.Events) + 1), Payload: append([]byte(nil), event.Payload...),
+			}
 			output.Events = append(output.Events, event)
 		}
 		if current.root {
@@ -242,7 +236,7 @@ func RunDirect[A, R any](ctx context.Context, root flow.Registration, args A, ma
 				return DirectResult[R]{}, fmt.Errorf("flowtest: no worker for %s/%d", child.Name, child.Version)
 			}
 			seen[child.Key] = struct{}{}
-			queue = append(queue, item{key: child.Key, reg: registration, args: child.Args})
+			queue = append(queue, item{key: child.Key, reg: registration, args: child.Args, waits: child.Waits})
 		}
 	}
 	return output, nil

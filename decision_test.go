@@ -2,6 +2,7 @@ package flow
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -82,35 +83,52 @@ func TestDecisionBufferRejectsInvalidEventGates(t *testing.T) {
 	}
 }
 
-func TestResultOfAndOutcomeOfEnforceSnapshot(t *testing.T) {
+func TestDecisionBufferEnforcesEventWaitLimit(t *testing.T) {
+	command := DefineCommand[decisionArgs, decisionResult]("decision_wait_limit", 1)
+	event := DefineEvent[None]("decision.wait_limit")
+
+	accepted := &Work[None]{scope: &scopeState{}}
+	acceptedNode := Execute(accepted, "child", command, decisionArgs{})
+	for index := range maxCommandEventWaits {
+		acceptedNode.WaitFor(event, fmt.Sprintf("event/%03d", index))
+	}
+	if err := validateDecisionCommands(accepted.scope.decision); err != nil {
+		t.Fatalf("256 event waits = %v", err)
+	}
+
+	rejected := &Work[None]{scope: &scopeState{}}
+	rejectedNode := Execute(rejected, "child", command, decisionArgs{})
+	for index := range maxCommandEventWaits + 1 {
+		rejectedNode.WaitFor(event, fmt.Sprintf("event/%03d", index))
+	}
+	if err := rejected.scope.firstError; !errors.Is(err, ErrInvalid) {
+		t.Fatalf("257 event waits = %v, want ErrInvalid", err)
+	}
+}
+
+func TestResultOfEnforcesTraceSnapshot(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_result", 1)
 	other := DefineCommand[decisionArgs, decisionResult]("decision_result", 2)
 	encoded, err := command.def.Result.Encode(decisionResult{Value: "done"}, maxCommandResultBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := ExecutionTrace{results: resultSourceState{
-		values: map[string]resultSourceValue{
-			"success": {name: command.Name(), version: command.Version(), status: StatusSucceeded, result: encoded.Bytes},
-			"failure": {name: command.Name(), version: command.Version(), status: StatusFailed, failure: &CommandFailure{Code: "boom", Message: "failed"}},
-		},
+	source := ExecutionTrace{Commands: []TraceCommand{
+		{Key: "success", Name: command.Name(), Version: command.Version(), State: string(StatusSucceeded), Result: encoded.Bytes},
+		{Key: "failure", Name: command.Name(), Version: command.Version(), State: string(StatusFailed), FailureCode: "boom", FailureMessage: "failed"},
 	}}
 
 	result, err := ResultOf(source, "success", command)
 	if err != nil || result.Value != "done" {
 		t.Fatalf("ResultOf = %#v, %v", result, err)
 	}
-	outcome, err := OutcomeOf(source, "failure", command)
-	if err != nil || outcome.Status != StatusFailed || outcome.Failure == nil || outcome.Failure.Code != "boom" {
-		t.Fatalf("OutcomeOf = %#v, %v", outcome, err)
-	}
 	if _, err := ResultOf(source, "failure", command); !errors.Is(err, ErrInvalidState) || !failure.IsPermanent(err) {
 		t.Fatalf("failed ResultOf = %v", err)
 	}
-	if _, err := OutcomeOf(source, "missing", command); !errors.Is(err, ErrNotFound) || !failure.IsPermanent(err) {
-		t.Fatalf("missing OutcomeOf = %v", err)
+	if _, err := ResultOf(source, "missing", command); !errors.Is(err, ErrNotFound) || !failure.IsPermanent(err) {
+		t.Fatalf("missing ResultOf = %v", err)
 	}
-	if _, err := OutcomeOf(source, "success", other); !errors.Is(err, ErrConflict) || !failure.IsPermanent(err) {
-		t.Fatalf("mismatched OutcomeOf = %v", err)
+	if _, err := ResultOf(source, "success", other); !errors.Is(err, ErrConflict) || !failure.IsPermanent(err) {
+		t.Fatalf("mismatched ResultOf = %v", err)
 	}
 }

@@ -1,12 +1,12 @@
 ---
 status: complete
 historical: true
-superseded_by: 2-remove-plan.md
+superseded_by: 3-remove-coordinator.md
 ---
 
 # Plan: make Flow smaller and lighter
 
-> Historical record: the follow-up removal plan supersedes the workflow-graph portions of this completed proposal. Active product behavior is defined by `2-remove-plan.md` and the synchronized project specifications.
+> Historical record: the two follow-up removal plans supersede this completed proposal. Active product behavior is defined by `3-remove-coordinator.md` and the synchronized project specifications.
 
 ## 1. Purpose
 

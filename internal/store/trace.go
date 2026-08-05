@@ -34,30 +34,16 @@ type TraceCommandRow struct {
 	LeaseExpiresAt   *time.Time
 }
 
-type TraceCoordinatorRow struct {
-	ID               uuid.UUID
-	Status           string
-	State            []byte
-	StateRevision    int64
-	StatePosition    int64
-	StartPending     bool
-	InboxPosition    int64
-	DeliveryKey      string
-	DeliveryPosition *int64
-	DeliveryState    string
-	AttemptOrdinal   int
-	ConsumedAttempts int
-	LeaseOwner       string
-	LeaseStartedAt   *time.Time
-	LeaseExpiresAt   *time.Time
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	FinishedAt       *time.Time
+type TraceEventWaitRow struct {
+	CommandID         uuid.UUID
+	Name              string
+	Key               string
+	SatisfiedPosition *int64
 }
 
 type TraceOperationalRows struct {
-	Commands    []TraceCommandRow
-	Coordinator *TraceCoordinatorRow
+	Commands []TraceCommandRow
+	Waits    []TraceEventWaitRow
 }
 
 func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (TraceOperationalRows, error) {
@@ -110,34 +96,27 @@ func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUI
 	}
 	rows.Close()
 
-	query = `SELECT coordinator_id,status,state,state_revision,state_position,start_pending,inbox_position,
-		delivery_key,delivery_position,delivery_state,attempt_ordinal,consumed_attempts,lease_owner,
-		lease_started_at,lease_expires_at,created_at,updated_at,finished_at
-		FROM ` + pgschema.Table(s.schema, "flow_coordinators") + ` WHERE execution_id=$1`
-	var row pgx.Row
+	query = `SELECT command_id,event_name,event_key,satisfied_position
+		FROM ` + pgschema.Table(s.schema, "flow_command_event_waits") + `
+		WHERE execution_id=$1 ORDER BY command_id,event_name,event_key`
 	if tx != nil {
-		row = tx.QueryRow(ctx, query, id)
+		rows, err = tx.Query(ctx, query, id)
 	} else {
-		row = s.db.Conn.QueryRow(ctx, query, id)
+		rows, err = s.db.Conn.Query(ctx, query, id)
 	}
-	var coordinator TraceCoordinatorRow
-	var deliveryKey, leaseOwner *string
-	err = row.Scan(&coordinator.ID, &coordinator.Status, &coordinator.State, &coordinator.StateRevision,
-		&coordinator.StatePosition, &coordinator.StartPending, &coordinator.InboxPosition, &deliveryKey,
-		&coordinator.DeliveryPosition, &coordinator.DeliveryState, &coordinator.AttemptOrdinal,
-		&coordinator.ConsumedAttempts, &leaseOwner, &coordinator.LeaseStartedAt, &coordinator.LeaseExpiresAt,
-		&coordinator.CreatedAt, &coordinator.UpdatedAt, &coordinator.FinishedAt)
-	if err == nil {
-		if deliveryKey != nil {
-			coordinator.DeliveryKey = *deliveryKey
+	if err != nil {
+		return TraceOperationalRows{}, MapError("read trace event waits", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var wait TraceEventWaitRow
+		if err := rows.Scan(&wait.CommandID, &wait.Name, &wait.Key, &wait.SatisfiedPosition); err != nil {
+			return TraceOperationalRows{}, MapError("scan trace event wait", err)
 		}
-		if leaseOwner != nil {
-			coordinator.LeaseOwner = *leaseOwner
-		}
-		coordinator.State = append([]byte(nil), coordinator.State...)
-		result.Coordinator = &coordinator
-	} else if err != pgx.ErrNoRows {
-		return TraceOperationalRows{}, MapError("read trace coordinator", err)
+		result.Waits = append(result.Waits, wait)
+	}
+	if err := rows.Err(); err != nil {
+		return TraceOperationalRows{}, MapError("read trace event wait rows", err)
 	}
 	return result, nil
 }

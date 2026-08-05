@@ -71,20 +71,4 @@ func TestLeaseRenewalResultCannotCancelWorkOutsideItsSnapshot(t *testing.T) {
 		t.Fatal("a newer attempt for a snapshotted command was cancelled")
 	default:
 	}
-
-	coordinators := newActiveCoordinators()
-	coordinatorID, coordinatorOldAttempt, coordinatorNewAttempt := uuid.New(), uuid.New(), uuid.New()
-	coordinatorCancelled := make(chan struct{}, 1)
-	coordinators.register(activeCoordinator{coordinatorID: coordinatorID, attemptID: coordinatorNewAttempt,
-		cancel: func(error) { coordinatorCancelled <- struct{}{} }})
-	coordinators.renewed(coordinatorID, coordinatorOldAttempt, time.Now().Add(time.Hour))
-	if got := coordinators.snapshot(); len(got) != 1 || !got[0].localExpiry.IsZero() {
-		t.Fatal("an older renewal changed a newer coordinator attempt's local expiry")
-	}
-	coordinators.cancelUnrenewed(map[uuid.UUID]uuid.UUID{coordinatorID: coordinatorOldAttempt}, map[uuid.UUID]struct{}{})
-	select {
-	case <-coordinatorCancelled:
-		t.Fatal("a newer coordinator attempt was cancelled by an older renewal result")
-	default:
-	}
 }
