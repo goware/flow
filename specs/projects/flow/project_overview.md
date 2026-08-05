@@ -36,7 +36,7 @@ A direct execution starts with one root command. A successful worker may stage a
 
 ### Coordinator
 
-A coordinator execution starts with typed state and an `OnStart` delivery. It can handle typed application events with `On` and terminal command outcomes with `OnOutcome`. Each accepted delivery atomically updates state, stages commands/events, and advances the inbox.
+A coordinator execution starts with typed state and an `OnStart` delivery. It can handle typed application events with `OnEvent` and terminal command outcomes with `OnOutcome`. Each accepted delivery atomically updates state, stages commands/events, and advances the inbox.
 
 Coordinators own joins, branching, races, loops, and adaptive work. They must explicitly call `Succeed` or `Fail` to become terminal.
 

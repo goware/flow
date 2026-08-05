@@ -94,7 +94,7 @@ func TestRegistrationValidation(t *testing.T) {
 
 	event := DefineEvent[string]("noticed")
 	handler := func(context.Context, *Coordination[int], Received[string]) error { return nil }
-	duplicate := DefineCoordinator("duplicate", 1, On(event, handler), On(event, handler))
+	duplicate := DefineCoordinator("duplicate", 1, OnEvent(event, handler), OnEvent(event, handler))
 	if duplicate.err == nil {
 		t.Fatal("duplicate coordinator event selector was accepted")
 	}
@@ -105,7 +105,7 @@ func TestRegistrationValidation(t *testing.T) {
 	if starts.err == nil {
 		t.Fatal("duplicate start handler was accepted")
 	}
-	if DefineCoordinator("zero-event", 1, On[int](Event[string]{}, handler)).err == nil {
+	if DefineCoordinator("zero-event", 1, OnEvent[int](Event[string]{}, handler)).err == nil {
 		t.Fatal("zero event handler was accepted")
 	}
 	if DefineCoordinator("zero-command", 1,
@@ -203,7 +203,7 @@ func TestErasedCoordinatorRegistration(t *testing.T) {
 			coordination.State++
 			return nil
 		}),
-		On(event, func(_ context.Context, coordination *Coordination[int], received Received[string]) error {
+		OnEvent(event, func(_ context.Context, coordination *Coordination[int], received Received[string]) error {
 			coordination.State += len(received.Payload)
 			return nil
 		}),
@@ -247,7 +247,7 @@ func TestErasedCoordinatorRegistration(t *testing.T) {
 	if err := eventHandler.invoke(context.Background(), scope, Received[int]{Payload: 1}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("payload type error = %v", err)
 	}
-	if DefineCoordinator[int]("nil_handlers", 1, OnStart[int](nil), On[int](event, nil), OnOutcome[int](cmd, nil)).err == nil {
+	if DefineCoordinator[int]("nil_handlers", 1, OnStart[int](nil), OnEvent[int](event, nil), OnOutcome[int](cmd, nil)).err == nil {
 		t.Fatal("nil coordinator handlers were accepted")
 	}
 	if (Coordinator[int]{}).flowRegistration().validation == nil {

@@ -56,7 +56,7 @@ var (
 		flow.OnStart(startResearchAgent),
 		flow.OnOutcome(agentThink, handleAgentThought),
 		flow.OnOutcome(agentTool, handleAgentTool),
-		flow.On(agentUserMessage, handleAgentMessage),
+		flow.OnEvent(agentUserMessage, handleAgentMessage),
 	)
 )
 

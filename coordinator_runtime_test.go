@@ -279,7 +279,7 @@ func TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion(t *testing.T) {
 			Execute(c, "task/bad", task, coordinatorTaskArgs{Key: "bad", Fail: true}).Optional()
 			return nil
 		}),
-		On(notice, func(_ context.Context, c *Coordination[coordinatorTestState], received Received[coordinatorNotice]) error {
+		OnEvent(notice, func(_ context.Context, c *Coordination[coordinatorTestState], received Received[coordinatorNotice]) error {
 			c.State.Notice = received.Payload.Value
 			return nil
 		}),

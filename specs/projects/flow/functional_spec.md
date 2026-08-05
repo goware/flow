@@ -43,7 +43,7 @@ Flow does not support a declarative workflow graph, command dependencies, automa
 `DefineCoordinator[S](name, version, handlers...)` creates a durable state machine with typed state. Handler selectors are:
 
 - `OnStart` for its initial delivery;
-- `On(event, handler)` for application events;
+- `OnEvent(event, handler)` for application events;
 - `OnOutcome(command, handler)` for terminal command outcomes.
 
 Duplicate selectors are invalid. A coordinator is also its registration value.

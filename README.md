@@ -115,7 +115,7 @@ Use a coordinator when the next command depends on outcomes or events, when work
 var report = flow.DefineCoordinator[reportState]("report.build", 1,
 	flow.OnStart(startReport),
 	flow.OnOutcome(analyzePart, partFinished),
-	flow.On(reportRequested, requestReceived),
+	flow.OnEvent(reportRequested, requestReceived),
 )
 ```
 

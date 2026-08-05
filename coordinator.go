@@ -81,7 +81,7 @@ func OnStart[S any](handler func(context.Context, *Coordination[S]) error) Handl
 	return value
 }
 
-func On[S, T any](event Event[T], handler func(context.Context, *Coordination[S], Received[T]) error) Handler[S] {
+func OnEvent[S, T any](event Event[T], handler func(context.Context, *Coordination[S], Received[T]) error) Handler[S] {
 	ref := event.flowEventRef()
 	value := coordinatorHandler[S]{selector: coordinatorSelector{
 		kind: coordinatorEvent, namespace: ref.namespace, name: ref.name,

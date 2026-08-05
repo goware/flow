@@ -65,9 +65,9 @@ The complexity of a dynamic join becomes visible application coordinator code. I
 | A successful worker always continues with known work | `flow.Execute(work, ...)` |
 | A successful worker discovers bounded parallel work and no join is required | stage children from the worker |
 | A command must not run until exact execution-scoped facts exist | `WaitFor` and optional `Within` |
-| A fact's payload determines command arguments or branching | coordinator `On` |
+| A fact's payload determines command arguments or branching | coordinator `OnEvent` |
 | Later work depends on one or more command outcomes | coordinator `OnOutcome` |
-| Dynamic fan-out, join, quorum, race, or loop | coordinator state plus `OnOutcome`/`On` |
+| Dynamic fan-out, join, quorum, race, or loop | coordinator state plus `OnOutcome`/`OnEvent` |
 
 There is no separate plan-versus-coordinator choice.
 
@@ -130,7 +130,7 @@ This stages the command, exact waits, and coordinator state transition in one tr
 `WaitFor` is a readiness gate. It proves that an exact fact exists, but it does not inject the event payload into command arguments. When the payload is needed, a coordinator handles the event and explicitly passes typed data to a command:
 
 ```go
-flow.On(BridgeDelivered, func(
+flow.OnEvent(BridgeDelivered, func(
     ctx context.Context,
     coordination *flow.Coordination[BridgeState],
     delivery flow.Received[BridgeDelivery],
@@ -184,7 +184,7 @@ The orchestration replacements are deliberate:
 - a continuation receives data explicitly in its command arguments;
 - a coordinator receives a typed `Outcome[R]` through `OnOutcome`;
 - a coordinator tracks dynamic membership in bounded state;
-- a coordinator consumes application facts through `On`;
+- a coordinator consumes application facts through `OnEvent`;
 - operator and test code reads retained results from `ExecutionTrace`.
 
 ### 5.3 Retain typed outcomes for coordinators and traces
@@ -320,7 +320,7 @@ A pending gate owns no worker delivery, worker semaphore, command lease, or dedi
 
 Plans previously branched by repeatedly reading facts and outcomes. A coordinator branches once when it receives the relevant durable event:
 
-- `On(event)` decodes the typed application payload;
+- `OnEvent(event)` decodes the typed application payload;
 - `OnOutcome(command)` decodes every terminal command state;
 - the handler updates bounded state and stages commands atomically;
 - the inbox position prevents accepted history from being silently replayed as a new decision.
