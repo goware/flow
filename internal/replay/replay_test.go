@@ -16,15 +16,15 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	executionID := uuid.New()
 	commandID := uuid.New()
 	start := row(t, executionID, 1, store.ExecutionStarted, nil, journalcodec.ExecutionStartedBody{
-		V: 1, ExecutionID: executionID.String(), DriverMode: "direct", DefinitionName: "work",
+		V: 1, ExecutionID: executionID.String(), DefinitionName: "work",
 		DefinitionVersion: 1, ExecutionKey: "key", Input: json.RawMessage(`{"x":1}`),
 		FailFast: true, DeadlineMode: "none", MaxCommands: 5, Metadata: json.RawMessage(`{}`),
 	})
 	created := row(t, executionID, 2, store.CommandCreated, &commandID, journalcodec.CommandCreatedBody{
 		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
-		Args: json.RawMessage(`{"x":1}`), Origin: "direct_root", Required: true,
+		Args: json.RawMessage(`{"x":1}`), Required: true,
 		InitialState: "ready", Queue: "default", RetryPolicy: json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
-		ScheduleKind: "none", DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
+		DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
 	})
 	state, err := Fold([]store.JournalRow{start, created})
 	if err != nil {

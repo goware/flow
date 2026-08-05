@@ -19,7 +19,6 @@ const MaxExecutionListLimit = 201
 
 type ExecutionRow struct {
 	ID                uuid.UUID
-	Mode              string
 	DefinitionName    string
 	DefinitionVersion int
 	Key               string
@@ -28,11 +27,6 @@ type ExecutionRow struct {
 	MaxCommands       int
 	CommandCount      int
 	OpenCommands      int
-	PlanDirty         bool
-	PlanQuiescent     bool
-	PlanRevision      int64
-	PlanWaitingCount  int
-	PlanWaitingOn     []string
 	DeadlineAt        *time.Time
 	FailureCode       string
 	FailureMessage    string
@@ -130,9 +124,8 @@ func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter Execut
 	return s.queryExecutions(ctx, tx, query, args...)
 }
 
-const executionSelectColumns = `SELECT execution_id,driver_mode,definition_name,definition_version,execution_key,status,
-	fail_fast,max_commands,command_count,open_commands,plan_dirty,plan_quiescent,plan_revision,
-	plan_waiting_count,plan_waiting_on,deadline_at,failure,created_at,updated_at,status_at,
+const executionSelectColumns = `SELECT execution_id,definition_name,definition_version,execution_key,status,
+	fail_fast,max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
 	finished_at,metadata FROM `
 
 func (s *Store) executionSelect() string {
@@ -167,19 +160,13 @@ func (s *Store) queryExecutions(ctx context.Context, tx pgx.Tx, query string, ar
 
 func scanExecution(row pgx.Row) (ExecutionRow, error) {
 	var value ExecutionRow
-	var waiting, failure, metadata []byte
+	var failure, metadata []byte
 	if err := row.Scan(
-		&value.ID, &value.Mode, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
-		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.PlanDirty,
-		&value.PlanQuiescent, &value.PlanRevision, &value.PlanWaitingCount, &waiting, &value.DeadlineAt,
+		&value.ID, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
+		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.DeadlineAt,
 		&failure, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
 	); err != nil {
 		return ExecutionRow{}, MapError("scan execution", err)
-	}
-	if len(waiting) != 0 && string(waiting) != "null" {
-		if err := json.Unmarshal(waiting, &value.PlanWaitingOn); err != nil {
-			return ExecutionRow{}, fmt.Errorf("%w: invalid plan waiting projection", flowerr.ErrInvalidState)
-		}
 	}
 	if len(failure) != 0 && string(failure) != "null" {
 		var decoded struct {

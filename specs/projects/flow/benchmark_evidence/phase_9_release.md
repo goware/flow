@@ -1,9 +1,13 @@
 ---
 status: complete
+historical: true
+superseded_by: remove_plan.md
 recorded_at: 2026-07-26
 ---
 
 # Phase 9 release benchmark evidence
+
+> Historical baseline for the superseded architecture. Current retained workload evidence is in `remove_plan.md`; workflow-reconciliation measurements below are not a current product claim.
 
 These development-machine measurements are regression baselines, not service-level objectives. They ran on Linux/amd64 with an Intel Core Ultra 7 255H and a local PostgreSQL server. `FLOW_TEST_DATABASE_PASSWORD` was configured without being printed.
 

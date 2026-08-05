@@ -23,20 +23,17 @@ type Option interface {
 }
 
 type runtimeOptions struct {
-	schema                 string
-	maxCommands            int
-	workerConcurrency      int
-	planConcurrency        int
-	coordinatorConcurrency int
-	queueConcurrency       map[string]int
-	commandLease           time.Duration
-	pollInterval           time.Duration
-	shutdownGrace          time.Duration
-	planVerification       bool
-	notifications          bool
-	observer               Observer
-	faults                 fault.Hook
-	errs                   []error
+	schema            string
+	maxCommands       int
+	workerConcurrency int
+	queueConcurrency  map[string]int
+	commandLease      time.Duration
+	pollInterval      time.Duration
+	shutdownGrace     time.Duration
+	notifications     bool
+	observer          Observer
+	faults            fault.Hook
+	errs              []error
 }
 
 type runtimeOptionFunc func(*runtimeOptions)
@@ -76,31 +73,6 @@ func WithWorkerConcurrency(concurrency int) Option {
 			return
 		}
 		options.workerConcurrency = concurrency
-	})
-}
-
-// WithPlanConcurrency bounds plan reconciliation transactions in this
-// process. Different executions may reconcile concurrently; one execution is
-// still serialized by its PostgreSQL execution-row lock.
-func WithPlanConcurrency(concurrency int) Option {
-	return runtimeOptionFunc(func(options *runtimeOptions) {
-		if concurrency <= 0 {
-			options.errs = append(options.errs, errors.New("plan concurrency must be positive"))
-			return
-		}
-		options.planConcurrency = concurrency
-	})
-}
-
-// WithCoordinatorConcurrency bounds short coordinator decisions in this
-// process independently from command workers.
-func WithCoordinatorConcurrency(concurrency int) Option {
-	return runtimeOptionFunc(func(options *runtimeOptions) {
-		if concurrency <= 0 {
-			options.errs = append(options.errs, errors.New("coordinator concurrency must be positive"))
-			return
-		}
-		options.coordinatorConcurrency = concurrency
 	})
 }
 
@@ -169,46 +141,34 @@ func WithShutdownGrace(grace time.Duration) Option {
 	})
 }
 
-// WithPlanVerification enables development-time double evaluation of every
-// complete pure-plan snapshot. It detects nondeterministic declarations or
-// consulted reads before a reconciliation is committed.
-func WithPlanVerification(enabled bool) Option {
-	return runtimeOptionFunc(func(options *runtimeOptions) { options.planVerification = enabled })
-}
-
 // Runtime is a configured PostgreSQL-backed Flow client. New starts no
 // goroutines; execution operations are usable before background processing is
 // started.
 type Runtime struct {
-	db                     *pgkit.DB
-	store                  *store.Store
-	schema                 string
-	maxCommands            int
-	workerConcurrency      int
-	planConcurrency        int
-	coordinatorConcurrency int
-	queueConcurrency       map[string]int
-	commandLease           time.Duration
-	pollInterval           time.Duration
-	shutdownGrace          time.Duration
-	planVerification       bool
-	notifications          bool
-	instanceID             uuid.UUID
-	observer               Observer
-	observations           *observerAdapter
-	faults                 fault.Hook
+	db                *pgkit.DB
+	store             *store.Store
+	schema            string
+	maxCommands       int
+	workerConcurrency int
+	queueConcurrency  map[string]int
+	commandLease      time.Duration
+	pollInterval      time.Duration
+	shutdownGrace     time.Duration
+	notifications     bool
+	instanceID        uuid.UUID
+	observer          Observer
+	observations      *observerAdapter
+	faults            fault.Hook
 
-	mu                 sync.RWMutex
-	closed             bool
-	lifecycle          runtimeLifecycle
-	registry           *runtimeRegistry
-	runCancel          context.CancelFunc
-	runDone            chan struct{}
-	wake               *wakeHub
-	active             *activeCommands
-	activeCoordinators *activeCoordinators
-	workerGroup        sync.WaitGroup
-	coordinatorGroup   sync.WaitGroup
+	mu          sync.RWMutex
+	closed      bool
+	lifecycle   runtimeLifecycle
+	registry    *runtimeRegistry
+	runCancel   context.CancelFunc
+	runDone     chan struct{}
+	wake        *wakeHub
+	active      *activeCommands
+	workerGroup sync.WaitGroup
 }
 
 // New validates configuration and schema compatibility without migrating or
@@ -217,9 +177,7 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	options := runtimeOptions{
 		schema: defaultSchema, maxCommands: defaultMaxCommandsPerExecution,
 		workerConcurrency: max(1, runtime.GOMAXPROCS(0)), commandLease: 60 * time.Second,
-		planConcurrency:        1,
-		coordinatorConcurrency: 1,
-		pollInterval:           time.Second, shutdownGrace: 30 * time.Second,
+		pollInterval: time.Second, shutdownGrace: 30 * time.Second,
 		notifications: true,
 		observer:      NopObserver{}, faults: fault.None{},
 	}
@@ -243,16 +201,13 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	return &Runtime{
 		db: db, store: repository, schema: options.schema, maxCommands: options.maxCommands,
 		workerConcurrency: options.workerConcurrency, commandLease: options.commandLease,
-		planConcurrency:        options.planConcurrency,
-		coordinatorConcurrency: options.coordinatorConcurrency,
-		queueConcurrency:       cloneIntMap(options.queueConcurrency),
-		pollInterval:           options.pollInterval, shutdownGrace: options.shutdownGrace,
-		planVerification: options.planVerification,
-		notifications:    options.notifications,
-		instanceID:       uuid.New(),
-		observer:         options.observer, observations: newObserverAdapter(options.observer),
+		queueConcurrency: cloneIntMap(options.queueConcurrency),
+		pollInterval:     options.pollInterval, shutdownGrace: options.shutdownGrace,
+		notifications: options.notifications,
+		instanceID:    uuid.New(),
+		observer:      options.observer, observations: newObserverAdapter(options.observer),
 		faults: options.faults, lifecycle: runtimeCreated,
-		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(), activeCoordinators: newActiveCoordinators(),
+		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(),
 	}, nil
 }
 

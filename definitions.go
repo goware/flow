@@ -22,20 +22,6 @@ type Event[T any] struct {
 	err error
 }
 
-type PlanDef[A any] struct {
-	def    *definition.Plan
-	invoke func(*Plan, A)
-	client Client
-	err    error
-}
-
-type Coordinator[S any] struct {
-	def      *definition.Coordinator
-	handlers []coordinatorHandler[S]
-	client   Client
-	err      error
-}
-
 type EventRef interface {
 	flowEventRef() eventReference
 }
@@ -95,45 +81,6 @@ func DefineEvent[T any](name string) Event[T] {
 	return event
 }
 
-func DefinePlan[A any](name string, version int, plan func(*Plan, A)) PlanDef[A] {
-	base := definition.Base{Kind: definition.PlanKind, Name: name, Version: version}
-	def := PlanDef[A]{
-		def:    &definition.Plan{Base: base, Args: definition.NewCodec[A]()},
-		invoke: plan,
-	}
-	def.err = definition.ValidateBase(base)
-	if plan == nil {
-		def.err = errors.Join(def.err, errors.New("plan function must not be nil"))
-	}
-	return def
-}
-
-func DefineCoordinator[S any](name string, version int, handlers ...Handler[S]) Coordinator[S] {
-	base := definition.Base{Kind: definition.CoordinatorKind, Name: name, Version: version}
-	coordinator := Coordinator[S]{def: &definition.Coordinator{
-		Base:  base,
-		State: definition.NewCodec[S](),
-	}}
-	coordinator.err = definition.ValidateBase(base)
-
-	seen := make(map[string]struct{}, len(handlers))
-	for _, handler := range handlers {
-		if handler == nil {
-			coordinator.err = errors.Join(coordinator.err, errors.New("nil coordinator handler"))
-			continue
-		}
-		value := handler.flowCoordinatorHandler()
-		coordinator.handlers = append(coordinator.handlers, value)
-		coordinator.err = errors.Join(coordinator.err, value.err)
-		key := value.selector.key()
-		if _, exists := seen[key]; exists {
-			coordinator.err = errors.Join(coordinator.err, fmt.Errorf("duplicate coordinator handler %s", key))
-		}
-		seen[key] = struct{}{}
-	}
-	return coordinator
-}
-
 func (c Command[A, R]) Name() string {
 	if c.def == nil {
 		return ""
@@ -166,47 +113,6 @@ func (e Event[T]) Name() string {
 		return ""
 	}
 	return e.def.Name
-}
-
-func (p PlanDef[A]) Name() string {
-	if p.def == nil {
-		return ""
-	}
-	return p.def.Name
-}
-
-func (p PlanDef[A]) Version() int {
-	if p.def == nil {
-		return 0
-	}
-	return p.def.Version
-}
-
-func (c Coordinator[S]) Name() string {
-	if c.def == nil {
-		return ""
-	}
-	return c.def.Name
-}
-
-func (c Coordinator[S]) Version() int {
-	if c.def == nil {
-		return 0
-	}
-	return c.def.Version
-}
-
-func (p PlanDef[A]) With(client Client) PlanDef[A] {
-	copy := p
-	copy.client = client
-	return copy
-}
-
-func (c Coordinator[S]) With(client Client) Coordinator[S] {
-	copy := c
-	copy.client = client
-	copy.handlers = append([]coordinatorHandler[S](nil), c.handlers...)
-	return copy
 }
 
 func WithRetry(policy RetryPolicy) CommandOption {

@@ -2,79 +2,53 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/jackc/pgx/v5"
 )
 
-type graphGroup struct {
-	id           uuid.UUID
-	dependent    uuid.UUID
-	dependentKey string
-	ordinal      int
-	kind         string
-	members      []graphMember
+// readinessCommand is the small projection needed to release exact event
+// gates. Event waits and the initial delay are independent prerequisites.
+type readinessCommand struct {
+	id               uuid.UUID
+	key              string
+	name             string
+	version          int
+	queue            string
+	state            string
+	required         bool
+	createdPosition  int64
+	unsatisfiedWaits int
+	initialDelay     time.Duration
+	createdAt        time.Time
+	waitStartedAt    *time.Time
+	waitTimeout      time.Duration
 }
 
-type graphMember struct {
-	id    uuid.UUID
-	state string
-}
-
-type graphCommand struct {
-	id                uuid.UUID
-	key               string
-	name              string
-	version           int
-	queue             string
-	parent            *uuid.UUID
-	state             string
-	required          bool
-	failureScope      bool
-	createdPosition   int64
-	unsatisfiedGroups int
-	unsatisfiedWaits  int
-	scheduleKind      string
-	initialDelay      time.Duration
-	createdAt         time.Time
-	waitStartedAt     *time.Time
-	waitTimeout       time.Duration
-}
-
-type graphGroupUpdate struct {
-	id    uuid.UUID
-	state string
-}
-
-type graphWaitUpdate struct {
+type waitUpdate struct {
 	commandID uuid.UUID
 	name      string
 	key       string
 	position  int64
 }
 
-type graphResolution struct {
-	groups  []graphGroupUpdate
-	waits   []graphWaitUpdate
-	ready   []graphCommand
-	waiting []graphCommand
-	skipped []graphCommand
+type readinessResolution struct {
+	waits   []waitUpdate
+	ready   []readinessCommand
+	waiting []readinessCommand
 }
 
-// failureResolution is the complete graph effect of one unsuccessful required
-// command. In fail-fast mode it also records the durable survivor closure and
-// every queued/pending command that must be cancelled. Running commands are
-// always survivors; fencing lets them finish without being torn down midway.
+// failureResolution describes the pending work cancelled by fail-fast.
+// Attempts already running are deliberately left alone and may settle.
 type failureResolution struct {
-	graphResolution
-	survivors []graphCommand
-	cancelled []graphCommand
+	readinessResolution
+	survivors []readinessCommand
+	cancelled []readinessCommand
 }
 
 func (s *Store) resolveRequiredFailureLocked(
@@ -93,128 +67,30 @@ func (s *Store) resolveRequiredFailuresLocked(
 	baseOverrides map[uuid.UUID]string,
 	failFast bool,
 ) (failureResolution, error) {
-	resolution, err := s.resolveGraphLocked(ctx, semantic, baseOverrides, nil)
+	readiness, err := s.resolveReadinessLocked(ctx, semantic, baseOverrides, nil)
 	if err != nil {
 		return failureResolution{}, err
 	}
+	result := failureResolution{readinessResolution: readiness}
 	if !failFast {
-		return failureResolution{graphResolution: resolution}, nil
+		return result, nil
 	}
-
-	commands, err := s.loadGraphCommands(ctx, semantic)
+	commands, err := s.loadReadinessCommands(ctx, semantic)
 	if err != nil {
 		return failureResolution{}, err
 	}
-	adjacency, err := s.loadGraphAdjacency(ctx, semantic)
-	if err != nil {
-		return failureResolution{}, err
-	}
-	byID := make(map[uuid.UUID]graphCommand, len(commands))
-	scope := make(map[uuid.UUID]bool, len(commands))
 	for _, command := range commands {
-		byID[command.id] = command
-		if command.failureScope || command.state == "running" {
-			scope[command.id] = true
-		}
-	}
-	// Any work directly made viable by the failure is part of failure
-	// handling. Closing over dependency and parent/child edges retains all of
-	// its descendants without application-authored scope bookkeeping.
-	for _, command := range append(append([]graphCommand(nil), resolution.ready...), resolution.waiting...) {
-		scope[command.id] = true
-	}
-	for commandID := range baseOverrides {
-		for _, dependent := range adjacency[commandID] {
-			scope[dependent] = true
-		}
-	}
-	closeFailureScope(scope, adjacency)
-
-	for {
-		cancelled := failureCancellations(commands, baseOverrides, scope)
-		overrides := make(map[uuid.UUID]string, len(baseOverrides)+len(cancelled))
-		for commandID, terminalState := range baseOverrides {
-			overrides[commandID] = terminalState
-		}
-		for _, command := range cancelled {
-			overrides[command.id] = "cancelled"
-		}
-		resolution, err = s.resolveGraphLocked(ctx, semantic, overrides, nil)
-		if err != nil {
-			return failureResolution{}, err
-		}
-		before := len(scope)
-		for _, command := range append(append([]graphCommand(nil), resolution.ready...), resolution.waiting...) {
-			scope[command.id] = true
-		}
-		closeFailureScope(scope, adjacency)
-		if len(scope) == before {
-			survivors := make([]graphCommand, 0, len(scope))
-			for id := range scope {
-				_, failed := baseOverrides[id]
-				if command, ok := byID[id]; ok && !isCommandTerminal(command.state) && !failed {
-					survivors = append(survivors, command)
-				}
-			}
-			sort.Slice(survivors, func(i, j int) bool { return survivors[i].key < survivors[j].key })
-			return failureResolution{graphResolution: resolution, survivors: survivors, cancelled: cancelled}, nil
-		}
-	}
-}
-
-func failureCancellations(commands []graphCommand, failedIDs map[uuid.UUID]string, scope map[uuid.UUID]bool) []graphCommand {
-	result := make([]graphCommand, 0, len(commands))
-	for _, command := range commands {
-		if _, failed := failedIDs[command.id]; failed || isCommandTerminal(command.state) || scope[command.id] || command.state == "running" {
+		if _, failed := baseOverrides[command.id]; failed || isCommandTerminal(command.state) {
 			continue
 		}
-		result = append(result, command)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].key < result[j].key })
-	return result
-}
-
-func closeFailureScope(scope map[uuid.UUID]bool, adjacency map[uuid.UUID][]uuid.UUID) {
-	queue := make([]uuid.UUID, 0, len(scope))
-	for id := range scope {
-		queue = append(queue, id)
-	}
-	for len(queue) > 0 {
-		id := queue[0]
-		queue = queue[1:]
-		for _, dependent := range adjacency[id] {
-			if scope[dependent] {
-				continue
-			}
-			scope[dependent] = true
-			queue = append(queue, dependent)
+		if command.state == "running" {
+			result.survivors = append(result.survivors, command)
+			continue
 		}
+		result.cancelled = append(result.cancelled, command)
 	}
-}
-
-func (s *Store) loadGraphAdjacency(ctx context.Context, semantic *SemanticTx) (map[uuid.UUID][]uuid.UUID, error) {
-	rows, err := semantic.PGX().Query(ctx, `SELECT m.predecessor_command_id,g.dependent_command_id
-		FROM `+pgschema.Table(s.schema, "flow_command_dependency_members")+` m
-		JOIN `+pgschema.Table(s.schema, "flow_command_dependency_groups")+` g USING (group_id)
-		WHERE g.execution_id=$1
-		UNION ALL
-		SELECT parent_command_id,command_id FROM `+pgschema.Table(s.schema, "flow_commands")+`
-		WHERE execution_id=$1 AND parent_command_id IS NOT NULL`, semantic.ExecutionID())
-	if err != nil {
-		return nil, MapError("load graph adjacency", err)
-	}
-	defer rows.Close()
-	result := make(map[uuid.UUID][]uuid.UUID)
-	for rows.Next() {
-		var from, to uuid.UUID
-		if err := rows.Scan(&from, &to); err != nil {
-			return nil, MapError("scan graph adjacency", err)
-		}
-		result[from] = append(result[from], to)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, MapError("read graph adjacency", err)
-	}
+	sort.Slice(result.survivors, func(i, j int) bool { return result.survivors[i].key < result.survivors[j].key })
+	sort.Slice(result.cancelled, func(i, j int) bool { return result.cancelled[i].key < result.cancelled[j].key })
 	return result, nil
 }
 
@@ -279,8 +155,8 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return false, MapError("lock expired command wait", err)
 	}
 
-	// A fact accepted on or before the persisted deadline wins even if this
-	// maintenance transaction runs later.
+	// A fact committed on or before the persisted deadline wins, even when
+	// expiry maintenance observes the row later.
 	rows, err := semantic.PGX().Query(ctx, `SELECT w.event_name,w.event_key,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+` j
 		 WHERE j.execution_id=w.execution_id AND j.event_namespace='application'
@@ -316,16 +192,16 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	}
 	rows.Close()
 	if missing == 0 && len(accepted) > 0 {
-		waitUpdates := make([]graphWaitUpdate, 0, len(accepted))
+		updates := make([]waitUpdate, 0, len(accepted))
 		for _, wait := range accepted {
-			waitUpdates = append(waitUpdates, graphWaitUpdate{commandID: candidate.CommandID,
+			updates = append(updates, waitUpdate{commandID: candidate.CommandID,
 				name: wait.name, key: wait.key, position: *wait.position})
 		}
-		resolution, err := s.resolveGraphLocked(ctx, semantic, nil, waitUpdates)
+		resolution, err := s.resolveReadinessLocked(ctx, semantic, nil, updates)
 		if err != nil {
 			return false, err
 		}
-		if err := s.applyGraphResolution(ctx, semantic, resolution, ApplyResult{}, 0); err != nil {
+		if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 			return false, err
 		}
 		if err := semantic.Commit(ctx); err != nil {
@@ -334,13 +210,13 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return true, nil
 	}
 
-	resolution := graphResolution{}
+	resolution := readinessResolution{}
 	failureEffects := failureResolution{}
 	if required {
 		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, candidate.CommandID, "expired", head.FailFast)
-		resolution = failureEffects.graphResolution
+		resolution = failureEffects.readinessResolution
 	} else {
-		resolution, err = s.resolveGraphLocked(ctx, semantic, map[uuid.UUID]string{candidate.CommandID: "expired"}, nil)
+		resolution, err = s.resolveReadinessLocked(ctx, semantic, map[uuid.UUID]string{candidate.CommandID: "expired"}, nil)
 	}
 	if err != nil {
 		return false, err
@@ -352,12 +228,6 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	}
 	expired.CausationPosition = clonePointer(&createdPosition)
 	entries := []JournalEntry{expired}
-	skippedOffset := len(entries)
-	skipped, err := resolution.skippedEntries(0)
-	if err != nil {
-		return false, err
-	}
-	entries = append(entries, skipped...)
 	executionFailed := required || head.Status == "failing"
 	if required && head.Status == "running" {
 		survivors := make([]string, len(failureEffects.survivors))
@@ -381,8 +251,8 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return false, err
 	}
 	entries = append(entries, cancelledEntries...)
-	effectiveOpen := head.OpenCommands - 1 - len(resolution.skipped) - len(failureEffects.cancelled)
-	terminalExecution := head.Mode == DriverDirect && effectiveOpen == 0
+	effectiveOpen := head.OpenCommands - 1 - len(failureEffects.cancelled)
+	terminalExecution := effectiveOpen == 0
 	if terminalExecution {
 		status, name, reason := "succeeded", "flow.execution_succeeded", ""
 		if executionFailed {
@@ -407,11 +277,11 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return false, MapError("expire command wait", err)
 	}
 	if required {
-		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, skippedOffset, cancelledOffset,
+		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, 0, cancelledOffset,
 			"cancelled by fail-fast after required command expiry"); err != nil {
 			return false, err
 		}
-	} else if err := s.applyGraphResolution(ctx, semantic, resolution, journal, skippedOffset); err != nil {
+	} else if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 		return false, err
 	}
 	status := head.Status
@@ -428,32 +298,14 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		SET status=$2,open_commands=open_commands-1-$5,
 		failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
 		finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
-		plan_dirty=CASE WHEN driver_mode='plan' THEN true ELSE plan_dirty END,
-		plan_dirty_since=CASE WHEN driver_mode='plan' THEN COALESCE(plan_dirty_since,$4) ELSE plan_dirty_since END,
-		plan_quiescent=CASE WHEN driver_mode='plan' THEN false ELSE plan_quiescent END,
 		updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END WHERE execution_id=$1`,
-		head.ID, status, jsonString(failure), semantic.DBNow(), len(resolution.skipped)+len(failureEffects.cancelled), executionFailed); err != nil {
+		head.ID, status, jsonString(failure), semantic.DBNow(), len(failureEffects.cancelled), executionFailed); err != nil {
 		return false, MapError("update execution after wait expiry", err)
 	}
 	if err := semantic.Commit(ctx); err != nil {
 		return false, err
 	}
 	return true, nil
-}
-
-func (resolution graphResolution) skippedEntries(causeBatchIndex int) ([]JournalEntry, error) {
-	entries := make([]JournalEntry, 0, len(resolution.skipped))
-	for _, command := range resolution.skipped {
-		entry, err := terminalEventWithCode(command.id, command.key, "skipped", "dependency_unsatisfiable",
-			"a command dependency became unsatisfiable", "flow.command_skipped", "command_terminal")
-		if err != nil {
-			return nil, err
-		}
-		cause := causeBatchIndex
-		entry.CausationBatchIndex = &cause
-		entries = append(entries, entry)
-	}
-	return entries, nil
 }
 
 func (resolution failureResolution) cancellationEntries(causeBatchIndex int, reason string) ([]JournalEntry, error) {
@@ -476,23 +328,12 @@ func (s *Store) applyFailureResolution(
 	semantic *SemanticTx,
 	resolution failureResolution,
 	journal ApplyResult,
-	skippedOffset int,
+	_ int,
 	cancelledOffset int,
 	reason string,
 ) error {
-	if err := s.applyGraphResolution(ctx, semantic, resolution.graphResolution, journal, skippedOffset); err != nil {
+	if err := s.applyReadinessResolution(ctx, semantic, resolution.readinessResolution); err != nil {
 		return err
-	}
-	if len(resolution.survivors) > 0 {
-		ids := make([]uuid.UUID, len(resolution.survivors))
-		for index, command := range resolution.survivors {
-			ids[index] = command.id
-		}
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-			SET failure_scope=true,updated_at=$3 WHERE execution_id=$1 AND command_id=ANY($2)`,
-			semantic.ExecutionID(), ids, semantic.DBNow()); err != nil {
-			return MapError("mark failure survivor scope", err)
-		}
 	}
 	failure := terminalFailure{Code: "fail_fast", Message: reason}
 	for index, command := range resolution.cancelled {
@@ -500,9 +341,9 @@ func (s *Store) applyFailureResolution(
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
 			SET state='cancelled',last_error=$2::jsonb,terminal_failure=$2::jsonb,terminal_position=$3,
 			    finished_at=$4,updated_at=$4,status_at=$4
-			WHERE command_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired','skipped')`,
+			WHERE command_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired')`,
 			command.id, jsonString(failure), position, semantic.DBNow()); err != nil {
-			return MapError("cancel command outside failure scope", err)
+			return MapError("cancel command after fail-fast", err)
 		}
 		if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+`
 			WHERE command_id=$1`, command.id); err != nil {
@@ -512,208 +353,78 @@ func (s *Store) applyFailureResolution(
 	return nil
 }
 
-// resolveGraphLocked calculates the full terminal dependency cascade without
-// mutating storage. Overrides represent terminal states being accepted by the
-// current transaction but not materialized yet. The result can therefore be
-// journaled in one ordered batch before all projections are updated.
-func (s *Store) resolveGraphLocked(
+// resolveReadinessLocked calculates exact-wait releases without mutating
+// storage. Overrides describe terminal states accepted by the transaction.
+func (s *Store) resolveReadinessLocked(
 	ctx context.Context,
 	semantic *SemanticTx,
 	overrides map[uuid.UUID]string,
-	waits []graphWaitUpdate,
-) (graphResolution, error) {
-	commands, err := s.loadGraphCommands(ctx, semantic)
+	waits []waitUpdate,
+) (readinessResolution, error) {
+	commands, err := s.loadReadinessCommands(ctx, semantic)
 	if err != nil {
-		return graphResolution{}, err
+		return readinessResolution{}, err
 	}
-	groups, err := s.loadUnresolvedGraphGroups(ctx, semantic)
-	if err != nil {
-		return graphResolution{}, err
-	}
-	states := make(map[uuid.UUID]string, len(commands)+len(overrides))
-	byID := make(map[uuid.UUID]*graphCommand, len(commands))
+	byID := make(map[uuid.UUID]*readinessCommand, len(commands))
 	for index := range commands {
-		states[commands[index].id] = commands[index].state
 		byID[commands[index].id] = &commands[index]
 	}
 	for id, state := range overrides {
-		states[id] = state
 		if command := byID[id]; command != nil {
 			command.state = state
 		}
 	}
-	resolution := graphResolution{waits: waits}
+	resolution := readinessResolution{waits: waits}
 	for _, wait := range waits {
 		if command := byID[wait.commandID]; command != nil && command.unsatisfiedWaits > 0 {
 			command.unsatisfiedWaits--
 		}
 	}
-	remaining := append([]graphGroup(nil), groups...)
-	for {
-		progressed := false
-		next := remaining[:0]
-		for _, group := range remaining {
-			state := evaluateDependencyGroup(group, states)
-			if state == "unresolved" {
-				next = append(next, group)
-				continue
-			}
-			progressed = true
-			resolution.groups = append(resolution.groups, graphGroupUpdate{id: group.id, state: state})
-			dependent := byID[group.dependent]
-			if dependent == nil {
-				return graphResolution{}, fmt.Errorf("%w: dependency group has no command", flowerr.ErrInvalidState)
-			}
-			if dependent.unsatisfiedGroups > 0 {
-				dependent.unsatisfiedGroups--
-			}
-			if state == "unsatisfiable" && !isCommandTerminal(states[dependent.id]) {
-				states[dependent.id] = "skipped"
-				dependent.state = "skipped"
-				resolution.skipped = append(resolution.skipped, *dependent)
-			}
-		}
-		remaining = next
-		if !progressed {
-			break
-		}
-	}
 	for index := range commands {
 		command := &commands[index]
-		if command.state == "pending" && command.unsatisfiedGroups == 0 && command.unsatisfiedWaits == 0 {
+		if command.state == "pending" && command.unsatisfiedWaits == 0 {
 			resolution.ready = append(resolution.ready, *command)
-		} else if command.state == "pending" && command.unsatisfiedGroups == 0 && command.unsatisfiedWaits > 0 && command.waitStartedAt == nil {
+		} else if command.state == "pending" && command.unsatisfiedWaits > 0 && command.waitStartedAt == nil {
 			resolution.waiting = append(resolution.waiting, *command)
 		}
 	}
-	sort.Slice(resolution.groups, func(i, j int) bool { return resolution.groups[i].id.String() < resolution.groups[j].id.String() })
 	sort.Slice(resolution.ready, func(i, j int) bool { return resolution.ready[i].key < resolution.ready[j].key })
 	sort.Slice(resolution.waiting, func(i, j int) bool { return resolution.waiting[i].key < resolution.waiting[j].key })
-	sort.Slice(resolution.skipped, func(i, j int) bool { return resolution.skipped[i].key < resolution.skipped[j].key })
 	return resolution, nil
 }
 
-func evaluateDependencyGroup(group graphGroup, states map[uuid.UUID]string) string {
-	succeeded, unsuccessful, terminal := 0, 0, 0
-	for _, member := range group.members {
-		state := states[member.id]
-		if state == "succeeded" {
-			succeeded++
-			terminal++
-		} else if isCommandTerminal(state) {
-			unsuccessful++
-			terminal++
-		}
-	}
-	switch group.kind {
-	case "all_succeeded":
-		if unsuccessful > 0 {
-			return "unsatisfiable"
-		}
-		if succeeded == len(group.members) {
-			return "satisfied"
-		}
-	case "all_settled":
-		if terminal == len(group.members) {
-			return "satisfied"
-		}
-	case "all_failed":
-		if succeeded > 0 {
-			return "unsatisfiable"
-		}
-		if unsuccessful == len(group.members) {
-			return "satisfied"
-		}
-	}
-	return "unresolved"
-}
-
-func (s *Store) loadGraphCommands(ctx context.Context, semantic *SemanticTx) ([]graphCommand, error) {
-	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,name,version,queue,parent_command_id,state,
-		required,failure_scope,created_position,
-		unsatisfied_groups,unsatisfied_waits,schedule_kind,COALESCE(initial_delay_ms,0),created_at,
-		wait_started_at,COALESCE(wait_timeout_ms,0)
+func (s *Store) loadReadinessCommands(ctx context.Context, semantic *SemanticTx) ([]readinessCommand, error) {
+	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,name,version,queue,state,required,created_position,
+		unsatisfied_waits,COALESCE(initial_delay_ms,0),created_at,wait_started_at,COALESCE(wait_timeout_ms,0)
 		FROM `+pgschema.Table(s.schema, "flow_commands")+` WHERE execution_id=$1 ORDER BY command_key`, semantic.ExecutionID())
 	if err != nil {
-		return nil, MapError("load graph commands", err)
+		return nil, MapError("load readiness commands", err)
 	}
 	defer rows.Close()
-	var result []graphCommand
+	var result []readinessCommand
 	for rows.Next() {
-		var item graphCommand
+		var item readinessCommand
 		var delayMS, waitTimeoutMS int64
-		if err := rows.Scan(&item.id, &item.key, &item.name, &item.version, &item.queue, &item.parent, &item.state,
-			&item.required, &item.failureScope, &item.createdPosition,
-			&item.unsatisfiedGroups, &item.unsatisfiedWaits, &item.scheduleKind, &delayMS, &item.createdAt,
+		if err := rows.Scan(&item.id, &item.key, &item.name, &item.version, &item.queue, &item.state,
+			&item.required, &item.createdPosition, &item.unsatisfiedWaits, &delayMS, &item.createdAt,
 			&item.waitStartedAt, &waitTimeoutMS); err != nil {
-			return nil, MapError("scan graph command", err)
+			return nil, MapError("scan readiness command", err)
 		}
 		item.initialDelay = time.Duration(delayMS) * time.Millisecond
 		item.waitTimeout = time.Duration(waitTimeoutMS) * time.Millisecond
 		result = append(result, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, MapError("read graph commands", err)
+		return nil, MapError("read readiness commands", err)
 	}
 	return result, nil
 }
 
-func (s *Store) loadUnresolvedGraphGroups(ctx context.Context, semantic *SemanticTx) ([]graphGroup, error) {
-	rows, err := semantic.PGX().Query(ctx, `SELECT g.group_id,g.dependent_command_id,d.command_key,g.ordinal,g.kind,
-		m.predecessor_command_id,p.state
-		FROM `+pgschema.Table(s.schema, "flow_command_dependency_groups")+` g
-		JOIN `+pgschema.Table(s.schema, "flow_commands")+` d ON d.command_id=g.dependent_command_id
-		JOIN `+pgschema.Table(s.schema, "flow_command_dependency_members")+` m ON m.group_id=g.group_id
-		JOIN `+pgschema.Table(s.schema, "flow_commands")+` p ON p.command_id=m.predecessor_command_id
-		WHERE g.execution_id=$1 AND g.state='unresolved'
-		ORDER BY d.command_key,g.ordinal,m.predecessor_key`, semantic.ExecutionID())
-	if err != nil {
-		return nil, MapError("load unresolved dependency groups", err)
-	}
-	defer rows.Close()
-	var result []graphGroup
-	var current *graphGroup
-	for rows.Next() {
-		var groupID, dependentID, predecessorID uuid.UUID
-		var dependentKey, kind, predecessorState string
-		var ordinal int
-		if err := rows.Scan(&groupID, &dependentID, &dependentKey, &ordinal, &kind, &predecessorID, &predecessorState); err != nil {
-			return nil, MapError("scan unresolved dependency group", err)
-		}
-		if current == nil || current.id != groupID {
-			result = append(result, graphGroup{id: groupID, dependent: dependentID, dependentKey: dependentKey,
-				ordinal: ordinal, kind: kind})
-			current = &result[len(result)-1]
-		}
-		current.members = append(current.members, graphMember{id: predecessorID, state: predecessorState})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, MapError("read unresolved dependency groups", err)
-	}
-	return result, nil
-}
-
-func (s *Store) applyGraphResolution(
+func (s *Store) applyReadinessResolution(
 	ctx context.Context,
 	semantic *SemanticTx,
-	resolution graphResolution,
-	journal ApplyResult,
-	skippedEntryOffset int,
+	resolution readinessResolution,
 ) error {
-	for _, group := range resolution.groups {
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_dependency_groups")+`
-			SET state=$2,resolved_at=$3 WHERE group_id=$1 AND state='unresolved'`, group.id, group.state, semantic.DBNow()); err != nil {
-			return MapError("resolve dependency group", err)
-		}
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+` c
-			SET state=CASE WHEN c.state='pending' AND c.unsatisfied_groups=1 AND c.unsatisfied_waits=0 THEN 'ready' ELSE c.state END,
-			    unsatisfied_groups=GREATEST(0,c.unsatisfied_groups-1),updated_at=$2,
-			    status_at=CASE WHEN c.state='pending' AND c.unsatisfied_groups=1 AND c.unsatisfied_waits=0 THEN $2 ELSE c.status_at END
-			FROM `+pgschema.Table(s.schema, "flow_command_dependency_groups")+` g
-			WHERE g.group_id=$1 AND c.command_id=g.dependent_command_id`, group.id, semantic.DBNow()); err != nil {
-			return MapError("update resolved dependency count", err)
-		}
-	}
 	for _, wait := range resolution.waits {
 		commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_event_waits")+`
 			SET satisfied_position=$4 WHERE command_id=$1 AND event_name=$2 AND event_key=$3
@@ -723,25 +434,12 @@ func (s *Store) applyGraphResolution(
 		}
 		if commandTag.RowsAffected() > 0 {
 			if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-				SET state=CASE WHEN state='pending' AND unsatisfied_waits=1 AND unsatisfied_groups=0 THEN 'ready' ELSE state END,
+				SET state=CASE WHEN state='pending' AND unsatisfied_waits=1 THEN 'ready' ELSE state END,
 				    unsatisfied_waits=GREATEST(0,unsatisfied_waits-1),updated_at=$2,
-				    status_at=CASE WHEN state='pending' AND unsatisfied_waits=1 AND unsatisfied_groups=0 THEN $2 ELSE status_at END
+				    status_at=CASE WHEN state='pending' AND unsatisfied_waits=1 THEN $2 ELSE status_at END
 				WHERE command_id=$1`, wait.commandID, semantic.DBNow()); err != nil {
 				return MapError("update satisfied wait count", err)
 			}
-		}
-	}
-	for index, command := range resolution.skipped {
-		position := journal.Journal[skippedEntryOffset+index].Position
-		failure := terminalFailure{Code: "dependency_unsatisfiable", Message: "a command dependency became unsatisfiable"}
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-			SET state='skipped',terminal_failure=$2::jsonb,terminal_position=$3,finished_at=$4,
-			updated_at=$4,status_at=$4 WHERE command_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired','skipped')`,
-			command.id, jsonString(failure), position, semantic.DBNow()); err != nil {
-			return MapError("skip unsatisfiable command", err)
-		}
-		if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, command.id); err != nil {
-			return MapError("remove skipped command queue row", err)
 		}
 	}
 	for _, command := range resolution.ready {
@@ -754,11 +452,10 @@ func (s *Store) applyGraphResolution(
 		}
 		commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
 			SET state='ready',budget_started_at=$2,next_attempt_at=$2,updated_at=$3,status_at=$3
-			WHERE command_id=$1 AND state IN ('pending','ready') AND unsatisfied_groups=0 AND unsatisfied_waits=0
-			AND budget_started_at IS NULL`,
-			command.id, nextRun, semantic.DBNow())
+			WHERE command_id=$1 AND state IN ('pending','ready') AND unsatisfied_waits=0
+			AND budget_started_at IS NULL`, command.id, nextRun, semantic.DBNow())
 		if err != nil {
-			return MapError("make dependency command ready", err)
+			return MapError("make gated command ready", err)
 		}
 		if commandTag.RowsAffected() > 0 {
 			_, err = semantic.PGX().Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_queue")+`
@@ -766,7 +463,7 @@ func (s *Store) applyGraphResolution(
 				VALUES ($1,$2,$3,$4,$5,'ready',$6,$7) ON CONFLICT (command_id) DO NOTHING`,
 				command.id, semantic.ExecutionID(), command.queue, command.name, command.version, nextRun, semantic.DBNow())
 			if err != nil {
-				return MapError("enqueue dependency command", err)
+				return MapError("enqueue gated command", err)
 			}
 		}
 	}
@@ -786,7 +483,7 @@ func (s *Store) applyGraphResolution(
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
 			SET wait_started_at=COALESCE(wait_started_at,$2),wait_deadline_at=COALESCE(wait_deadline_at,$3),updated_at=$2
-			WHERE command_id=$1 AND state='pending' AND unsatisfied_groups=0 AND unsatisfied_waits>0`,
+			WHERE command_id=$1 AND state='pending' AND unsatisfied_waits>0`,
 			command.id, semantic.DBNow(), deadline); err != nil {
 			return MapError("start command event wait", err)
 		}
@@ -799,7 +496,7 @@ func (s *Store) matchingWaitsLocked(
 	semantic *SemanticTx,
 	name, key string,
 	position int64,
-) ([]graphWaitUpdate, error) {
+) ([]waitUpdate, error) {
 	rows, err := semantic.PGX().Query(ctx, `SELECT w.command_id,w.event_name,w.event_key
 		FROM `+pgschema.Table(s.schema, "flow_command_event_waits")+` w
 		JOIN `+pgschema.Table(s.schema, "flow_commands")+` c USING (command_id)
@@ -810,9 +507,9 @@ func (s *Store) matchingWaitsLocked(
 		return nil, MapError("lock matching command waits", err)
 	}
 	defer rows.Close()
-	var waits []graphWaitUpdate
+	var waits []waitUpdate
 	for rows.Next() {
-		var wait graphWaitUpdate
+		var wait waitUpdate
 		if err := rows.Scan(&wait.commandID, &wait.name, &wait.key); err != nil {
 			return nil, MapError("scan matching command wait", err)
 		}
@@ -826,3 +523,7 @@ func (s *Store) matchingWaitsLocked(
 }
 
 func graphNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
+
+// Keep encoding/json linked here because terminal failures are persisted as
+// JSON by the wait-expiry path through jsonString.
+var _ = json.Valid

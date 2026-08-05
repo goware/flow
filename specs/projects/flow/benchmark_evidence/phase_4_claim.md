@@ -1,9 +1,13 @@
 ---
 status: complete
+historical: true
+superseded_by: remove_plan.md
 recorded_at: 2026-07-26
 ---
 
 # Phase 4 claim-probe evidence
+
+> Historical baseline. The original dedicated query-plan fixture was removed during the pre-release architecture reduction; current retained workload evidence is in `remove_plan.md`.
 
 `TestClaimProbeQueryPlan` builds an isolated real-PostgreSQL queue with 90% of
 the oldest rows assigned to an unregistered command kind and the remaining 10%

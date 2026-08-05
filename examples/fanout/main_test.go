@@ -38,7 +38,7 @@ func TestFanOutExampleEndToEnd(t *testing.T) {
 	if err != nil || final.Total != 6 {
 		t.Fatalf("final report = %#v, %v", final, err)
 	}
-	if trace.Execution.Status != "succeeded" || len(trace.Commands) != 5 {
+	if trace.Execution.Status != "succeeded" || len(trace.Commands) != 10 {
 		t.Fatalf("example trace = %#v", trace)
 	}
 	var queueRows, createdRows, terminalRows int
@@ -52,7 +52,7 @@ func TestFanOutExampleEndToEnd(t *testing.T) {
 		Scan(&createdRows, &terminalRows); err != nil {
 		t.Fatal(err)
 	}
-	if queueRows != 0 || createdRows != 5 || terminalRows != 5 {
+	if queueRows != 0 || createdRows != 10 || terminalRows != 10 {
 		t.Fatalf("database rows queue=%d created=%d terminal=%d", queueRows, createdRows, terminalRows)
 	}
 	replaytest.AssertMatchesLive(t, database.DB, database.Schema, handle.ID)

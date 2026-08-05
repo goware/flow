@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Phase 8: Inspection, testing, and operational surfaces
+
+> Historical delivery record. Removed workflow fields no longer exist in the active inspection contract.
 
 ## Goal
 

@@ -1,9 +1,7 @@
 package flow
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"sort"
 	"strings"
@@ -23,10 +21,6 @@ type ingressArgs struct {
 
 type ingressResult struct {
 	Value string `json:"value"`
-}
-
-type ingressState struct {
-	Count int `json:"count"`
 }
 
 func TestExecutionStartsAndEventEmit(t *testing.T) {
@@ -50,7 +44,7 @@ func TestExecutionStartsAndEventEmit(t *testing.T) {
 	if !direct.Created || direct.RootCommandID == "" || direct.Type != command.Name() {
 		t.Fatalf("direct handle = %#v", direct)
 	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, direct, "direct", 1, 1, false)
+	assertExecutionShape(t, database.Schema, database.DB.Conn, direct, 1, 1)
 
 	repeated, err := command.With(runtime).Execute(ctx, "direct/1", ingressArgs{Value: "a"}, WithMetadata(map[string]string{"tenant": "one"}))
 	if err != nil || repeated.Created || repeated.ID != direct.ID || repeated.RootCommandID != direct.RootCommandID {
@@ -63,57 +57,61 @@ func TestExecutionStartsAndEventEmit(t *testing.T) {
 		t.Fatalf("conflicting direct options error = %v", err)
 	}
 
-	planCalled := false
-	plan := DefinePlan[ingressArgs]("ingress.plan", 1, func(*Plan, ingressArgs) { planCalled = true })
-	planned, err := plan.With(runtime).Execute(ctx, "plan/1", ingressArgs{Value: "p"})
-	if err != nil {
-		t.Fatalf("Plan.Execute() error = %v", err)
-	}
-	if planCalled {
-		t.Fatal("Plan.Execute invoked the plan inline")
-	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, planned, "plan", 0, 0, true)
-
 	event := DefineEvent[ingressArgs]("ingress.fact")
-	if err := event.Emit(ctx, runtime, planned.ID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
+	if err := event.Emit(ctx, runtime, direct.ID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
 		t.Fatalf("Emit() error = %v", err)
 	}
-	if err := event.Emit(ctx, runtime, planned.ID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
+	if err := event.Emit(ctx, runtime, direct.ID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
 		t.Fatalf("repeated Emit() error = %v", err)
 	}
-	if err := event.Emit(ctx, runtime, planned.ID, "fact/1", ingressArgs{Value: "changed"}); !errors.Is(err, ErrConflict) {
+	if err := event.Emit(ctx, runtime, direct.ID, "fact/1", ingressArgs{Value: "changed"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting Emit() error = %v", err)
 	}
+}
 
-	coordinatorCalled := false
-	coordinator := DefineCoordinator[ingressState]("ingress.coordinator", 1, OnStart(func(context.Context, *Coordination[ingressState]) error {
-		coordinatorCalled = true
-		return nil
-	}))
-	coordinated, err := coordinator.With(runtime).Execute(ctx, "coordinator/1", ingressState{Count: 2})
+func TestApplicationEventCannotReopenTerminalExecution(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("ingress.terminal_event", 1)
+	event := DefineEvent[string]("ingress.after_terminal")
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithPollInterval(5*time.Millisecond))
 	if err != nil {
-		t.Fatalf("Coordinator.Execute() error = %v", err)
+		t.Fatal(err)
 	}
-	if coordinatorCalled {
-		t.Fatal("Coordinator.Execute invoked OnStart inline")
+	if err := runtime.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
 	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, coordinated, "coordinator", 0, 0, false)
-	var deliveryState, deliveryKey string
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT delivery_state,delivery_key FROM `+
-		pgschema.Table(database.Schema, "flow_coordinators")+` WHERE execution_id=$1`, coordinated.ID).
-		Scan(&deliveryState, &deliveryKey); err != nil {
-		t.Fatalf("read coordinator: %v", err)
+	cancel, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, runResult)
+	handle, err := command.With(runtime).Execute(ctx, "terminal-event", None{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if deliveryState != "ready" || deliveryKey != "start" {
-		t.Fatalf("coordinator delivery = %s/%s", deliveryState, deliveryKey)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
+	before, err := History(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := CancelExecution(ctx, runtime, coordinated.ID, "stop coordinator"); err != nil {
-		t.Fatalf("CancelExecution(coordinator) error = %v", err)
+	if err := event.Emit(ctx, runtime, handle.ID, "late", "must not be recorded"); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("late Event.Emit() error=%v, want ErrTerminal", err)
 	}
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT status FROM `+pgschema.Table(database.Schema, "flow_coordinators")+` WHERE execution_id=$1`, coordinated.ID).Scan(&deliveryState); err != nil || deliveryState != "cancelled" {
-		t.Fatalf("cancelled coordinator status = %q, %v", deliveryState, err)
+	after, err := History(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	assertReplayMatches(t, runtime, coordinated.ID)
+	execution, err := GetExecution(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.Status != "succeeded" || len(after) != len(before) {
+		t.Fatalf("terminal execution status=%s history before=%d after=%d", execution.Status, len(before), len(after))
+	}
 }
 
 func TestCallerOwnedTransactionCommitAndRollback(t *testing.T) {
@@ -176,7 +174,7 @@ func TestCallerOwnedTransactionCommitAndRollback(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, committed, "direct", 1, 1, false)
+	assertExecutionShape(t, database.Schema, database.DB.Conn, committed, 1, 1)
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "app_records")).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("committed application count = %d, %v", count, err)
 	}
@@ -226,7 +224,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if created != 1 {
 		t.Fatalf("created handles = %d, want 1", created)
 	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, handles[0], "direct", 1, 1, false)
+	assertExecutionShape(t, database.Schema, database.DB.Conn, handles[0], 1, 1)
 
 	changedRuntime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(99))
 	if err != nil {
@@ -252,16 +250,10 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 			maxCommands, queue, acceptedAttempts, timeoutMS)
 	}
 
-	plan := DefinePlan[ingressArgs]("ceiling.plan", 1, func(*Plan, ingressArgs) {})
-	planned, err := plan.With(runtime).Execute(ctx, "ceiling", ingressArgs{})
-	if err != nil {
-		t.Fatalf("Plan.Execute() error = %v", err)
-	}
-	assertExecutionShape(t, database.Schema, database.DB.Conn, planned, "plan", 0, 0, true)
 	fact := DefineEvent[ingressArgs]("ceiling.fact")
 	publishErrors := make(chan error, callers)
 	for range callers {
-		go func() { publishErrors <- fact.Emit(ctx, runtime, planned.ID, "same", ingressArgs{Value: "fact"}) }()
+		go func() { publishErrors <- fact.Emit(ctx, runtime, handles[0].ID, "same", ingressArgs{Value: "fact"}) }()
 	}
 	for range callers {
 		if err := <-publishErrors; err != nil {
@@ -270,7 +262,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	}
 	var eventCount int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE execution_id=$1 AND event_class='application'`, planned.ID).Scan(&eventCount); err != nil || eventCount != 1 {
+		WHERE execution_id=$1 AND event_class='application'`, handles[0].ID).Scan(&eventCount); err != nil || eventCount != 1 {
 		t.Fatalf("concurrent event count = %d, %v", eventCount, err)
 	}
 }
@@ -287,9 +279,9 @@ func TestTransactionExecutionOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	plan := DefinePlan[ingressArgs]("order.plan", 1, func(*Plan, ingressArgs) {})
-	first, _ := plan.With(runtime).Execute(ctx, "one", ingressArgs{})
-	second, _ := plan.With(runtime).Execute(ctx, "two", ingressArgs{})
+	command := DefineCommand[ingressArgs, ingressResult]("order.command", 1)
+	first, _ := command.With(runtime).Execute(ctx, "one", ingressArgs{})
+	second, _ := command.With(runtime).Execute(ctx, "two", ingressArgs{})
 	ids := []ExecutionID{first.ID, second.ID}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	fact := DefineEvent[ingressArgs]("order.fact")
@@ -370,10 +362,9 @@ func TestRuntimeAndIngressValidation(t *testing.T) {
 	if err := DefineEvent[ingressArgs]("event").Emit(ctx, runtime, ExecutionID("bad"), "key", ingressArgs{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Emit(invalid ID) error = %v", err)
 	}
-	plan := DefinePlan[ingressArgs]("validation.plan", 1, func(*Plan, ingressArgs) {})
-	handle, err := plan.With(runtime).Execute(ctx, "validation/event-size", ingressArgs{})
+	handle, err := command.With(runtime).Execute(ctx, "validation/event-size", ingressArgs{})
 	if err != nil {
-		t.Fatalf("Plan.Execute(event size) error = %v", err)
+		t.Fatalf("Command.Execute(event size) error = %v", err)
 	}
 	largeEvent := DefineEvent[ingressArgs]("validation.large_event")
 	if err := largeEvent.Emit(ctx, runtime, handle.ID, "large", ingressArgs{Value: strings.Repeat("x", maxApplicationEventBytes)}); !errors.Is(err, ErrPayloadTooLarge) {
@@ -439,35 +430,6 @@ func TestIngressCancellationAndTerminalIdempotency(t *testing.T) {
 		t.Fatalf("cancelled direct = execution=%s command=%s queue=%d events=%d", executionStatus, commandStatus, queueCount, terminalEvents)
 	}
 
-	plan := DefinePlan[ingressArgs]("cancel.plan", 1, func(*Plan, ingressArgs) {})
-	planned, err := plan.With(runtime).Execute(ctx, "cancel/plan", ingressArgs{})
-	if err != nil {
-		t.Fatalf("Plan.Execute() error = %v", err)
-	}
-	fact := DefineEvent[ingressArgs]("cancel.fact")
-	if err := fact.Emit(ctx, runtime, planned.ID, "fact", ingressArgs{Value: "before"}); err != nil {
-		t.Fatalf("Emit() error = %v", err)
-	}
-	if err := CancelExecution(ctx, runtime, planned.ID, "stop plan"); err != nil {
-		t.Fatalf("CancelExecution() error = %v", err)
-	}
-	if err := CancelExecution(ctx, runtime, planned.ID, "stop plan"); err != nil {
-		t.Fatalf("idempotent CancelExecution() error = %v", err)
-	}
-	if err := fact.Emit(ctx, runtime, planned.ID, "fact", ingressArgs{Value: "before"}); err != nil {
-		t.Fatalf("idempotent Emit(after terminal) error = %v", err)
-	}
-	if err := fact.Emit(ctx, runtime, planned.ID, "new", ingressArgs{}); !errors.Is(err, ErrTerminal) {
-		t.Fatalf("new Emit(after terminal) error = %v", err)
-	}
-	var dirty bool
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT status,plan_dirty FROM `+pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, planned.ID).Scan(&executionStatus, &dirty); err != nil {
-		t.Fatalf("read cancelled plan: %v", err)
-	}
-	if executionStatus != "cancelled" || dirty {
-		t.Fatalf("cancelled plan = %s dirty=%v", executionStatus, dirty)
-	}
-
 	history, err := History(ctx, runtime, direct.ID, HistoryLimit(2))
 	if err != nil {
 		t.Fatalf("History() error = %v", err)
@@ -495,21 +457,18 @@ func TestIngressCancellationAndTerminalIdempotency(t *testing.T) {
 	}
 
 	assertReplayMatches(t, runtime, direct.ID)
-	assertReplayMatches(t, runtime, planned.ID)
 }
 
 type queryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func assertExecutionShape(t *testing.T, schema string, db queryRower, handle ExecutionHandle, mode string, commands, open int, dirty bool) {
+func assertExecutionShape(t *testing.T, schema string, db queryRower, handle ExecutionHandle, commands, open int) {
 	t.Helper()
-	var gotMode string
 	var gotCommands, gotOpen, journalCount, queueCount int
-	var gotDirty bool
-	if err := db.QueryRow(context.Background(), `SELECT driver_mode,command_count,open_commands,plan_dirty FROM `+
+	if err := db.QueryRow(context.Background(), `SELECT command_count,open_commands FROM `+
 		pgschema.Table(schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).
-		Scan(&gotMode, &gotCommands, &gotOpen, &gotDirty); err != nil {
+		Scan(&gotCommands, &gotOpen); err != nil {
 		t.Fatalf("read execution: %v", err)
 	}
 	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM `+pgschema.Table(schema, "flow_journal")+` WHERE execution_id=$1`, handle.ID).Scan(&journalCount); err != nil {
@@ -519,10 +478,9 @@ func assertExecutionShape(t *testing.T, schema string, db queryRower, handle Exe
 		t.Fatalf("count queue: %v", err)
 	}
 	wantJournal := 1 + commands
-	if gotMode != mode || gotCommands != commands || gotOpen != open || gotDirty != dirty || journalCount != wantJournal || queueCount != commands {
-		t.Fatalf("execution shape = mode=%s commands=%d open=%d dirty=%v journal=%d queue=%d; want %s/%d/%d/%v/%d/%d",
-			gotMode, gotCommands, gotOpen, gotDirty, journalCount, queueCount,
-			mode, commands, open, dirty, wantJournal, commands)
+	if gotCommands != commands || gotOpen != open || journalCount != wantJournal || queueCount != commands {
+		t.Fatalf("execution shape = commands=%d open=%d journal=%d queue=%d; want %d/%d/%d/%d",
+			gotCommands, gotOpen, journalCount, queueCount, commands, open, wantJournal, commands)
 	}
 }
 
@@ -547,16 +505,14 @@ func assertReplayMatches(t *testing.T, runtime *Runtime, id ExecutionID) {
 	}
 	var status string
 	var count, open int
-	var dirty bool
-	if err := runtime.db.Conn.QueryRow(context.Background(), `SELECT status,command_count,open_commands,plan_dirty FROM `+
+	if err := runtime.db.Conn.QueryRow(context.Background(), `SELECT status,command_count,open_commands FROM `+
 		pgschema.Table(runtime.schema, "flow_executions")+` WHERE execution_id=$1`, parsed).
-		Scan(&status, &count, &open, &dirty); err != nil {
+		Scan(&status, &count, &open); err != nil {
 		t.Fatalf("read live projection: %v", err)
 	}
-	if state.Status != status || state.CommandCount != count || state.OpenCommands != open || state.PlanDirty != dirty {
-		t.Fatalf("replay/live differ: replay=%s/%d/%d/%v live=%s/%d/%d/%v",
-			state.Status, state.CommandCount, state.OpenCommands, state.PlanDirty,
-			status, count, open, dirty)
+	if state.Status != status || state.CommandCount != count || state.OpenCommands != open {
+		t.Fatalf("replay/live differ: replay=%s/%d/%d live=%s/%d/%d",
+			state.Status, state.CommandCount, state.OpenCommands, status, count, open)
 	}
 	for commandID, replayed := range state.Commands {
 		var liveState string
@@ -571,37 +527,8 @@ func assertReplayMatches(t *testing.T, runtime *Runtime, id ExecutionID) {
 			t.Fatalf("replayed command %s differs: %#v live=%s/%d/%v", commandID, replayed, liveState, created, terminal)
 		}
 	}
-	if state.Coordinator != nil {
-		var liveID string
-		var liveStatus, liveDeliveryState string
-		var liveState, liveRetryHash []byte
-		var liveStatePosition, liveStateRevision int64
-		var liveStartPending bool
-		var liveDeliveryKey *string
-		if err := runtime.db.Conn.QueryRow(context.Background(), `SELECT coordinator_id::text,status,state,state_position,
-			state_revision,start_pending,delivery_state,delivery_key,retry_policy_hash FROM `+
-			pgschema.Table(runtime.schema, "flow_coordinators")+` WHERE execution_id=$1`, parsed).
-			Scan(&liveID, &liveStatus, &liveState, &liveStatePosition, &liveStateRevision, &liveStartPending,
-				&liveDeliveryState, &liveDeliveryKey, &liveRetryHash); err != nil {
-			t.Fatalf("read live coordinator: %v", err)
-		}
-		replayRetryHash := sha256.Sum256(state.Coordinator.RetryPolicy)
-		if state.Coordinator.ID.String() != liveID || state.Coordinator.Status != liveStatus ||
-			!bytes.Equal(state.Coordinator.State, liveState) || state.Coordinator.StatePosition != liveStatePosition ||
-			state.Coordinator.StateRevision != liveStateRevision || state.Coordinator.StartPending != liveStartPending ||
-			state.Coordinator.DeliveryState != liveDeliveryState || !equalStringPointer(state.Coordinator.DeliveryKey, liveDeliveryKey) ||
-			!bytes.Equal(replayRetryHash[:], liveRetryHash) {
-			t.Fatalf("replayed coordinator differs: replay=%#v live=%s/%s/%q/%d/%d/%v/%s/%v/%x",
-				*state.Coordinator, liveID, liveStatus, liveState, liveStatePosition, liveStateRevision,
-				liveStartPending, liveDeliveryState, liveDeliveryKey, liveRetryHash)
-		}
-	}
 }
 
 func equalInt64Pointer(a, b *int64) bool {
 	return a == nil && b == nil || a != nil && b != nil && *a == *b
-}
-
-func equalStringPointer(value string, pointer *string) bool {
-	return value == "" && pointer == nil || pointer != nil && value == *pointer
 }

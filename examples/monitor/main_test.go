@@ -36,10 +36,10 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 		t.Fatalf("runExampleCommand() error = %v", err)
 	}
 	if !strings.Contains(output.String(), "external monitor observed bridge delivery") ||
-		!strings.Contains(output.String(), "bridge delivery confirmed") {
+		!strings.Contains(output.String(), "bridge delivery 0xexample confirmed") {
 		t.Fatalf("example output = %q", output.String())
 	}
-	confirmed, err := flow.ResultOf(trace, "confirm", confirmBridge)
+	confirmed, err := flow.ResultOf(trace, "root", confirmBridge)
 	if err != nil || !confirmed.Confirmed {
 		t.Fatalf("confirmation = %#v, %v", confirmed, err)
 	}

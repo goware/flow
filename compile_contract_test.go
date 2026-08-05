@@ -1,6 +1,9 @@
 package flow
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +11,59 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate flow package")
+	}
+	denied := map[string]struct{}{
+		"Plan": {}, "PlanDef": {}, "DefinePlan": {}, "Fact": {}, "Facts": {},
+		"Coordinator": {}, "Coordination": {}, "Handler": {}, "DefineCoordinator": {},
+		"OnStart": {}, "OnEvent": {}, "OnOutcome": {}, "Received": {}, "CoordinatorID": {},
+		"Outcome": {}, "OutcomeOf": {}, "ResultSource": {}, "Scope": {}, "WithCoordinatorConcurrency": {},
+	}
+	entries, err := os.ReadDir(filepath.Dir(currentFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(files, filepath.Join(filepath.Dir(currentFile), name), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		check := func(identifier *ast.Ident) {
+			if identifier == nil || !ast.IsExported(identifier.Name) {
+				return
+			}
+			if _, removed := denied[identifier.Name]; removed {
+				t.Errorf("removed package declaration %s reappeared in %s", identifier.Name, name)
+			}
+		}
+		for _, declaration := range file.Decls {
+			switch value := declaration.(type) {
+			case *ast.FuncDecl:
+				check(value.Name)
+			case *ast.GenDecl:
+				for _, specification := range value.Specs {
+					switch specification := specification.(type) {
+					case *ast.TypeSpec:
+						check(specification.Name)
+					case *ast.ValueSpec:
+						for _, identifier := range specification.Names {
+							check(identifier)
+						}
+					}
+				}
+			}
+		}
+	}
+}
 
 // TestGenericAPIMisuseDoesNotCompile keeps the most important static-safety
 // claims executable. Each fixture is a separate package so one expected type

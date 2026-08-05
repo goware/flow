@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -13,28 +14,51 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type reportArgs struct {
-	Parts int `json:"parts"`
-}
-
 type prepareReportArgs struct {
-	Parts int `json:"parts"`
+	Parts []int `json:"parts"`
 }
 
 type prepareReportResult struct {
-	Count int `json:"count"`
+	Parts int `json:"parts"`
 }
 
 type analyzePartArgs struct {
 	Part int `json:"part"`
 }
 
-type analyzePartResult struct {
+type analyzedPart struct {
+	Part  int `json:"part"`
 	Score int `json:"score"`
 }
 
+type joinAnalysisArgs struct {
+	Parts []int `json:"parts"`
+}
+
+type joinAnalysisResult struct {
+	Parts int `json:"parts"`
+}
+
+type enrichPartArgs struct {
+	Part  int `json:"part"`
+	Score int `json:"score"`
+}
+
+type enrichedPart struct {
+	Part  int `json:"part"`
+	Score int `json:"score"`
+}
+
+type joinEnrichmentArgs struct {
+	Parts []int `json:"parts"`
+}
+
+type joinEnrichmentResult struct {
+	Total int `json:"total"`
+}
+
 type generateReportArgs struct {
-	AnalysisKeys []string `json:"analysis_keys"`
+	Total int `json:"total"`
 }
 
 type generateReportResult struct {
@@ -42,19 +66,14 @@ type generateReportResult struct {
 }
 
 var (
-	analyzePart    = flow.DefineCommand[analyzePartArgs, analyzePartResult]("example.analyze_part", 1)
 	prepareReport  = flow.DefineCommand[prepareReportArgs, prepareReportResult]("example.prepare_report", 1)
+	analyzePart    = flow.DefineCommand[analyzePartArgs, flow.None]("example.analyze_part", 1)
+	joinAnalysis   = flow.DefineCommand[joinAnalysisArgs, joinAnalysisResult]("example.join_analysis", 1)
+	enrichPart     = flow.DefineCommand[enrichPartArgs, flow.None]("example.enrich_part", 1)
+	joinEnrichment = flow.DefineCommand[joinEnrichmentArgs, joinEnrichmentResult]("example.join_enrichment", 1)
 	generateReport = flow.DefineCommand[generateReportArgs, generateReportResult]("example.generate_report", 1)
-	reportPlan     = flow.DefinePlan[reportArgs]("example.report", 1, func(plan *flow.Plan, args reportArgs) {
-		prepare := flow.Execute(plan, "prepare", prepareReport, prepareReportArgs{Parts: args.Parts})
-		analysisKeys, childrenClosed := prepare.Children()
-		if !childrenClosed {
-			return
-		}
-		flow.Execute(plan, "generate", generateReport, generateReportArgs{
-			AnalysisKeys: analysisKeys,
-		}).After(analysisKeys...)
-	})
+	partAnalyzed   = flow.DefineEvent[analyzedPart]("example.part_analyzed")
+	partEnriched   = flow.DefineEvent[enrichedPart]("example.part_enriched")
 )
 
 type fanoutExample struct {
@@ -102,15 +121,16 @@ func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtim
 		flow.WithSchema(schema),
 		flow.WithWorkerConcurrency(8),
 		flow.WithPollInterval(20*time.Millisecond),
-		flow.WithPlanVerification(true),
 	)
 	if err != nil {
 		return nil, err
 	}
 	if err := runtime.Register(
-		reportPlan,
 		flow.Handle(prepareReport, example.prepareReport),
 		flow.Handle(analyzePart, example.analyzePart),
+		flow.Handle(joinAnalysis, example.joinAnalysis),
+		flow.Handle(enrichPart, example.enrichPart),
+		flow.Handle(joinEnrichment, example.joinEnrichment),
 		flow.Handle(generateReport, example.generateReport),
 	); err != nil {
 		return nil, err
@@ -131,10 +151,9 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 	}
 }
 
-// runExampleCommand executes a dynamic fan-out plan and waits for its terminal
-// trace.
+// runExampleCommand executes two command-owned fan-out/join phases.
 func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	handle, err := reportPlan.With(runtime).Execute(ctx, "report/example", reportArgs{Parts: 3})
+	handle, err := prepareReport.With(runtime).Execute(ctx, "report/example", prepareReportArgs{Parts: []int{0, 1, 2}})
 	if err != nil {
 		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
 	}
@@ -142,39 +161,75 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Executi
 	return handle, trace, err
 }
 
-// prepareReport is the planning worker handler.
+// prepareReport discovers the stable part list and atomically stages every
+// analysis plus their exact all-of join.
 func (example *fanoutExample) prepareReport(_ context.Context, work *flow.Work[prepareReportArgs]) (prepareReportResult, error) {
-	fmt.Fprintf(example.output, "planning %d report analyses\n", work.Args.Parts)
-	for part := range work.Args.Parts {
+	fmt.Fprintf(example.output, "preparing %d report analyses\n", len(work.Args.Parts))
+	seen := make(map[int]struct{}, len(work.Args.Parts))
+	join := flow.Execute(work, "analysis/join", joinAnalysis, joinAnalysisArgs{Parts: work.Args.Parts})
+	for _, part := range work.Args.Parts {
+		if _, duplicate := seen[part]; duplicate {
+			return prepareReportResult{}, flow.Permanent(fmt.Errorf("duplicate report part %d", part))
+		}
+		seen[part] = struct{}{}
 		key := fmt.Sprintf("analysis/%d", part)
 		flow.Execute(work, key, analyzePart, analyzePartArgs{Part: part})
+		join.WaitFor(partAnalyzed, key)
 	}
-	return prepareReportResult{Count: work.Args.Parts}, nil
+	return prepareReportResult{Parts: len(work.Args.Parts)}, nil
 }
 
-// analyzePart is the analysis worker handler.
-func (example *fanoutExample) analyzePart(ctx context.Context, work *flow.Work[analyzePartArgs]) (analyzePartResult, error) {
-	fmt.Fprintf(example.output, "analyzing part %d\n", work.Args.Part)
+func (example *fanoutExample) analyzePart(ctx context.Context, work *flow.Work[analyzePartArgs]) (flow.None, error) {
+	delay := time.Duration(rand.IntN(4)+1) * time.Second // simulating random amount of work
+	fmt.Fprintf(example.output, "analyzing part %d for %s\n", work.Args.Part, delay)
 	select {
 	case <-ctx.Done():
-		return analyzePartResult{}, ctx.Err()
-	case <-time.After(20 * time.Millisecond):
+		return flow.None{}, ctx.Err()
+	case <-time.After(delay):
 	}
-	return analyzePartResult{Score: work.Args.Part + 1}, nil
+	key := fmt.Sprintf("analysis/%d", work.Args.Part)
+	return flow.None{}, flow.Emit(work, partAnalyzed, key, analyzedPart{Part: work.Args.Part, Score: work.Args.Part + 1})
 }
 
-// generateReport is the final worker handler.
-func (example *fanoutExample) generateReport(_ context.Context, work *flow.Work[generateReportArgs]) (generateReportResult, error) {
-	total := 0
-	for _, key := range work.Args.AnalysisKeys {
-		analysis, err := flow.ResultOf(work, key, analyzePart)
+// joinAnalysis consumes only its declared event inputs, then stages the
+// second fan-out and its next all-of join.
+func (example *fanoutExample) joinAnalysis(_ context.Context, work *flow.Work[joinAnalysisArgs]) (joinAnalysisResult, error) {
+	join := flow.Execute(work, "enrichment/join", joinEnrichment, joinEnrichmentArgs{Parts: work.Args.Parts})
+	for _, part := range work.Args.Parts {
+		analysisKey := fmt.Sprintf("analysis/%d", part)
+		analyzed, err := flow.ReadEvent(work, partAnalyzed, analysisKey)
 		if err != nil {
-			return generateReportResult{}, err
+			return joinAnalysisResult{}, err
 		}
-		total += analysis.Score
+		enrichmentKey := fmt.Sprintf("enrichment/%d", part)
+		flow.Execute(work, enrichmentKey, enrichPart, enrichPartArgs{Part: analyzed.Part, Score: analyzed.Score})
+		join.WaitFor(partEnriched, enrichmentKey)
 	}
-	fmt.Fprintf(example.output, "generated report with score %d\n", total)
-	return generateReportResult{Total: total}, nil
+	return joinAnalysisResult{Parts: len(work.Args.Parts)}, nil
+}
+
+func (example *fanoutExample) enrichPart(_ context.Context, work *flow.Work[enrichPartArgs]) (flow.None, error) {
+	fmt.Fprintf(example.output, "enriching part %d\n", work.Args.Part)
+	key := fmt.Sprintf("enrichment/%d", work.Args.Part)
+	return flow.None{}, flow.Emit(work, partEnriched, key, enrichedPart{Part: work.Args.Part, Score: work.Args.Score})
+}
+
+func (example *fanoutExample) joinEnrichment(_ context.Context, work *flow.Work[joinEnrichmentArgs]) (joinEnrichmentResult, error) {
+	total := 0
+	for _, part := range work.Args.Parts {
+		value, err := flow.ReadEvent(work, partEnriched, fmt.Sprintf("enrichment/%d", part))
+		if err != nil {
+			return joinEnrichmentResult{}, err
+		}
+		total += value.Score
+	}
+	flow.Execute(work, "generate", generateReport, generateReportArgs{Total: total})
+	return joinEnrichmentResult{Total: total}, nil
+}
+
+func (example *fanoutExample) generateReport(_ context.Context, work *flow.Work[generateReportArgs]) (generateReportResult, error) {
+	fmt.Fprintf(example.output, "generated report with score %d\n", work.Args.Total)
+	return generateReportResult{Total: work.Args.Total}, nil
 }
 
 type synchronizedWriter struct {

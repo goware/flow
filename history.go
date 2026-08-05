@@ -13,14 +13,12 @@ import (
 type HistoryKind string
 
 const (
-	HistoryExecutionStarted      HistoryKind = "execution_started"
-	HistoryExecutionFailing      HistoryKind = "execution_failing"
-	HistoryCommandCreated        HistoryKind = "command_created"
-	HistoryAttemptStarted        HistoryKind = "attempt_started"
-	HistoryAttemptConcluded      HistoryKind = "attempt_concluded"
-	HistoryEventRecorded         HistoryKind = "event_recorded"
-	HistoryPlanReconciled        HistoryKind = "plan_reconciled"
-	HistoryCoordinatorTransition HistoryKind = "coordinator_transition"
+	HistoryExecutionStarted HistoryKind = "execution_started"
+	HistoryExecutionFailing HistoryKind = "execution_failing"
+	HistoryCommandCreated   HistoryKind = "command_created"
+	HistoryAttemptStarted   HistoryKind = "attempt_started"
+	HistoryAttemptConcluded HistoryKind = "attempt_concluded"
+	HistoryEventRecorded    HistoryKind = "event_recorded"
 )
 
 type HistoryEntry struct {
@@ -32,8 +30,6 @@ type HistoryEntry struct {
 	CausationPosition *JournalPosition
 	CommandID         CommandID
 	AttemptID         AttemptID
-	CoordinatorID     CoordinatorID
-	PlanRevision      PlanRevision
 	EventID           EventID
 	EventNamespace    string
 	EventName         string
@@ -121,12 +117,6 @@ func historyEntries(rows []store.JournalRow) []HistoryEntry {
 		}
 		if row.AttemptID != nil {
 			entry.AttemptID = AttemptID(row.AttemptID.String())
-		}
-		if row.CoordinatorID != nil {
-			entry.CoordinatorID = CoordinatorID(row.CoordinatorID.String())
-		}
-		if row.PlanRevision != nil {
-			entry.PlanRevision = PlanRevision(*row.PlanRevision)
 		}
 		if row.EventID != nil {
 			entry.EventID = EventID(row.EventID.String())

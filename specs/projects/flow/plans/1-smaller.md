@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: 3-remove-coordinator.md
 ---
 
 # Plan: make Flow smaller and lighter
+
+> Historical record: the two follow-up removal plans supersede this completed proposal. Active product behavior is defined by `3-remove-coordinator.md` and the synchronized project specifications.
 
 ## 1. Purpose
 
@@ -66,7 +70,7 @@ ResultOf / OutcomeOf
 Execute
 Emit
 Node.Optional / Node.Delay
-On / OnOutcome / OnStart
+OnEvent / OnOutcome / OnStart
 Coordination.Succeed / Coordination.Fail
 ```
 
@@ -240,7 +244,7 @@ Implementation consequences:
 - remove the derived event descriptor from `Command` definitions;
 - remove the `command_success` event namespace from the public event system;
 - reject command definitions as `WaitFor` operands;
-- remove `On(command.Done(), ...)` and success/outcome overlap validation;
+- remove the former command-terminal event selector and success/outcome overlap validation;
 - retain exactly one terminal journal event for every command;
 - retain typed successful results in `Outcome[R]` and in the journal body;
 - preserve the 256 KiB command-result limit for that terminal event.
@@ -644,7 +648,7 @@ var ResearchAgent = flow.DefineCoordinator[AgentState](
     "research_agent",
     1,
     flow.OnStart(startAgent),
-    flow.On(UserMessage, onUserMessage),
+    flow.OnEvent(UserMessage, onUserMessage),
     flow.OnOutcome(Think, onThought),
     flow.OnOutcome(RunTool, onToolOutcome),
 )

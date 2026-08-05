@@ -1,7 +1,7 @@
 -- Live-scoped execution keys and delayed direct starts.
 --
 -- key_scope 'permanent' keeps the original identity semantics: one execution
--- ever per (driver_mode, definition_name, execution_key), idempotently
+-- ever per (definition_name, execution_key), idempotently
 -- rediscovered by an equivalent start. key_scope 'live' scopes uniqueness to
 -- non-terminal executions: the key is held while its execution runs and is
 -- released when it settles, so a later start with the same key creates a new
@@ -14,15 +14,9 @@ ALTER TABLE {{schema}}.flow_executions
 DROP INDEX {{schema}}.flow_executions_idempotency_uq;
 
 CREATE UNIQUE INDEX flow_executions_idempotency_uq
-    ON {{schema}}.flow_executions (driver_mode, definition_name, execution_key)
+    ON {{schema}}.flow_executions (definition_name, execution_key)
     WHERE execution_key <> '' AND key_scope = 'permanent';
 
 CREATE UNIQUE INDEX flow_executions_live_key_uq
-    ON {{schema}}.flow_executions (driver_mode, definition_name, execution_key)
+    ON {{schema}}.flow_executions (definition_name, execution_key)
     WHERE execution_key <> '' AND key_scope = 'live' AND status IN ('running', 'failing');
-
--- 'execute_delay' schedules a direct root command's first attempt after a
--- caller-supplied delay (flow.WithStartDelay).
-ALTER TABLE {{schema}}.flow_commands DROP CONSTRAINT flow_commands_schedule_kind_ck;
-ALTER TABLE {{schema}}.flow_commands ADD CONSTRAINT flow_commands_schedule_kind_ck CHECK
-    (schedule_kind IN ('none', 'plan_delay', 'execute_delay'));

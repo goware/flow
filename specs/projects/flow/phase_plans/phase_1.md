@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Phase 1: Public Contracts and Deterministic Foundation
+
+> Historical delivery record for the original milestone. Its plan and coordinator contracts are removed; the active command/worker/event contract is defined by `../plans/3-remove-coordinator.md` and the synchronized component specifications.
 
 ## Overview
 

@@ -185,11 +185,9 @@ func AwaitExecution(ctx context.Context, c Client, id ExecutionID) (Execution, e
 
 func executionFromStore(row store.ExecutionRow) Execution {
 	return Execution{
-		ID: ExecutionID(row.ID.String()), Mode: row.Mode, Type: row.DefinitionName, Version: row.DefinitionVersion,
+		ID: ExecutionID(row.ID.String()), Type: row.DefinitionName, Version: row.DefinitionVersion,
 		Key: row.Key, Status: row.Status, FailFast: row.FailFast, MaxCommands: row.MaxCommands,
-		CommandCount: row.CommandCount, OpenCommands: row.OpenCommands, PlanDirty: row.PlanDirty,
-		PlanQuiescent: row.PlanQuiescent, PlanRevision: PlanRevision(row.PlanRevision),
-		PlanWaitingCount: row.PlanWaitingCount, PlanWaitingOn: append([]string(nil), row.PlanWaitingOn...),
+		CommandCount: row.CommandCount, OpenCommands: row.OpenCommands,
 		DeadlineAt:  cloneTimePointer(row.DeadlineAt),
 		FailureCode: row.FailureCode, FailureMessage: row.FailureMessage,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StatusAt: row.StatusAt,

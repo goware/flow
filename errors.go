@@ -71,7 +71,7 @@ func newError(category error, op, resource, id, reason string) error {
 }
 
 // Permanent classifies an application error as terminal for the current
-// command or coordinator delivery.
+// command delivery.
 func Permanent(err error) error { return failure.Permanent(err) }
 
 // RetryAfter classifies an error as retryable after a requested delay. The

@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Phase 5: Durable Graph Semantics
+
+> Historical delivery record. Its dependency-graph portions were deleted by `../plans/2-remove-plan.md`.
 
 ## Overview
 

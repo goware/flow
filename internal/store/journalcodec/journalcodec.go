@@ -16,7 +16,6 @@ import (
 type ExecutionStartedBody struct {
 	V                 int             `json:"v"`
 	ExecutionID       string          `json:"execution_id"`
-	DriverMode        string          `json:"driver_mode"`
 	DefinitionName    string          `json:"definition_name"`
 	DefinitionVersion int             `json:"definition_version"`
 	ExecutionKey      string          `json:"execution_key"`
@@ -28,58 +27,32 @@ type ExecutionStartedBody struct {
 	DeadlineAt        *time.Time      `json:"deadline_at,omitempty"`
 	MaxCommands       int             `json:"max_commands"`
 	Metadata          json.RawMessage `json:"metadata"`
-	CoordinatorID     string          `json:"coordinator_id,omitempty"`
-	CoordinatorPolicy json.RawMessage `json:"coordinator_retry_policy,omitempty"`
 }
 
 type CommandCreatedBody struct {
-	V                      int                   `json:"v"`
-	CommandID              string                `json:"command_id"`
-	CommandKey             string                `json:"command_key"`
-	Name                   string                `json:"name"`
-	Version                int                   `json:"version"`
-	Args                   json.RawMessage       `json:"args"`
-	Origin                 string                `json:"origin"`
-	ParentCommandID        string                `json:"parent_command_id,omitempty"`
-	Required               bool                  `json:"required"`
-	FailureScope           bool                  `json:"failure_scope"`
-	InitialState           string                `json:"initial_state"`
-	Queue                  string                `json:"queue"`
-	AttemptTimeoutMS       *int64                `json:"attempt_timeout_ms,omitempty"`
-	RetryPolicy            json.RawMessage       `json:"retry_policy"`
-	ScheduleKind           string                `json:"schedule_kind"`
-	InitialDelayMS         *int64                `json:"initial_delay_ms,omitempty"`
-	BudgetStartedAt        *time.Time            `json:"budget_started_at,omitempty"`
-	NextAttemptAt          *time.Time            `json:"next_attempt_at,omitempty"`
-	DeclarationFingerprint string                `json:"declaration_fingerprint"`
-	Dependencies           []DependencyGroupBody `json:"dependencies,omitempty"`
-	Waits                  []EventWaitBody       `json:"waits,omitempty"`
-	WithinMS               *int64                `json:"within_ms,omitempty"`
-}
-
-type DependencyGroupBody struct {
-	Kind    string   `json:"kind"`
-	Members []string `json:"members"`
+	V                      int             `json:"v"`
+	CommandID              string          `json:"command_id"`
+	CommandKey             string          `json:"command_key"`
+	Name                   string          `json:"name"`
+	Version                int             `json:"version"`
+	Args                   json.RawMessage `json:"args"`
+	ParentCommandID        string          `json:"parent_command_id,omitempty"`
+	Required               bool            `json:"required"`
+	InitialState           string          `json:"initial_state"`
+	Queue                  string          `json:"queue"`
+	AttemptTimeoutMS       *int64          `json:"attempt_timeout_ms,omitempty"`
+	RetryPolicy            json.RawMessage `json:"retry_policy"`
+	InitialDelayMS         *int64          `json:"initial_delay_ms,omitempty"`
+	BudgetStartedAt        *time.Time      `json:"budget_started_at,omitempty"`
+	NextAttemptAt          *time.Time      `json:"next_attempt_at,omitempty"`
+	DeclarationFingerprint string          `json:"declaration_fingerprint"`
+	Waits                  []EventWaitBody `json:"waits,omitempty"`
+	WithinMS               *int64          `json:"within_ms,omitempty"`
 }
 
 type EventWaitBody struct {
 	Name string `json:"name"`
 	Key  string `json:"key"`
-}
-
-type PlanReconciledBody struct {
-	V               int                         `json:"v"`
-	Revision        int64                       `json:"revision"`
-	ConsumedThrough int64                       `json:"consumed_through"`
-	WaitingReads    int                         `json:"waiting_reads"`
-	Quiescent       bool                        `json:"quiescent"`
-	Declarations    []PlanReconciledDeclaration `json:"declarations,omitempty"`
-}
-
-type PlanReconciledDeclaration struct {
-	Key         string `json:"key"`
-	CommandID   string `json:"command_id"`
-	Fingerprint string `json:"fingerprint"`
 }
 
 type ApplicationEventBody struct {
@@ -106,8 +79,6 @@ type AttemptStartedBody struct {
 	LeaseDurationMS  int64     `json:"lease_duration_ms"`
 	ConsumedAttempts int       `json:"consumed_attempts"`
 	BudgetStartedAt  time.Time `json:"budget_started_at"`
-	CoordinatorID    string    `json:"coordinator_id,omitempty"`
-	DeliveryKey      string    `json:"delivery_key,omitempty"`
 }
 
 type AttemptConcludedBody struct {
@@ -123,19 +94,6 @@ type AttemptConcludedBody struct {
 	NextAttemptAt    *time.Time `json:"next_attempt_at,omitempty"`
 	ErrorCode        string     `json:"error_code,omitempty"`
 	ErrorMessage     string     `json:"error_message,omitempty"`
-	CoordinatorID    string     `json:"coordinator_id,omitempty"`
-	DeliveryKey      string     `json:"delivery_key,omitempty"`
-}
-
-type CoordinatorTransitionBody struct {
-	V                  int             `json:"v"`
-	CoordinatorID      string          `json:"coordinator_id"`
-	DeliveryKey        string          `json:"delivery_key"`
-	HandledPosition    *int64          `json:"handled_position,omitempty"`
-	PriorStateRevision int64           `json:"prior_state_revision"`
-	StateRevision      int64           `json:"state_revision"`
-	State              json.RawMessage `json:"state"`
-	TerminalDecision   string          `json:"terminal_decision,omitempty"`
 }
 
 type CommandSucceededBody struct {

@@ -3,7 +3,6 @@ package flow
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -186,84 +185,6 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 	assertReplayMatches(t, runtime, successHandle.ID)
 }
 
-func TestCoordinatorStagedEventCommitsWithTerminalTransition(t *testing.T) {
-	t.Parallel()
-	database := testpg.Open(t)
-	ctx := context.Background()
-	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
-		t.Fatal(err)
-	}
-	event := DefineEvent[stagedEventPayload]("staged.coordinator_event")
-	child := DefineCommand[None, None]("staged.coordinator_child", 1)
-	var childCalls atomic.Int32
-	coordinator := DefineCoordinator[int]("staged.coordinator", 1, OnStart(func(_ context.Context, c *Coordination[int]) error {
-		c.State = 7
-		if err := Emit(c, event, "done", stagedEventPayload{Value: "accepted"}); err != nil {
-			return err
-		}
-		Execute(c, "terminal-child", child, None{}).Optional()
-		c.Succeed()
-		return nil
-	}))
-	observer := &recordingObserver{}
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithCoordinatorConcurrency(1),
-		WithPollInterval(5*time.Millisecond), WithNotifications(false), WithObserver(observer))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.Register(coordinator, Handle(child, func(context.Context, *Work[None]) (None, error) {
-		childCalls.Add(1)
-		return None{}, nil
-	})); err != nil {
-		t.Fatal(err)
-	}
-	cancel, runResult := startRuntime(t, runtime)
-	defer stopRuntime(t, cancel, runResult)
-	handle, err := coordinator.With(runtime).Execute(ctx, "terminal-event", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
-	trace, err := Trace(ctx, runtime, handle.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if trace.Coordinator == nil || string(trace.Coordinator.State) != "7" {
-		t.Fatalf("coordinator=%+v", trace.Coordinator)
-	}
-	found := false
-	for _, recorded := range trace.Events {
-		if recorded.Class == "application" && recorded.Name == event.Name() && recorded.Key == "done" {
-			found = recorded.CoordinatorID != ""
-		}
-	}
-	if !found {
-		t.Fatalf("trace events=%+v", trace.Events)
-	}
-	if childCalls.Load() != 0 || len(trace.Commands) != 1 || trace.Commands[0].Key != "terminal-child" || trace.Commands[0].State != "cancelled" {
-		t.Fatalf("terminal child calls=%d commands=%+v", childCalls.Load(), trace.Commands)
-	}
-	observations := waitForMatchingObservations(t, observer, 2, func(observation Observation) bool {
-		return observation.ExecutionID == handle.ID && observation.Operation == "settle" &&
-			(observation.Kind == ObservationEvent || observation.Kind == ObservationCoordinator)
-	})
-	for _, observation := range observations {
-		switch observation.Kind {
-		case ObservationEvent:
-			if observation.Outcome != "accepted" || observation.Name != event.Name() ||
-				observation.CommandID != "" || observation.CommandKey != "" {
-				t.Fatalf("coordinator event observation=%+v", observation)
-			}
-		case ObservationCoordinator:
-			if observation.Outcome != "succeeded" || observation.Name != coordinator.Name() ||
-				observation.Version != coordinator.Version() || observation.Count != 1 {
-				t.Fatalf("coordinator settle observation=%+v", observation)
-			}
-		}
-	}
-	assertReplayMatches(t, runtime, handle.ID)
-}
-
 func waitForMatchingObservations(t *testing.T, observer *recordingObserver, count int,
 	match func(Observation) bool) []Observation {
 	t.Helper()
@@ -288,69 +209,6 @@ func waitForMatchingObservations(t *testing.T, observer *recordingObserver, coun
 	}
 	t.Fatalf("matching observations=%d want at least %d: %+v", len(matching), count, observer.snapshot())
 	return nil
-}
-
-func TestWorkerStagedEventSatisfiesExactPlanWait(t *testing.T) {
-	t.Parallel()
-	database := testpg.Open(t)
-	ctx := context.Background()
-	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
-		t.Fatal(err)
-	}
-	event := DefineEvent[stagedEventPayload]("staged.wait_event")
-	emitter := DefineCommand[None, None]("staged.wait_emitter", 1, WithRetry(Attempts(1)))
-	waiter := DefineCommand[None, None]("staged.wait_consumer", 1, WithRetry(Attempts(1)))
-	plan := DefinePlan[None]("staged.wait_plan", 1, func(plan *Plan, _ None) {
-		Execute(plan, "emit", emitter, None{})
-		Execute(plan, "wait", waiter, None{}).WaitFor(event, "ready")
-	})
-	var waiterCalls atomic.Int32
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
-		WithPlanConcurrency(1), WithPollInterval(5*time.Millisecond), WithNotifications(false))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.Register(plan,
-		Handle(emitter, func(_ context.Context, work *Work[None]) (None, error) {
-			return None{}, Emit(work, event, "ready", stagedEventPayload{Value: "go"})
-		}),
-		Handle(waiter, func(context.Context, *Work[None]) (None, error) {
-			waiterCalls.Add(1)
-			return None{}, nil
-		}),
-	); err != nil {
-		t.Fatal(err)
-	}
-	cancel, runResult := startRuntime(t, runtime)
-	defer stopRuntime(t, cancel, runResult)
-	handle, err := plan.With(runtime).Execute(ctx, "wait", None{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
-	if waiterCalls.Load() != 1 {
-		t.Fatalf("waiter calls=%d", waiterCalls.Load())
-	}
-	trace, err := Trace(ctx, runtime, handle.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foundSatisfied := false
-	for _, command := range trace.Commands {
-		if command.Key == "wait" && command.State == "succeeded" && len(command.Waits) == 1 {
-			foundSatisfied = true
-		}
-	}
-	if !foundSatisfied {
-		t.Fatalf("trace commands=%+v", trace.Commands)
-	}
-	var satisfiedPosition *int64
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT w.satisfied_position FROM `+
-		pgschema.Table(database.Schema, "flow_command_event_waits")+` w JOIN `+
-		pgschema.Table(database.Schema, "flow_commands")+` c USING(command_id)
-		WHERE c.execution_id=$1 AND c.command_key='wait'`, handle.ID).Scan(&satisfiedPosition); err != nil || satisfiedPosition == nil {
-		t.Fatalf("satisfied position=%v err=%v", satisfiedPosition, err)
-	}
 }
 
 func TestWorkerStagedEventCoalescesOrConflictsWithDurableIdentity(t *testing.T) {

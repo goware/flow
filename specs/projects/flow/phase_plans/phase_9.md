@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Phase 9: Milestone 1 hardening and release
+
+> Historical delivery record. Current release evidence is in `../acceptance_evidence.md` and `../benchmark_evidence/remove_plan.md`.
 
 ## Goal
 

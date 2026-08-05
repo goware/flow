@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Phase 4: Distributed Command Runtime
+
+> Historical delivery record. The current runtime contract is in `../components/runtime.md`.
 
 ## Overview
 

@@ -179,10 +179,6 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 		t.Fatalf("delayed root ran after %s, before its %s delay", elapsed, delay)
 	}
 
-	plan := DefinePlan[liveKeyArgs]("livekey.plan", 1, func(*Plan, liveKeyArgs) {})
-	if _, err := plan.With(runtime).Execute(ctx, "plan/delayed", liveKeyArgs{}, WithStartDelay(delay)); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("plan start delay error = %v", err)
-	}
 }
 
 // GetQueueDepth counts one lane's deliverable, scheduled, and leased commands

@@ -3,18 +3,17 @@ package flow
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
 )
 
-// BenchmarkExecutionIngressNotification measures the commit-path cost of the
-// optional transactional hint. It intentionally does not run a listener: the
-// comparison isolates pg_notify generation/commit from handler scheduling.
 func BenchmarkExecutionIngressNotification(b *testing.B) {
 	for _, notifications := range []bool{false, true} {
 		name := map[bool]string{false: "poll_only", true: "notify"}[notifications]
@@ -39,11 +38,34 @@ func BenchmarkExecutionIngressNotification(b *testing.B) {
 	}
 }
 
-// BenchmarkCoordinatorSparseOutcomeScan10K records the adversarial idle cost
-// of an outcome-only coordinator above a long prefix of unrelated application
-// events. The execution ceiling bounds commands, not facts, so this remains a
-// useful regression workload even for ordinary M1 executions.
-func BenchmarkCoordinatorSparseOutcomeScan10K(b *testing.B) {
+// BenchmarkReadEventLookup256 measures the worker-time O(1) lookup at the
+// maximum declared-input count. No database work occurs in the benchmark.
+func BenchmarkReadEventLookup256(b *testing.B) {
+	event := DefineEvent[int]("benchmark.read_event")
+	inputs := make(map[string]eventInputSnapshot, maxCommandEventWaits)
+	for index := range maxCommandEventWaits {
+		payload, err := canonical.Marshal(index, maxApplicationEventBytes)
+		if err != nil {
+			b.Fatal(err)
+		}
+		key := fmt.Sprintf("input/%03d", index)
+		inputs[event.Name()+"\x00"+key] = eventInputSnapshot{position: int64(index + 1), payload: payload.BytesCopy()}
+	}
+	work := &Work[None]{scope: &scopeState{eventInputs: inputs}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		value, err := ReadEvent(work, event, "input/255")
+		if err != nil || value != 255 {
+			b.Fatalf("ReadEvent() = %d, %v", value, err)
+		}
+	}
+}
+
+// BenchmarkEventSnapshotMaterialization256 measures a command claim that
+// batches 256 maximum-size event payloads into one immutable worker input
+// snapshot. Setup is excluded from the timed region.
+func BenchmarkEventSnapshotMaterialization256(b *testing.B) {
 	database := testpg.Open(b)
 	ctx := context.Background()
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
@@ -53,60 +75,42 @@ func BenchmarkCoordinatorSparseOutcomeScan10K(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	coordinator := DefineCoordinator[None]("benchmark.coordinator.sparse", 1)
-	handle, err := coordinator.With(runtime).Execute(ctx, "sparse", None{}, WithoutExecutionDeadline())
-	if err != nil {
-		b.Fatal(err)
-	}
-	executionID, err := uuid.Parse(string(handle.ID))
-	if err != nil {
-		b.Fatal(err)
-	}
-	var coordinatorID uuid.UUID
-	if err := database.DB.Conn.QueryRow(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_coordinators")+`
-		SET start_pending=false,scan_position=0,delivery_state='idle',delivery_key=NULL,delivery_position=NULL
-		WHERE execution_id=$1 RETURNING coordinator_id`, executionID).Scan(&coordinatorID); err != nil {
-		b.Fatal(err)
-	}
-	if _, err := database.DB.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "flow_journal")+` (
-		execution_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,
-		event_key,event_class,body,body_hash)
-		SELECT $1::uuid,1+n,md5(($1::uuid)::text || '/entry/' || n)::uuid,'event_recorded',clock_timestamp(),
-		       md5(($1::uuid)::text || '/event/' || n)::uuid,'application','benchmark.unrelated','event/' || n,
-		       'application','{}'::text::bytea,decode(repeat('00',32),'hex')
-		FROM generate_series(1,10000) rows(n)`, executionID); err != nil {
-		b.Fatal(err)
-	}
-	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_executions")+`
-		SET next_journal_position=10002 WHERE execution_id=$1`, executionID); err != nil {
-		b.Fatal(err)
-	}
-	for _, table := range []string{"flow_journal", "flow_commands"} {
-		if _, err := database.DB.Conn.Exec(ctx, `ANALYZE `+pgschema.Table(database.Schema, table)); err != nil {
-			b.Fatal(err)
-		}
-	}
-	candidate := store.CoordinatorCandidate{CoordinatorID: coordinatorID, ExecutionID: executionID,
-		Name: coordinator.Name(), Version: coordinator.Version()}
-	selectors := []store.CoordinatorSelector{{Name: "benchmark.never", Version: 1, Outcome: true}}
-
-	b.ResetTimer()
-	for range b.N {
+	event := DefineEvent[string]("benchmark.snapshot_event")
+	command := DefineCommand[None, None]("benchmark.snapshot_command", 1)
+	payload := strings.Repeat("x", maxApplicationEventBytes-2)
+	b.ReportAllocs()
+	for index := range b.N {
 		b.StopTimer()
-		if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_coordinators")+`
-			SET scan_position=0 WHERE coordinator_id=$1`, coordinatorID); err != nil {
+		opts := make([]ExecutionOption, 0, maxCommandEventWaits+1)
+		opts = append(opts, WithoutExecutionDeadline())
+		for wait := range maxCommandEventWaits {
+			opts = append(opts, WaitFor(event, fmt.Sprintf("input/%03d", wait)))
+		}
+		handle, err := command.With(runtime).Execute(ctx, fmt.Sprintf("snapshot/%d", index), None{}, opts...)
+		if err != nil {
 			b.Fatal(err)
 		}
+		for wait := range maxCommandEventWaits {
+			if err := event.Emit(ctx, runtime, handle.ID, fmt.Sprintf("input/%03d", wait), payload); err != nil {
+				b.Fatal(err)
+			}
+		}
+		commandID, _ := uuid.Parse(string(handle.RootCommandID))
+		executionID, _ := uuid.Parse(string(handle.ID))
+		candidate := store.CommandCandidate{CommandID: commandID, ExecutionID: executionID,
+			Queue: defaultQueue, Name: command.Name(), Version: command.Version()}
 		b.StartTimer()
-		result, err := runtime.store.ClaimCoordinator(ctx, candidate, selectors, time.Minute, "benchmark", nil)
-		if err != nil || !result.Progressed || result.Coordinator != nil {
-			b.Fatalf("ClaimCoordinator() = %#v, %v", result, err)
+		result, err := runtime.store.ClaimCommand(ctx, candidate, time.Minute, "benchmark", nil)
+		if err != nil || result.Command == nil || len(result.Command.EventInputs) != maxCommandEventWaits {
+			count := 0
+			if result.Command != nil {
+				count = len(result.Command.EventInputs)
+			}
+			b.Fatalf("ClaimCommand() inputs=%d, err=%v", count, err)
 		}
 	}
 }
 
-// BenchmarkInspection100Commands measures the bounded public diagnostic paths
-// against one execution with a non-trivial graph-shaped command population.
 func BenchmarkInspection100Commands(b *testing.B) {
 	for _, operation := range []string{"history", "trace"} {
 		b.Run(operation, func(b *testing.B) {
@@ -115,40 +119,8 @@ func BenchmarkInspection100Commands(b *testing.B) {
 			if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 				b.Fatal(err)
 			}
-			runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithMaxCommandsPerExecution(0))
-			if err != nil {
-				b.Fatal(err)
-			}
-			command := DefineCommand[None, None]("benchmark.inspection.command", 1)
-			plan := DefinePlan[None]("benchmark.inspection.plan", 1, func(plan *Plan, _ None) {
-				for index := range 100 {
-					Execute(plan, fmt.Sprintf("work/%03d", index), command, None{})
-				}
-			})
-			if err := runtime.Register(plan); err != nil {
-				b.Fatal(err)
-			}
-			runCtx, cancel := context.WithCancel(ctx)
-			runResult := make(chan error, 1)
-			go func() { runResult <- runtime.Run(runCtx) }()
-			defer func() {
-				cancel()
-				<-runResult
-			}()
-			handle, err := plan.With(runtime).Execute(ctx, "inspection", None{}, WithoutExecutionDeadline())
-			if err != nil {
-				b.Fatal(err)
-			}
-			deadline := time.Now().Add(3 * time.Second)
-			for time.Now().Before(deadline) {
-				var count int
-				var dirty bool
-				if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count,plan_dirty FROM `+
-					pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).Scan(&count, &dirty); err == nil && count == 100 && !dirty {
-					break
-				}
-				time.Sleep(5 * time.Millisecond)
-			}
+			runtime, handle, stop := startHundredCommandExecution(b, database, ctx, "inspection")
+			defer stop()
 			b.ResetTimer()
 			for range b.N {
 				switch operation {
@@ -175,36 +147,8 @@ func TestJournalGrowthMeasurement100Commands(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
-		WithMaxCommandsPerExecution(0), WithPollInterval(5*time.Millisecond))
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := DefineCommand[None, None]("measure.journal.command", 1)
-	plan := DefinePlan[None]("measure.journal.plan", 1, func(plan *Plan, _ None) {
-		for index := range 100 {
-			Execute(plan, fmt.Sprintf("work/%03d", index), command, None{})
-		}
-	})
-	if err := runtime.Register(plan); err != nil {
-		t.Fatal(err)
-	}
-	cancel, result := startRuntime(t, runtime)
-	handle, err := plan.With(runtime).Execute(ctx, "journal-growth", None{}, WithoutExecutionDeadline())
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		var count int
-		var dirty bool
-		if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count,plan_dirty FROM `+
-			pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).Scan(&count, &dirty); err == nil && count == 100 && !dirty {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	stopRuntime(t, cancel, result)
+	_, handle, stop := startHundredCommandExecution(t, database, ctx, "journal-growth")
+	defer stop()
 	var rows int
 	var tupleBytes, bodyBytes int64
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*),COALESCE(sum(pg_column_size(j)),0),COALESCE(sum(octet_length(body)),0)
@@ -212,9 +156,56 @@ func TestJournalGrowthMeasurement100Commands(t *testing.T) {
 		Scan(&rows, &tupleBytes, &bodyBytes); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 102 {
-		t.Fatalf("journal rows=%d want 102", rows)
+	if rows != 402 {
+		t.Fatalf("journal rows=%d want 402", rows)
 	}
-	t.Logf("100-command declaration journal: rows=%d tuple_bytes=%d body_bytes=%d tuple_bytes_per_command=%.1f",
+	t.Logf("100-command journal: rows=%d tuple_bytes=%d body_bytes=%d tuple_bytes_per_command=%.1f",
 		rows, tupleBytes, bodyBytes, float64(tupleBytes)/100)
+}
+
+type benchmarkTB interface {
+	Helper()
+	Fatal(...any)
+}
+
+func startHundredCommandExecution(tb benchmarkTB, database testpg.Database, ctx context.Context, key string) (*Runtime, ExecutionHandle, func()) {
+	tb.Helper()
+	child := DefineCommand[None, None]("benchmark.inspection.child", 1)
+	root := DefineCommand[None, None]("benchmark.inspection.root", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+		WithMaxCommandsPerExecution(0), WithWorkerConcurrency(16), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
+			for index := range 99 {
+				Execute(work, fmt.Sprintf("work/%03d", index), child, None{})
+			}
+			return None{}, nil
+		}),
+		Handle(child, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+	); err != nil {
+		tb.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(runCtx) }()
+	handle, err := root.With(runtime).Execute(ctx, key, None{}, WithoutExecutionDeadline())
+	if err != nil {
+		cancel()
+		tb.Fatal(err)
+	}
+	deadlineCtx, deadlineCancel := context.WithTimeout(ctx, 10*time.Second)
+	settled, err := AwaitExecution(deadlineCtx, runtime, handle.ID)
+	deadlineCancel()
+	if err != nil || settled.Status != "succeeded" || settled.CommandCount != 100 {
+		cancel()
+		<-runResult
+		tb.Fatal("hundred-command execution failed", err, settled)
+	}
+	return runtime, handle, func() {
+		cancel()
+		<-runResult
+	}
 }

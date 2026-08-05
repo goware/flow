@@ -52,7 +52,7 @@ func TestExecutionInspectionAndStablePagination(t *testing.T) {
 	if err := json.Unmarshal(got.Metadata, &metadata); err != nil {
 		t.Fatalf("decode metadata: %v", err)
 	}
-	if got.ID != handles[2].ID || got.Type != command.Name() || got.Mode != "direct" || got.Status != "running" ||
+	if got.ID != handles[2].ID || got.Type != command.Name() || got.Status != "running" ||
 		got.CommandCount != 1 || got.OpenCommands != 1 || metadata["bucket"] != "0" || metadata["tenant"] != "acme" {
 		t.Fatalf("GetExecution() = %#v", got)
 	}

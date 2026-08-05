@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Phase 2: PostgreSQL Schema and Store Foundation
+
+> Historical delivery record for the original schema. The active six-table command-only schema is defined by `../plans/3-remove-coordinator.md` and `../components/schema.md`.
 
 ## Overview
 

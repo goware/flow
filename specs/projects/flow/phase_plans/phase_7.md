@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/3-remove-coordinator.md
 ---
 
 # Phase 7: Coordinators and durable agents
+
+> Historical delivery record for the removed coordinator subsystem. Coordinators are not retained; the active command-only replacement is defined by `../plans/3-remove-coordinator.md`.
 
 ## Goal
 
