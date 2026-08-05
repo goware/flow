@@ -5,9 +5,9 @@ completed_at: 2026-08-04
 
 # Implementation plan: command-only architecture
 
-## Controlling amendment
+## Controlling amendments
 
-[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. This is a pre-release breaking change; removed APIs and durable formats have no compatibility aliases or data migration.
+[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. This remains a pre-release API; removed APIs and durable formats have no compatibility aliases or data migration.
 
 ## Completed delivery
 
@@ -25,6 +25,7 @@ completed_at: 2026-08-04
 - [x] Replace coordinator benchmarks with event-input and command-only workloads.
 - [x] Synchronize README, package docs, examples, and active specifications.
 - [x] Verify formatting, static analysis, package/PostgreSQL/race tests, migration inventory, and removed-symbol scans.
+- [x] Add `Event.Deliver` by reusing external ingress, with active-worker and caller-transaction coverage.
 
 ## Product boundary
 

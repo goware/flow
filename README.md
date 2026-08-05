@@ -101,7 +101,15 @@ value, err := flow.ReadEvent(work, approved, "approval/42")
 
 Multiple waits are AND conditions. Matching is exact on event name and key within one execution. Events recorded before command declaration still satisfy the gate. `Within` starts at command creation and runs independently of `Delay`. At most 256 waits may be declared for one command; larger joins should use a tree of join commands or stable external references.
 
-External systems publish with `Event.Emit`. Workers use `flow.Emit` so their events commit atomically with their accepted result and sub-command declarations.
+Flow has three event paths:
+
+| API | Use |
+| --- | --- |
+| `flow.Emit(work, ...)` | stage an event in the current execution with the worker decision |
+| `event.Emit(ctx, client, id, ...)` | record an external event in a known execution |
+| `event.Deliver(ctx, client, id, ...)` | deliberately record a detached event in another known execution, including from an active worker |
+
+`Deliver` needs only the target execution ID. With `runtime.InTx(tx)`, it commits or rolls back with the caller's application writes; with a regular runtime client it commits independently. A committed delivery survives source failure and retry, so producers should use stable keys and deterministic payloads. Same-execution worker events should use staged `flow.Emit`: explicitly delivering to the current execution is detached and may survive a failed attempt. Delivery is targeted ingress, not publish/subscribe, and target workers remain at-least-once.
 
 Fan-out, fan-in, multi-stage joins, branches, and bounded loops are ordinary command composition. Flow intentionally has no separate coordinator/state-machine API, outcome subscriptions, OR/quorum/race gates, or automatic result dataflow.
 

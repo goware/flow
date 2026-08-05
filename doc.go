@@ -18,4 +18,9 @@
 // keeps no process-global registry. Application handlers should use stable
 // idempotency keys for external effects because invocation remains at-least-once
 // even though durable PostgreSQL progression commits exactly once.
+//
+// External callers record execution-scoped events with Event.Emit. Event.Deliver
+// provides deliberately detached ingress to a known execution, including from
+// an active worker; passing Runtime.InTx joins it to caller-owned application
+// writes. Same-execution worker events should normally use staged Emit instead.
 package flow

@@ -51,6 +51,8 @@ Worker success may atomically include application commit SQL, a result, events, 
 
 Application events live in the journal. `flow_command_event_waits` is the reverse readiness index and records each satisfying journal position. Command claim loads all declared wait rows plus the referenced application-event bodies in one bounded query. The connection is released before invocation; `ReadEvent` decodes from an immutable in-memory selector map.
 
+`Event.Emit` and `Event.Deliver` share the same target-side ingress transaction. `Emit` rejects active attempt contexts; `Deliver` deliberately permits them and remains detached from source settlement. A transaction-bound client joins delivery to caller-owned writes. No source identity, delivery record, schema object, or scheduler path is introduced.
+
 This mechanism supports sibling and cross-branch joins without a second state machine or scheduler. Commands form ownership/provenance trees; events provide synchronization.
 
 ## Failure, replay, and scaling

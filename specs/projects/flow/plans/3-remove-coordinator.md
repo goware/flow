@@ -381,6 +381,8 @@ handle, err := Confirm.With(runtime).Execute(ctx, "bridge/42", args,
 
 The worker may call `ReadEvent` to decode `BridgeDelivered`. External publishers need only an event definition and a client; they register no handlers and do not call `Run`.
 
+Plan 4 extends this retained ingress model with targeted `Event.Deliver` for application code that deliberately records an event in another known execution, including from inside an active worker. It does not restore coordinator state or another scheduler.
+
 ### 5.7 Event identity and AND gates
 
 Application-event identity remains:

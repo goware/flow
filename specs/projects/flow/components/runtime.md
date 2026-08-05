@@ -23,7 +23,7 @@ Success settlement atomically accepts commit callback SQL, result, events, sub-c
 
 ## Event ingress and readiness
 
-External `Event.Emit` canonicalizes content and performs idempotency checks. A new event appends history, resolves exact wait rows, and updates command readiness in one transaction. Worker-staged events use the same path during settlement.
+External `Event.Emit` canonicalizes content and performs idempotency checks. `Event.Deliver` uses that same target-side ingress but bypasses the active-attempt guard, allowing detached delivery to a known execution from application code inside a worker. A regular runtime client commits independently; `runtime.InTx(tx)` preserves caller commit ownership and makes delivery atomic with application writes. A new event appends history, resolves exact wait rows, and updates command readiness in one transaction. Worker-staged events use the same path during settlement.
 
 The maintenance scheduler expires unresolved wait budgets independently of initial delay. Events only release predeclared commands; they never invoke application code directly.
 
