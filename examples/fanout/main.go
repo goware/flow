@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -179,11 +180,12 @@ func (example *fanoutExample) prepareReport(_ context.Context, work *flow.Work[p
 }
 
 func (example *fanoutExample) analyzePart(ctx context.Context, work *flow.Work[analyzePartArgs]) (flow.None, error) {
-	fmt.Fprintf(example.output, "analyzing part %d\n", work.Args.Part)
+	delay := time.Duration(rand.IntN(4)+1) * time.Second // simulating random amount of work
+	fmt.Fprintf(example.output, "analyzing part %d for %s\n", work.Args.Part, delay)
 	select {
 	case <-ctx.Done():
 		return flow.None{}, ctx.Err()
-	case <-time.After(20 * time.Millisecond):
+	case <-time.After(delay):
 	}
 	key := fmt.Sprintf("analysis/%d", work.Args.Part)
 	return flow.None{}, flow.Emit(work, partAnalyzed, key, analyzedPart{Part: work.Args.Part, Score: work.Args.Part + 1})

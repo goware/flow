@@ -6,7 +6,7 @@ superseded_by: ../plans/3-remove-coordinator.md
 
 # Phase 3: Transactional Ingress and Initial Replay
 
-> Historical delivery record. The active ingress and replay contract is defined by `../plans/2-remove-plan.md`.
+> Historical delivery record for the original ingress model. The active command-only ingress and replay contract is defined by `../plans/3-remove-coordinator.md` and the synchronized component specifications.
 
 ## Overview
 

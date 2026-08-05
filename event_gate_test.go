@@ -167,6 +167,25 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	if len(trace.Commands) != 2 || optionalState != string(StatusExpired) {
 		t.Fatalf("optional expiry trace=%+v", trace.Commands)
 	}
+
+	deadline, err := parent.With(runtime).Execute(ctx, "optional/deadline", false, WithExecutionDeadline(250*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, deadline.ID, "expired", 5*time.Second)
+	deadlineTrace, err := Trace(ctx, runtime, deadline.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deadlineOptional TraceCommand
+	for _, command := range deadlineTrace.Commands {
+		if command.Key == "optional" {
+			deadlineOptional = command
+		}
+	}
+	if deadlineOptional.State != string(StatusCancelled) || deadlineOptional.FailureCode != "execution_expired" {
+		t.Fatalf("optional deadline trace=%+v", deadlineTrace.Commands)
+	}
 	if calls.Load() != 1 {
 		t.Fatalf("optional child calls=%d, want 1", calls.Load())
 	}
@@ -304,6 +323,59 @@ func TestWorkerStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 	assertReplayMatches(t, runtime, handle.ID)
 }
 
+func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	event := DefineEvent[None]("gate.required_child_completed")
+	parent := DefineCommand[None, None]("gate.required_failure_parent", 1)
+	producer := DefineCommand[None, None]("gate.required_failure_producer", 1, WithRetry(Attempts(1)))
+	join := DefineCommand[None, None]("gate.required_failure_join", 1)
+	var joinCalls atomic.Int32
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
+			Execute(work, "producer", producer, None{})
+			Execute(work, "join", join, None{}).WaitFor(event, "producer")
+			return None{}, nil
+		}),
+		Handle(producer, func(context.Context, *Work[None]) (None, error) {
+			return None{}, Permanent(errors.New("analysis failed"))
+		}),
+		Handle(join, func(context.Context, *Work[None]) (None, error) {
+			joinCalls.Add(1)
+			return None{}, nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, runResult)
+	handle, err := parent.With(runtime).Execute(ctx, "required-failure", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "failed", 5*time.Second)
+	trace, err := Trace(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := make(map[string]TraceCommand, len(trace.Commands))
+	for _, command := range trace.Commands {
+		states[command.Key] = command
+	}
+	if states["producer"].State != string(StatusFailed) || states["join"].State != string(StatusCancelled) ||
+		states["join"].FailureCode != "fail_fast" || joinCalls.Load() != 0 {
+		t.Fatalf("required failure trace=%+v join calls=%d", trace.Commands, joinCalls.Load())
+	}
+}
+
 func TestWaitCanExpireWhileInitialDelayIsPending(t *testing.T) {
 	t.Parallel()
 	database := testpg.Open(t)
@@ -341,6 +413,9 @@ func TestWaitCanExpireWhileInitialDelayIsPending(t *testing.T) {
 	}
 	if len(trace.Commands) != 1 || trace.Commands[0].State != string(StatusExpired) || trace.Commands[0].FailureCode != "wait_expired" {
 		t.Fatalf("expired gate trace=%+v", trace.Commands)
+	}
+	if err := event.Emit(ctx, runtime, handle.ID, "missing", None{}); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("late event error=%v, want ErrTerminal", err)
 	}
 	assertReplayMatches(t, runtime, handle.ID)
 }

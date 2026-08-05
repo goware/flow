@@ -81,6 +81,19 @@ func TestDecisionBufferRejectsInvalidEventGates(t *testing.T) {
 	if err := validateDecisionCommands(missing.scope.decision); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Within without WaitFor = %v", err)
 	}
+
+	empty := &Work[None]{scope: &scopeState{}}
+	Execute(empty, "child", command, decisionArgs{}).WaitFor(event, "")
+	if !errors.Is(empty.scope.firstError, ErrInvalid) {
+		t.Fatalf("empty event key poison = %v", empty.scope.firstError)
+	}
+
+	delayConflict := &Work[None]{scope: &scopeState{}}
+	Execute(delayConflict, "child", command, decisionArgs{}).Delay(time.Second)
+	Execute(delayConflict, "child", command, decisionArgs{}).Delay(2 * time.Second)
+	if !errors.Is(delayConflict.scope.firstError, ErrInvalid) {
+		t.Fatalf("repeated declaration delay poison = %v", delayConflict.scope.firstError)
+	}
 }
 
 func TestDecisionBufferEnforcesEventWaitLimit(t *testing.T) {

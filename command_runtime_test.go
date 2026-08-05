@@ -506,14 +506,21 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	stopRuntime(t, cancelRun, runResult)
 
 	takeover := DefineCommand[runtimeArgs, runtimeResult]("runtime.takeover", 1, WithRetry(Attempts(2)))
+	takeoverInput := DefineEvent[runtimeArgs]("runtime.takeover_input")
 	firstStarted := make(chan struct{}, 1)
 	releaseFirst := make(chan struct{})
+	var firstInput, secondInput atomic.Value
 	first, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
 		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(90*time.Millisecond), WithShutdownGrace(0))
 	if err != nil {
 		t.Fatalf("New(first) error = %v", err)
 	}
-	if err := first.Register(Handle(takeover, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
+	if err := first.Register(Handle(takeover, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
+		input, err := ReadEvent(work, takeoverInput, "input")
+		if err != nil {
+			return runtimeResult{}, err
+		}
+		firstInput.Store(input.Value)
 		firstStarted <- struct{}{}
 		<-releaseFirst // deliberately ignores cancellation; its stale result must be fenced.
 		return runtimeResult{Value: "stale"}, nil
@@ -521,9 +528,12 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 		t.Fatalf("Register(first) error = %v", err)
 	}
 	cancelFirst, firstResult := startRuntime(t, first)
-	handle, err := takeover.With(first).Execute(ctx, "takeover", runtimeArgs{})
+	handle, err := takeover.With(first).Execute(ctx, "takeover", runtimeArgs{}, WaitFor(takeoverInput, "input"))
 	if err != nil {
 		t.Fatalf("Execute(takeover) error = %v", err)
+	}
+	if err := takeoverInput.Emit(ctx, first, handle.ID, "input", runtimeArgs{Value: "stable"}); err != nil {
+		t.Fatalf("Emit(takeover input) error = %v", err)
 	}
 	select {
 	case <-firstStarted:
@@ -545,7 +555,12 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(second) error = %v", err)
 	}
-	if err := second.Register(Handle(takeover, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
+	if err := second.Register(Handle(takeover, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
+		input, err := ReadEvent(work, takeoverInput, "input")
+		if err != nil {
+			return runtimeResult{}, err
+		}
+		secondInput.Store(input.Value)
 		return runtimeResult{Value: "takeover"}, nil
 	})); err != nil {
 		t.Fatalf("Register(second) error = %v", err)
@@ -566,7 +581,8 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	trace, err = Trace(ctx, reader, handle.ID)
 	if err != nil || len(trace.Commands) != 1 || len(trace.Commands[0].Attempts) != 2 ||
 		trace.Commands[0].Attempts[0].Classification != "lease_lost" || trace.Commands[0].Result == nil ||
-		string(trace.Commands[0].Result) != `{"value":"takeover"}` {
+		string(trace.Commands[0].Result) != `{"value":"takeover"}` || len(trace.Commands[0].Waits) != 1 ||
+		trace.Commands[0].Waits[0].SatisfiedPosition == nil || firstInput.Load() != "stable" || secondInput.Load() != "stable" {
 		t.Fatalf("takeover Trace = %#v, %v", trace, err)
 	}
 }

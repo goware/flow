@@ -99,6 +99,17 @@ func TestRunWorkerReadsDeclaredEventInputs(t *testing.T) {
 	if err != nil || !errors.Is(missing.Err, flow.ErrInvalidState) {
 		t.Fatalf("missing event decision=%+v err=%v", missing, err)
 	}
+
+	wrongType := flow.DefineEvent[int]("flowtest.worker_input")
+	wrongRegistration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		_, err := flow.ReadEvent(work, wrongType, "input/1")
+		return testResult{}, err
+	})
+	wrong, err := flowtest.RunWorker[testArgs, testResult](context.Background(), wrongRegistration, testArgs{},
+		flowtest.WithEvent(event, "input/1", testFact{Value: "stable"}))
+	if err != nil || !errors.Is(wrong.Err, flow.ErrInvalidState) {
+		t.Fatalf("wrong event type decision=%+v err=%v", wrong, err)
+	}
 }
 func TestExternalEventIngressIsRejectedInsideAttempt(t *testing.T) {
 	event := flow.DefineEvent[testFact]("flowtest.external_in_attempt")

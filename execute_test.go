@@ -69,6 +69,51 @@ func TestExecutionStartsAndEventEmit(t *testing.T) {
 	}
 }
 
+func TestApplicationEventCannotReopenTerminalExecution(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("ingress.terminal_event", 1)
+	event := DefineEvent[string]("ingress.after_terminal")
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, runResult)
+	handle, err := command.With(runtime).Execute(ctx, "terminal-event", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
+	before, err := History(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := event.Emit(ctx, runtime, handle.ID, "late", "must not be recorded"); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("late Event.Emit() error=%v, want ErrTerminal", err)
+	}
+	after, err := History(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := GetExecution(ctx, runtime, handle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.Status != "succeeded" || len(after) != len(before) {
+		t.Fatalf("terminal execution status=%s history before=%d after=%d", execution.Status, len(before), len(after))
+	}
+}
+
 func TestCallerOwnedTransactionCommitAndRollback(t *testing.T) {
 	t.Parallel()
 
