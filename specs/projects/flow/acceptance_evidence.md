@@ -1,77 +1,91 @@
 ---
 status: complete
-recorded_at: 2026-07-29
+recorded_at: 2026-08-04
 ---
 
 # Flow acceptance evidence
 
-This matrix maps every acceptance statement in functional specification §17 to executable evidence for the smaller Flow API. PostgreSQL tests use a real PostgreSQL 17 server and an isolated schema. The four example tests call the same scenario functions as their runnable programs; Flow itself is never mocked.
+This matrix records evidence for the command/event/coordinator architecture. PostgreSQL tests create isolated schemas on a real server; the example package tests invoke the same scenario functions as the binaries.
 
-## Public surface (§17.1)
+## Public surface
 
-| Criterion | Evidence |
+| Contract | Evidence |
 |---|---|
-| All four `Execute` forms mean durable asynchronous execution | `TestExecutionStartsAndEventEmit`, `TestRuntimeExecutesDirectCommand`, `TestPlanDynamicFanOutJoinEndToEnd`, `TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion`; worker invocation occurs only in `Runtime.Run`. |
-| One in-execution command verb; no compatibility aliases | `TestGenericAPIMisuseDoesNotCompile`, `TestDecisionBufferCoalescesAndPoisonsConflicts`, and the recorded `go doc github.com/goware/flow` surface audit. |
-| Staged and external application-event APIs are distinct | `TestStagedEventsAreRecordedDeterministically`, `TestStagedEventDefectsPoisonDecisions`, `TestExternalEventIngressIsRejectedInsideAttempt`, `TestExecutionStartsAndEventEmit`; the removed-symbol audit finds no `Publish`. |
-| Events are unversioned and `EventRef` is sealed | `TestDefinitionIdentityAndBinding`, `TestDefinitionValidation`, compile-contract tests, migration/schema constraint tests, and the public documentation audit. |
-| `Node[R]` preserves typing and its modifier/read surface | `TestPlanRecorderValidatesTopologyWithoutDatabase`, `TestPlanRecorderReadAvailabilityAndDeterministicFingerprint`, `TestDecisionBufferRejectsInvalidOptions`, negative compiler fixtures. |
-| One `Outcome[R]` vocabulary | `TestResultOfAndOutcomeOfEnforceSnapshot`, `TestPlanFailureBranchAndWorkerOutcome`, `TestRunCoordinatorHandlesMixedOutcomes`, plus the removed-symbol audit. |
-| Removed advanced/overlapping APIs are absent | Public `go doc` and repository scans verify no `AfterAny`, plan retry override, `Command.Done`, external issue, exact type/key lookup, configurable jitter, or public lease option. |
-| Retry surface is `WithRetry`, `RetryFor`, and `Attempts` | `TestRetryPolicyPublicBuilders`, `internal/retry` builder/validation/decision/canonical-round-trip tests. |
-| Coordinator terminality is method-based | `TestCoordinatorTerminalDecision`, `TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion`, agent E2E, and scope-poisoning tests. |
-| `WithCommit` is the sole application-write hook | `TestRunWorkerCommitAndDirectUseProductionDecisionRecorder`, `TestRuntimeRetriesPermanentTimeoutAndCommit`, `TestCommandFaultBoundariesRecoverWithoutDuplicateProgress`, and the public surface audit. |
+| Direct commands and coordinators are the only execution starts | `definitions_test.go`, `execute_test.go`, `compile_contract_test.go`, and the repository removed-symbol scan |
+| Workers/coordinators share `flow.Execute` and non-generic `Node` | `decision_test.go`, `definitions_test.go`, `flowtest/engine_test.go` |
+| Worker inputs contain only arguments and command info | `definitions_test.go`, `decision_test.go`; `Work` no longer implements `ResultSource` |
+| Trace retains typed result/outcome lookup | `TestResultOfAndOutcomeOfEnforceSnapshot`, inspection/replay tests |
+| Staged and external event APIs are distinct | staged-event tests and `TestExecutionStartsAndEventEmit` |
 
-## Execution behavior (§17.2)
+## Exact event gates
 
-| Criterion | Evidence |
+| Contract | Evidence |
 |---|---|
-| Direct work needs no orchestration and supports another replica | `TestRuntimeExecutesDirectCommand`, `TestDirectExampleEndToEnd`, `TestRuntimeCapacityLeaseRenewalAndTakeover`. |
-| Worker child creation and membership closure are atomic | `TestRuntimeStagesDelayedChildrenAtomically`, `TestCommandFaultBoundariesRecoverWithoutDuplicateProgress`, fan-out E2E trace/history assertions. |
-| Worker/coordinator staged events share their fenced decision transaction | `TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit`, `TestCoordinatorStagedEventCommitsWithTerminalTransition`, `TestWorkerStagedEventSatisfiesExactPlanWait`, flowtest staged-event tests, agent E2E trace/history assertions. |
-| Plans are pure, monotonic, exact-keyed, and idempotently reconciled | `TestPlanRecorderValidatesTopologyWithoutDatabase`, `TestPlanLazyFactsAndDeterminismFailure`, `TestPlanSimulationAndDeterminism`, `TestPlanReconcilerRollbackLeavesDirtyForTakeover`. |
-| Missing dependency keys fail as plan defects | `TestPlanRecorderValidatesTopologyWithoutDatabase`, `TestPlanDefectFailsDurablyWithoutRunningWorker`. |
-| Every terminal command yields an available typed outcome | `TestPlanFailureBranchAndWorkerOutcome`, `TestResultOfAndOutcomeOfEnforceSnapshot`, `TestPlanImmediateSkipReconcilesFailureBranchInOneRevision`. |
-| Exact keys and both emit/wait orders work | `TestPlanAwaitPublishBeforeDeclareAndWithinExpiry`, `TestExternalMonitorExampleEndToEnd`; keyed facts are also covered by plan recorder and flowtest simulation tests. |
-| `Within` starts after command dependencies and late facts do not resurrect expiry | `TestPlanAwaitPublishBeforeDeclareAndWithinExpiry`, `TestWithinLateFactRemainsHistoryWithoutResurrectingWait`. |
-| `OnOutcome` observes every terminal state exactly once | `TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion`, `TestRunCoordinatorHandlesMixedOutcomes`, durable agent E2E. |
-| Coordinator completion is atomic and invalid combinations poison the decision | `TestCoordinatorTerminalDecision`, `TestDecisionBufferCoalescesAndPoisonsConflicts`, coordinator fault/retry and agent E2E assertions. |
-| Accepted retry timing remains stable | `TestConcurrentStartDefaultsAndCommandCeiling`, `TestRetryPolicyPublicBuilders`, retry canonical round-trip/decision tests, coordinator replay hash assertions in `TestExecutionStartsAndEventEmit`. |
+| Direct root waits for exact name/key and ignores mismatches | `TestDirectRootWaitsForExactApplicationEvent` |
+| Event and child gate can commit in one worker decision | `TestWorkerEventSatisfiesNewChildGateInSameDecision` |
+| Coordinator-staged multiple waits use AND semantics | `TestCoordinatorStagesMultipleEventGatesWithANDSemantics` |
+| Wait expiry runs independently of an initial delay | `TestWaitCanExpireWhileInitialDelayIsPending` |
+| Duplicate normalization and invalid combinations poison decisions | `TestDecisionBufferNormalizesEventGates`, `TestDecisionBufferRejectsInvalidEventGates`, `flowtest` assertions |
+| Event publication is idempotent and transaction-aware | `TestExecutionStartsAndEventEmit`, `TestCallerOwnedTransactionCommitAndRollback`, staged-event conflict tests |
 
-## PostgreSQL and distribution (§17.3)
+## Coordinators and examples
 
-| Criterion | Evidence |
+| Contract | Evidence |
 |---|---|
-| All tables are `flow_`-prefixed in the application database | `TestMigrateAndCheckSchema`, `TestSchemaConstraints`; schema audit counts exactly nine tables. |
-| Claims are capacity-bounded, skip locked work, and release connections before handlers | `TestClaimSkipsLockedRowsAndUnhandledBacklog`, `TestClaimProbeQueryPlan`, `TestRuntimeReleasesDatabaseConnectionBeforeWorker`, queue concurrency tests. |
-| Production command lease is fixed at 60 seconds | Public `go doc` has no lease option; expiry/renewal/takeover tests use only the unexported in-package seam. |
-| Notifications are hints and poll-only remains correct | `TestNotificationHintsCommitButDoNotRollback`, `TestDistributedNotificationAndReconnectCatchUp`, examples and schedulers exercised with notification and polling configurations. |
-| Stale leases cannot settle Flow or application state | `TestRuntimeCapacityLeaseRenewalAndTakeover`, `TestSettlementOutageRecoversByLeaseExpiry`, `TestCommandFaultBoundariesRecoverWithoutDuplicateProgress`. |
-| Caller transactions obey Flow-first and ascending execution order | `TestCallerOwnedTransactionCommitAndRollback`, `TestTransactionExecutionOrdering`, `internal/store.TestLockOrder`. |
-| External facts work in caller transactions without plan registration | `TestCallerOwnedTransactionCommitAndRollback`, `TestExternalMonitorExampleEndToEnd`, plan-dirty takeover tests. |
-| Split and rolling deployments work | `TestRuntimeRollingVersionLeavesUnknownWorkUnclaimed`, command/coordinator lease takeover tests, publisher/runtime separation in monitor E2E, distributed notification tests. |
+| Retained start/event/outcome delivery, retries, and completion | `TestCoordinatorHistoricalDeliveryRetryOutcomesAndCompletion` |
+| Lease takeover and scan progression are durable | coordinator lease and scan-cursor tests |
+| Terminal mutation and permanent failure are rejected/fail durably | coordinator terminal tests |
+| Dynamic fan-out/fan-in is explicit coordinator state | `examples/fanout/main.go` and its PostgreSQL package tests |
+| Event-gated external monitoring needs no coordinator | `examples/monitor/main.go` and its PostgreSQL package tests |
+| Direct and durable-agent patterns remain runnable | `examples/direct`, `examples/agent` package tests |
 
-## History and operations (§17.4)
+## Failure, fencing, and recovery
 
-| Criterion | Evidence |
+| Contract | Evidence |
 |---|---|
-| Every command has creation and exactly one terminal journal entry | `TestJournalAllocationGapFreeAndHistory`, `TestSchemaConstraints`, command runtime/fault suites, all example E2E histories. |
-| Replay reconstructs topology, attempts, facts, and terminal state | `internal/replay.TestFoldInitialProjectionAndValidation`, replay/live conformance in execution tests and all example E2E tests. |
-| `Trace` exposes graph and operational causes | `TestExecutionInspectionAndStablePagination`, command retry tests, plan/fan-out/monitor/agent E2E trace assertions. |
-| Applications use durable `ExecutionID`; listing is operational | `TestExecutionStartsAndEventEmit`, `TestExecutionInspectionAndStablePagination`, `TestTransactionScopedInspectionAndAwait`; public surface has no exact historical type/key lookup. |
-| Coordinator retry policy remains durable but not configurable | projection/replay hash assertions in `TestExecutionStartsAndEventEmit`, schema constraints, and public `go doc` audit. |
-| Four real-PostgreSQL examples pass | `TestDirectExampleEndToEnd`, `TestFanOutExampleEndToEnd`, `TestExternalMonitorExampleEndToEnd`, `TestDurableAdaptiveAgentExampleEndToEnd`. |
+| Required fail-fast cancels queued siblings | `TestRuntimeFailFastCancelsQueuedSiblings` |
+| Running attempts settle after failure; their events survive and new children cancel | `TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren` |
+| Retry, permanent errors, timeout, and commit hooks are durable | `TestRuntimeRetriesPermanentTimeoutAndCommit` |
+| Lease loss/takeover cannot duplicate progression | capacity/takeover, command fault, and settlement outage tests |
+| Cancellation concludes only the owned attempt | `TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt` |
+| Deadlines and recovery survive faults | runtime deadline and maintenance fault tests |
+| Command ceiling rejects complete batches atomically | `TestCommandCeilingRejectsWorkerAndCoordinatorBatchesAtomically` |
 
-## Release gates
+## Storage and replay
 
-The final smaller-API verification run completed with PostgreSQL integration enabled:
+| Contract | Evidence |
+|---|---|
+| Migration creates exactly seven expected tables | `TestMigrateAndCheckSchema`, `TestMigrationFSAppliesCompatibleSchema` |
+| Only direct/coordinator modes and retained command/status shapes are allowed | `TestSchemaConstraints` |
+| Journal allocation is gap-free and history bounded | `TestJournalAllocationGapFreeAndHistory`, public history tests |
+| Replay matches retained direct/coordinator semantics | `internal/replay` tests, inspection tests, runtime tests |
+| Caller transactions obey execution-first locking | `TestTransactionExecutionOrdering`, `TestLockOrder` |
+| Claim probes skip locked rows and unhandled work | `TestClaimSkipsLockedRowsAndUnhandledBacklog` |
 
-```text
+## Runtime and operations
+
+| Contract | Evidence |
+|---|---|
+| Handlers release database connections and capacity is bounded | connection-release, queue-concurrency, and capacity tests |
+| Unknown versions remain durable for compatible replicas | `TestRuntimeRollingVersionLeavesUnknownWorkUnclaimed` |
+| Notifications are hints and reconnect catches up | notification commit/rollback and reconnect tests |
+| Cooperative shutdown is retryable and budget-neutral | `TestRuntimeCooperativeShutdownIsRetryableAndBudgetNeutral` |
+| Observers are bounded and panic-isolated | `TestObserverAdapterIsBoundedAndPanicIsolated` |
+| Public inspection and pagination are stable | execution inspection and transaction-scoped inspection tests |
+
+## Performance and storage evidence
+
+Retained workload coverage is in `hardening_benchmark_test.go`: notification ingress, sparse coordinator scanning over 10K unrelated events, history/trace over 100 commands, and measured journal growth for a 100-command coordinator decision. The journal-growth test expects 104 semantic rows.
+
+The obsolete workflow-reconciliation benchmark and query-plan fixture were deleted. Claim and coordinator benchmarks remain representative of the two schedulers that ship.
+
+## Verification commands
+
+```bash
 go test ./...
-go test ./... -count=3
-go test -race ./...
+FLOW_TEST_DATABASE_URL='postgres://postgres@localhost/postgres?sslmode=disable' go test ./...
 go vet ./...
 git diff --check
 ```
 
-Targeted query-plan and workload evidence additionally runs `TestClaimProbeQueryPlan`, `TestDirtyPlanAndEventSnapshotQueryPlans`, `BenchmarkClaimProbeUnhandledHead10K`, `BenchmarkPlanReconciliation`, and `BenchmarkCoordinatorSparseOutcomeScan10K`. Repository scans verify the removed symbols and durable columns are absent, and the migration inventory contains exactly nine `flow_` tables.
+Repository scans additionally verify no removed API, runtime mode, dependency storage, journal kind, status, or active documentation claim remains outside intentionally historical specs and the controlling removal plan.

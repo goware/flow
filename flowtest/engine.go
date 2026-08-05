@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/goware/flow"
 	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/testengine"
@@ -22,6 +20,13 @@ type StagedCommand struct {
 	Args       json.RawMessage
 	Required   bool
 	StartAfter time.Duration
+	Waits      []EventWait
+	Within     time.Duration
+}
+
+type EventWait struct {
+	Name string
+	Key  string
 }
 
 type StagedEvent struct {
@@ -30,27 +35,10 @@ type StagedEvent struct {
 	Payload json.RawMessage
 }
 
-type Dependency struct {
-	value testengine.Dependency
-	err   error
-}
-
-func Succeeded[A, R any](key string, command flow.Command[A, R], result R) Dependency {
-	encoded, err := canonical.Marshal(result, 256<<10)
-	return Dependency{value: testengine.Dependency{Key: key, Name: command.Name(), Version: command.Version(),
-		Status: string(flow.StatusSucceeded), Result: encoded.BytesCopy()}, err: err}
-}
-
-func Failed[A, R any](key string, command flow.Command[A, R], code, message string) Dependency {
-	return Dependency{value: testengine.Dependency{Key: key, Name: command.Name(), Version: command.Version(),
-		Status: string(flow.StatusFailed), FailureCode: code, FailureMessage: message}}
-}
-
 type WorkerOption interface{ applyWorker(*workerOptions) }
 
 type workerOptions struct {
-	info         flow.CommandInfo
-	dependencies []Dependency
+	info flow.CommandInfo
 }
 
 type workerOptionFunc func(*workerOptions)
@@ -59,11 +47,6 @@ func (f workerOptionFunc) applyWorker(options *workerOptions) { f(options) }
 
 func WithCommandInfo(info flow.CommandInfo) WorkerOption {
 	return workerOptionFunc(func(options *workerOptions) { options.info = info })
-}
-
-func WithDependencies(values ...Dependency) WorkerOption {
-	copy := append([]Dependency(nil), values...)
-	return workerOptionFunc(func(options *workerOptions) { options.dependencies = copy })
 }
 
 type WorkerResult[R any] struct {
@@ -88,15 +71,8 @@ func RunWorker[A, R any](ctx context.Context, registration flow.Registration, ar
 	if err != nil {
 		return WorkerResult[R]{}, fmt.Errorf("flowtest: encode worker arguments: %w", err)
 	}
-	dependencies := make([]testengine.Dependency, len(options.dependencies))
-	for index, dependency := range options.dependencies {
-		if dependency.err != nil {
-			return WorkerResult[R]{}, fmt.Errorf("flowtest: encode dependency: %w", dependency.err)
-		}
-		dependencies[index] = dependency.value
-	}
 	result, err := testengine.Invoke(registration, testengine.Request{Operation: testengine.Worker, Context: ctx,
-		Args: encoded.BytesCopy(), Info: bridgeInfo(options.info), Dependencies: dependencies})
+		Args: encoded.BytesCopy(), Info: bridgeInfo(options.info)})
 	if err != nil {
 		return WorkerResult[R]{}, err
 	}
@@ -125,150 +101,6 @@ func RunCommit[A, R any](ctx context.Context, registration flow.Registration, tx
 	_, err = testengine.Invoke(registration, testengine.Request{Operation: testengine.Commit, Context: ctx,
 		Args: argsBytes.BytesCopy(), Result: resultBytes.BytesCopy(), Info: bridgeInfo(info), Tx: tx})
 	return err
-}
-
-type PlanCommand struct {
-	value testengine.PlanCommand
-	err   error
-}
-
-func SucceededCommand[A, R any](key string, command flow.Command[A, R], result R) PlanCommand {
-	encoded, err := canonical.Marshal(result, 256<<10)
-	return PlanCommand{value: testengine.PlanCommand{ID: uuid.NewString(), Key: key, Name: command.Name(),
-		Version: command.Version(), Origin: "plan", State: string(flow.StatusSucceeded), Result: encoded.BytesCopy(),
-	}, err: err}
-}
-
-func FailedCommand[A, R any](key string, command flow.Command[A, R], code, message string) PlanCommand {
-	return PlanCommand{value: testengine.PlanCommand{ID: uuid.NewString(), Key: key, Name: command.Name(),
-		Version: command.Version(), Origin: "plan", State: string(flow.StatusFailed), FailureCode: code, FailureMessage: message}}
-}
-
-type EventRef struct {
-	Namespace string
-	Name      string
-}
-
-func EventReference[T any](event flow.Event[T]) EventRef {
-	return EventRef{Namespace: "application", Name: event.Name()}
-}
-
-type PlanEvent struct {
-	value testengine.PlanEvent
-	err   error
-}
-
-func Fact[T any](position int64, event flow.Event[T], key string, payload T) PlanEvent {
-	encoded, err := canonical.Marshal(payload, 64<<10)
-	return PlanEvent{value: testengine.PlanEvent{ID: uuid.NewString(), Position: position, Namespace: "application",
-		Name: event.Name(), Key: key, Payload: encoded.BytesCopy()}, err: err}
-}
-
-type PlanWorld struct {
-	ExecutionID    flow.ExecutionID
-	Status         string
-	MaxCommands    int
-	JournalThrough int64
-	Commands       []PlanCommand
-	Events         []PlanEvent
-	KnownEvents    []EventRef
-}
-
-type Declaration struct {
-	Key          string
-	Name         string
-	Version      int
-	Args         json.RawMessage
-	Required     bool
-	Dependencies [][]string
-	Waits        []string
-	Within       time.Duration
-	Delay        time.Duration
-}
-
-type Read struct {
-	Kind         string
-	Identity     string
-	Availability string
-}
-
-type PlanResult struct {
-	Declarations []Declaration
-	Reads        []Read
-	WaitingReads int
-}
-
-// RunPlan evaluates the production pure plan recorder over one synthetic
-// immutable snapshot.
-func RunPlan[A any](plan flow.PlanDef[A], args A, world PlanWorld) (PlanResult, error) {
-	encoded, err := canonical.Marshal(args, 256<<10)
-	if err != nil {
-		return PlanResult{}, err
-	}
-	commands := make([]testengine.PlanCommand, len(world.Commands))
-	for i, command := range world.Commands {
-		if command.err != nil {
-			return PlanResult{}, fmt.Errorf("flowtest: encode plan command: %w", command.err)
-		}
-		commands[i] = command.value
-	}
-	events := make([]testengine.PlanEvent, len(world.Events))
-	for i, event := range world.Events {
-		if event.err != nil {
-			return PlanResult{}, fmt.Errorf("flowtest: encode plan event: %w", event.err)
-		}
-		events[i] = event.value
-	}
-	knownEvents := make([]testengine.EventSelector, len(world.KnownEvents))
-	for i, event := range world.KnownEvents {
-		knownEvents[i] = testengine.EventSelector{Namespace: event.Namespace, Name: event.Name}
-	}
-	result, err := testengine.Invoke(plan, testengine.Request{Operation: testengine.Plan, Args: encoded.BytesCopy(),
-		ExecutionID: string(world.ExecutionID), Status: world.Status, MaxCommands: world.MaxCommands,
-		JournalThrough: world.JournalThrough, Commands: commands, Events: events, KnownEvents: knownEvents})
-	if err != nil {
-		return PlanResult{}, err
-	}
-	output := PlanResult{WaitingReads: result.WaitingReads, Declarations: make([]Declaration, len(result.Declarations)), Reads: make([]Read, len(result.Reads))}
-	for i, declaration := range result.Declarations {
-		output.Declarations[i] = Declaration{Key: declaration.Key, Name: declaration.Name, Version: declaration.Version,
-			Args: declaration.Args, Required: declaration.Required, Dependencies: declaration.Dependencies,
-			Waits: declaration.Waits, Within: declaration.Within, Delay: declaration.Delay}
-	}
-	for i, read := range result.Reads {
-		output.Reads[i] = Read(read)
-	}
-	return output, nil
-}
-
-// Simulate returns the declaration/read projection after every supplied
-// immutable history prefix.
-func Simulate[A any](plan flow.PlanDef[A], args A, worlds ...PlanWorld) ([]PlanResult, error) {
-	result := make([]PlanResult, len(worlds))
-	for index, world := range worlds {
-		value, err := RunPlan(plan, args, world)
-		if err != nil {
-			return nil, fmt.Errorf("flowtest: simulate prefix %d: %w", index, err)
-		}
-		result[index] = value
-	}
-	return result, nil
-}
-
-func AssertPlanDeterministic[A any](t TestingT, plan flow.PlanDef[A], args A, world PlanWorld) PlanResult {
-	t.Helper()
-	first, err := RunPlan(plan, args, world)
-	if err != nil {
-		t.Fatalf("first plan evaluation: %v", err)
-	}
-	second, err := RunPlan(plan, args, world)
-	if err != nil {
-		t.Fatalf("second plan evaluation: %v", err)
-	}
-	if !reflect.DeepEqual(first, second) {
-		t.Fatalf("plan evaluation is nondeterministic:\nfirst: %#v\nsecond: %#v", first, second)
-	}
-	return first
 }
 
 type CoordinatorDelivery struct {
@@ -426,7 +258,11 @@ func publicCommands(values []testengine.StagedCommand) []StagedCommand {
 	result := make([]StagedCommand, len(values))
 	for i, value := range values {
 		result[i] = StagedCommand{Key: value.Key, Name: value.Name, Version: value.Version,
-			Args: value.Args, Required: value.Required, StartAfter: value.StartAfter}
+			Args: value.Args, Required: value.Required, StartAfter: value.StartAfter,
+			Within: value.Within, Waits: make([]EventWait, len(value.Waits))}
+		for j, wait := range value.Waits {
+			result[i].Waits[j] = EventWait{Name: wait.Name, Key: wait.Key}
+		}
 	}
 	return result
 }

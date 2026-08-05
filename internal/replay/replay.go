@@ -27,10 +27,6 @@ type Execution struct {
 	MaxCommands       int
 	CommandCount      int
 	OpenCommands      int
-	PlanDirty         bool
-	PlanQuiescent     bool
-	PlanRevision      int64
-	PlanWaitingCount  int
 	RootCommandID     *uuid.UUID
 	LastPosition      int64
 	FailureCode       string
@@ -48,32 +44,29 @@ type Execution struct {
 }
 
 type Command struct {
-	ID                    uuid.UUID
-	Key                   string
-	Name                  string
-	Version               int
-	Origin                string
-	ParentCommandID       *uuid.UUID
-	Required              bool
-	State                 string
-	Args                  []byte
-	Queue                 string
-	RetryPolicy           []byte
-	AttemptTimeoutMS      *int64
-	ScheduleKind          string
-	InitialDelayMS        *int64
-	BudgetStartedAt       *time.Time
-	NextAttemptAt         *time.Time
-	Dependencies          []journalcodec.DependencyGroupBody
-	Waits                 []journalcodec.EventWaitBody
-	WithinMS              *int64
-	ChildMembershipClosed bool
-	CreatedPosition       int64
-	TerminalPosition      *int64
-	Result                []byte
-	FailureCode           string
-	FailureMessage        string
-	Attempts              []Attempt
+	ID               uuid.UUID
+	Key              string
+	Name             string
+	Version          int
+	Origin           string
+	ParentCommandID  *uuid.UUID
+	Required         bool
+	State            string
+	Args             []byte
+	Queue            string
+	RetryPolicy      []byte
+	AttemptTimeoutMS *int64
+	InitialDelayMS   *int64
+	BudgetStartedAt  *time.Time
+	NextAttemptAt    *time.Time
+	Waits            []journalcodec.EventWaitBody
+	WithinMS         *int64
+	CreatedPosition  int64
+	TerminalPosition *int64
+	Result           []byte
+	FailureCode      string
+	FailureMessage   string
+	Attempts         []Attempt
 }
 
 type Attempt struct {
@@ -169,7 +162,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.StatusAt = row.RecordedAt
 		state.FailFast = body.FailFast
 		state.MaxCommands = body.MaxCommands
-		state.PlanDirty = state.DriverMode == store.DriverPlan
 		state.Input = slices.Clone(body.Input)
 		state.Metadata = slices.Clone(body.Metadata)
 		state.DeadlineAt = pointerClone(body.DeadlineAt)
@@ -209,9 +201,9 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			Origin: body.Origin, Required: body.Required, State: body.InitialState,
 			Args: slices.Clone(body.Args), Queue: body.Queue, RetryPolicy: slices.Clone(body.RetryPolicy),
 			AttemptTimeoutMS: pointerClone(body.AttemptTimeoutMS), CreatedPosition: row.Position,
-			ScheduleKind: body.ScheduleKind, InitialDelayMS: pointerClone(body.InitialDelayMS),
+			InitialDelayMS:  pointerClone(body.InitialDelayMS),
 			BudgetStartedAt: pointerClone(body.BudgetStartedAt), NextAttemptAt: pointerClone(body.NextAttemptAt),
-			Dependencies: slices.Clone(body.Dependencies), Waits: slices.Clone(body.Waits), WithinMS: pointerClone(body.WithinMS),
+			Waits: slices.Clone(body.Waits), WithinMS: pointerClone(body.WithinMS),
 		}
 		if body.ParentCommandID != "" {
 			parentID, err := uuid.Parse(body.ParentCommandID)
@@ -354,19 +346,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Status = "failing"
 		state.StatusAt = row.RecordedAt
 
-	case store.PlanReconciled:
-		body, err := journalcodec.Decode[journalcodec.PlanReconciledBody](row.Body)
-		if err != nil {
-			return err
-		}
-		if row.PlanRevision == nil || body.Revision != *row.PlanRevision || body.Revision != state.PlanRevision+1 {
-			return errors.New("PlanReconciled revision is not contiguous")
-		}
-		state.PlanRevision = body.Revision
-		state.PlanDirty = false
-		state.PlanQuiescent = body.Quiescent
-		state.PlanWaitingCount = body.WaitingReads
-
 	case store.CoordinatorTransition:
 		if state.Coordinator == nil || row.CoordinatorID == nil || *row.CoordinatorID != state.Coordinator.ID {
 			return errors.New("CoordinatorTransition has invalid subject")
@@ -409,11 +388,8 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Events = append(state.Events, event)
 		switch *row.EventClass {
 		case "application":
-			// Application facts affect plans/coordinators, not the settled
-			// execution or command projection represented in this phase.
-			if state.DriverMode == store.DriverPlan {
-				state.PlanDirty = true
-			}
+			// Application facts affect exact command gates and coordinators;
+			// those readiness projections are reconstructed from retained rows.
 		case "command_terminal":
 			if row.CommandID == nil || row.TerminalStatus == nil {
 				return errors.New("command terminal event has no subject or status")
@@ -430,7 +406,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 					return err
 				}
 				command.Result = slices.Clone(body.Result)
-				command.ChildMembershipClosed = true
 			} else {
 				body, err := journalcodec.Decode[journalcodec.TerminalEventBody](row.Body)
 				if err != nil {
@@ -444,10 +419,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			}
 			state.Commands[*row.CommandID] = command
 			state.OpenCommands--
-			if state.DriverMode == store.DriverPlan {
-				state.PlanDirty = true
-				state.PlanQuiescent = false
-			}
 		case "execution_terminal":
 			if row.TerminalStatus == nil {
 				return errors.New("execution terminal event has no status")
@@ -455,7 +426,6 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			state.Status = *row.TerminalStatus
 			state.StatusAt = row.RecordedAt
 			state.FinishedAt = pointer(row.RecordedAt)
-			state.PlanDirty = false
 			if *row.TerminalStatus != "succeeded" {
 				body, err := journalcodec.Decode[journalcodec.TerminalEventBody](row.Body)
 				if err != nil {
@@ -498,7 +468,7 @@ func pointerClone[T any](value *T) *T {
 
 func isTerminal(state string) bool {
 	switch state {
-	case "succeeded", "failed", "cancelled", "expired", "skipped":
+	case "succeeded", "failed", "cancelled", "expired":
 		return true
 	default:
 		return false

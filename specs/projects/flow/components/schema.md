@@ -4,298 +4,150 @@ status: complete
 
 # Component: PostgreSQL storage and journal
 
-## 1. Purpose
+## Purpose
 
-The store owns Flow's durable authority: migrations, constraints, indexes, ordered semantic transactions, queue materialization, graph/wait rows, fencing, idempotency, journal append, projections, and inspection queries.
+The store is Flow's durable authority. It owns migrations, constraints, indexes, semantic transactions, queues, exact wait rows, fencing, idempotency, the immutable journal, and inspection projections.
 
-All tables use the `flow_` prefix and live in the application's PostgreSQL database/schema.
+All objects use the `flow_` prefix in the selected application schema.
 
-## 2. Storage rules
+## Storage invariants
 
-1. Every semantic mutation belongs to exactly one execution and locks its execution row first.
-2. Journal positions are allocated under that lock and are gap-free/commit-ordered per execution.
-3. Mutable projections and immutable journal rows commit together.
-4. Queue/lease churn is isolated from immutable command identity and results.
-5. Claims use only no-wait `SKIP LOCKED` locks.
-6. All durable times come from PostgreSQL after required locks.
-7. Canonical bodies and hashes make retries comparable without application callbacks.
-8. Constraints reject impossible local row shapes; store code validates cross-row invariants.
+1. A semantic mutation locks its execution row first.
+2. Journal positions are gap-free and commit-ordered per execution.
+3. Immutable journal entries and mutable projections commit together.
+4. Queue/lease churn is separate from immutable command identity and result.
+5. Claim probes use no-wait `SKIP LOCKED` behavior.
+6. Durable timestamps come from PostgreSQL after required locks.
+7. Canonical bodies and hashes make retries comparable.
+8. Constraints reject impossible local row shapes; store code validates cross-row transitions.
 
-## 3. Table inventory
+## Seven-table inventory
 
 | Table | Responsibility |
 |---|---|
-| `flow_executions` | execution identity, mode, counters, deadline, plan dirty/lease fields, terminal state |
-| `flow_commands` | immutable command identity/config plus current lifecycle/result/fence state |
-| `flow_command_queue` | hot claim projection: eligible time, priority, queue, lease locality fields |
-| `flow_command_dependency_groups` | normalized all-succeeded/all-settled/all-failed groups |
-| `flow_command_dependency_members` | predecessor membership and reverse lookup |
-| `flow_command_event_waits` | exact application-event waits and durable wait deadlines |
-| `flow_coordinators` | durable state, inbox, lease, persisted delivery retry policy/state |
-| `flow_journal` | immutable ordered execution history |
-| `flow_schema_migrations` | embedded migration ledger |
+| `flow_executions` | execution identity, mode, counters, deadline, status, idempotency |
+| `flow_commands` | immutable declaration plus current semantic command state/result |
+| `flow_command_queue` | claim eligibility, active attempt, lease, and retry timing |
+| `flow_command_event_waits` | exact event selectors and satisfaction positions |
+| `flow_coordinators` | typed state, inbox cursor, delivery, retry, and lease state |
+| `flow_journal` | immutable ordered semantic history and retained events |
+| `flow_schema_migrations` | checksummed migration and compatibility records |
 
-No table is merged merely to reduce count: their access patterns, mutation rates, and indexes differ materially.
+The only execution driver modes are `direct` and `coordinator`.
 
-## 4. Execution rows
+## Executions
 
-Important fields:
+Execution rows store definition identity, permanent/live key scope, start fingerprint/input, metadata, fail-fast flag, deadline, command ceiling/counters, journal allocator, optional root command, failure, and timestamps.
 
-- UUID primary key;
-- driver mode `direct|plan|coordinator`;
-- definition name/version and canonical start input;
-- stable/live key scope and start fingerprint;
-- status `running|failing|succeeded|failed|cancelled|expired`;
-- fail-fast, deadline, metadata, max/accepted command count;
-- open/required-failed/waiting counters;
-- next journal position;
-- terminal journal position and timestamps;
-- plan dirty, dirty-since, quiescent, reconciliation revision/lease fields;
-- created/updated PostgreSQL times.
+Statuses are `running`, `failing`, `succeeded`, `failed`, `cancelled`, and `expired`. Permanent keys have a partial unique index across all executions; live keys are unique only across running/failing executions.
 
-There is no `outcome_ref`. Typed final command results and application tables own result references.
+## Commands
 
-Stable start uniqueness is `(driver,name,key)` for non-empty stable keys plus start-fingerprint equivalence. Live keys use a partial live-row ownership relation released on terminality. Empty keys create distinct executions.
-
-Terminal rows satisfy terminal-position/time and clean-plan constraints. Counters are non-negative. Plan fields are null/default for other modes.
-
-## 5. Command rows
-
-Immutable fields include execution ID, command ID/key, name/version, origin, parent, required flag, canonical arguments/hash, accepted retry policy/hash, timeout, queue, creation position/time, and initial schedule/budget anchor.
-
-Mutable fields include lifecycle state, result/failure, invocation and consumed-attempt counts, next-attempt time, running attempt ID/token/start/lease expiry, child-membership closure, terminal position/time, and update time.
+Command rows store execution/key identity, definition, origin, optional parent, required flag, canonical arguments/fingerprint, semantic state, queue/retry/timeout settings, initial delay, wait timing, attempt counters, result/failure, journal positions, and timestamps.
 
 Origins are:
 
 - `direct_root`;
-- `plan`;
 - `worker_child`;
 - `coordinator_command`.
 
-No `external_issue` origin exists. One `(execution_id,command_key)` is unique. One terminal position per command is unique and references its terminal journal subject logically.
+States are `pending`, `ready`, `running`, `retry_wait`, `succeeded`, `failed`, `cancelled`, and `expired`. Pending requires unresolved waits. Terminal states require terminal position/time, and only success stores result bytes/hash.
 
-The accepted policy includes fixed effective jitter and never changes because a replica redeploys. `BudgetStartedAt` is immutable once first eligible. `NextAttemptAt` may move.
+Each `(execution_id, command_key)` is unique. Parent identity is present only for worker-created children.
 
-## 6. Command queue
+## Command queue
 
-One queue row exists only while a command is claimable now or later. It stores command/execution IDs, queue name, priority, eligible time, and optional affinity hint. It does not duplicate results, dependencies, or event selectors.
+Queue rows exist only for ready, retry-wait, or running commands. They duplicate the minimum claim dimensions: command/execution IDs, definition version, queue, next run time, and active lease fence.
 
-The claim index begins with queue and eligible time and includes a stable tie-breaker. Partial predicates exclude terminal/running commands through maintained row existence/state rather than volatile expressions.
+Ready/retry claims use an index over definition, time, queue, and command ID. Lease recovery uses a separate partial expiry index. Deleting a queue row cannot delete immutable command/history state.
 
-Queue creation/deletion always occurs in the same semantic transaction as the lifecycle change that makes it necessary/unnecessary.
+## Exact event waits
 
-## 7. Dependency groups and members
+Each row is keyed by `(command_id,event_name,event_key)` and records its execution plus optional satisfying journal position. A reverse partial index finds unresolved matches when an application event arrives.
 
-Group rows contain command ID, stable group ordinal, and kind restricted to:
+At command creation, the store checks retained application events before calculating `unsatisfied_waits`. The command row owns `wait_started_at`, optional `wait_deadline_at`, and `wait_timeout_ms`. Delay and wait timing remain independent.
 
-- `all_succeeded`;
-- `all_settled`;
-- `all_failed`.
+## Coordinators
 
-There is no threshold column or quorum kind.
+One coordinator row belongs to one coordinator execution. It stores name/version, canonical state/revision/position, start-pending flag, monotonic inbox and scan positions, current delivery identity, retry counters, lease fence, status, and timestamps.
 
-Member rows map each group to predecessor command ID/key. Unique membership prevents duplicate edges. Reverse index `(predecessor_command_id,group_id)` supports terminal resolution; `(command_id,group_id)` supports trace/snapshot loads.
+Partial indexes support ready delivery claims, idle retained-history scanning, and expired-lease recovery. Coordinator status is `active`, `completed`, `failed`, or `cancelled`.
 
-Unknown forward references are resolved within one accepted plan batch before insertion. Missing references reject the entire reconciliation.
+## Journal
 
-## 8. Exact event waits
+The primary key is `(execution_id,position)`. Each entry has a globally unique entry ID, kind, PostgreSQL time, optional causation position, typed subject columns, canonical body, and hash.
 
-Each row contains execution ID, command ID, application event name, non-empty event key, optional satisfied journal position, optional wait-start time, and optional persisted deadline.
+Kinds are:
 
-Primary/unique identity is `(command_id,event_name,event_key)`. Reverse lookup index begins `(execution_id,event_name,event_key)` and includes unresolved command ID. No event namespace or version is needed because only application `Event[T]` can be a wait operand.
+- `execution_started`;
+- `execution_failing`;
+- `command_created`;
+- `attempt_started`;
+- `attempt_concluded`;
+- `event_recorded`;
+- `coordinator_transition`.
 
-Wait state constraints enforce:
+Event classes are application, command terminal, execution terminal, and coordinator terminal. Unique partial indexes enforce one command-created event, terminal events, attempt boundaries, and exact application-event identity.
 
-- unsatisfied rows have null satisfied position;
-- deadline is null until wait starts;
-- `Within` creates one deadline only after command dependencies satisfy;
-- terminal commands leave no active unresolved wait.
+The journal is also retained event storage. There is no separate application-event table.
 
-## 9. Coordinator rows
+## Start transactions
 
-One row per coordinator execution stores coordinator ID, name/version, canonical state/hash, inbox position, start-pending flag, state revision, running delivery key/position, attempt/token/lease fields, retry state, accepted canonical `retry_policy` and `retry_policy_hash`, terminal/failure fields, and timestamps.
+A start checks permanent/live identity, compares fingerprints where required, locks or creates the execution, appends `ExecutionStarted`, and creates either a root command or coordinator row.
 
-The stored policy remains even though M1 exposes no public coordinator retry option. Without it, restart or rolling deployment could reinterpret an active delivery.
+Root command creation records exact waits, resolves any retained matching events, derives pending/ready/delayed state, inserts queue state if eligible, increments counters, and appends `CommandCreated` in the same transaction.
 
-Inbox advances only with the matching committed state transition. One lease token fences all coordinator writes.
+## Command settlement
 
-## 10. Journal
+Success settlement:
 
-Columns include:
+1. locks execution, command, and fenced queue state;
+2. validates the active attempt;
+3. runs the optional application commit callback;
+4. canonicalizes and appends staged application events;
+5. creates staged children in stable key order;
+6. records attempt conclusion and command terminal event;
+7. resolves waits/readiness and execution failure/completion;
+8. mutates projections and removes the active queue row.
 
-- execution ID and positive position primary key;
-- globally unique journal entry ID;
-- PostgreSQL recorded time;
-- kind and canonical body/hash;
-- causation entry/command/event IDs where applicable;
-- command, attempt, coordinator subject IDs;
-- application event ID/name/key for staged or externally ingressed facts;
-- event/terminal classification fields needed by indexed matching;
-- definition name/version where useful for projections.
+If the execution is already failing, new child declarations from a surviving attempt are inserted and immediately cancelled, while its accepted result/events/commit remain durable.
 
-Application event rows have name/key and no event version. Runtime terminal rows use command/attempt subjects and kinds, not a public command-success namespace.
+Failure settlement chooses retry or terminal failure from policy/classification. Terminal required failure can record `ExecutionFailing` and cancel non-running work in the same transaction.
 
-Partial unique indexes enforce:
+## Coordinator settlement
 
-- one `CommandCreated` per command;
-- one terminal event per command;
-- one application event identity `(execution_id,event_name,event_key)`;
-- one execution terminal event;
-- one plan reconciliation revision;
-- stable coordinator delivery/transition identity.
+Coordinator claim and settlement use a delivery/lease fence separate from command attempts. Accepted settlement updates state, stages event/command batches, advances inbox, records the transition, and optionally terminalizes coordinator/execution atomically.
 
-Journal bodies are canonical bounded JSON. Indexed columns repeat only fields required for idempotency, selection, and inspection.
+Unmatched retained entries advance the scan cursor without handler invocation. Matched but unaccepted inputs remain deliverable across crashes.
 
-## 11. Journal body contracts
+## Event ingress
 
-- `ExecutionStarted`: mode, definition/version, key scope, canonical input/initial state, deadline, fail-fast, command ceiling, metadata, accepted coordinator policy when applicable.
-- `CommandCreated`: key, definition/version, arguments, origin, parent, required flag, normalized dependencies/waits, accepted absolute initial schedule, retry/timeout/queue, causation.
-- attempt entries: attempt ID/ordinal, database times, conclusion classification, consumed count, next schedule where applicable.
-- application event: event name/key and canonical payload.
-- command terminal: status, typed result or structured failure.
-- `PlanReconciled`: revision, snapshot position, quiescence, accepted command keys/fingerprints.
-- coordinator transition: prior/new revision, delivered position, state hash/body, and terminal intent; staged events and commands are separate causally linked entries in the same batch.
-- execution terminal: final status and structured reason.
+External event ingress first checks exact identity for idempotency, then locks the execution and rechecks. A new canonical application event is appended, matching unresolved wait rows receive its position, affected command readiness is recalculated, and coordinator discovery is hinted.
 
-`PlanReconciled` never duplicates full command arguments. `CommandCreated` is their authoritative historical record.
+Equivalent repeats succeed even if the execution later terminalized. Conflicting repeats fail. New events cannot be added to a terminal execution.
 
-## 12. Ordered semantic transaction
+## Maintenance
 
-`SemanticTx` owns:
+Bounded indexed maintenance handles:
 
-- caller/library transaction handle;
-- locked execution row and captured database now;
-- next journal position cursor;
-- deterministic journal batch;
-- greatest execution ID locked in caller-owned composition;
-- projection/queue/graph mutation helpers.
+- expired command and coordinator leases;
+- unresolved event-wait deadlines;
+- execution deadlines;
+- coordinator retained-input discovery;
+- completion after derived transitions.
 
-Opening a semantic transaction locks the execution row and checks ascending ID order. Appending N entries reserves the next N positions in memory and updates the execution counter once. Bodies and projections are written before commit; notification hints are sent transactionally last.
+Every semantic maintenance change uses the same execution lock/journal rules.
 
-The store exposes narrow operations for start, event emit, cancellation, claim, settle, plan snapshot/reconcile, coordinator claim/settle, maintenance, and inspection. No caller assembles SQL categories ad hoc.
+## Inspection and replay
 
-## 13. Idempotent start
+Point lookup uses execution primary keys. Listing uses bounded indexed filters and keyset cursors. History scans `(execution_id,position)`. Trace folds the journal under repeatable read and loads operational command/coordinator fields in bounded queries.
 
-Start first searches the appropriate stable/live-key identity. If found, it verifies start fingerprint for stable keys and returns the existing handle. Live-key repetition returns the current live handle according to live-dedupe semantics. A new start locks/creates identity, appends `ExecutionStarted`, creates root/coordinator state where applicable, and marks plan dirty where applicable.
+Replay rejects invalid kind/body/transition shapes and is tested against live projections. Operational queue and lease changes do not alter semantic replay.
 
-An ambiguous client response is recovered by repeating identical `Execute`; no type/key lookup API is required.
+## Migration policy
 
-## 14. Event emission
+This pre-release refactor edits the baseline schema and recreates development/test schemas. Removed workflow projection and command-relationship formats receive no compatibility columns or data conversion. `CheckSchema` verifies the exact two checksummed migrations and the seven expected tables.
 
-`Event.Emit` first checks existing `(execution,name,key)` before terminal rejection. Equivalent canonical body returns success; disagreement conflicts. A new fact then locks the running execution, rechecks identity, appends the journal row, resolves exact wait rows, sets plan dirty when applicable, and updates coordinator wake eligibility.
+## Verification
 
-Two concurrent first emissions serialize on the execution lock and unique index. Unique violations are mapped back through the semantic equality check, never exposed as raw SQL ambiguity.
-
-`flow.Emit` uses the same application-event row shape but performs no ingress SQL. Worker/coordinator settlement sorts staged identities, coalesces equivalent durable rows, rejects conflicts, assigns positions in the shared semantic batch, resolves matching waits, and commits their projections atomically with the enclosing decision.
-
-## 15. Command creation batch
-
-All command-producing paths call one batch primitive with distinct internal origins. Under the execution lock it:
-
-1. resolves keys against existing commands and within-batch declarations;
-2. validates equivalence and ownership;
-3. checks command ceiling before writing any member;
-4. assigns command IDs and `CommandCreated` positions deterministically;
-5. inserts immutable command rows;
-6. inserts dependencies and exact waits;
-7. derives pending/ready/delayed/skipped state;
-8. inserts queue rows where needed;
-9. updates execution counters;
-10. returns created/existing IDs.
-
-Worker batches additionally set one parent and close its membership atomically. Plan batches carry normalized dependency records. Coordinator batches share the transition/inbox transaction.
-
-## 16. Claim and fencing SQL
-
-### 16.1 Command claim
-
-The probe selects a bounded eligible set by queue and registered name/version, then locks queue and command rows with `FOR UPDATE SKIP LOCKED`. It updates state/token/lease and appends attempt history in the same short transaction.
-
-The claim path never blocks on an execution lock and is exempt from semantic blocking order. If later semantic attempt-start journaling requires the execution lock, candidates whose execution is locked are skipped/no-wait rather than held while waiting.
-
-### 16.2 Renewal
-
-Renewal is one fenced update matching command ID, running state, attempt ID, and token. It returns renewed IDs. No journal row is written for heartbeat.
-
-### 16.3 Settlement
-
-Settlement locks execution then command, verifies fence, and applies the engine change set. Token mismatch returns lease lost without writes. The registered application commit function executes only after fence validation and Flow-owned locks/writes.
-
-## 17. Plan storage operations
-
-Dirty probe uses a partial index over non-terminal plan rows with `plan_dirty=true` ordered by dirty-since/ID and `SKIP LOCKED`. Claim stores plan lease token/expiry.
-
-Snapshot loads are bounded batched queries for execution, commands, dependencies, waits, terminal values, child membership, and lazily selected application events. There is no plan-read table.
-
-Reconciliation re-locks/validates lease, inserts command delta through the batch primitive, appends `PlanReconciled`, increments revision, sets quiescence, and clears dirty only if no later trigger exists under the same lock.
-
-## 18. Coordinator selection
-
-Selection finds the earliest matching position above inbox from:
-
-- application event rows matching registered event names;
-- command terminal rows joined to command name/version for `OnOutcome`.
-
-Indexes support `(execution,event_name,position)` and `(execution,command_name,command_version,terminal_position)` shapes so sparse subscriptions do not re-filter an unmatched prefix indefinitely.
-
-Claim writes delivery identity/token/lease. Settlement verifies token and inbox, writes state/commands/terminality, appends transition, and advances inbox once.
-
-## 19. Maintenance
-
-Bounded maintenance uses partial indexes and skip-locked claims for:
-
-- expired command leases;
-- expired coordinator/plan leases;
-- due retry/delay queue rows;
-- exact event wait deadlines;
-- execution deadlines.
-
-Each winning transition locks execution, rechecks predicates against PostgreSQL now, journals once, and updates projections. Repetition is harmless.
-
-## 20. Inspection
-
-`GetExecution` uses primary key. `ListExecutions` requires bounded filters/order/page size and supporting indexes; it is not a point-identity API. `History` scans `(execution_id,position)` only. `Trace` batches by execution and uses parent/dependency/wait/attempt indexes rather than N+1 queries.
-
-Payload bodies are optional in inspection query shapes and redacted by default where APIs permit.
-
-## 21. Migrations
-
-The implementation is pre-release. The reduced design edits the initial migration in place and recreates development/test schemas unless a preserved external database is declared before work. Migration checksums and schema-version rows detect incompatible binaries.
-
-Required reduction:
-
-- remove event-version columns, constraints, indexes, and codecs;
-- remove `outcome_ref`;
-- remove dependency threshold;
-- remove external-issue origin;
-- replace spawn origin names with worker/coordinator command origins;
-- remove command-success application-event selector namespace;
-- retain coordinator retry policy/hash;
-- retain exactly nine prefixed tables.
-
-## 22. Error mapping
-
-Constraint/SQL errors map to stable Flow categories. Unique violations trigger semantic reread where equivalence matters. Lock-not-available/no-row fence cases map to lease/invalid-state errors. Caller transactions receive retryable PostgreSQL errors rather than hidden retries that could repeat caller application work.
-
-## 23. Growth and retention
-
-Hot tables (`flow_command_queue`, running fields, coordinator lease fields) receive benchmark-driven fillfactor/autovacuum tuning. Journal is append-only and expected to dominate size. M1 retains indefinitely; growth evidence records bytes per command/attempt/fact and vacuum behavior.
-
-Future retention removes complete terminal executions only under an explicit coordinated policy. Payload-body thinning may precede causal-skeleton deletion but must record the resulting loss of historical decode/simulation guarantees.
-
-## 24. Test and benchmark plan
-
-DDL tests verify every check, unique/foreign key, partial index, and row shape. Concurrency tests cover start/event idempotency, command batches, gap-free ordering, claim no-wait behavior, fence races, wait/deadline races, plan dirty clear, coordinator inbox, cancellation, and caller lock order.
-
-Replay tests compare every semantic path to projections. Query-plan evidence covers 10K/1M/10M representative rows for claim, dirty plan, exact waits, coordinator outcome matching, history, and trace.
-
-## 25. Acceptance conditions
-
-- Fresh migration creates exactly the nine documented `flow_` tables.
-- No event-version, threshold, `outcome_ref`, external-issue, or command-success-selector storage remains; staged events reuse ordinary application-event journal rows.
-- Coordinator retry policy/hash remain durable.
-- Journal positions are gap-free and commit-ordered per execution.
-- Every projection change shares a transaction with its journal cause.
-- Claims and maintenance use bounded indexed/no-wait shapes.
-- Exact event idempotency and wait resolution are race-safe.
-- Replay reconstructs stored settled state after every write path.
+DDL tests exercise constraints, indexes, idempotency, lock order, claim behavior, fences, wait/event races, deadlines, reduced fail-fast, coordinator inboxes, replay conformance, and caller transactions. Query/workload tests cover command claims, exact wait lookup, coordinator scanning, history/trace, journal growth, and multi-replica takeover.

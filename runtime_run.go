@@ -270,7 +270,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	serviceCtx, stopServices := context.WithCancel(context.Background())
 	var services sync.WaitGroup
-	serviceCount := 2 + r.planConcurrency + r.coordinatorConcurrency
+	serviceCount := 2 + r.coordinatorConcurrency
 	if r.notifications {
 		serviceCount++
 	}
@@ -287,12 +287,6 @@ func (r *Runtime) Run(ctx context.Context) error {
 		go func() {
 			defer services.Done()
 			r.runNotificationListener(serviceCtx)
-		}()
-	}
-	for range r.planConcurrency {
-		go func() {
-			defer services.Done()
-			r.runPlanScheduler(serviceCtx)
 		}()
 	}
 	for range r.coordinatorConcurrency {

@@ -59,13 +59,6 @@ func TestStagedEventDefectsPoisonDecisions(t *testing.T) {
 		t.Fatalf("decision error=%v", decision.Err)
 	}
 
-	plan := flow.DefinePlan[testArgs]("flowtest.plan_emit", 1, func(plan *flow.Plan, _ testArgs) {
-		_ = flow.Emit(plan, event, "invalid", testFact{})
-	})
-	if _, err := flowtest.RunPlan(plan, testArgs{}, flowtest.PlanWorld{}); !errors.Is(err, flow.ErrInvalidState) {
-		t.Fatalf("plan emit error=%v", err)
-	}
-
 	invalid := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
 		_ = flow.Emit(work, event, "", testFact{})
 		return testResult{}, nil
@@ -150,23 +143,23 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	child := flow.DefineCommand[testArgs, testResult]("flowtest.child", 1)
 	parent := flow.DefineCommand[testArgs, testResult]("flowtest.parent", 1)
 	directEvent := flow.DefineEvent[testFact]("flowtest.direct_event")
+	gate := flow.DefineEvent[testFact]("flowtest.child_gate")
 
 	parentRegistration := flow.Handle(parent, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		dependency, err := flow.ResultOf(work, "dependency", child)
-		if err != nil {
-			return testResult{}, err
-		}
-		flow.Execute(work, "child/next", child, testArgs{Value: work.Args.Value}).Optional().Delay(time.Second)
-		return testResult{Value: dependency.Value + "/" + work.Args.Value}, nil
+		flow.Execute(work, "child/next", child, testArgs{Value: work.Args.Value}).
+			Optional().Delay(time.Second).WaitFor(gate, "ready").Within(2 * time.Second)
+		return testResult{Value: "ready/" + work.Args.Value}, nil
 	}, flow.WithCommit(func(ctx context.Context, tx flow.Tx, commit flow.Commit[testArgs, testResult]) error {
 		_, err := tx.Exec(ctx, "record", commit.Args.Value, commit.Result.Value)
 		return err
 	}))
 
 	decision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), parentRegistration,
-		testArgs{Value: "parent"}, flowtest.WithDependencies(flowtest.Succeeded("dependency", child, testResult{Value: "ready"})))
+		testArgs{Value: "parent"})
 	if err != nil || decision.Err != nil || decision.Result.Value != "ready/parent" ||
-		len(decision.Commands) != 1 || decision.Commands[0].Required || decision.Commands[0].StartAfter != time.Second {
+		len(decision.Commands) != 1 || decision.Commands[0].Required || decision.Commands[0].StartAfter != time.Second ||
+		decision.Commands[0].Within != 2*time.Second || len(decision.Commands[0].Waits) != 1 ||
+		decision.Commands[0].Waits[0].Name != gate.Name() || decision.Commands[0].Waits[0].Key != "ready" {
 		t.Fatalf("RunWorker() = %#v, %v", decision, err)
 	}
 	tx := &recordingTx{}
@@ -202,38 +195,6 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	if _, err := flowtest.RunDirect[testArgs, testResult](context.Background(), rootRegistration,
 		testArgs{}, 10, func(string, int) (flow.Registration, bool) { return conflictingChild, true }); err == nil {
 		t.Fatal("RunDirect accepted conflicting staged event identities")
-	}
-}
-
-func TestPlanSimulationAndDeterminism(t *testing.T) {
-	analyze := flow.DefineCommand[testArgs, testResult]("flowtest.analyze", 1)
-	finish := flow.DefineCommand[testArgs, testResult]("flowtest.finish", 1)
-	release := flow.DefineEvent[testFact]("flowtest.release")
-	plan := flow.DefinePlan[testArgs]("flowtest.plan", 1, func(plan *flow.Plan, args testArgs) {
-		analysis := flow.Execute(plan, "analyze", analyze, args)
-		if _, ok := flow.Fact(plan, release, "release/1"); !ok {
-			return
-		}
-		if outcome, ok := analysis.Outcome(); ok && outcome.Status == flow.StatusSucceeded {
-			flow.Execute(plan, "finish", finish, args).After("analyze")
-		}
-	})
-	firstWorld := flowtest.PlanWorld{KnownEvents: []flowtest.EventRef{flowtest.EventReference(release)}}
-	secondWorld := flowtest.PlanWorld{
-		Commands: []flowtest.PlanCommand{flowtest.SucceededCommand("analyze", analyze, testResult{Value: "ok"})},
-		Events:   []flowtest.PlanEvent{flowtest.Fact(2, release, "release/1", testFact{Value: "go"})},
-	}
-	steps, err := flowtest.Simulate(plan, testArgs{Value: "input"}, firstWorld, secondWorld)
-	if err != nil {
-		t.Fatalf("Simulate() error = %v", err)
-	}
-	if len(steps) != 2 || len(steps[0].Declarations) != 1 || steps[0].WaitingReads != 1 ||
-		len(steps[1].Declarations) != 2 || steps[1].Declarations[1].Key != "finish" {
-		t.Fatalf("simulation = %#v", steps)
-	}
-	checked := flowtest.AssertPlanDeterministic(t, plan, testArgs{Value: "input"}, secondWorld)
-	if len(checked.Declarations) != 2 {
-		t.Fatalf("deterministic result = %#v", checked)
 	}
 }
 

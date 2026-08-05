@@ -24,7 +24,7 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
 		Args: json.RawMessage(`{"x":1}`), Origin: "direct_root", Required: true,
 		InitialState: "ready", Queue: "default", RetryPolicy: json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
-		ScheduleKind: "none", DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
+		DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
 	})
 	state, err := Fold([]store.JournalRow{start, created})
 	if err != nil {

@@ -20,9 +20,3 @@ CREATE UNIQUE INDEX flow_executions_idempotency_uq
 CREATE UNIQUE INDEX flow_executions_live_key_uq
     ON {{schema}}.flow_executions (driver_mode, definition_name, execution_key)
     WHERE execution_key <> '' AND key_scope = 'live' AND status IN ('running', 'failing');
-
--- 'execute_delay' schedules a direct root command's first attempt after a
--- caller-supplied delay (flow.WithStartDelay).
-ALTER TABLE {{schema}}.flow_commands DROP CONSTRAINT flow_commands_schedule_kind_ck;
-ALTER TABLE {{schema}}.flow_commands ADD CONSTRAINT flow_commands_schedule_kind_ck CHECK
-    (schedule_kind IN ('none', 'plan_delay', 'execute_delay'));

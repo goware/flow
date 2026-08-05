@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,8 +14,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type reportArgs struct {
-	Parts int `json:"parts"`
+type reportState struct {
+	Parts   int             `json:"parts"`
+	Pending map[string]bool `json:"pending"`
+	Total   int             `json:"total"`
 }
 
 type prepareReportArgs struct {
@@ -22,7 +25,7 @@ type prepareReportArgs struct {
 }
 
 type prepareReportResult struct {
-	Count int `json:"count"`
+	Parts []int `json:"parts"`
 }
 
 type analyzePartArgs struct {
@@ -34,7 +37,7 @@ type analyzePartResult struct {
 }
 
 type generateReportArgs struct {
-	AnalysisKeys []string `json:"analysis_keys"`
+	Total int `json:"total"`
 }
 
 type generateReportResult struct {
@@ -42,19 +45,15 @@ type generateReportResult struct {
 }
 
 var (
-	analyzePart    = flow.DefineCommand[analyzePartArgs, analyzePartResult]("example.analyze_part", 1)
-	prepareReport  = flow.DefineCommand[prepareReportArgs, prepareReportResult]("example.prepare_report", 1)
-	generateReport = flow.DefineCommand[generateReportArgs, generateReportResult]("example.generate_report", 1)
-	reportPlan     = flow.DefinePlan[reportArgs]("example.report", 1, func(plan *flow.Plan, args reportArgs) {
-		prepare := flow.Execute(plan, "prepare", prepareReport, prepareReportArgs{Parts: args.Parts})
-		analysisKeys, childrenClosed := prepare.Children()
-		if !childrenClosed {
-			return
-		}
-		flow.Execute(plan, "generate", generateReport, generateReportArgs{
-			AnalysisKeys: analysisKeys,
-		}).After(analysisKeys...)
-	})
+	analyzePart       = flow.DefineCommand[analyzePartArgs, analyzePartResult]("example.analyze_part", 1)
+	prepareReport     = flow.DefineCommand[prepareReportArgs, prepareReportResult]("example.prepare_report", 1)
+	generateReport    = flow.DefineCommand[generateReportArgs, generateReportResult]("example.generate_report", 1)
+	reportCoordinator = flow.DefineCoordinator[reportState]("example.report", 1,
+		flow.OnStart(startReport),
+		flow.OnOutcome(prepareReport, handlePreparedReport),
+		flow.OnOutcome(analyzePart, handleAnalyzedPart),
+		flow.OnOutcome(generateReport, handleGeneratedReport),
+	)
 )
 
 type fanoutExample struct {
@@ -101,14 +100,14 @@ func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtim
 	runtime, err := flow.New(db,
 		flow.WithSchema(schema),
 		flow.WithWorkerConcurrency(8),
+		flow.WithCoordinatorConcurrency(2),
 		flow.WithPollInterval(20*time.Millisecond),
-		flow.WithPlanVerification(true),
 	)
 	if err != nil {
 		return nil, err
 	}
 	if err := runtime.Register(
-		reportPlan,
+		reportCoordinator,
 		flow.Handle(prepareReport, example.prepareReport),
 		flow.Handle(analyzePart, example.analyzePart),
 		flow.Handle(generateReport, example.generateReport),
@@ -131,10 +130,10 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 	}
 }
 
-// runExampleCommand executes a dynamic fan-out plan and waits for its terminal
-// trace.
+// runExampleCommand executes a coordinator-owned dynamic fan-out and waits for
+// its terminal trace.
 func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	handle, err := reportPlan.With(runtime).Execute(ctx, "report/example", reportArgs{Parts: 3})
+	handle, err := reportCoordinator.With(runtime).Execute(ctx, "report/example", reportState{Parts: 3})
 	if err != nil {
 		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
 	}
@@ -142,14 +141,68 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Executi
 	return handle, trace, err
 }
 
-// prepareReport is the planning worker handler.
-func (example *fanoutExample) prepareReport(_ context.Context, work *flow.Work[prepareReportArgs]) (prepareReportResult, error) {
-	fmt.Fprintf(example.output, "planning %d report analyses\n", work.Args.Parts)
-	for part := range work.Args.Parts {
-		key := fmt.Sprintf("analysis/%d", part)
-		flow.Execute(work, key, analyzePart, analyzePartArgs{Part: part})
+func startReport(_ context.Context, coordination *flow.Coordination[reportState]) error {
+	coordination.State.Pending = map[string]bool{}
+	flow.Execute(coordination, "prepare", prepareReport, prepareReportArgs{Parts: coordination.State.Parts}).Optional()
+	return nil
+}
+
+func handlePreparedReport(_ context.Context, coordination *flow.Coordination[reportState], received flow.Received[flow.Outcome[prepareReportResult]]) error {
+	if received.Payload.Status != flow.StatusSucceeded {
+		coordination.Fail(errors.New("report preparation failed"))
+		return nil
 	}
-	return prepareReportResult{Count: work.Args.Parts}, nil
+	for _, part := range received.Payload.Result.Parts {
+		key := fmt.Sprintf("analysis/%d", part)
+		if coordination.State.Pending[key] {
+			return flow.Permanent(fmt.Errorf("duplicate report part %d", part))
+		}
+		coordination.State.Pending[key] = true
+		flow.Execute(coordination, key, analyzePart, analyzePartArgs{Part: part}).Optional()
+	}
+	if len(coordination.State.Pending) == 0 {
+		stageReportGeneration(coordination)
+	}
+	return nil
+}
+
+func handleAnalyzedPart(_ context.Context, coordination *flow.Coordination[reportState], received flow.Received[flow.Outcome[analyzePartResult]]) error {
+	if !coordination.State.Pending[received.Key] {
+		return flow.Permanent(fmt.Errorf("unexpected analysis outcome %q", received.Key))
+	}
+	delete(coordination.State.Pending, received.Key)
+	if received.Payload.Status != flow.StatusSucceeded {
+		coordination.Fail(fmt.Errorf("analysis %q failed", received.Key))
+		return nil
+	}
+	coordination.State.Total += received.Payload.Result.Score
+	if len(coordination.State.Pending) == 0 {
+		stageReportGeneration(coordination)
+	}
+	return nil
+}
+
+func stageReportGeneration(coordination *flow.Coordination[reportState]) {
+	flow.Execute(coordination, "generate", generateReport, generateReportArgs{Total: coordination.State.Total}).Optional()
+}
+
+func handleGeneratedReport(_ context.Context, coordination *flow.Coordination[reportState], received flow.Received[flow.Outcome[generateReportResult]]) error {
+	if received.Payload.Status != flow.StatusSucceeded {
+		coordination.Fail(errors.New("report generation failed"))
+		return nil
+	}
+	coordination.Succeed()
+	return nil
+}
+
+// prepareReport is the discovery worker handler.
+func (example *fanoutExample) prepareReport(_ context.Context, work *flow.Work[prepareReportArgs]) (prepareReportResult, error) {
+	fmt.Fprintf(example.output, "preparing %d report analyses\n", work.Args.Parts)
+	parts := make([]int, work.Args.Parts)
+	for part := range work.Args.Parts {
+		parts[part] = part
+	}
+	return prepareReportResult{Parts: parts}, nil
 }
 
 // analyzePart is the analysis worker handler.
@@ -165,16 +218,8 @@ func (example *fanoutExample) analyzePart(ctx context.Context, work *flow.Work[a
 
 // generateReport is the final worker handler.
 func (example *fanoutExample) generateReport(_ context.Context, work *flow.Work[generateReportArgs]) (generateReportResult, error) {
-	total := 0
-	for _, key := range work.Args.AnalysisKeys {
-		analysis, err := flow.ResultOf(work, key, analyzePart)
-		if err != nil {
-			return generateReportResult{}, err
-		}
-		total += analysis.Score
-	}
-	fmt.Fprintf(example.output, "generated report with score %d\n", total)
-	return generateReportResult{Total: total}, nil
+	fmt.Fprintf(example.output, "generated report with score %d\n", work.Args.Total)
+	return generateReportResult{Total: work.Args.Total}, nil
 }
 
 type synchronizedWriter struct {

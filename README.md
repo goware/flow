@@ -5,9 +5,11 @@
 ```text
 command  →  worker  →  events
                      └→ optional child commands
+
+events/outcomes  →  coordinator  →  commands + state
 ```
 
-Commands instruct work. Workers do the work. Events record durable facts. Optional plans react declaratively. Coordinators handle open-ended, cyclic, or adaptive work. PostgreSQL stores the queue, leases, execution graph, current projections, and a gap-free journal for each execution.
+Commands instruct work. Workers do the work. Events record immutable facts. Coordinators handle joins, branching, loops, and other stateful orchestration. PostgreSQL stores the queue, leases, current projections, and a gap-free journal for each execution.
 
 ## Install
 
@@ -15,155 +17,148 @@ Commands instruct work. Workers do the work. Events record durable facts. Option
 go get github.com/goware/flow
 ```
 
-Flow uses the application's existing PostgreSQL database. Its nine tables all have a `flow_` prefix and default to the `public` schema; `flow.WithSchema` selects another schema without changing the table names.
+Flow uses the application's existing PostgreSQL database. Its seven tables use a `flow_` prefix and default to the `public` schema. `flow.WithSchema` selects another schema.
 
 Run migrations explicitly during deployment:
 
 ```go
 if err := flow.Migrate(ctx, db); err != nil {
-    return err
-}
-
-rt, err := flow.New(db)
-if err != nil {
-    return err // includes missing or incompatible schema
+	return err
 }
 ```
 
-`db` is a `*pgkit.DB` from [`github.com/goware/pgkit/v2`](https://github.com/goware/pgkit). `flow.New` validates compatibility and starts no goroutines. `flow.MigrationFS` exposes the same embedded migrations for an external runner.
+`flow.New` validates the installed schema and starts no goroutines. Register handlers, then call `Runtime.Run` in the process that should execute work.
 
-## Smallest durable worker
+## A direct command
 
 ```go
-type ReceiptArgs struct {
-    OrderID string `json:"order_id"`
-    Email   string `json:"email"`
+type emailArgs struct {
+	To string `json:"to"`
 }
 
-type ReceiptSent struct {
-    ProviderMessageID string `json:"provider_message_id"`
+type emailResult struct {
+	MessageID string `json:"message_id"`
 }
 
-var SendReceipt = flow.DefineCommand[ReceiptArgs, ReceiptSent]("send_receipt", 1)
-var ReceiptDelivered = flow.DefineEvent[ReceiptSent]("receipt_delivered")
+var sendEmail = flow.DefineCommand[emailArgs, emailResult]("mail.send", 1)
 
-func sendReceipt(ctx context.Context, work *flow.Work[ReceiptArgs]) (ReceiptSent, error) {
-    id, err := provider.Send(ctx, work.Args.Email)
-    if err != nil {
-        return ReceiptSent{}, err
-    }
-    result := ReceiptSent{ProviderMessageID: id}
-    if err := flow.Emit(work, ReceiptDelivered, "order/"+work.Args.OrderID, result); err != nil {
-        return ReceiptSent{}, err
-    }
-    return result, nil
+func sendEmailWorker(ctx context.Context, work *flow.Work[emailArgs]) (emailResult, error) {
+	return emailResult{MessageID: "provider-123"}, nil
 }
 
-rt, err := flow.New(db)
+runtime, err := flow.New(db)
 if err != nil {
-    return err
+	return err
 }
-if err := rt.Register(flow.Handle(SendReceipt, sendReceipt)); err != nil {
-    return err
+if err := runtime.Register(flow.Handle(sendEmail, sendEmailWorker)); err != nil {
+	return err
 }
+go runtime.Run(ctx)
 
-runCtx, stop := context.WithCancel(context.Background())
-defer stop()
-go func() {
-    if err := rt.Run(runCtx); err != nil {
-        log.Printf("flow runtime stopped: %v", err)
-    }
-}()
-
-handle, err := SendReceipt.With(rt).Execute(ctx, "receipt/"+orderID, ReceiptArgs{
-    OrderID: orderID,
-    Email:   email,
+handle, err := sendEmail.With(runtime).Execute(ctx, "email/order-42", emailArgs{
+	To: "person@example.com",
 })
-if err != nil {
-    return err
+```
+
+`Execute` always creates or rediscovers durable asynchronous work; it never calls a worker inline. A stable non-empty execution key is permanently idempotent by default. `flow.WithLiveKey()` instead deduplicates only while an execution is non-terminal.
+
+## Worker decisions
+
+A worker may atomically stage application events and bounded child commands with its successful result:
+
+```go
+var charged = flow.DefineEvent[chargeResult]("billing.charged")
+
+func chargeWorker(ctx context.Context, work *flow.Work[chargeArgs]) (chargeResult, error) {
+	result := chargeResult{Receipt: "receipt-42"}
+	if err := flow.Emit(work, charged, "charge/42", result); err != nil {
+		return chargeResult{}, err
+	}
+	flow.Execute(work, "notify/42", notifyCustomer, notifyArgs{Receipt: result.Receipt})
+	return result, nil
 }
-
-execution, err := flow.AwaitExecution(ctx, rt, handle.ID)
 ```
 
-`Execute` always enqueues; it never calls the worker inline. Any compatible replica may claim the command. `flow.Emit` only stages a typed event in the worker decision: successful fenced settlement commits staged events, children, the typed result, and an optional commit-function write together. Failure, panic, timeout, cancellation, lease loss, or rollback exposes none of the staged output. Handlers remain at-least-once at the external-effect boundary, so externally visible effects still need stable idempotency keys.
+Repeated declarations with the same key and canonical content coalesce. A conflicting declaration poisons the decision. A `WithCommit` callback can update application tables in the same fenced transaction as Flow settlement.
 
-## Choose only the orchestration you need
+## Exact event gates
 
-- Direct mode is a durable background command and its bounded spawned child tree. No plan is required.
-- A plan is a pure Go function for dependencies, joins, waits, and fact-driven branching. The runtime re-evaluates it from immutable durable inputs.
-- A coordinator is a durable serialized state machine for adaptive agents, open-ended membership, loops, and mixed command outcomes.
-- `Event.Emit` lets a webhook, batch monitor, or another process record an external fact into an execution. Worker and coordinator handlers use staged `flow.Emit` instead. An awaited command consumes no worker, connection, or lease while waiting.
-- `flow.WithCommit` declares a short database-local tail that commits atomically with command success. Its inputs are restricted to durable command arguments, result, and metadata.
+A direct root command can wait for exact execution-scoped application events:
 
-Use `GetExecution` for bounded summaries, `ListExecutions` for stable cursor pagination, `History` for incremental journal pages, and `Trace` for the current graph plus events, attempts, causation, waits, coordinator state, and operational delivery detail.
+```go
+var approved = flow.DefineEvent[approval]("orders.approved")
 
-## Runnable examples
-
-The repository contains four complete examples. Application work is stubbed with deterministic prints and short sleeps; Flow itself uses real PostgreSQL, migrations, queue rows, leases, and journal settlement.
-
-```bash
-export FLOW_EXAMPLE_DATABASE_URL='postgres://postgres:password@127.0.0.1/postgres?sslmode=disable'
-
-go run ./examples/direct
-go run ./examples/fanout
-go run ./examples/monitor
-go run ./examples/agent
+handle, err := fulfill.With(runtime).Execute(ctx, "order/42", args,
+	flow.WaitFor(approved, "approval/42"),
+	flow.Within(30*time.Minute),
+)
 ```
 
-- `direct` is ordinary durable background work.
-- `fanout` is a plan-driven dynamic fan-out and join.
-- `monitor` publishes an external fact that releases waiting work.
-- `agent` is an adaptive coordinator that consumes mixed tool outcomes and schedules another turn.
+Commands staged by workers or coordinators use the returned node:
 
-Each scenario is also a real-PostgreSQL end-to-end test. The tests assert the public result, `Trace`, `History`, database rows, and replay-vs-live projection equality.
-
-## Test
-
-Unit tests and the `flowtest` package do not need PostgreSQL:
-
-```bash
-go test ./flowtest ./internal/...
+```go
+flow.Execute(work, "fulfill/42", fulfill, args).
+	WaitFor(approved, "approval/42").
+	Within(30 * time.Minute).
+	Delay(time.Second)
 ```
 
-The full suite creates isolated schemas in a real database:
+Multiple waits are AND conditions. Matching is exact on event name and key inside one execution. Events published before command declaration still satisfy the gate. `Within` starts when the command is created, runs independently of `Delay`, and expires the command if a wait remains unresolved.
+
+External systems publish with `Event.Emit`. Workers and coordinators use `flow.Emit` so the event commits atomically with their accepted decision.
+
+## Coordinators
+
+Use a coordinator when the next command depends on outcomes or events, when work fans out dynamically, or when orchestration has loops or durable state:
+
+```go
+var report = flow.DefineCoordinator[reportState]("report.build", 1,
+	flow.OnStart(startReport),
+	flow.OnOutcome(analyzePart, partFinished),
+	flow.On(reportRequested, requestReceived),
+)
+```
+
+Handlers receive one retained input at a time, mutate typed state, and stage commands/events. Call `coordination.Succeed()` or `coordination.Fail(err)` explicitly. Stable command keys make repeated delivery safe.
+
+Use workers for bounded local continuation and coordinators for dynamic joins and branching. Pass data needed by later commands in their arguments; workers do not read results from other commands.
+
+## Examples
+
+Each example contains its complete logic:
+
+- `examples/direct`: one background command;
+- `examples/fanout`: coordinator-owned dynamic fan-out and fan-in;
+- `examples/monitor`: a direct command gated by an externally published event;
+- `examples/agent`: a durable stateful agent loop.
+
+Run one against PostgreSQL:
 
 ```bash
-export FLOW_TEST_DATABASE_URL='postgres://postgres@127.0.0.1/postgres?sslmode=disable'
-# Or set FLOW_TEST_DATABASE_PASSWORD separately.
+FLOW_EXAMPLE_DATABASE_URL='postgres://postgres@localhost/postgres?sslmode=disable' \
+  go run ./examples/direct
+```
+
+## Operations
+
+- Command and coordinator claims match exact registered name/version pairs. Unknown work remains durable until a compatible replica appears.
+- Workers are at-least-once at the application boundary; settlement is fenced and commits durable progression once. External effects still need stable idempotency keys.
+- Required command failure enters reduced fail-fast by default: pending work is cancelled, while already-running attempts may settle. `flow.WithFailFast(false)` lets remaining work continue.
+- Execution deadlines, retries, queues, concurrency limits, graceful shutdown, polling, notification hints, observers, history, trace, cancellation, and caller-owned transactions are supported.
+- Publishers may use a `Runtime` without calling `Run` or registering handlers. Worker and coordinator pools may be deployed separately.
+
+## Tests
+
+Database-free tests:
+
+```bash
 go test ./...
-go test -race ./...
 ```
 
-`flowtest.RunWorker`, `RunCommit`, `RunDirect`, `RunPlan`, `Simulate`, `AssertPlanDeterministic`, and `RunCoordinator` invoke the production deterministic recorders without PostgreSQL and expose staged events alongside commands. SQL behavior, locking, leases, fencing, and commit-function SQL remain integration tests.
+PostgreSQL integration tests:
 
-## Deployment roles
+```bash
+FLOW_TEST_DATABASE_URL='postgres://postgres@localhost/postgres?sslmode=disable' go test ./...
+```
 
-One binary may serve requests and call `Run`, but the roles may also be split:
-
-- API and publisher processes construct a `Runtime` and use it as a lightweight `Client`; they do not call `Run`.
-- Command-worker pools register only the command versions they can execute.
-- Plan-reconciliation pools register exact plan versions. Command workers and publishers do not need plan code.
-- Coordinator pools register coordinator definitions. Command settlement does not need coordinator code; terminal events wait durably for a compatible coordinator replica.
-
-All roles point at one PostgreSQL database. Schedulers use bounded process-local capacity, `FOR UPDATE SKIP LOCKED` claims, poll-first correctness, and transactional notification hints. Notifications are enabled by default and use one dedicated session connection per running runtime; `flow.WithNotifications(false)` selects fully correct poll-only operation for transaction-pooling proxies or connection-constrained deployments. Adding replicas adds capacity; no leader, partition map, or sticky ownership protocol is required.
-
-## Guarantees and boundaries
-
-- Per-execution journal positions are gap-free and commit ordered.
-- Journaled command creation and terminal settlement reconstruct the settled execution graph; each command retains exactly one terminal event.
-- Queue delivery, retries, leases, and attempts are operational records; they are not fabricated as application events.
-- Plans are pure and additive. Facts and terminal outcomes are immutable and durably re-readable.
-- Command/worker progression is atomic in PostgreSQL, but arbitrary external APIs cannot share that transaction.
-- Milestone 1 retains terminal executions and complete journals indefinitely. Operational retention/archival is a near-term follow-on.
-
-## Design documentation
-
-- [Project overview](specs/projects/flow/project_overview.md)
-- [Functional specification](specs/projects/flow/functional_spec.md)
-- [Architecture](specs/projects/flow/architecture.md)
-- [PostgreSQL storage and journal](specs/projects/flow/components/schema.md)
-- [Definitions and execution engine](specs/projects/flow/components/engine.md)
-- [Distributed runtime and operations](specs/projects/flow/components/runtime.md)
-- [Milestone 1 acceptance matrix](specs/projects/flow/acceptance_evidence.md)
-- [Release benchmark and example evidence](specs/projects/flow/benchmark_evidence/phase_9_release.md)
+Integration tests create isolated schemas and clean them up.

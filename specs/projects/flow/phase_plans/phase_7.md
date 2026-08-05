@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/2-remove-plan.md
 ---
 
 # Phase 7: Coordinators and durable agents
+
+> Historical delivery record. The retained coordinator contract is synchronized in the active specifications.
 
 ## Goal
 

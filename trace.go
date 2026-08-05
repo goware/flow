@@ -13,29 +13,24 @@ import (
 )
 
 type Execution struct {
-	ID               ExecutionID
-	Mode             string
-	Type             string
-	Version          int
-	Key              string
-	Status           string
-	FailFast         bool
-	MaxCommands      int
-	CommandCount     int
-	OpenCommands     int
-	PlanDirty        bool
-	PlanQuiescent    bool
-	PlanRevision     PlanRevision
-	PlanWaitingCount int
-	PlanWaitingOn    []string
-	DeadlineAt       *time.Time
-	FailureCode      string
-	FailureMessage   string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	StatusAt         time.Time
-	FinishedAt       *time.Time
-	Metadata         json.RawMessage
+	ID             ExecutionID
+	Mode           string
+	Type           string
+	Version        int
+	Key            string
+	Status         string
+	FailFast       bool
+	MaxCommands    int
+	CommandCount   int
+	OpenCommands   int
+	DeadlineAt     *time.Time
+	FailureCode    string
+	FailureMessage string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	StatusAt       time.Time
+	FinishedAt     *time.Time
+	Metadata       json.RawMessage
 }
 
 type TraceAttempt struct {
@@ -53,51 +48,42 @@ type TraceAttempt struct {
 }
 
 type TraceCommand struct {
-	ID                    CommandID
-	Key                   string
-	Name                  string
-	Version               int
-	Origin                string
-	ParentCommandID       CommandID
-	Required              bool
-	State                 string
-	Args                  json.RawMessage
-	Result                json.RawMessage
-	Queue                 string
-	ScheduleKind          string
-	InitialDelay          time.Duration
-	BudgetStartedAt       *time.Time
-	NextAttemptAt         *time.Time
-	Within                time.Duration
-	ChildMembershipClosed bool
-	Dependencies          []TraceDependencyGroup
-	Waits                 []TraceEventWait
-	CreatedPosition       JournalPosition
-	TerminalPosition      *JournalPosition
-	FailureCode           string
-	FailureMessage        string
-	LastErrorCode         string
-	LastErrorMessage      string
-	UnsatisfiedGroups     int
-	UnsatisfiedWaits      int
-	AttemptOrdinal        int
-	ConsumedAttempts      int
-	WaitStartedAt         *time.Time
-	WaitDeadlineAt        *time.Time
-	DeliveryState         string
-	LeaseOwner            string
-	LeaseStartedAt        *time.Time
-	LeaseExpiresAt        *time.Time
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
-	StatusAt              time.Time
-	FinishedAt            *time.Time
-	Attempts              []TraceAttempt
-}
-
-type TraceDependencyGroup struct {
-	Kind    string
-	Members []string
+	ID               CommandID
+	Key              string
+	Name             string
+	Version          int
+	Origin           string
+	ParentCommandID  CommandID
+	Required         bool
+	State            string
+	Args             json.RawMessage
+	Result           json.RawMessage
+	Queue            string
+	InitialDelay     time.Duration
+	BudgetStartedAt  *time.Time
+	NextAttemptAt    *time.Time
+	Within           time.Duration
+	Waits            []TraceEventWait
+	CreatedPosition  JournalPosition
+	TerminalPosition *JournalPosition
+	FailureCode      string
+	FailureMessage   string
+	LastErrorCode    string
+	LastErrorMessage string
+	UnsatisfiedWaits int
+	AttemptOrdinal   int
+	ConsumedAttempts int
+	WaitStartedAt    *time.Time
+	WaitDeadlineAt   *time.Time
+	DeliveryState    string
+	LeaseOwner       string
+	LeaseStartedAt   *time.Time
+	LeaseExpiresAt   *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	StatusAt         time.Time
+	FinishedAt       *time.Time
+	Attempts         []TraceAttempt
 }
 
 type TraceEventWait struct {
@@ -236,8 +222,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 			Origin: command.Origin, Required: command.Required, State: command.State,
 			Args: json.RawMessage(append([]byte(nil), command.Args...)), Result: json.RawMessage(append([]byte(nil), command.Result...)),
 			Queue: command.Queue, CreatedPosition: JournalPosition(command.CreatedPosition),
-			ScheduleKind: command.ScheduleKind, BudgetStartedAt: cloneTimePointer(command.BudgetStartedAt),
-			NextAttemptAt: cloneTimePointer(command.NextAttemptAt), ChildMembershipClosed: command.ChildMembershipClosed,
+			BudgetStartedAt: cloneTimePointer(command.BudgetStartedAt), NextAttemptAt: cloneTimePointer(command.NextAttemptAt),
 			FailureCode: command.FailureCode, FailureMessage: command.FailureMessage,
 		}
 		if command.ParentCommandID != nil {
@@ -248,11 +233,6 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		}
 		if command.WithinMS != nil {
 			item.Within = time.Duration(*command.WithinMS) * time.Millisecond
-		}
-		for _, group := range command.Dependencies {
-			item.Dependencies = append(item.Dependencies, TraceDependencyGroup{
-				Kind: group.Kind, Members: append([]string(nil), group.Members...),
-			})
 		}
 		for _, wait := range command.Waits {
 			item.Waits = append(item.Waits, TraceEventWait{Name: wait.Name, Key: wait.Key})
@@ -266,7 +246,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 			item.BudgetStartedAt = cloneTimePointer(current.BudgetStartedAt)
 			item.NextAttemptAt = cloneTimePointer(current.NextAttemptAt)
 			item.LastErrorCode, item.LastErrorMessage = current.LastErrorCode, current.LastErrorMessage
-			item.UnsatisfiedGroups, item.UnsatisfiedWaits = current.UnsatisfiedGroups, current.UnsatisfiedWaits
+			item.UnsatisfiedWaits = current.UnsatisfiedWaits
 			item.AttemptOrdinal, item.ConsumedAttempts = current.AttemptOrdinal, current.ConsumedAttempts
 			item.WaitStartedAt, item.WaitDeadlineAt = cloneTimePointer(current.WaitStartedAt), cloneTimePointer(current.WaitDeadlineAt)
 			item.DeliveryState, item.LeaseOwner = current.DeliveryState, current.LeaseOwner

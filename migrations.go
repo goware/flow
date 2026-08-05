@@ -341,7 +341,6 @@ func verifyAppliedMigrations(applied map[int]appliedMigration, units []migration
 func verifyFlowTables(ctx context.Context, db queryer, schema string) error {
 	expected := []string{
 		"flow_executions", "flow_commands", "flow_command_queue",
-		"flow_command_dependency_groups", "flow_command_dependency_members",
 		"flow_command_event_waits", "flow_journal", "flow_coordinators",
 		"flow_schema_migrations",
 	}

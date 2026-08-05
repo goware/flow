@@ -4,238 +4,107 @@ status: complete
 
 # Component: definitions and execution engine
 
-## 1. Purpose
+## Purpose
 
-The engine owns Flow's typed contracts and deterministic state-transition rules. It knows nothing about goroutine scheduling or PostgreSQL query plans. Given durable snapshot data and one application decision, it validates, canonicalizes, and produces the exact change set and ordered journal body values the store commits.
+The engine owns typed contracts and deterministic application decisions. It validates definitions and transforms one worker or coordinator invocation into a canonical change set. It does not schedule goroutines or issue PostgreSQL queries while application code runs.
 
-## 2. Internal layers
+## Definitions
 
-```text
-typed public definitions
-        ↓ erase through codecs
-canonical descriptors and policy data
-        ↓
-plan / worker / coordinator decision recorders
-        ↓
-validated normalized change sets
-        ↓
-journal batch + projection mutations
-```
+Commands retain name/version, argument/result codecs, retry policy, attempt timeout, and queue. Events retain a name and payload codec. Coordinators retain name/version, state codec, and unique typed handler selectors.
 
-Pure packages cover canonical JSON, descriptor validation, retry policy, failure classification, replay, and deterministic test decisions.
+All definitions are immutable values. Zero definitions, invalid names/versions, duplicate options, nil handlers, and duplicate coordinator selectors become registration/start errors rather than panics.
 
-## 3. Definition contracts
+Registration erases generic functions behind codecs after validation. The runtime registry contains only worker and coordinator entries keyed by exact name/version.
 
-### 3.1 Command
+## Canonical values
 
-An erased command descriptor contains name, positive version, argument/result codecs, and no derived public success event. The typed `Command[A,R]` adds compile-time shape, immutable client binding, and creation defaults.
+Durable arguments, results, state, event payloads, metadata, retry settings, and journal bodies use bounded canonical JSON. Canonical bytes and SHA-256 hashes support deterministic equality, idempotent retries, declaration fingerprints, and replay verification.
 
-Definition defaults are retry policy, attempt timeout, and queue. `WithRetry` is the sole retry option. Duplicate options or invalid values accumulate into the immutable definition error and fail registration/execution before durable writes.
+Command declaration fingerprints cover definition, key, arguments, origin, parent, required flag, exact waits, initial delay, wait budget, queue, timeout, and retry policy.
 
-### 3.2 Event
+## Worker scope
 
-An erased event contains name, application namespace, and payload codec. Its durable schema identity has no integer version. `EventRef` is sealed and implemented only by typed events.
+`Work[A]` exposes typed `Args` and immutable `CommandInfo`. Its private scope contains:
 
-### 3.3 Plan and coordinator
+- the first validation defect;
+- staged application events;
+- staged child commands;
+- stable insertion order.
 
-Plans retain name/version, start-argument codec, and typed pure invocation. Coordinators retain name/version, state codec, and erased handlers. Registration freezes exact name/version pairs and rejects duplicates.
+It does not expose results or outcomes from other commands.
 
-### 3.4 Outcomes
+`flow.Emit` validates the application event, non-empty stable key, payload type/size, duplicate identity, and scope. `flow.Execute` validates command definition, key, arguments, and scope, then returns an ephemeral `Node`.
 
-`Outcome[R]` carries terminal `CommandStatus`, `R` on success, and structured failure on unsuccessful states. It is the sole shared terminal value for plan nodes, worker dependency reads, coordinator deliveries, and tests.
+## Node grammar
 
-## 4. Canonical identity
+`Node` has no result type because it is a staging builder, not a query handle.
 
-Definition values are encoded once through their registered codec, canonicalized, bounded, and fingerprinted. Durable equality never calls application code.
+- `Key` returns its durable command key.
+- `Optional` clears the required flag.
+- `Delay` sets one initial delay of at least one millisecond.
+- `WaitFor` adds one exact application event name/key selector.
+- `Within` sets one wait budget of at least one millisecond.
 
-Command declaration fingerprints cover key, definition, arguments, origin, parent, required flag, normalized dependencies, exact waits, initial schedule, and accepted effective settings. The accepted retry policy includes the fixed 20% jitter so existing work is independent of later library defaults.
+Multiple waits are normalized, sorted, deduplicated, and interpreted as AND. Repeating the same staged command in a decision merges waits. Different arguments or singleton settings poison the complete decision. `Within` without waits is invalid.
 
-Root execution fingerprints cover driver, definition, version, key semantics, canonical input/initial state, deadline, fail-fast, ceiling, and semantically relevant options. Metadata is canonicalized separately.
+Nodes are valid only during their owning worker/coordinator decision. They cannot be used to read outcomes or retained after return.
 
-## 5. Retry engine
+## Coordinator scope
 
-Canonical retry policy contains:
+`Coordination[S]` contains mutable typed state and the same decision recorder. Handlers receive exactly one typed retained input.
 
-- optional positive maximum consumed attempts;
-- optional positive maximum elapsed duration;
-- ordered non-empty positive backoff;
-- fixed proportional jitter `0.20`.
+`OnOutcome` decodes every terminal command event into `Outcome[R]`. Success contains `R`; failure, cancellation, and expiry contain structured failure information.
 
-At least one bound is required. The final backoff repeats. Retry evaluation receives persisted `BudgetStartedAt`, consumed attempts, database now, attempt identity, error class, and optional `RetryAfter`. It calls no clock or application callback.
+`Succeed` and `Fail` encode the terminal state selection. A coordinator terminal choice is single-assignment; staging afterward poisons the decision. Handler error leaves the current delivery and state unaccepted so runtime retry can occur.
 
-Permanent errors never retry. `RetryAfter` replaces the policy delay but not its bounds. The selected absolute next-attempt time is persisted. Interruption and lease loss do not increment consumed attempts or choose a new schedule.
+## Decision normalization
 
-Coordinator delivery uses the same canonical policy shape, snapshotted from the runtime default at coordinator creation.
+Before settlement, the engine:
 
-## 6. Unified `Execute` recorder
+1. returns the first scope defect, if any;
+2. encodes the worker result or coordinator state;
+3. sorts staged events by name/key;
+4. sorts staged commands by key;
+5. validates each modifier combination;
+6. computes declaration fingerprints;
+7. enforces the execution command ceiling;
+8. emits store-ready canonical records.
 
-The public generic function switches only across sealed library scopes.
+No partially valid decision is accepted.
 
-### 6.1 Plan path
+## Exact waits and readiness
 
-The recorder creates or finds one `planDeclaration`, validates typed definition and arguments, and returns `Node[R]`. Repeated keys must be equivalent after all builder modifiers.
-
-### 6.2 Worker/coordinator path
-
-The recorder creates or finds one staged command in the decision buffer and returns `Node[R]`. A staged command initially uses command defaults, is required, and has no delay. The owner records call order for deterministic journal ordering while key maps provide idempotent lookup.
-
-### 6.3 Node behavior
-
-Every node stores owner kind, command key, descriptor, and record reference.
-
-- `Key` always returns the stable key.
-- `Optional` and `Delay` work for every owner.
-- `After`, `AfterSettled`, `AfterFailed`, `WaitFor`, `Within`, `Outcome`, and `Children` require a plan owner.
-
-Invalid scope use stores the first deterministic defect on the owner. Later calls may be no-ops, but validation always fails the complete decision. No partial outputs survive.
-
-`Node[R]` contains no durable capability and must never escape its callback. Tests verify that behavior contract and owner poisoning.
-
-## 7. Worker decisions
-
-`Work[A]` exposes immutable `Args`, `Info`, and dependency-scoped result access. Its private buffer contains staged events, staged commands, and the first defect. `flow.Emit` validates a typed event, stable non-empty key, canonical payload, and the 64 KiB bound without performing SQL.
-
-Repeated `(event name,key)` identities coalesce only when canonical content matches; disagreement poisons the decision. Events are ordered by name then key for deterministic settlement. Plans are not an emitting scope and attempted use poisons reconciliation.
-
-Repeated child keys coalesce only when command definition/version, canonical arguments, required flag, and delay agree. `Delay` must be finite and at least one millisecond. The accepting transaction later converts the duration into an immutable absolute schedule using PostgreSQL time.
-
-Handler conclusions:
-
-- `(result,nil)`: encode/bound result, validate decision, attempt fenced settlement;
-- retryable error: discard staged events and commands and apply policy;
-- permanent error/panic/timeout with exhausted policy: discard outputs and terminalize failed;
-- lost fence: write nothing from the stale handler.
-
-Successful settlement closes child membership even when it is empty.
-
-## 8. Commit function
-
-`WithCommit` binds a statically registered typed function to a worker. It is not part of handler output and cannot capture per-attempt hidden values. Its inputs are decoded from the durable command arguments, accepted successful result, and command metadata.
-
-The function runs after Flow locks and semantic writes are staged, before notification and transaction commit. Error rolls back the entire settlement; the same already-computed handler decision may be attempted again only under the transaction retry rules. The function must perform short local database work and no external I/O.
-
-## 9. Plan snapshot and reads
-
-The snapshot indexes commands by key, terminal results/failures by command ID, children by parent, and application events by `(name,key)` plus journal order.
-
-`Fact` reads one exact key. `Facts` reads all values for one definition. `Node.Outcome` validates that its definition matches the snapshot command and returns unavailable only while non-terminal. `Node.Children` returns unavailable until successful membership closure.
-
-Reads are recorded in-memory for diagnostics, simulation, and double-evaluation comparison. They are not stored in a relational plan-read table. Dirty reconciliation is the scheduling authority.
-
-## 10. Plan validation and reconciliation
-
-At evaluation end:
-
-1. surface panic or recorded defect;
-2. finish decoding any lazily requested event/result bodies;
-3. verify duplicate declarations agree;
-4. verify every dependency exists in snapshot or declaration set;
-5. normalize dependency members and reject cycles;
-6. reject unsupported threshold/quorum semantics;
-7. require non-empty exact event keys;
-8. require `Within` only with `WaitFor`;
-9. reject ownership conflicts and command-ceiling overflow;
-10. compute declaration and evaluation fingerprints.
-
-Reconciliation accepts only new command keys. Existing plan-owned keys must remain equivalent. Existing worker/coordinator keys cannot be redeclared by a plan. Commands immediately unsatisfiable may terminalize as skipped in the same transaction; the dirty scheduler later re-evaluates from their terminal facts. `plan_quiescent` means the accepted evaluation declared no new commands.
-
-`PlanReconciled` records revision, snapshot position, quiescence, and accepted keys/fingerprints without duplicating arguments already recorded in each `CommandCreated`.
-
-## 11. Dependencies and waits
-
-Dependency group evaluation returns `pending`, `satisfied`, or `impossible`:
-
-- all-succeeded becomes impossible on any unsuccessful member;
-- all-settled becomes satisfied when every member terminalizes;
-- all-failed becomes impossible on any successful member.
-
-When all groups satisfy, the engine evaluates exact waits. Existing matching facts mark waits satisfied. Missing waits start their once-only `Within` deadline when specified. With no remaining wait, the engine sets the command ready at the maximum of database now and explicit initial delay.
-
-Impossible required commands become skipped and participate in failure processing. Optional skips do not determine execution outcome.
-
-## 12. Command state machine
-
-The engine validates every transition and derives counters/queue effects:
+Readiness is a two-input calculation:
 
 ```text
-pending → ready → running → succeeded
-                    └→ retry_wait → ready
-pending|ready|running|retry_wait → failed|cancelled|expired|skipped
+all exact waits satisfied AND initial delay elapsed
 ```
 
-Success appends the typed terminal event and closes membership. Retry records attempt conclusion and immutable next schedule. Cancellation and expiry own terminality if they win the execution lock before settlement. A late fact never changes a terminal wait.
+The wait deadline is derived at command creation. It runs concurrently with initial delay. Expiry terminalizes a still-waiting command. Once all waits resolve, delay eligibility remains authoritative.
 
-Required failure enters execution failing and resolves `AfterFailed`/`AfterSettled` before fail-fast cancellation. This ordering preserves explicit failure-handling branches.
+Wait declarations contain only event name/key. Event payloads are consumed by coordinator handlers, not by command readiness.
 
-## 13. Completion
+## Failure calculation
 
-The engine consumes incrementally maintained execution counters and flags.
+The deterministic failure resolver distinguishes required and optional commands. Required failure can enter execution `failing`; optional failure is retained but does not determine direct completion.
 
-- direct: required closed tree settled successfully and no open command;
-- plan: no open command/wait, not dirty, and quiescent;
-- coordinator: explicit `Succeed` plus no required open command;
-- failure: required unsuccessful outcome plus mode/fail-fast settlement rules;
-- cancellation/deadline: immediate execution terminality plus outstanding command terminalization.
+Reduced fail-fast targets commands without running attempts. Running attempts keep their fences. If one later settles successfully, its result/events/commit are accepted and its staged children are recorded as cancelled when the execution is already failing.
 
-Consulted-but-unavailable plan reads block success only. Once required failure makes success impossible, those reads do not delay terminal failure.
+## Event ordering
 
-## 14. Coordinator decisions
+Within a semantic transaction, journal entries use deterministic groups:
 
-Erased handler selectors are start, application event name, or command terminal outcome name/version. `OnOutcome` decodes the command terminal journal row into `Outcome[R]`.
+1. attempt conclusion or coordinator transition context;
+2. staged application events in canonical order;
+3. staged command creation in key order;
+4. command/coordinator terminal events;
+5. derived cancellations or expiries in key order;
+6. execution failing/terminal event where applicable.
 
-The decision buffer contains cloned state, staged events, staged commands, optional terminal decision, and first defect. `Succeed` and `Fail` return no error and record terminal intent. Mixed/repeated incompatible calls or later mutation poison the decision.
+Causation positions connect derived entries to the accepted input.
 
-Nil handler return validates command ceiling and success preconditions, canonicalizes state, and creates one atomic change set. Handler error discards all changes and invokes persisted delivery retry policy. Permanent/exhausted failure records coordinator failure and fails the execution.
+## Testing surface
 
-## 15. Event ingress
+`flowtest` crosses a private bridge to use the production recorder. It supports worker invocation, coordinator start/event/outcome delivery, staged event/command inspection, modifier inspection, commit-function execution, and command-ceiling validation without PostgreSQL.
 
-`Event.Emit` is external ingress, distinct from decision-scoped `flow.Emit`. Validation covers typed definition, non-empty exact key, canonical payload, 64 KiB limit, and execution ID. The store owns terminal/idempotency ordering and rejects ingress through an attempt context.
-
-No public command-injection operation exists. Existing executions gain commands only through their plan, workers, or coordinator authority.
-
-## 16. Journal builder and replay
-
-The engine emits ordered semantic entries. Within a worker success batch the stable category order is:
-
-1. attempt conclusion;
-2. staged application events in `(name,key)` order;
-3. child `CommandCreated` entries in key order;
-4. parent terminal event;
-5. dependency/wait-derived terminal events in deterministic key order;
-6. execution transition if reached.
-
-Other paths define equally fixed category order. The store assigns positions but never invents meaning.
-
-Replay folds journal kinds into execution, command, attempt, graph, fact, plan, and coordinator state. Projection conformance tests extend whenever a journal kind/body changes.
-
-## 17. `flowtest`
-
-The deterministic harness supports:
-
-- invoking workers with args/info/dependency outcomes and inspecting staged events and child commands;
-- testing registered commit functions with a transaction double;
-- evaluating plans over synthetic commands/facts and inspecting typed nodes/reads;
-- double-evaluation and always-evaluate purity assertions;
-- delivering `Outcome[R]` and events to coordinators and inspecting state, staged events, commands, and terminal decisions;
-- recursively simulating closed direct trees;
-- asserting scope poisoning and declaration conflicts.
-
-It exposes the reduced public vocabulary and no legacy aliases.
-
-## 18. Test plan
-
-Unit/property coverage includes definition validation, canonical equality, fixed jitter policy, every dependency truth table, exact event keys, node owner matrix, duplicate staging, missing keys, cycles, plan purity, terminal read availability, failure completion, coordinator terminal poisoning, and replay.
-
-PostgreSQL integration contracts cover idempotent command creation, atomic membership, wait races, fenced commit functions, command ceilings, plan dirty reconciliation, coordinator retries, and journal/projection equality.
-
-## 19. Acceptance conditions
-
-- Public definitions expose the exact functional-spec API and no removed aliases.
-- `Execute` retains one meaning while producing correct scope-specific records.
-- Worker/coordinator scopes stage bounded application events but expose no Flow client/transaction; plan scopes cannot emit.
-- `Outcome[R]` losslessly represents every command terminal state.
-- Event definitions and waits contain no version.
-- No quorum, plan-node policy override, or external command-injection branch remains.
-- Every defect rejects the whole enclosing decision.
-- Retry and coordinator policies are canonical persisted data.
-- Replay and `flowtest` cover every retained transition.
+Unit and integration tests cover duplicate declarations, scope poisoning, canonical equality, gate combinations, delay/expiry timing, outcomes, coordinator terminality, command ceilings, fail-fast settlement, and replay parity.

@@ -16,9 +16,7 @@ const (
 	ObservationAttempt     ObservationKind = "attempt"
 	ObservationClaim       ObservationKind = "claim"
 	ObservationLease       ObservationKind = "lease"
-	ObservationPlan        ObservationKind = "plan"
 	ObservationWait        ObservationKind = "wait"
-	ObservationDependency  ObservationKind = "dependency"
 	ObservationCoordinator ObservationKind = "coordinator"
 	ObservationRuntime     ObservationKind = "runtime"
 )

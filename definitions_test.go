@@ -39,10 +39,9 @@ func TestDefinitionIdentityAndBinding(t *testing.T) {
 		t.Fatal("With changed durable definition identity")
 	}
 
-	plan := DefinePlan("receipt_flow", 1, func(*Plan, testArgs) {})
 	coord := DefineCoordinator("receipt_agent", 1, OnStart(func(context.Context, *Coordination[testArgs]) error { return nil }))
-	if plan.With(clientA).client != clientA || plan.client != nil || coord.With(clientA).client != clientA || coord.client != nil {
-		t.Fatal("plan/coordinator binding is not immutable")
+	if coord.With(clientA).client != clientA || coord.client != nil {
+		t.Fatal("coordinator binding is not immutable")
 	}
 
 	encoded, err := cmd.def.Args.Encode(testArgs{ID: "42"}, 0)
@@ -147,7 +146,7 @@ func TestErasedWorkerRegistration(t *testing.T) {
 	var committed Commit[testArgs, testResult]
 	registration := Handle(cmd,
 		func(_ context.Context, work *Work[testArgs]) (testResult, error) {
-			if work.Args.ID != "input" || work.Info().CommandKey != "work/1" || work.flowScope() == nil || work.flowResultSource() == nil {
+			if work.Args.ID != "input" || work.Info().CommandKey != "work/1" || work.flowScope() == nil {
 				t.Fatalf("worker scope = %#v", work)
 			}
 			return testResult{OK: true}, nil
@@ -180,7 +179,7 @@ func TestErasedWorkerRegistration(t *testing.T) {
 	}
 
 	var nilWork *Work[testArgs]
-	if nilWork.Info() != (CommandInfo{}) || nilWork.flowScope() != nil || nilWork.flowResultSource() != nil {
+	if nilWork.Info() != (CommandInfo{}) || nilWork.flowScope() != nil {
 		t.Fatal("nil Work accessors are not safe")
 	}
 	if Handle(cmd, func(context.Context, *Work[testArgs]) (testResult, error) { return testResult{}, nil }, nil).flowRegistration().validation == nil {
@@ -191,33 +190,6 @@ func TestErasedWorkerRegistration(t *testing.T) {
 	}
 	if Handle(cmd, func(context.Context, *Work[testArgs]) (testResult, error) { return testResult{}, nil }, WithCommit[testArgs, testResult](nil)).flowRegistration().validation == nil {
 		t.Fatal("nil commit function was accepted")
-	}
-}
-
-func TestErasedPlanRegistration(t *testing.T) {
-	t.Parallel()
-
-	called := false
-	plan := DefinePlan("erase_plan", 2, func(_ *Plan, args testArgs) { called = args.ID == "input" })
-	if plan.def.Name != "erase_plan" || plan.def.Version != 2 {
-		t.Fatalf("plan identity = %s/%d", plan.def.Name, plan.def.Version)
-	}
-	registration := plan.flowRegistration()
-	if registration.validation != nil || registration.kind != planRegistrationKind {
-		t.Fatalf("registration = %#v", registration)
-	}
-	erased := registration.value.(erasedPlan)
-	if err := erased.invoke(&Plan{}, testArgs{ID: "input"}); err != nil || !called {
-		t.Fatalf("invoke() error = %v, called = %v", err, called)
-	}
-	if err := erased.invoke(&Plan{}, "wrong"); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("invoke type error = %v", err)
-	}
-	if (PlanDef[testArgs]{}).flowRegistration().validation == nil {
-		t.Fatal("zero plan registration was accepted")
-	}
-	if DefinePlan[testArgs]("nil_plan", 1, nil).err == nil {
-		t.Fatal("nil plan function was accepted")
 	}
 }
 

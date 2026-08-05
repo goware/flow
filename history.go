@@ -19,7 +19,6 @@ const (
 	HistoryAttemptStarted        HistoryKind = "attempt_started"
 	HistoryAttemptConcluded      HistoryKind = "attempt_concluded"
 	HistoryEventRecorded         HistoryKind = "event_recorded"
-	HistoryPlanReconciled        HistoryKind = "plan_reconciled"
 	HistoryCoordinatorTransition HistoryKind = "coordinator_transition"
 )
 
@@ -33,7 +32,6 @@ type HistoryEntry struct {
 	CommandID         CommandID
 	AttemptID         AttemptID
 	CoordinatorID     CoordinatorID
-	PlanRevision      PlanRevision
 	EventID           EventID
 	EventNamespace    string
 	EventName         string
@@ -124,9 +122,6 @@ func historyEntries(rows []store.JournalRow) []HistoryEntry {
 		}
 		if row.CoordinatorID != nil {
 			entry.CoordinatorID = CoordinatorID(row.CoordinatorID.String())
-		}
-		if row.PlanRevision != nil {
-			entry.PlanRevision = PlanRevision(*row.PlanRevision)
 		}
 		if row.EventID != nil {
 			entry.EventID = EventID(row.EventID.String())

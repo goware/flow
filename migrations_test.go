@@ -39,8 +39,8 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	).Scan(&tables); err != nil {
 		t.Fatalf("count tables: %v", err)
 	}
-	if tables != 9 {
-		t.Fatalf("Flow table count = %d, want 9", tables)
+	if tables != 7 {
+		t.Fatalf("Flow table count = %d, want 7", tables)
 	}
 	if err := database.DB.Conn.QueryRow(ctx,
 		`SELECT count(*) FROM pg_catalog.pg_indexes WHERE schemaname=$1 AND indexname LIKE 'flow_%'`,

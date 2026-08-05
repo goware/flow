@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/2-remove-plan.md
 ---
 
 # Phase 2: PostgreSQL Schema and Store Foundation
+
+> Historical delivery record. The active seven-table schema is defined by `../plans/2-remove-plan.md` and `../components/schema.md`.
 
 ## Overview
 

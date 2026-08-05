@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -45,6 +46,9 @@ type executionOptions struct {
 	keyScopeSet   bool
 	startDelay    time.Duration
 	startDelaySet bool
+	waits         []commandEventWait
+	within        time.Duration
+	withinSet     bool
 	errs          []error
 }
 
@@ -119,7 +123,7 @@ func WithLiveKey() ExecutionOption {
 
 // WithStartDelay schedules a direct execution's root command to become
 // deliverable after the delay instead of immediately, mirroring StartAfter
-// for spawned children. Plan and coordinator starts reject it.
+// for spawned children. Coordinator starts reject it.
 func WithStartDelay(delay time.Duration) ExecutionOption {
 	return executionOptionFunc(func(options *executionOptions) {
 		if options.startDelaySet {
@@ -132,6 +136,39 @@ func WithStartDelay(delay time.Duration) ExecutionOption {
 			return
 		}
 		options.startDelay = delay
+	})
+}
+
+// WaitFor gates a direct root command on one exact application event inside
+// the execution it creates. Multiple waits are AND conditions. Worker and
+// coordinator decisions use the matching Node.WaitFor method.
+func WaitFor(event EventRef, key string) ExecutionOption {
+	return executionOptionFunc(func(options *executionOptions) {
+		wait, err := makeCommandEventWait(event, key)
+		if err != nil {
+			options.errs = append(options.errs, err)
+			return
+		}
+		options.waits = addCommandEventWait(options.waits, wait)
+	})
+}
+
+// Within bounds how long a direct root command waits for its exact events.
+// It is valid only when the same start declares at least one WaitFor option.
+func Within(duration time.Duration) ExecutionOption {
+	return executionOptionFunc(func(options *executionOptions) {
+		if duration < time.Millisecond {
+			options.errs = append(options.errs, errors.New("within must be at least one millisecond"))
+			return
+		}
+		if options.withinSet && options.within == duration {
+			return
+		}
+		if options.withinSet {
+			options.errs = append(options.errs, errors.New("within configured with different values"))
+			return
+		}
+		options.withinSet, options.within = true, duration
 	})
 }
 
@@ -160,8 +197,15 @@ func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts .
 		return ExecutionHandle{}, err
 	}
 	if options.startDelay > 0 {
-		root.ScheduleKind = "execute_delay"
 		root.InitialDelay = options.startDelay
+	}
+	for _, wait := range options.waits {
+		root.Waits = append(root.Waits, store.EventWaitCreate{Name: wait.name, Key: wait.key})
+	}
+	root.Within = options.within
+	root.DeclarationFingerprint, err = commandDeclarationFingerprint(root)
+	if err != nil {
+		return ExecutionHandle{}, err
 	}
 	request := store.StartRequest{
 		ID: uuid.New(), Mode: store.DriverDirect, DefinitionName: cmd.Name(), DefinitionVersion: cmd.Version(), Key: key,
@@ -169,36 +213,6 @@ func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts .
 		FailFast: options.failFast, Deadline: options.deadline, MaxCommands: client.runtime.maxCommands, Root: &root,
 	}
 	return executeStart(ctx, client, request)
-}
-
-func (plan PlanDef[A]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (ExecutionHandle, error) {
-	var definitionError error
-	if plan.def == nil {
-		definitionError = errors.New("zero definition")
-	}
-	if err := errors.Join(plan.err, definitionError, validateBoundClient(plan.client)); err != nil {
-		return ExecutionHandle{}, newError(ErrInvalid, "execute", "plan", planDefinitionName(plan.def), err.Error())
-	}
-	input, err := encodeDefinitionValue(plan.def.Args, args, maxCommandArgumentBytes, "plan arguments")
-	if err != nil {
-		return ExecutionHandle{}, err
-	}
-	client, err := resolveClient(plan.client)
-	if err != nil {
-		return ExecutionHandle{}, err
-	}
-	options, metadata, fingerprint, err := prepareStartOptions(store.DriverPlan, plan.def.Name, plan.def.Version, key, input, opts...)
-	if err != nil {
-		return ExecutionHandle{}, err
-	}
-	if options.startDelay > 0 {
-		return ExecutionHandle{}, newError(ErrInvalid, "execute", "plan", plan.def.Name, "plan starts do not accept a start delay")
-	}
-	return executeStart(ctx, client, store.StartRequest{
-		ID: uuid.New(), Mode: store.DriverPlan, DefinitionName: plan.def.Name, DefinitionVersion: plan.def.Version, Key: key,
-		KeyScope: options.keyScope, StartFingerprint: fingerprint, Input: input, Metadata: metadata,
-		FailFast: options.failFast, Deadline: options.deadline, MaxCommands: client.runtime.maxCommands,
-	})
 }
 
 func (coordinator Coordinator[S]) Execute(ctx context.Context, key string, initial S, opts ...ExecutionOption) (ExecutionHandle, error) {
@@ -418,6 +432,12 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	if options.keyScope == store.KeyScopeLive && key == "" {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "key", "", "live key scope requires a non-empty execution key")
 	}
+	if options.withinSet && len(options.waits) == 0 {
+		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "within", "", "Within requires WaitFor")
+	}
+	if mode != store.DriverDirect && (len(options.waits) > 0 || options.withinSet) {
+		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "options", "", "WaitFor and Within are accepted only by direct command starts")
+	}
 	if err := validateMetadata(options.metadata); err != nil {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, err
 	}
@@ -428,23 +448,26 @@ func prepareStartOptions(mode store.DriverMode, name string, version int, key st
 	// key_scope and start_delay_ms are omitted when zero so fingerprints of
 	// starts that predate these options remain rediscoverable.
 	fingerprintRecord := struct {
-		V                 int             `json:"v"`
-		DriverMode        string          `json:"driver_mode"`
-		DefinitionName    string          `json:"definition_name"`
-		DefinitionVersion int             `json:"definition_version"`
-		ExecutionKey      string          `json:"execution_key"`
-		KeyScope          string          `json:"key_scope,omitempty"`
-		Input             json.RawMessage `json:"input"`
-		DeadlineMode      string          `json:"deadline_mode"`
-		DeadlineDuration  int64           `json:"deadline_duration"`
-		FailFast          bool            `json:"fail_fast"`
-		StartDelayMS      int64           `json:"start_delay_ms,omitempty"`
-		Metadata          json.RawMessage `json:"metadata"`
+		V                 int                      `json:"v"`
+		DriverMode        string                   `json:"driver_mode"`
+		DefinitionName    string                   `json:"definition_name"`
+		DefinitionVersion int                      `json:"definition_version"`
+		ExecutionKey      string                   `json:"execution_key"`
+		KeyScope          string                   `json:"key_scope,omitempty"`
+		Input             json.RawMessage          `json:"input"`
+		DeadlineMode      string                   `json:"deadline_mode"`
+		DeadlineDuration  int64                    `json:"deadline_duration"`
+		FailFast          bool                     `json:"fail_fast"`
+		StartDelayMS      int64                    `json:"start_delay_ms,omitempty"`
+		Waits             []commandWaitFingerprint `json:"waits,omitempty"`
+		WithinMS          int64                    `json:"within_ms,omitempty"`
+		Metadata          json.RawMessage          `json:"metadata"`
 	}{
 		V: 1, DriverMode: string(mode), DefinitionName: name, DefinitionVersion: version,
 		ExecutionKey: key, KeyScope: options.keyScope, Input: json.RawMessage(input.BytesCopy()),
 		DeadlineMode: options.deadline.Mode, DeadlineDuration: int64(options.deadline.Duration),
 		FailFast: options.failFast, StartDelayMS: options.startDelay.Milliseconds(),
+		Waits: commandWaitFingerprints(options.waits), WithinMS: options.within.Milliseconds(),
 		Metadata: json.RawMessage(metadata.BytesCopy()),
 	}
 	fingerprint, err := canonical.Marshal(fingerprintRecord, 0)
@@ -480,8 +503,84 @@ func prepareCommand(id uuid.UUID, key string, command *definition.Command, defau
 	return store.CommandCreate{
 		ID: id, Key: key, Name: command.Name, Version: command.Version, Args: args,
 		DeclarationFingerprint: declaration.Digest, Origin: origin, Required: true,
-		Queue: defaults.queue, AttemptTimeout: defaults.attemptTimeout, RetryPolicy: policy, ScheduleKind: "none",
+		Queue: defaults.queue, AttemptTimeout: defaults.attemptTimeout, RetryPolicy: policy,
 	}, nil
+}
+
+type commandWaitFingerprint struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	Key       string `json:"key"`
+}
+
+func commandWaitFingerprints(waits []commandEventWait) []commandWaitFingerprint {
+	result := make([]commandWaitFingerprint, len(waits))
+	for index, wait := range waits {
+		result[index] = commandWaitFingerprint{Namespace: wait.namespace, Name: wait.name, Key: wait.key}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Namespace != result[j].Namespace {
+			return result[i].Namespace < result[j].Namespace
+		}
+		if result[i].Name != result[j].Name {
+			return result[i].Name < result[j].Name
+		}
+		return result[i].Key < result[j].Key
+	})
+	return result
+}
+
+func makeCommandEventWait(event EventRef, key string) (commandEventWait, error) {
+	if event == nil {
+		return commandEventWait{}, newError(ErrInvalid, "execute", "wait", key, "nil event selector")
+	}
+	if err := validateStableKey(key, maxCommandKeyBytes, "event"); err != nil {
+		return commandEventWait{}, err
+	}
+	selector := event.flowEventRef()
+	if selector.name == "" || selector.namespace != "application" {
+		return commandEventWait{}, newError(ErrInvalid, "execute", "wait", key, "invalid event selector")
+	}
+	return commandEventWait{eventReference: selector, key: key}, nil
+}
+
+func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error) {
+	parent := ""
+	if command.ParentCommandID != nil {
+		parent = command.ParentCommandID.String()
+	}
+	waits := make([]commandWaitFingerprint, len(command.Waits))
+	for index, wait := range command.Waits {
+		waits[index] = commandWaitFingerprint{Namespace: "application", Name: wait.Name, Key: wait.Key}
+	}
+	sort.Slice(waits, func(i, j int) bool {
+		if waits[i].Name != waits[j].Name {
+			return waits[i].Name < waits[j].Name
+		}
+		return waits[i].Key < waits[j].Key
+	})
+	declaration, err := canonical.Marshal(struct {
+		V            int                      `json:"v"`
+		Key          string                   `json:"key"`
+		Name         string                   `json:"name"`
+		Version      int                      `json:"version"`
+		Args         json.RawMessage          `json:"args"`
+		Origin       string                   `json:"origin"`
+		Parent       string                   `json:"parent,omitempty"`
+		Required     bool                     `json:"required"`
+		StartAfterMS int64                    `json:"start_after_ms,omitempty"`
+		Waits        []commandWaitFingerprint `json:"waits,omitempty"`
+		WithinMS     int64                    `json:"within_ms,omitempty"`
+	}{
+		V: 1, Key: command.Key, Name: command.Name, Version: command.Version,
+		Args: json.RawMessage(command.Args.BytesCopy()), Origin: command.Origin, Parent: parent,
+		Required: command.Required, StartAfterMS: command.InitialDelay.Milliseconds(),
+		Waits: waits, WithinMS: command.Within.Milliseconds(),
+	}, 0)
+	if err != nil {
+		return [32]byte{}, newError(ErrInvalid, "create", "command", command.Key, "declaration cannot be canonicalized")
+	}
+	return declaration.Digest, nil
 }
 
 func encodeDefinitionValue(codec definition.Codec, value any, maxBytes int, resource string) (canonical.Value, error) {
@@ -535,13 +634,6 @@ func cloneStringMap(input map[string]string) map[string]string {
 		result[key] = value
 	}
 	return result
-}
-
-func planDefinitionName(plan *definition.Plan) string {
-	if plan == nil {
-		return ""
-	}
-	return plan.Name
 }
 
 func coordinatorDefinitionName(coordinator *definition.Coordinator) string {

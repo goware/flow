@@ -258,15 +258,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		CreatedAt: claim.CreatedAt, BudgetStartedAt: claim.BudgetStartedAt,
 		Attempt: claim.Attempt, AttemptStartedAt: claim.DBNow,
 	}
-	inputs, err := r.store.LoadCommandInputs(workerCtx, claim.CommandID)
-	if err != nil {
-		r.concludeClaim(context.Background(), claim, classifiedConclusion{
-			class: retrypolicy.ClassInterrupted, code: "dependency_load", message: "dependency inputs could not be loaded",
-		})
-		return
-	}
 	scope := &workScope{args: args, info: info}
-	scope.state.results = workerResultSource(inputs)
 	workerCtx = withAttemptScope(workerCtx, &scope.state)
 	if err := r.faults.Hit(workerCtx, fault.HandlerStart); err != nil {
 		r.concludeClaim(workerCtx, claim, classifiedConclusion{class: retrypolicy.ClassInterrupted, code: "handler_start_interrupted", message: "handler start was interrupted"})
@@ -370,26 +362,9 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 }
 
-func workerResultSource(inputs []store.CommandInput) resultSourceState {
-	state := resultSourceState{restricted: true, values: make(map[string]resultSourceValue, len(inputs))}
-	for _, input := range inputs {
-		value := resultSourceValue{
-			name: input.Name, version: input.Version, status: commandStatus(input.State),
-			result: append([]byte(nil), input.Result...),
-		}
-		if input.Failure != nil {
-			value.failure = &CommandFailure{Code: input.Failure.Code, Message: input.Failure.Message}
-		} else if value.status != "" && value.status != StatusSucceeded {
-			value.failure = &CommandFailure{Code: input.State, Message: "command ended " + input.State}
-		}
-		state.values[input.Key] = value
-	}
-	return state
-}
-
 func commandStatus(state string) CommandStatus {
 	switch CommandStatus(state) {
-	case StatusSucceeded, StatusFailed, StatusCancelled, StatusExpired, StatusSkipped:
+	case StatusSucceeded, StatusFailed, StatusCancelled, StatusExpired:
 		return CommandStatus(state)
 	default:
 		return ""
@@ -397,6 +372,9 @@ func commandStatus(state string) CommandStatus {
 }
 
 func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]store.ApplicationEvent, []store.CommandCreate, error) {
+	if err := validateDecisionCommands(scope.state.decision); err != nil {
+		return nil, nil, err
+	}
 	stagedEvents := scope.state.decision.orderedEvents()
 	events := make([]store.ApplicationEvent, 0, len(stagedEvents))
 	for _, staged := range stagedEvents {
@@ -420,29 +398,16 @@ func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]stor
 		child.ParentCommandID = cloneUUIDPointer(claim.CommandID)
 		child.Required = staged.required
 		if staged.startAfter > 0 {
-			child.ScheduleKind = "execute_delay"
 			child.InitialDelay = staged.startAfter
 		}
-		declaration, err := canonical.Marshal(struct {
-			V            int             `json:"v"`
-			Key          string          `json:"key"`
-			Name         string          `json:"name"`
-			Version      int             `json:"version"`
-			Args         json.RawMessage `json:"args"`
-			Origin       string          `json:"origin"`
-			Parent       string          `json:"parent"`
-			Required     bool            `json:"required"`
-			StartAfterMS int64           `json:"start_after_ms,omitempty"`
-		}{
-			V: 1, Key: child.Key, Name: child.Name, Version: child.Version,
-			Args: json.RawMessage(child.Args.BytesCopy()), Origin: child.Origin,
-			Parent: claim.CommandID.String(), Required: child.Required,
-			StartAfterMS: child.InitialDelay.Milliseconds(),
-		}, 0)
-		if err != nil {
-			return nil, nil, newError(ErrInvalid, "settle", "command", child.Key, "declaration cannot be canonicalized")
+		for _, wait := range staged.waits {
+			child.Waits = append(child.Waits, store.EventWaitCreate{Name: wait.name, Key: wait.key})
 		}
-		child.DeclarationFingerprint = declaration.Digest
+		child.Within = staged.within
+		child.DeclarationFingerprint, err = commandDeclarationFingerprint(child)
+		if err != nil {
+			return nil, nil, err
+		}
 		children = append(children, child)
 	}
 	return events, children, nil

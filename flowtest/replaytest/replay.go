@@ -56,9 +56,7 @@ func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.Execut
 	if projected.ID.String() != string(live.ID) || string(projected.DriverMode) != live.Mode ||
 		projected.DefinitionName != live.Type || projected.DefinitionVersion != live.Version ||
 		projected.ExecutionKey != live.Key || projected.Status != live.Status || projected.CommandCount != live.CommandCount ||
-		projected.OpenCommands != live.OpenCommands || projected.PlanDirty != live.PlanDirty ||
-		projected.PlanQuiescent != live.PlanQuiescent || projected.PlanRevision != int64(live.PlanRevision) ||
-		projected.PlanWaitingCount != live.PlanWaitingCount ||
+		projected.OpenCommands != live.OpenCommands ||
 		projected.FailureCode != live.FailureCode || projected.FailureMessage != live.FailureMessage {
 		t.Fatalf("replay/live execution mismatch:\nreplay=%#v\nlive=%#v", projected, live)
 	}

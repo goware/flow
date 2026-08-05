@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/definition"
+	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -47,13 +49,6 @@ func (w *Work[A]) flowScope() *scopeState {
 }
 
 func (w *Work[A]) flowExecuteScope() {}
-
-func (w *Work[A]) flowResultSource() *resultSourceState {
-	if w == nil || w.scope == nil {
-		return nil
-	}
-	return &w.scope.results
-}
 
 type Scope interface {
 	flowExecuteScope()
@@ -114,7 +109,6 @@ type registrationKind string
 
 const (
 	workerRegistrationKind      registrationKind = "worker"
-	planRegistrationKind        registrationKind = "plan"
 	coordinatorRegistrationKind registrationKind = "coordinator"
 )
 
@@ -203,14 +197,12 @@ func Handle[A, R any](
 
 type scopeState struct {
 	firstError error
-	results    resultSourceState
 	terminal   *coordinatorTerminal
 	decision   decisionState
 }
 
 type resultSourceState struct {
-	restricted bool
-	values     map[string]resultSourceValue
+	values map[string]resultSourceValue
 }
 
 type resultSourceValue struct {
@@ -234,6 +226,13 @@ type stagedCommand struct {
 	args       canonical.Value
 	required   bool
 	startAfter time.Duration
+	waits      []commandEventWait
+	within     time.Duration
+}
+
+type commandEventWait struct {
+	eventReference
+	key string
 }
 
 type decisionState struct {
@@ -251,15 +250,8 @@ func (s *scopeState) poison(err error) {
 
 // Emit stages an application event in a worker or coordinator decision. It
 // performs no database work and becomes durable only when the enclosing
-// decision settles successfully. Plans are pure and cannot emit events.
+// decision settles successfully.
 func Emit[T any](scope Scope, event Event[T], key string, payload T) error {
-	if plan, ok := scope.(*Plan); ok {
-		err := newError(ErrInvalidState, "emit", "plan", key, "plans cannot emit events")
-		if plan != nil {
-			plan.poison(err)
-		}
-		return err
-	}
 	state, err := usableDecisionScope(scope, "emit")
 	if err != nil {
 		return err
@@ -300,15 +292,11 @@ func Emit[T any](scope Scope, event Event[T], key string, payload T) error {
 	return nil
 }
 
-// Execute requests a command from a plan, worker, or coordinator. It never
-// invokes the worker inline. The sealed scope selects the durable acceptance
-// path while Node keeps the public builder vocabulary uniform.
-func Execute[A, R any](scope Scope, key string, cmd Command[A, R], args A) *Node[R] {
-	if plan, ok := scope.(*Plan); ok {
-		return executePlan(plan, key, cmd, args)
-	}
+// Execute requests a command from a worker or coordinator. It never invokes
+// the worker inline; the command is staged in the enclosing durable decision.
+func Execute[A, R any](scope Scope, key string, cmd Command[A, R], args A) *Node {
 	state, err := usableDecisionScope(scope, "execute")
-	node := &Node[R]{scope: state, key: key}
+	node := &Node{scope: state, key: key}
 	if err != nil {
 		return node
 	}
@@ -354,6 +342,8 @@ func equivalentStagedCommandIdentity(a, b stagedCommand) bool {
 	left, right := a, b
 	left.required, right.required = true, true
 	left.startAfter, right.startAfter = 0, 0
+	left.waits, right.waits = nil, nil
+	left.within, right.within = 0, 0
 	return equivalentStagedCommand(left, right)
 }
 
@@ -379,12 +369,47 @@ func equivalentStagedCommand(a, b stagedCommand) bool {
 		return false
 	}
 	if a.definition.Name != b.definition.Name || a.definition.Version != b.definition.Version ||
-		a.required != b.required || a.startAfter != b.startAfter ||
+		a.required != b.required || a.startAfter != b.startAfter || a.within != b.within ||
 		!equivalentCommandDefaults(a.defaults, b.defaults) ||
-		!bytes.Equal(a.args.Bytes, b.args.Bytes) {
+		!bytes.Equal(a.args.Bytes, b.args.Bytes) || !slices.Equal(a.waits, b.waits) {
 		return false
 	}
 	return true
+}
+
+func equivalentCommandDefaults(a, b commandDefaults) bool {
+	if a.queue != b.queue || a.attemptTimeout != b.attemptTimeout {
+		return false
+	}
+	left, leftErr := retrypolicy.CanonicalPublic(a.retryPolicy)
+	right, rightErr := retrypolicy.CanonicalPublic(b.retryPolicy)
+	return leftErr == nil && rightErr == nil && bytes.Equal(left.Bytes, right.Bytes)
+}
+
+func addCommandEventWait(waits []commandEventWait, wait commandEventWait) []commandEventWait {
+	if slices.Contains(waits, wait) {
+		return waits
+	}
+	waits = append(waits, wait)
+	sort.Slice(waits, func(i, j int) bool {
+		if waits[i].namespace != waits[j].namespace {
+			return waits[i].namespace < waits[j].namespace
+		}
+		if waits[i].name != waits[j].name {
+			return waits[i].name < waits[j].name
+		}
+		return waits[i].key < waits[j].key
+	})
+	return waits
+}
+
+func validateDecisionCommands(state decisionState) error {
+	for _, command := range state.commands {
+		if command.within > 0 && len(command.waits) == 0 {
+			return newError(ErrInvalid, "execute", "within", command.key, "Within requires WaitFor")
+		}
+	}
+	return nil
 }
 
 func (state *decisionState) orderedEvents() []stagedEvent {
@@ -461,11 +486,7 @@ func lookupResultSource(source ResultSource, key string, command *definition.Com
 	state := source.flowResultSource()
 	value, exists := state.values[key]
 	if !exists {
-		reason := "command is not an available dependency"
-		if !state.restricted {
-			reason = "command does not exist in the snapshot"
-		}
-		return resultSourceValue{}, newError(ErrNotFound, "read", "command", key, reason)
+		return resultSourceValue{}, newError(ErrNotFound, "read", "command", key, "command does not exist in the snapshot")
 	}
 	if value.name != command.Name || value.version != command.Version {
 		return resultSourceValue{}, newError(ErrConflict, "read", "command", key, fmt.Sprintf("definition differs from %s/%d", value.name, value.version))

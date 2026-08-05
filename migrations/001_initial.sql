@@ -22,13 +22,6 @@ CREATE TABLE {{schema}}.flow_executions (
     command_count         integer NOT NULL DEFAULT 0 CHECK (command_count >= 0),
     open_commands         integer NOT NULL DEFAULT 0 CHECK (open_commands >= 0),
 
-    plan_dirty            boolean NOT NULL DEFAULT false,
-    plan_dirty_since      timestamptz,
-    plan_quiescent        boolean NOT NULL DEFAULT false,
-    plan_revision         bigint NOT NULL DEFAULT 0 CHECK (plan_revision >= 0),
-    plan_waiting_count    integer NOT NULL DEFAULT 0 CHECK (plan_waiting_count >= 0),
-    plan_waiting_on       jsonb NOT NULL DEFAULT '[]'::jsonb,
-
     next_journal_position bigint NOT NULL DEFAULT 1 CHECK (next_journal_position >= 1),
     root_command_id       uuid,
     failure               jsonb,
@@ -39,7 +32,7 @@ CREATE TABLE {{schema}}.flow_executions (
     finished_at           timestamptz,
 
     CONSTRAINT flow_executions_driver_mode_ck CHECK
-        (driver_mode IN ('direct', 'plan', 'coordinator')),
+        (driver_mode IN ('direct', 'coordinator')),
     CONSTRAINT flow_executions_status_ck CHECK
         (status IN ('running', 'failing', 'succeeded', 'failed', 'cancelled', 'expired')),
     CONSTRAINT flow_executions_terminal_shape_ck CHECK (
@@ -48,18 +41,7 @@ CREATE TABLE {{schema}}.flow_executions (
         (status IN ('succeeded', 'failed', 'cancelled', 'expired') AND finished_at IS NOT NULL)
     ),
     CONSTRAINT flow_executions_command_limit_ck CHECK
-        (max_commands = 0 OR command_count <= max_commands),
-    CONSTRAINT flow_executions_plan_fields_ck CHECK (
-        (driver_mode = 'plan' AND jsonb_typeof(plan_waiting_on) = 'array'
-            AND (plan_dirty = (plan_dirty_since IS NOT NULL))) OR
-        (driver_mode <> 'plan' AND plan_dirty = false AND plan_dirty_since IS NULL
-            AND plan_revision = 0
-            AND plan_quiescent = false AND plan_waiting_count = 0
-            AND plan_waiting_on = '[]'::jsonb)
-    ),
-    CONSTRAINT flow_executions_terminal_plan_ck CHECK (
-        status IN ('running', 'failing') OR plan_dirty = false
-    )
+        (max_commands = 0 OR command_count <= max_commands)
 );
 
 CREATE UNIQUE INDEX flow_executions_idempotency_uq
@@ -83,13 +65,6 @@ CREATE INDEX flow_executions_deadline_idx
     ON {{schema}}.flow_executions (deadline_at, execution_id)
     WHERE status IN ('running', 'failing') AND deadline_at IS NOT NULL;
 
-CREATE INDEX flow_executions_plan_queue_idx
-    ON {{schema}}.flow_executions
-       (definition_name, definition_version, plan_dirty_since, execution_id)
-    WHERE driver_mode = 'plan'
-      AND status IN ('running', 'failing')
-      AND plan_dirty;
-
 CREATE TABLE {{schema}}.flow_commands (
     command_id              uuid PRIMARY KEY,
     execution_id            uuid NOT NULL
@@ -107,17 +82,13 @@ CREATE TABLE {{schema}}.flow_commands (
     declaration_fingerprint bytea NOT NULL CHECK (octet_length(declaration_fingerprint) = 32),
 
     state                   text NOT NULL,
-    unsatisfied_groups      integer NOT NULL DEFAULT 0 CHECK (unsatisfied_groups >= 0),
     unsatisfied_waits       integer NOT NULL DEFAULT 0 CHECK (unsatisfied_waits >= 0),
-    child_membership_closed boolean NOT NULL DEFAULT false,
-    failure_scope           boolean NOT NULL DEFAULT false,
 
     queue                   text NOT NULL,
     attempt_timeout_ms      bigint CHECK (attempt_timeout_ms IS NULL OR attempt_timeout_ms > 0),
     retry_policy            jsonb NOT NULL,
     retry_policy_hash       bytea NOT NULL CHECK (octet_length(retry_policy_hash) = 32),
 
-    schedule_kind           text NOT NULL DEFAULT 'none',
     initial_delay_ms        bigint CHECK (initial_delay_ms IS NULL OR initial_delay_ms > 0),
     budget_started_at       timestamptz,
     next_attempt_at         timestamptz,
@@ -142,17 +113,10 @@ CREATE TABLE {{schema}}.flow_commands (
 
     CONSTRAINT flow_commands_execution_key_uq UNIQUE (execution_id, command_key),
     CONSTRAINT flow_commands_origin_ck CHECK
-        (origin IN ('direct_root', 'plan', 'worker_child', 'coordinator_command')),
+        (origin IN ('direct_root', 'worker_child', 'coordinator_command')),
     CONSTRAINT flow_commands_state_ck CHECK
         (state IN ('pending', 'ready', 'running', 'retry_wait',
-                   'succeeded', 'failed', 'cancelled', 'expired', 'skipped')),
-    CONSTRAINT flow_commands_schedule_kind_ck CHECK
-        (schedule_kind IN ('none', 'plan_delay')),
-    CONSTRAINT flow_commands_schedule_shape_ck CHECK (
-        (schedule_kind = 'none' AND initial_delay_ms IS NULL)
-        OR
-        (schedule_kind <> 'none' AND initial_delay_ms IS NOT NULL)
-    ),
+                   'succeeded', 'failed', 'cancelled', 'expired')),
     CONSTRAINT flow_commands_parent_shape_ck CHECK (
         (origin = 'worker_child' AND parent_command_id IS NOT NULL)
         OR
@@ -164,16 +128,13 @@ CREATE TABLE {{schema}}.flow_commands (
         (state <> 'succeeded' AND result IS NULL AND result_hash IS NULL)
     ),
     CONSTRAINT flow_commands_pending_shape_ck CHECK (
-        state <> 'pending' OR (unsatisfied_groups + unsatisfied_waits > 0)
-    ),
-    CONSTRAINT flow_commands_child_closure_ck CHECK (
-        child_membership_closed = (state = 'succeeded')
+        state <> 'pending' OR unsatisfied_waits > 0
     ),
     CONSTRAINT flow_commands_terminal_shape_ck CHECK (
-        (state IN ('succeeded', 'failed', 'cancelled', 'expired', 'skipped')
+        (state IN ('succeeded', 'failed', 'cancelled', 'expired')
             AND finished_at IS NOT NULL AND terminal_position IS NOT NULL)
         OR
-        (state NOT IN ('succeeded', 'failed', 'cancelled', 'expired', 'skipped')
+        (state NOT IN ('succeeded', 'failed', 'cancelled', 'expired')
             AND finished_at IS NULL AND terminal_position IS NULL)
     ),
     CONSTRAINT flow_commands_budget_shape_ck CHECK (
@@ -188,7 +149,7 @@ CREATE TABLE {{schema}}.flow_commands (
 CREATE INDEX flow_commands_execution_idx
     ON {{schema}}.flow_commands (execution_id, command_key)
     INCLUDE (command_id, name, version, origin, parent_command_id, required,
-             state, unsatisfied_groups, unsatisfied_waits, terminal_position);
+             state, unsatisfied_waits, terminal_position);
 
 CREATE INDEX flow_commands_parent_idx
     ON {{schema}}.flow_commands (parent_command_id, command_key)
@@ -246,45 +207,6 @@ CREATE INDEX flow_command_queue_lease_idx
 
 CREATE INDEX flow_command_queue_execution_idx
     ON {{schema}}.flow_command_queue (execution_id, command_id);
-
-CREATE TABLE {{schema}}.flow_command_dependency_groups (
-    group_id             uuid PRIMARY KEY,
-    execution_id         uuid NOT NULL
-        REFERENCES {{schema}}.flow_executions(execution_id) ON DELETE CASCADE,
-    dependent_command_id uuid NOT NULL
-        REFERENCES {{schema}}.flow_commands(command_id) ON DELETE CASCADE,
-    ordinal              smallint NOT NULL CHECK (ordinal >= 0),
-    kind                 text NOT NULL,
-    state                text NOT NULL DEFAULT 'unresolved',
-    resolved_at          timestamptz,
-
-    CONSTRAINT flow_command_dependency_groups_ordinal_uq
-        UNIQUE (dependent_command_id, ordinal),
-    CONSTRAINT flow_command_dependency_groups_kind_ck CHECK
-        (kind IN ('all_succeeded', 'all_settled', 'all_failed')),
-    CONSTRAINT flow_command_dependency_groups_state_ck CHECK
-        (state IN ('unresolved', 'satisfied', 'unsatisfiable')),
-    CONSTRAINT flow_command_dependency_groups_resolved_ck CHECK
-        ((state = 'unresolved') = (resolved_at IS NULL))
-);
-
-CREATE TABLE {{schema}}.flow_command_dependency_members (
-    group_id               uuid NOT NULL
-        REFERENCES {{schema}}.flow_command_dependency_groups(group_id) ON DELETE CASCADE,
-    predecessor_command_id uuid NOT NULL
-        REFERENCES {{schema}}.flow_commands(command_id) ON DELETE RESTRICT,
-    execution_id           uuid NOT NULL
-        REFERENCES {{schema}}.flow_executions(execution_id) ON DELETE CASCADE,
-    predecessor_key        text NOT NULL,
-
-    PRIMARY KEY (group_id, predecessor_command_id)
-);
-
-CREATE INDEX flow_command_dependency_reverse_idx
-    ON {{schema}}.flow_command_dependency_members (predecessor_command_id, group_id);
-
-CREATE INDEX flow_command_dependency_execution_idx
-    ON {{schema}}.flow_command_dependency_groups (execution_id, dependent_command_id, ordinal);
 
 CREATE TABLE {{schema}}.flow_command_event_waits (
     command_id         uuid NOT NULL
@@ -392,8 +314,6 @@ CREATE TABLE {{schema}}.flow_journal (
     command_id         uuid,
     attempt_id         uuid,
     coordinator_id     uuid,
-    plan_revision      bigint,
-
     event_id           uuid,
     event_namespace    text,
     event_name         text,
@@ -411,7 +331,7 @@ CREATE TABLE {{schema}}.flow_journal (
     CONSTRAINT flow_journal_entry_kind_ck CHECK
         (entry_kind IN ('execution_started', 'execution_failing', 'command_created',
                         'attempt_started', 'attempt_concluded',
-                        'event_recorded', 'plan_reconciled', 'coordinator_transition')),
+                        'event_recorded', 'coordinator_transition')),
     CONSTRAINT flow_journal_event_shape_ck CHECK (
         (entry_kind = 'event_recorded'
             AND event_id IS NOT NULL AND event_namespace IS NOT NULL
@@ -433,20 +353,13 @@ CREATE TABLE {{schema}}.flow_journal (
                 AND attempt_id IS NULL)
         )
         AND (entry_kind <> 'coordinator_transition' OR coordinator_id IS NOT NULL)
-        AND (entry_kind <> 'plan_reconciled'
-             OR (command_id IS NULL AND coordinator_id IS NULL))
         AND (event_class IS DISTINCT FROM 'coordinator_terminal' OR coordinator_id IS NOT NULL)
-    ),
-    CONSTRAINT flow_journal_plan_revision_shape_ck CHECK (
-        (entry_kind = 'plan_reconciled' AND plan_revision IS NOT NULL AND plan_revision > 0)
-        OR (entry_kind <> 'plan_reconciled' AND plan_revision IS NULL)
     ),
     CONSTRAINT flow_journal_event_namespace_ck CHECK
         (event_namespace IS NULL OR event_namespace IN ('application', 'runtime')),
     CONSTRAINT flow_journal_event_class_ck CHECK
         (event_class IS NULL OR event_class IN
-            ('application', 'command_terminal', 'execution_terminal',
-             'plan_terminal', 'coordinator_terminal')),
+            ('application', 'command_terminal', 'execution_terminal', 'coordinator_terminal')),
     CONSTRAINT flow_journal_application_event_key_ck CHECK (
         event_class IS DISTINCT FROM 'application'
         OR (event_key IS NOT NULL AND event_key <> '')
@@ -461,7 +374,7 @@ CREATE TABLE {{schema}}.flow_journal (
     ),
     CONSTRAINT flow_journal_terminal_status_ck CHECK
         (terminal_status IS NULL OR terminal_status IN
-            ('succeeded', 'failed', 'cancelled', 'expired', 'skipped'))
+            ('succeeded', 'failed', 'cancelled', 'expired'))
 );
 
 CREATE UNIQUE INDEX flow_journal_event_id_uq
@@ -490,10 +403,6 @@ CREATE UNIQUE INDEX flow_journal_execution_failing_uq
     ON {{schema}}.flow_journal (execution_id)
     WHERE entry_kind = 'execution_failing';
 
-CREATE UNIQUE INDEX flow_journal_plan_terminal_uq
-    ON {{schema}}.flow_journal (execution_id)
-    WHERE entry_kind = 'event_recorded' AND event_class = 'plan_terminal';
-
 CREATE UNIQUE INDEX flow_journal_coordinator_terminal_uq
     ON {{schema}}.flow_journal (coordinator_id)
     WHERE entry_kind = 'event_recorded' AND event_class = 'coordinator_terminal';
@@ -505,10 +414,6 @@ CREATE UNIQUE INDEX flow_journal_attempt_started_uq
 CREATE UNIQUE INDEX flow_journal_attempt_concluded_uq
     ON {{schema}}.flow_journal (attempt_id)
     WHERE entry_kind = 'attempt_concluded';
-
-CREATE UNIQUE INDEX flow_journal_plan_reconciled_uq
-    ON {{schema}}.flow_journal (execution_id, plan_revision)
-    WHERE entry_kind = 'plan_reconciled';
 
 CREATE INDEX flow_journal_event_lookup_idx
     ON {{schema}}.flow_journal

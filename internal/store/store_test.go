@@ -258,9 +258,9 @@ func TestStoreValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginSemantic(database validation) error = %v", err)
 	}
-	invalidEntry, err := store.NewJournalEntry(store.PlanReconciled, map[string]int{"v": 1})
+	invalidEntry, err := store.NewJournalEntry(store.EventRecorded, map[string]int{"v": 1})
 	if err != nil {
-		t.Fatalf("NewJournalEntry(plan) error = %v", err)
+		t.Fatalf("NewJournalEntry(removed kind) error = %v", err)
 	}
 	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{invalidEntry}}); !errors.Is(err, flow.ErrInvalid) {
 		t.Fatalf("Apply(database-invalid entry) error = %v", err)
@@ -318,10 +318,6 @@ func TestSchemaConstraints(t *testing.T) {
 		VALUES ($1,$2,'default','work',1,'ready',clock_timestamp(),$3,clock_timestamp())`, commandID, validID, uuid.New())
 	assertConstraint(t, err, "flow_command_queue_lease_shape_ck")
 
-	groupID := uuid.New()
-	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_command_dependency_groups")+`
-		(group_id,execution_id,dependent_command_id,ordinal,kind) VALUES ($1,$2,$3,0,'invalid')`, groupID, validID, commandID)
-	assertConstraint(t, err, "flow_command_dependency_groups_kind_ck")
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_command_event_waits")+`
 		(command_id,execution_id,event_name,event_key,satisfied_position) VALUES ($1,$2,'event','key',0)`, commandID, validID)
 	assertConstraint(t, err, "flow_command_event_waits_position_ck")
@@ -349,7 +345,7 @@ func seedCommand(t *testing.T, db *pgkit.DB, schema string, executionID uuid.UUI
 		command_id,execution_id,command_key,name,version,origin,args,args_hash,declaration_fingerprint,
 		state,queue,retry_policy,retry_policy_hash,budget_started_at,next_attempt_at,
 		created_position,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,'work',1,'plan','{}'::text::bytea,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),
+	) VALUES ($1,$2,$3,'work',1,'coordinator_command','{}'::text::bytea,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),
 		'ready','default','{}'::jsonb,decode(repeat('00',32),'hex'),clock_timestamp(),clock_timestamp(),
 		1,clock_timestamp(),clock_timestamp(),clock_timestamp())`, id, executionID, key)
 	if err != nil {

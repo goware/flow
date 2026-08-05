@@ -290,69 +290,6 @@ func waitForMatchingObservations(t *testing.T, observer *recordingObserver, coun
 	return nil
 }
 
-func TestWorkerStagedEventSatisfiesExactPlanWait(t *testing.T) {
-	t.Parallel()
-	database := testpg.Open(t)
-	ctx := context.Background()
-	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
-		t.Fatal(err)
-	}
-	event := DefineEvent[stagedEventPayload]("staged.wait_event")
-	emitter := DefineCommand[None, None]("staged.wait_emitter", 1, WithRetry(Attempts(1)))
-	waiter := DefineCommand[None, None]("staged.wait_consumer", 1, WithRetry(Attempts(1)))
-	plan := DefinePlan[None]("staged.wait_plan", 1, func(plan *Plan, _ None) {
-		Execute(plan, "emit", emitter, None{})
-		Execute(plan, "wait", waiter, None{}).WaitFor(event, "ready")
-	})
-	var waiterCalls atomic.Int32
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
-		WithPlanConcurrency(1), WithPollInterval(5*time.Millisecond), WithNotifications(false))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.Register(plan,
-		Handle(emitter, func(_ context.Context, work *Work[None]) (None, error) {
-			return None{}, Emit(work, event, "ready", stagedEventPayload{Value: "go"})
-		}),
-		Handle(waiter, func(context.Context, *Work[None]) (None, error) {
-			waiterCalls.Add(1)
-			return None{}, nil
-		}),
-	); err != nil {
-		t.Fatal(err)
-	}
-	cancel, runResult := startRuntime(t, runtime)
-	defer stopRuntime(t, cancel, runResult)
-	handle, err := plan.With(runtime).Execute(ctx, "wait", None{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, handle.ID, "succeeded", 5*time.Second)
-	if waiterCalls.Load() != 1 {
-		t.Fatalf("waiter calls=%d", waiterCalls.Load())
-	}
-	trace, err := Trace(ctx, runtime, handle.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foundSatisfied := false
-	for _, command := range trace.Commands {
-		if command.Key == "wait" && command.State == "succeeded" && len(command.Waits) == 1 {
-			foundSatisfied = true
-		}
-	}
-	if !foundSatisfied {
-		t.Fatalf("trace commands=%+v", trace.Commands)
-	}
-	var satisfiedPosition *int64
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT w.satisfied_position FROM `+
-		pgschema.Table(database.Schema, "flow_command_event_waits")+` w JOIN `+
-		pgschema.Table(database.Schema, "flow_commands")+` c USING(command_id)
-		WHERE c.execution_id=$1 AND c.command_key='wait'`, handle.ID).Scan(&satisfiedPosition); err != nil || satisfiedPosition == nil {
-		t.Fatalf("satisfied position=%v err=%v", satisfiedPosition, err)
-	}
-}
-
 func TestWorkerStagedEventCoalescesOrConflictsWithDurableIdentity(t *testing.T) {
 	t.Parallel()
 	database := testpg.Open(t)

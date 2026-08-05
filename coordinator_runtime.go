@@ -226,6 +226,9 @@ func invokeCoordinator(ctx context.Context, handler erasedCoordinatorHandler, sc
 }
 
 func prepareCoordinatorDecision(scope *coordinatorScope) ([]store.ApplicationEvent, []store.CommandCreate, error) {
+	if err := validateDecisionCommands(scope.scope.decision); err != nil {
+		return nil, nil, err
+	}
 	stagedEvents := scope.scope.decision.orderedEvents()
 	events := make([]store.ApplicationEvent, 0, len(stagedEvents))
 	for _, staged := range stagedEvents {
@@ -247,23 +250,16 @@ func prepareCoordinatorDecision(scope *coordinatorScope) ([]store.ApplicationEve
 		}
 		child.Required = staged.required
 		if staged.startAfter > 0 {
-			child.ScheduleKind, child.InitialDelay = "execute_delay", staged.startAfter
+			child.InitialDelay = staged.startAfter
 		}
-		declaration, err := canonical.Marshal(struct {
-			V            int             `json:"v"`
-			Key          string          `json:"key"`
-			Name         string          `json:"name"`
-			Version      int             `json:"version"`
-			Args         json.RawMessage `json:"args"`
-			Origin       string          `json:"origin"`
-			Required     bool            `json:"required"`
-			StartAfterMS int64           `json:"start_after_ms,omitempty"`
-		}{V: 1, Key: child.Key, Name: child.Name, Version: child.Version, Args: json.RawMessage(child.Args.BytesCopy()),
-			Origin: child.Origin, Required: child.Required, StartAfterMS: child.InitialDelay.Milliseconds()}, 0)
+		for _, wait := range staged.waits {
+			child.Waits = append(child.Waits, store.EventWaitCreate{Name: wait.name, Key: wait.key})
+		}
+		child.Within = staged.within
+		child.DeclarationFingerprint, err = commandDeclarationFingerprint(child)
 		if err != nil {
-			return nil, nil, newError(ErrInvalid, "settle", "command", child.Key, "declaration cannot be canonicalized")
+			return nil, nil, err
 		}
-		child.DeclarationFingerprint = declaration.Digest
 		children = append(children, child)
 	}
 	return events, children, nil

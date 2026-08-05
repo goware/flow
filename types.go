@@ -11,7 +11,6 @@ type AttemptID string
 type CoordinatorID string
 type JournalEntryID string
 type JournalPosition uint64
-type PlanRevision uint64
 
 type CommandStatus string
 
@@ -20,7 +19,6 @@ const (
 	StatusFailed    CommandStatus = "failed"
 	StatusCancelled CommandStatus = "cancelled"
 	StatusExpired   CommandStatus = "expired"
-	StatusSkipped   CommandStatus = "skipped"
 )
 
 type CommandFailure struct {

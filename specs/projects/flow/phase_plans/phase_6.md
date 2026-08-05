@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/2-remove-plan.md
 ---
 
 # Phase 6: Plan-Driven Execution
+
+> Historical delivery record. This complete feature vertical was removed by `../plans/2-remove-plan.md`.
 
 ## Overview
 

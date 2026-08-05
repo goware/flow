@@ -23,7 +23,6 @@ type DriverMode string
 
 const (
 	DriverDirect      DriverMode = "direct"
-	DriverPlan        DriverMode = "plan"
 	DriverCoordinator DriverMode = "coordinator"
 )
 
@@ -42,26 +41,12 @@ type CommandCreate struct {
 	Origin                 string
 	ParentCommandID        *uuid.UUID
 	Required               bool
-	FailureScope           bool
 	Queue                  string
 	AttemptTimeout         time.Duration
 	RetryPolicy            canonical.Value
-	ScheduleKind           string
 	InitialDelay           time.Duration
-	Dependencies           []DependencyGroupCreate
 	Waits                  []EventWaitCreate
 	Within                 time.Duration
-}
-
-type DependencyGroupCreate struct {
-	ID      uuid.UUID
-	Kind    string
-	Members []DependencyMemberCreate
-}
-
-type DependencyMemberCreate struct {
-	CommandID uuid.UUID
-	Key       string
 }
 
 type EventWaitCreate struct {
@@ -139,11 +124,6 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 		return StartResult{}, false, MapError("capture start time", err)
 	}
 	deadlineAt := deadlineAt(dbNow, request.Deadline)
-	planDirty := request.Mode == DriverPlan
-	var planDirtySince *time.Time
-	if planDirty {
-		planDirtySince = &dbNow
-	}
 	var rootID *uuid.UUID
 	commandCount := 0
 	if request.Root != nil {
@@ -155,14 +135,14 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	err := tx.QueryRow(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_executions")+` (
 		execution_id,driver_mode,definition_name,definition_version,execution_key,key_scope,status,fail_fast,
 		start_fingerprint,input,input_hash,metadata,metadata_canonical,metadata_hash,
-		deadline_at,max_commands,command_count,open_commands,plan_dirty,plan_dirty_since,
+		deadline_at,max_commands,command_count,open_commands,
 		next_journal_position,root_command_id,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,$4,$5,$6,'running',$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$16,$17,$18,1,$19,$20,$20,$20)
+	) VALUES ($1,$2,$3,$4,$5,$6,'running',$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$16,1,$17,$18,$18,$18)
 	ON CONFLICT DO NOTHING RETURNING execution_id`,
 		request.ID, string(request.Mode), request.DefinitionName, request.DefinitionVersion, request.Key, request.KeyScope,
 		request.FailFast, request.StartFingerprint[:], request.Input.Bytes, request.Input.Digest[:],
 		string(request.Metadata.Bytes), request.Metadata.Bytes, request.Metadata.Digest[:], deadlineAt,
-		request.MaxCommands, commandCount, planDirty, planDirtySince, rootID, dbNow,
+		request.MaxCommands, commandCount, rootID, dbNow,
 	).Scan(&inserted)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return StartResult{}, false, MapError("insert execution", err)
@@ -302,7 +282,7 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 	}
 	initialState := "ready"
 	var recordedBudget, recordedNext *time.Time
-	if len(command.Dependencies)+len(command.Waits) > 0 {
+	if len(command.Waits) > 0 {
 		initialState = "pending"
 	} else {
 		recordedBudget, recordedNext = &budgetStartedAt, &nextAttemptAt
@@ -310,18 +290,11 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 	body := journalcodec.CommandCreatedBody{
 		V: 1, CommandID: command.ID.String(), CommandKey: command.Key, Name: command.Name,
 		Version: command.Version, Args: json.RawMessage(command.Args.BytesCopy()), Origin: command.Origin,
-		Required: command.Required, FailureScope: command.FailureScope, InitialState: initialState,
+		Required: command.Required, InitialState: initialState,
 		Queue: command.Queue, AttemptTimeoutMS: timeoutMS,
-		RetryPolicy: json.RawMessage(command.RetryPolicy.BytesCopy()), ScheduleKind: command.ScheduleKind,
+		RetryPolicy:    json.RawMessage(command.RetryPolicy.BytesCopy()),
 		InitialDelayMS: initialDelayMS, BudgetStartedAt: recordedBudget, NextAttemptAt: recordedNext,
 		DeclarationFingerprint: hex.EncodeToString(command.DeclarationFingerprint[:]),
-	}
-	for _, group := range command.Dependencies {
-		value := journalcodec.DependencyGroupBody{Kind: group.Kind}
-		for _, member := range group.Members {
-			value.Members = append(value.Members, member.Key)
-		}
-		body.Dependencies = append(body.Dependencies, value)
 	}
 	for _, wait := range command.Waits {
 		body.Waits = append(body.Waits, journalcodec.EventWaitBody{Name: wait.Name, Key: wait.Key})
@@ -353,7 +326,6 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 		initialDelayMS = &value
 	}
 	state := "ready"
-	unsatisfiedGroups := len(command.Dependencies)
 	unsatisfiedWaits := 0
 	waitPositions := make(map[int]int64, len(command.Waits))
 	for index, wait := range command.Waits {
@@ -370,7 +342,7 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 		}
 		waitPositions[index] = position
 	}
-	if unsatisfiedGroups+unsatisfiedWaits > 0 {
+	if unsatisfiedWaits > 0 {
 		state = "pending"
 	}
 	var acceptedBudget, acceptedNext *time.Time
@@ -384,20 +356,20 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_commands")+` (
 		command_id,execution_id,command_key,name,version,origin,parent_command_id,required,
-		args,args_hash,declaration_fingerprint,state,unsatisfied_groups,unsatisfied_waits,child_membership_closed,failure_scope,
-		queue,attempt_timeout_ms,retry_policy,retry_policy_hash,schedule_kind,initial_delay_ms,
+		args,args_hash,declaration_fingerprint,state,unsatisfied_waits,
+		queue,attempt_timeout_ms,retry_policy,retry_policy_hash,initial_delay_ms,
 		budget_started_at,next_attempt_at,wait_timeout_ms,created_position,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,false,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25,$26,$26,$26)`,
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$23,$23)`,
 		command.ID, executionID, command.Key, command.Name, command.Version, command.Origin,
 		command.ParentCommandID, command.Required, command.Args.Bytes, command.Args.Digest[:],
-		command.DeclarationFingerprint[:], state, unsatisfiedGroups, unsatisfiedWaits, command.FailureScope, command.Queue, timeoutMS,
-		string(command.RetryPolicy.Bytes), command.RetryPolicy.Digest[:], command.ScheduleKind, initialDelayMS,
+		command.DeclarationFingerprint[:], state, unsatisfiedWaits, command.Queue, timeoutMS,
+		string(command.RetryPolicy.Bytes), command.RetryPolicy.Digest[:], initialDelayMS,
 		acceptedBudget, acceptedNext, withinMS, createdPosition, budgetStartedAt,
 	)
 	if err != nil {
 		return MapError("insert command", err)
 	}
-	if state == "pending" && unsatisfiedGroups == 0 && unsatisfiedWaits > 0 {
+	if state == "pending" && unsatisfiedWaits > 0 {
 		var deadline *time.Time
 		if command.Within > 0 {
 			value := budgetStartedAt.Add(command.Within)
@@ -423,23 +395,6 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 			command.ID, executionID, command.Queue, command.Name, command.Version, nextAttemptAt, budgetStartedAt)
 		if err != nil {
 			return MapError("enqueue command", err)
-		}
-	}
-	for ordinal, group := range command.Dependencies {
-		if group.ID == uuid.Nil {
-			group.ID = uuid.New()
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_dependency_groups")+`
-			(group_id,execution_id,dependent_command_id,ordinal,kind)
-			VALUES ($1,$2,$3,$4,$5)`, group.ID, executionID, command.ID, ordinal, group.Kind); err != nil {
-			return MapError("insert command dependency group", err)
-		}
-		for _, member := range group.Members {
-			if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_dependency_members")+`
-				(group_id,predecessor_command_id,execution_id,predecessor_key) VALUES ($1,$2,$3,$4)`,
-				group.ID, member.CommandID, executionID, member.Key); err != nil {
-				return MapError("insert command dependency member", err)
-			}
 		}
 	}
 	for index, wait := range command.Waits {
@@ -603,20 +558,12 @@ func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event Appl
 	if err != nil {
 		return false, err
 	}
-	resolution, err := s.resolveGraphLocked(ctx, semantic, nil, waits)
+	resolution, err := s.resolveReadinessLocked(ctx, semantic, nil, waits)
 	if err != nil {
 		return false, err
 	}
-	if err := s.applyGraphResolution(ctx, semantic, resolution, journal, len(journal.Journal)); err != nil {
+	if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 		return false, err
-	}
-	if head.Mode == DriverPlan {
-		_, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET plan_dirty=true,plan_dirty_since=COALESCE(plan_dirty_since,$2),plan_quiescent=false,updated_at=$2
-			WHERE execution_id=$1`, head.ID, semantic.DBNow())
-		if err != nil {
-			return false, MapError("mark plan dirty", err)
-		}
 	}
 	return true, nil
 }
@@ -745,23 +692,17 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	}
 	terminalIndex := len(entries)
 	entries = append(entries, commandEvent)
-	resolution := graphResolution{}
+	resolution := readinessResolution{}
 	failureEffects := failureResolution{}
 	if required {
 		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, commandID, "cancelled", head.FailFast)
-		resolution = failureEffects.graphResolution
+		resolution = failureEffects.readinessResolution
 	} else {
-		resolution, err = s.resolveGraphLocked(ctx, semantic, map[uuid.UUID]string{commandID: "cancelled"}, nil)
+		resolution, err = s.resolveReadinessLocked(ctx, semantic, map[uuid.UUID]string{commandID: "cancelled"}, nil)
 	}
 	if err != nil {
 		return CancelResult{}, err
 	}
-	skippedOffset := len(entries)
-	skippedEntries, err := resolution.skippedEntries(terminalIndex)
-	if err != nil {
-		return CancelResult{}, err
-	}
-	entries = append(entries, skippedEntries...)
 	becameFailing := required && head.Status == "running"
 	if becameFailing {
 		survivors := make([]string, len(failureEffects.survivors))
@@ -784,7 +725,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		return CancelResult{}, err
 	}
 	entries = append(entries, cancelledEntries...)
-	effectiveOpen := head.OpenCommands - 1 - len(resolution.skipped) - len(failureEffects.cancelled)
+	effectiveOpen := head.OpenCommands - 1 - len(failureEffects.cancelled)
 	executionFailed := required || head.Status == "failing"
 	terminalExecution := effectiveOpen == 0 && head.Mode == DriverDirect
 	if terminalExecution {
@@ -813,11 +754,11 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		return CancelResult{}, MapError("remove cancelled command delivery", err)
 	}
 	if required {
-		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, skippedOffset, cancelledOffset,
+		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, 0, cancelledOffset,
 			"cancelled by fail-fast after required command cancellation"); err != nil {
 			return CancelResult{}, err
 		}
-	} else if err := s.applyGraphResolution(ctx, semantic, resolution, journal, skippedOffset); err != nil {
+	} else if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 		return CancelResult{}, err
 	}
 
@@ -828,8 +769,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
 			SET status=$4,open_commands=0,failure=CASE WHEN $5 THEN $2::jsonb ELSE failure END,
-			    finished_at=$3,updated_at=$3,status_at=$3,
-			    plan_dirty=false,plan_dirty_since=NULL
+			    finished_at=$3,updated_at=$3,status_at=$3
 			WHERE execution_id=$1`, head.ID, jsonString(terminalFailure{Code: "command_cancelled", Message: reason}), semantic.DBNow(), status, executionFailed); err != nil {
 			return CancelResult{}, MapError("fail execution after command cancellation", err)
 		}
@@ -845,11 +785,8 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 			status = "failing"
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET status=$2,open_commands=open_commands-1-$4,updated_at=$3,status_at=CASE WHEN status<>$2 THEN $3 ELSE status_at END,
-			    plan_dirty=CASE WHEN driver_mode='plan' THEN true ELSE plan_dirty END,
-			    plan_dirty_since=CASE WHEN driver_mode='plan' THEN COALESCE(plan_dirty_since,$3) ELSE plan_dirty_since END,
-			    plan_quiescent=CASE WHEN driver_mode='plan' THEN false ELSE plan_quiescent END
-			WHERE execution_id=$1`, head.ID, status, semantic.DBNow(), len(resolution.skipped)+len(failureEffects.cancelled)); err != nil {
+			SET status=$2,open_commands=open_commands-1-$4,updated_at=$3,status_at=CASE WHEN status<>$2 THEN $3 ELSE status_at END
+			WHERE execution_id=$1`, head.ID, status, semantic.DBNow(), len(failureEffects.cancelled)); err != nil {
 			return CancelResult{}, MapError("update execution after command cancellation", err)
 		}
 	}
@@ -878,7 +815,7 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 
 	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,state FROM `+
 		pgschema.Table(s.schema, "flow_commands")+`
-		WHERE execution_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired','skipped')
+		WHERE execution_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired')
 		ORDER BY command_id FOR UPDATE`, head.ID)
 	if err != nil {
 		return CancelResult{}, MapError("lock execution commands for cancellation", err)
@@ -976,8 +913,7 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		return CancelResult{}, MapError("cancel coordinator", err)
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-		SET status='cancelled',open_commands=0,failure=$2::jsonb,finished_at=$3,updated_at=$3,status_at=$3,
-		    plan_dirty=false,plan_dirty_since=NULL
+		SET status='cancelled',open_commands=0,failure=$2::jsonb,finished_at=$3,updated_at=$3,status_at=$3
 		WHERE execution_id=$1`, head.ID, failure, semantic.DBNow()); err != nil {
 		return CancelResult{}, MapError("cancel execution", err)
 	}
@@ -1032,7 +968,7 @@ func jsonString(value any) string {
 
 func isCommandTerminal(state string) bool {
 	switch state {
-	case "succeeded", "failed", "cancelled", "expired", "skipped":
+	case "succeeded", "failed", "cancelled", "expired":
 		return true
 	default:
 		return false
@@ -1065,7 +1001,7 @@ func validateStartRequest(request StartRequest) error {
 		request.MaxCommands < 0 || len(request.Input.Bytes) == 0 || len(request.Metadata.Bytes) == 0 {
 		return fmt.Errorf("%w: incomplete execution start", flowerr.ErrInvalid)
 	}
-	if request.Mode != DriverDirect && request.Mode != DriverPlan && request.Mode != DriverCoordinator {
+	if request.Mode != DriverDirect && request.Mode != DriverCoordinator {
 		return fmt.Errorf("%w: invalid driver mode", flowerr.ErrInvalid)
 	}
 	if request.KeyScope != "" && request.KeyScope != KeyScopePermanent && request.KeyScope != KeyScopeLive {
@@ -1084,10 +1020,6 @@ func validateStartRequest(request StartRequest) error {
 	case DriverDirect:
 		if request.Root == nil || request.Coordinator != nil {
 			return fmt.Errorf("%w: invalid direct start shape", flowerr.ErrInvalid)
-		}
-	case DriverPlan:
-		if request.Root != nil || request.Coordinator != nil {
-			return fmt.Errorf("%w: invalid plan start shape", flowerr.ErrInvalid)
 		}
 	case DriverCoordinator:
 		if request.Root != nil || request.Coordinator == nil {

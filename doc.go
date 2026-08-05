@@ -3,12 +3,11 @@
 //
 // The primary model is command → worker → events: commands instruct work,
 // workers do the work, and events record durable facts. Workers may atomically
-// stage typed application events and bounded child commands. Optional pure
-// plans describe dependencies, joins, waits, and fact-driven branching;
-// durable coordinators handle adaptive agents, loops, and open-ended work.
-// The execution graph is a projection of command creation, terminal events,
-// dependencies, child membership, and causation retained in one ordered
-// per-execution journal.
+// stage typed application events and bounded child commands. Durable
+// coordinators handle joins, branching, adaptive agents, loops, and open-ended
+// work. Exact event gates can hold a command until execution-scoped facts
+// exist. Command creation, terminal events, and causation are retained in one
+// ordered per-execution journal.
 //
 // Execute always enqueues. Runtime.Run processes compatible work with bounded
 // concurrency, renewable leases, settlement fencing, and anonymous takeover

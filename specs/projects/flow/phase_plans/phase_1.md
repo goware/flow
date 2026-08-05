@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/2-remove-plan.md
 ---
 
 # Phase 1: Public Contracts and Deterministic Foundation
+
+> Historical delivery record. The active contract is the command/event/coordinator architecture in `../plans/2-remove-plan.md`.
 
 ## Overview
 

@@ -401,7 +401,7 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 	if err != nil {
 		return SettleResult{}, err
 	}
-	var waitUpdates []graphWaitUpdate
+	var waitUpdates []waitUpdate
 	for index, event := range request.Events {
 		waits, matchErr := s.matchingWaitsLocked(ctx, semantic, event.Name, event.Key, firstPosition+1+int64(index))
 		if matchErr != nil {
@@ -452,35 +452,16 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 	transition.CausationBatchIndex = &zero
 	entries = append(entries, transition)
 
-	resolution, err := s.resolveGraphLocked(ctx, semantic, nil, waitUpdates)
+	resolution, err := s.resolveReadinessLocked(ctx, semantic, nil, waitUpdates)
 	if err != nil {
 		return SettleResult{}, err
 	}
-	skippedOffset := len(entries)
-	skipped, err := resolution.skippedEntries(transitionIndex)
-	if err != nil {
-		return SettleResult{}, err
-	}
-	entries = append(entries, skipped...)
 
 	var cancelled []terminalizedCommand
 	if request.Terminal != "" {
 		cancelled, err = s.coordinatorTerminalCommandsLocked(ctx, semantic)
 		if err != nil {
 			return SettleResult{}, err
-		}
-		if len(resolution.skipped) != 0 {
-			skippedIDs := make(map[uuid.UUID]struct{}, len(resolution.skipped))
-			for _, command := range resolution.skipped {
-				skippedIDs[command.id] = struct{}{}
-			}
-			kept := cancelled[:0]
-			for _, command := range cancelled {
-				if _, skipped := skippedIDs[command.ID]; !skipped {
-					kept = append(kept, command)
-				}
-			}
-			cancelled = kept
 		}
 		// Commands staged by a terminal coordinator decision are still part of
 		// that decision's durable output. Record their creation, then terminalize
@@ -547,7 +528,7 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 			return SettleResult{}, err
 		}
 	}
-	if err := s.applyGraphResolution(ctx, semantic, resolution, journal, skippedOffset); err != nil {
+	if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 		return SettleResult{}, err
 	}
 	startPending := request.Claim.Delivery.Start
@@ -569,8 +550,8 @@ func (s *Store) SettleCoordinatorSuccess(ctx context.Context, request Coordinato
 			return SettleResult{}, MapError("advance coordinator inbox", err)
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET command_count=command_count+$2,open_commands=open_commands+$2-$3,updated_at=$4 WHERE execution_id=$1`,
-			semantic.ExecutionID(), len(request.Children), len(resolution.skipped), semantic.DBNow()); err != nil {
+			SET command_count=command_count+$2,open_commands=open_commands+$2,updated_at=$3 WHERE execution_id=$1`,
+			semantic.ExecutionID(), len(request.Children), semantic.DBNow()); err != nil {
 			return SettleResult{}, MapError("update execution after coordinator decision", err)
 		}
 	} else {
@@ -714,7 +695,7 @@ func (s *Store) coordinatorTerminalCommandsLocked(ctx context.Context, semantic 
 		 WHERE execution_id=c.execution_id AND attempt_id=q.active_attempt_id AND entry_kind='attempt_started')
 		FROM `+pgschema.Table(s.schema, "flow_commands")+` c
 		LEFT JOIN `+pgschema.Table(s.schema, "flow_command_queue")+` q ON q.command_id=c.command_id
-		WHERE c.execution_id=$1 AND c.state NOT IN ('succeeded','failed','cancelled','expired','skipped')
+		WHERE c.execution_id=$1 AND c.state NOT IN ('succeeded','failed','cancelled','expired')
 		ORDER BY c.command_key FOR UPDATE OF c`, semantic.ExecutionID())
 	if err != nil {
 		return nil, MapError("lock coordinator terminal commands", err)

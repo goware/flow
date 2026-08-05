@@ -13,26 +13,25 @@ import (
 )
 
 type TraceCommandRow struct {
-	ID                uuid.UUID
-	State             string
-	UnsatisfiedGroups int
-	UnsatisfiedWaits  int
-	BudgetStartedAt   *time.Time
-	NextAttemptAt     *time.Time
-	WaitStartedAt     *time.Time
-	WaitDeadlineAt    *time.Time
-	AttemptOrdinal    int
-	ConsumedAttempts  int
-	LastErrorCode     string
-	LastErrorMessage  string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	StatusAt          time.Time
-	FinishedAt        *time.Time
-	DeliveryState     string
-	LeaseOwner        string
-	LeaseStartedAt    *time.Time
-	LeaseExpiresAt    *time.Time
+	ID               uuid.UUID
+	State            string
+	UnsatisfiedWaits int
+	BudgetStartedAt  *time.Time
+	NextAttemptAt    *time.Time
+	WaitStartedAt    *time.Time
+	WaitDeadlineAt   *time.Time
+	AttemptOrdinal   int
+	ConsumedAttempts int
+	LastErrorCode    string
+	LastErrorMessage string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	StatusAt         time.Time
+	FinishedAt       *time.Time
+	DeliveryState    string
+	LeaseOwner       string
+	LeaseStartedAt   *time.Time
+	LeaseExpiresAt   *time.Time
 }
 
 type TraceCoordinatorRow struct {
@@ -65,7 +64,7 @@ func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUI
 	if id == uuid.Nil {
 		return TraceOperationalRows{}, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
 	}
-	query := `SELECT c.command_id,c.state,c.unsatisfied_groups,c.unsatisfied_waits,c.budget_started_at,c.next_attempt_at,
+	query := `SELECT c.command_id,c.state,c.unsatisfied_waits,c.budget_started_at,c.next_attempt_at,
 		c.wait_started_at,c.wait_deadline_at,c.attempt_ordinal,c.consumed_attempts,c.last_error,
 		c.created_at,c.updated_at,c.status_at,c.finished_at,q.state,q.lease_owner,q.lease_started_at,q.lease_expires_at
 		FROM ` + pgschema.Table(s.schema, "flow_commands") + ` c
@@ -86,7 +85,7 @@ func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUI
 		var value TraceCommandRow
 		var lastError []byte
 		var deliveryState, leaseOwner *string
-		if err := rows.Scan(&value.ID, &value.State, &value.UnsatisfiedGroups, &value.UnsatisfiedWaits,
+		if err := rows.Scan(&value.ID, &value.State, &value.UnsatisfiedWaits,
 			&value.BudgetStartedAt, &value.NextAttemptAt, &value.WaitStartedAt, &value.WaitDeadlineAt,
 			&value.AttemptOrdinal, &value.ConsumedAttempts, &lastError, &value.CreatedAt, &value.UpdatedAt,
 			&value.StatusAt, &value.FinishedAt, &deliveryState, &leaseOwner, &value.LeaseStartedAt, &value.LeaseExpiresAt); err != nil {

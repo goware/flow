@@ -15,7 +15,6 @@ type Operation string
 const (
 	Worker      Operation = "worker"
 	Commit      Operation = "commit"
-	Plan        Operation = "plan"
 	Coordinator Operation = "coordinator"
 )
 
@@ -31,42 +30,6 @@ type Info struct {
 	AttemptStartedAt time.Time
 }
 
-type Dependency struct {
-	Key            string
-	Name           string
-	Version        int
-	Status         string
-	Result         json.RawMessage
-	FailureCode    string
-	FailureMessage string
-}
-
-type PlanCommand struct {
-	ID             string
-	Key            string
-	Name           string
-	Version        int
-	Origin         string
-	State          string
-	Result         json.RawMessage
-	FailureCode    string
-	FailureMessage string
-}
-
-type PlanEvent struct {
-	ID        string
-	Position  int64
-	Namespace string
-	Name      string
-	Key       string
-	Payload   json.RawMessage
-}
-
-type EventSelector struct {
-	Namespace string
-	Name      string
-}
-
 type Request struct {
 	Operation Operation
 	Context   context.Context
@@ -74,15 +37,6 @@ type Request struct {
 	Result    json.RawMessage
 	Info      Info
 	Tx        any
-
-	ExecutionID    string
-	Status         string
-	MaxCommands    int
-	JournalThrough int64
-	Dependencies   []Dependency
-	Commands       []PlanCommand
-	Events         []PlanEvent
-	KnownEvents    []EventSelector
 
 	State                  json.RawMessage
 	DeliveryKind           string
@@ -106,6 +60,13 @@ type StagedCommand struct {
 	Args       json.RawMessage
 	Required   bool
 	StartAfter time.Duration
+	Waits      []EventWait
+	Within     time.Duration
+}
+
+type EventWait struct {
+	Name string
+	Key  string
 }
 
 type StagedEvent struct {
@@ -114,33 +75,12 @@ type StagedEvent struct {
 	Payload json.RawMessage
 }
 
-type Declaration struct {
-	Key          string
-	Name         string
-	Version      int
-	Args         json.RawMessage
-	Required     bool
-	Dependencies [][]string
-	Waits        []string
-	Within       time.Duration
-	Delay        time.Duration
-}
-
-type Read struct {
-	Kind         string
-	Identity     string
-	Availability string
-}
-
 type Result struct {
 	Value          json.RawMessage
 	HandlerError   error
 	Panicked       bool
 	Commands       []StagedCommand
 	Events         []StagedEvent
-	Declarations   []Declaration
-	Reads          []Read
-	WaitingReads   int
 	State          json.RawMessage
 	Terminal       string
 	TerminalReason string

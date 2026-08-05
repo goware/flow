@@ -120,12 +120,15 @@ func BenchmarkInspection100Commands(b *testing.B) {
 				b.Fatal(err)
 			}
 			command := DefineCommand[None, None]("benchmark.inspection.command", 1)
-			plan := DefinePlan[None]("benchmark.inspection.plan", 1, func(plan *Plan, _ None) {
-				for index := range 100 {
-					Execute(plan, fmt.Sprintf("work/%03d", index), command, None{})
-				}
-			})
-			if err := runtime.Register(plan); err != nil {
+			coordinator := DefineCoordinator[None]("benchmark.inspection.coordinator", 1,
+				OnStart(func(_ context.Context, coordination *Coordination[None]) error {
+					for index := range 100 {
+						Execute(coordination, fmt.Sprintf("work/%03d", index), command, None{}).Optional()
+					}
+					return nil
+				}),
+			)
+			if err := runtime.Register(coordinator); err != nil {
 				b.Fatal(err)
 			}
 			runCtx, cancel := context.WithCancel(ctx)
@@ -135,16 +138,15 @@ func BenchmarkInspection100Commands(b *testing.B) {
 				cancel()
 				<-runResult
 			}()
-			handle, err := plan.With(runtime).Execute(ctx, "inspection", None{}, WithoutExecutionDeadline())
+			handle, err := coordinator.With(runtime).Execute(ctx, "inspection", None{}, WithoutExecutionDeadline())
 			if err != nil {
 				b.Fatal(err)
 			}
 			deadline := time.Now().Add(3 * time.Second)
 			for time.Now().Before(deadline) {
 				var count int
-				var dirty bool
-				if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count,plan_dirty FROM `+
-					pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).Scan(&count, &dirty); err == nil && count == 100 && !dirty {
+				if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count FROM `+
+					pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).Scan(&count); err == nil && count == 100 {
 					break
 				}
 				time.Sleep(5 * time.Millisecond)
@@ -181,25 +183,27 @@ func TestJournalGrowthMeasurement100Commands(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := DefineCommand[None, None]("measure.journal.command", 1)
-	plan := DefinePlan[None]("measure.journal.plan", 1, func(plan *Plan, _ None) {
-		for index := range 100 {
-			Execute(plan, fmt.Sprintf("work/%03d", index), command, None{})
-		}
-	})
-	if err := runtime.Register(plan); err != nil {
+	coordinator := DefineCoordinator[None]("measure.journal.coordinator", 1,
+		OnStart(func(_ context.Context, coordination *Coordination[None]) error {
+			for index := range 100 {
+				Execute(coordination, fmt.Sprintf("work/%03d", index), command, None{}).Optional()
+			}
+			return nil
+		}),
+	)
+	if err := runtime.Register(coordinator); err != nil {
 		t.Fatal(err)
 	}
 	cancel, result := startRuntime(t, runtime)
-	handle, err := plan.With(runtime).Execute(ctx, "journal-growth", None{}, WithoutExecutionDeadline())
+	handle, err := coordinator.With(runtime).Execute(ctx, "journal-growth", None{}, WithoutExecutionDeadline())
 	if err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		var count int
-		var dirty bool
-		if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count,plan_dirty FROM `+
-			pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).Scan(&count, &dirty); err == nil && count == 100 && !dirty {
+		if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count FROM `+
+			pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, handle.ID).Scan(&count); err == nil && count == 100 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -212,8 +216,8 @@ func TestJournalGrowthMeasurement100Commands(t *testing.T) {
 		Scan(&rows, &tupleBytes, &bodyBytes); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 102 {
-		t.Fatalf("journal rows=%d want 102", rows)
+	if rows != 104 {
+		t.Fatalf("journal rows=%d want 104", rows)
 	}
 	t.Logf("100-command declaration journal: rows=%d tuple_bytes=%d body_bytes=%d tuple_bytes_per_command=%.1f",
 		rows, tupleBytes, bodyBytes, float64(tupleBytes)/100)

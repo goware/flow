@@ -14,7 +14,6 @@ type Kind string
 const (
 	CommandKind     Kind = "command"
 	EventKind       Kind = "event"
-	PlanKind        Kind = "plan"
 	CoordinatorKind Kind = "coordinator"
 )
 
@@ -67,11 +66,6 @@ type Event struct {
 	Name      string
 	Namespace string
 	Payload   Codec
-}
-
-type Plan struct {
-	Base
-	Args Codec
 }
 
 type Coordinator struct {

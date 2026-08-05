@@ -39,6 +39,49 @@ func TestDecisionBufferRejectsInvalidOptions(t *testing.T) {
 	}
 }
 
+func TestDecisionBufferNormalizesEventGates(t *testing.T) {
+	command := DefineCommand[decisionArgs, decisionResult]("decision_gated", 1)
+	first := DefineEvent[None]("decision.first")
+	second := DefineEvent[None]("decision.second")
+	scope := &Work[None]{scope: &scopeState{}}
+
+	Execute(scope, "child", command, decisionArgs{}).
+		WaitFor(second, "b").
+		WaitFor(first, "a").
+		Within(time.Second)
+	Execute(scope, "child", command, decisionArgs{}).
+		WaitFor(first, "a").
+		Within(time.Second)
+
+	if scope.scope.firstError != nil {
+		t.Fatalf("event gate poison = %v", scope.scope.firstError)
+	}
+	if err := validateDecisionCommands(scope.scope.decision); err != nil {
+		t.Fatalf("validate event gates = %v", err)
+	}
+	staged := scope.scope.decision.commands["child"]
+	if len(staged.waits) != 2 || staged.waits[0].name != first.Name() || staged.waits[1].name != second.Name() || staged.within != time.Second {
+		t.Fatalf("staged event gate = %+v", staged)
+	}
+}
+
+func TestDecisionBufferRejectsInvalidEventGates(t *testing.T) {
+	command := DefineCommand[decisionArgs, decisionResult]("decision_invalid_gate", 1)
+	event := DefineEvent[None]("decision.gate")
+
+	conflict := &Work[None]{scope: &scopeState{}}
+	Execute(conflict, "child", command, decisionArgs{}).WaitFor(event, "event").Within(time.Second).Within(2 * time.Second)
+	if !errors.Is(conflict.scope.firstError, ErrInvalid) {
+		t.Fatalf("conflicting Within poison = %v", conflict.scope.firstError)
+	}
+
+	missing := &Work[None]{scope: &scopeState{}}
+	Execute(missing, "child", command, decisionArgs{}).Within(time.Second)
+	if err := validateDecisionCommands(missing.scope.decision); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Within without WaitFor = %v", err)
+	}
+}
+
 func TestResultOfAndOutcomeOfEnforceSnapshot(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_result", 1)
 	other := DefineCommand[decisionArgs, decisionResult]("decision_result", 2)
@@ -46,13 +89,12 @@ func TestResultOfAndOutcomeOfEnforceSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := &Work[None]{scope: &scopeState{results: resultSourceState{
-		restricted: true,
+	source := ExecutionTrace{results: resultSourceState{
 		values: map[string]resultSourceValue{
 			"success": {name: command.Name(), version: command.Version(), status: StatusSucceeded, result: encoded.Bytes},
 			"failure": {name: command.Name(), version: command.Version(), status: StatusFailed, failure: &CommandFailure{Code: "boom", Message: "failed"}},
 		},
-	}}}
+	}}
 
 	result, err := ResultOf(source, "success", command)
 	if err != nil || result.Value != "done" {

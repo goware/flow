@@ -22,13 +22,6 @@ type Event[T any] struct {
 	err error
 }
 
-type PlanDef[A any] struct {
-	def    *definition.Plan
-	invoke func(*Plan, A)
-	client Client
-	err    error
-}
-
 type Coordinator[S any] struct {
 	def      *definition.Coordinator
 	handlers []coordinatorHandler[S]
@@ -95,19 +88,6 @@ func DefineEvent[T any](name string) Event[T] {
 	return event
 }
 
-func DefinePlan[A any](name string, version int, plan func(*Plan, A)) PlanDef[A] {
-	base := definition.Base{Kind: definition.PlanKind, Name: name, Version: version}
-	def := PlanDef[A]{
-		def:    &definition.Plan{Base: base, Args: definition.NewCodec[A]()},
-		invoke: plan,
-	}
-	def.err = definition.ValidateBase(base)
-	if plan == nil {
-		def.err = errors.Join(def.err, errors.New("plan function must not be nil"))
-	}
-	return def
-}
-
 func DefineCoordinator[S any](name string, version int, handlers ...Handler[S]) Coordinator[S] {
 	base := definition.Base{Kind: definition.CoordinatorKind, Name: name, Version: version}
 	coordinator := Coordinator[S]{def: &definition.Coordinator{
@@ -168,20 +148,6 @@ func (e Event[T]) Name() string {
 	return e.def.Name
 }
 
-func (p PlanDef[A]) Name() string {
-	if p.def == nil {
-		return ""
-	}
-	return p.def.Name
-}
-
-func (p PlanDef[A]) Version() int {
-	if p.def == nil {
-		return 0
-	}
-	return p.def.Version
-}
-
 func (c Coordinator[S]) Name() string {
 	if c.def == nil {
 		return ""
@@ -194,12 +160,6 @@ func (c Coordinator[S]) Version() int {
 		return 0
 	}
 	return c.def.Version
-}
-
-func (p PlanDef[A]) With(client Client) PlanDef[A] {
-	copy := p
-	copy.client = client
-	return copy
 }
 
 func (c Coordinator[S]) With(client Client) Coordinator[S] {

@@ -39,7 +39,7 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 		!strings.Contains(output.String(), "bridge delivery confirmed") {
 		t.Fatalf("example output = %q", output.String())
 	}
-	confirmed, err := flow.ResultOf(trace, "confirm", confirmBridge)
+	confirmed, err := flow.ResultOf(trace, "root", confirmBridge)
 	if err != nil || !confirmed.Confirmed {
 		t.Fatalf("confirmation = %#v, %v", confirmed, err)
 	}

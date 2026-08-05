@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
@@ -24,7 +23,7 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	command := DefineCommand[runtimeArgs, runtimeResult]("claim.plan.handled", 1)
+	command := DefineCommand[runtimeArgs, runtimeResult]("claim.handled", 1)
 	handle, err := command.With(runtime).Execute(ctx, "locked", runtimeArgs{})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
@@ -68,18 +67,4 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 		t.Fatalf("CancelExecution() error = %v", err)
 	}
 
-	plan := DefinePlan[runtimeArgs]("claim.plan", 1, func(*Plan, runtimeArgs) {})
-	planned, err := plan.With(runtime).Execute(ctx, "unhandled", runtimeArgs{})
-	if err != nil {
-		t.Fatalf("Plan.Execute() error = %v", err)
-	}
-	executionID, err := uuid.Parse(string(planned.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	seedClaimPlanRows(t, database.Schema, database.DB.Conn, executionID, 101)
-	candidates, err = runtime.store.ProbeCommands(ctx, kinds, 1)
-	if err != nil || len(candidates) != 1 || candidates[0].Name != command.Name() {
-		t.Fatalf("handled probe behind backlog = %#v, %v", candidates, err)
-	}
 }

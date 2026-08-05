@@ -25,11 +25,6 @@ const bridgeDeliveredName = "example.bridge_delivered"
 var (
 	bridgeDelivered = flow.DefineEvent[bridgeDelivery](bridgeDeliveredName)
 	confirmBridge   = flow.DefineCommand[flow.None, confirmBridgeResult]("example.confirm_bridge", 1)
-	bridgePlan      = flow.DefinePlan[flow.None]("example.bridge", 1, func(plan *flow.Plan, _ flow.None) {
-		flow.Execute(plan, "confirm", confirmBridge, flow.None{}).
-			WaitFor(bridgeDelivered, "delivery/example").
-			Within(2 * time.Second)
-	})
 )
 
 type monitorExample struct {
@@ -93,7 +88,6 @@ func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtim
 		return nil, err
 	}
 	if err := runtime.Register(
-		bridgePlan,
 		flow.Handle(confirmBridge, example.confirmBridge),
 	); err != nil {
 		return nil, err
@@ -102,8 +96,8 @@ func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtim
 }
 
 // newExternalMonitor creates only the lightweight publisher surface. It
-// registers neither the plan nor its worker, demonstrating that publishers and
-// plan processors can be deployed independently.
+// registers no worker, demonstrating that publishers and command processors
+// can be deployed independently.
 func newExternalMonitor(db *pgkit.DB, schema string, output io.Writer) (*externalMonitor, error) {
 	if output == nil {
 		output = io.Discard
@@ -128,10 +122,13 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 	}
 }
 
-// runExampleCommand executes a plan that waits for an independently published
-// event and returns its terminal trace.
+// runExampleCommand creates a direct command gated on an independently
+// published event and returns its terminal trace.
 func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *externalMonitor) (flow.ExecutionHandle, flow.ExecutionTrace, error) {
-	handle, err := bridgePlan.With(runtime).Execute(ctx, "bridge/example", flow.None{})
+	handle, err := confirmBridge.With(runtime).Execute(ctx, "bridge/example", flow.None{},
+		flow.WaitFor(bridgeDelivered, "delivery/example"),
+		flow.Within(2*time.Second),
+	)
 	if err != nil {
 		return flow.ExecutionHandle{}, flow.ExecutionTrace{}, err
 	}

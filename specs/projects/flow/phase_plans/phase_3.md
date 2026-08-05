@@ -1,8 +1,12 @@
 ---
 status: complete
+historical: true
+superseded_by: ../plans/2-remove-plan.md
 ---
 
 # Phase 3: Transactional Ingress and Initial Replay
+
+> Historical delivery record. The active ingress and replay contract is defined by `../plans/2-remove-plan.md`.
 
 ## Overview
 
