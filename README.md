@@ -131,16 +131,21 @@ FLOW_EXAMPLE_DATABASE_URL='postgres://postgres@localhost/postgres?sslmode=disabl
 
 ## Tests
 
-Database-free tests:
+The Makefile uses a local `flow_test` database and sets
+`FLOW_TEST_DATABASE_URL` explicitly, so PostgreSQL integration tests fail
+instead of being skipped when the database is unavailable:
 
 ```bash
-go test ./...
+make db-reset
+make test
 ```
 
-PostgreSQL integration tests:
+`db-reset` recreates the database and applies Flow's embedded migrations to the
+`public` schema. Individual integration tests continue to create and clean up
+isolated schemas inside that database. `make test` always enables Go's race
+detector.
 
-```bash
-FLOW_TEST_DATABASE_URL='postgres://postgres@localhost/postgres?sslmode=disable' go test ./...
-```
-
-Integration tests create isolated schemas and clean them up.
+The database connection can be customized with `PG_HOST`, `PG_PORT`, `PG_USER`,
+`PG_DATABASE`, and `PGPASSWORD`, or by setting `FLOW_TEST_DATABASE_URL`
+directly. `make test-with-reset` is available when a clean database and a test
+run are both wanted.
