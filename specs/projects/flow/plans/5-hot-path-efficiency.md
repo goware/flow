@@ -1370,10 +1370,10 @@ This plan is complete when all of the following are true:
 
 ### Command index
 
-- [ ] Remove the `INCLUDE` list from `flow_commands_execution_key_uq`.
-- [ ] Prove the unique key and same-execution ownership constraints remain.
-- [ ] Capture lookup/order/trace query plans with the narrow index.
-- [ ] Confirm no replacement duplicate index is added.
+- [x] Remove the `INCLUDE` list from `flow_commands_execution_key_uq`.
+- [x] Prove the unique key and same-execution ownership constraints remain.
+- [x] Capture lookup/order/trace query plans with the narrow index.
+- [x] Confirm no replacement duplicate index is added.
 
 ### Journal and notifications
 

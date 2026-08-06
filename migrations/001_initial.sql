@@ -104,9 +104,7 @@ CREATE TABLE {{schema}}.flow_commands (
     status_at               timestamptz NOT NULL,
     finished_at             timestamptz,
 
-    CONSTRAINT flow_commands_execution_key_uq UNIQUE (execution_id, command_key)
-        INCLUDE (command_id, name, version, parent_command_id, required,
-                 state, unsatisfied_waits, terminal_position),
+    CONSTRAINT flow_commands_execution_key_uq UNIQUE (execution_id, command_key),
     CONSTRAINT flow_commands_execution_command_uq UNIQUE (execution_id, command_id),
     CONSTRAINT flow_commands_parent_execution_fk
         FOREIGN KEY (execution_id, parent_command_id)

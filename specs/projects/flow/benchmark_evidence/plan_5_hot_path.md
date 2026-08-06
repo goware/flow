@@ -193,3 +193,57 @@ the row count and semantic shape remain fixed.
 This is retained storage cost, not only a hot-path timing metric. Later Plan 5
 phases must preserve the semantic journal and report whether throughput gains
 change this retention baseline.
+
+## Phase 1 command-key index evidence
+
+The baseline migration remains editable for this phase. The repository has no
+release tags, the controlling implementation plan explicitly describes the API
+and durable formats as pre-release, and `001_initial.sql` has been revised
+throughout the current hardening line. The Plan 5 released-migration STOP
+condition therefore did not require a forward migration or compatibility
+design.
+
+The Phase 1 schema test creates one completed 100-command execution plus 900
+unrelated one-command executions, analyzes the command and queue tables, and
+captures `EXPLAIN (ANALYZE, BUFFERS)` for the three planned query shapes. It
+then installs the former `INCLUDE` shape only inside the isolated test schema
+and repeats the same plans for comparison:
+
+```text
+env GOCACHE=/tmp/go-llm-go-build make test \
+  TEST=TestSchemaCommandKeyQueryPlans \
+  TEST_FLAGS='-count=1 -p 1 -parallel 4 -v'
+```
+
+| Query shape | Narrow command access | Former `INCLUDE` command access | Narrow / former execution time |
+|---|---|---|---:|
+| execution scan ordered by command key | bitmap index + heap scan, then sort | bitmap index + heap scan, then sort | 0.105 / 0.087 ms |
+| child-key conflict lookup with `ANY` | index-only scan; 3 heap fetches | index-only scan; 3 heap fetches | 0.036 / 0.019 ms |
+| trace command scan and queue join | bitmap index + heap scan feeding hash join | bitmap index + heap scan feeding hash join | 0.198 / 0.175 ms |
+
+In the recorded sample all three narrow plans used
+`flow_commands_execution_key_uq`. Repeated verification sometimes selected the
+separate `(execution_id, command_id)` ownership index for the two whole-execution
+scans because it has the same leading execution key and an equivalent estimated
+cost; the selective command-key lookup continued to use the command-key index.
+Heap access for the execution and trace scans is expected because both select
+projection data outside the uniqueness key. These are single structural samples
+with different cache state, not throughput measurements; the small
+execution-time differences are not treated as regressions or improvements. No
+query needed a replacement covering index.
+
+Across repeated runs of the same 1,000-command fixture, `pg_relation_size`
+reported 65,536-81,920 bytes for the narrow index and 147,456 bytes for the
+former `INCLUDE` form. The exact size is fixture- and insertion-order-specific,
+but it confirms the expected reduction in retained index payload. Catalog
+coverage also proves that the index is unique on exactly
+`(execution_id, command_key)`, contains no `INCLUDE`, has no duplicate, and
+retains the separate unique ownership key on `(execution_id, command_id)`.
+Cross-execution mutation tests continue to exercise the parent, queue, wait,
+journal, and root ownership foreign keys.
+
+Removing `unsatisfied_waits` from every index makes a state-preserving wait
+counter update eligible for a PostgreSQL HOT update when its heap page has
+space. This is structural eligibility rather than a cumulative-statistics
+assertion; updates that also change `state` can still require index maintenance
+because `state` participates in the partial wait-deadline index predicate.
