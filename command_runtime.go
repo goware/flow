@@ -376,15 +376,6 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 }
 
-func commandStatus(state string) CommandStatus {
-	switch CommandStatus(state) {
-	case StatusSucceeded, StatusFailed, StatusCancelled, StatusExpired:
-		return CommandStatus(state)
-	default:
-		return ""
-	}
-}
-
 func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]store.ApplicationEvent, []store.CommandCreate, error) {
 	if err := validateDecisionCommands(scope.state.decision); err != nil {
 		return nil, nil, err
@@ -481,7 +472,7 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 	for attempt := 0; attempt < settlementAttempts; attempt++ {
 		result, err := r.store.SettleCommandConclusion(ctx, store.CommandConclusion{
 			Claim: claim, Classification: conclusion.class, ExplicitDelay: conclusion.explicitDelay,
-			ErrorCode: conclusion.code, ErrorMessage: conclusion.message,
+			Failure: failure.Value{Code: conclusion.code, Message: conclusion.message},
 		}, r.faults)
 		if err == nil {
 			if result.Retry {

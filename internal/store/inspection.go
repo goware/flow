@@ -2,12 +2,12 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/jackc/pgx/v5"
@@ -29,8 +29,7 @@ type ExecutionRow struct {
 	CommandCount      int
 	OpenCommands      int
 	DeadlineAt        *time.Time
-	FailureCode       string
-	FailureMessage    string
+	Failure           *failure.Value
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	StatusAt          time.Time
@@ -161,24 +160,21 @@ func (s *Store) queryExecutions(ctx context.Context, tx pgx.Tx, query string, ar
 
 func scanExecution(row pgx.Row) (ExecutionRow, error) {
 	var value ExecutionRow
-	var failure, metadata []byte
+	var failureBytes, metadata []byte
 	if err := row.Scan(
 		&value.ID, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
 		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.DeadlineAt,
-		&failure, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
+		&failureBytes, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
 		&value.RootCommandID,
 	); err != nil {
 		return ExecutionRow{}, MapError("scan execution", err)
 	}
-	if len(failure) != 0 && string(failure) != "null" {
-		var decoded struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal(failure, &decoded); err != nil {
+	if len(failureBytes) != 0 && string(failureBytes) != "null" {
+		decoded, err := failure.Decode(failureBytes)
+		if err != nil {
 			return ExecutionRow{}, fmt.Errorf("%w: invalid execution failure projection", flowerr.ErrInvalidState)
 		}
-		value.FailureCode, value.FailureMessage = decoded.Code, decoded.Message
+		value.Failure = decoded
 	}
 	value.Metadata = append([]byte(nil), metadata...)
 	return value, nil

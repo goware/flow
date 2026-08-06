@@ -467,7 +467,7 @@ func lookupTraceResult(trace ExecutionTrace, key string, command *definition.Com
 		if value.Name != command.Name || value.Version != command.Version {
 			return TraceCommand{}, newError(ErrConflict, "read", "command", key, fmt.Sprintf("definition differs from %s/%d", value.Name, value.Version))
 		}
-		if commandStatus(value.State) != StatusSucceeded {
+		if value.State != CommandStatusSucceeded {
 			return TraceCommand{}, newError(ErrInvalidState, "read", "command", key, "command has no successful result")
 		}
 		return value, nil

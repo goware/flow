@@ -35,7 +35,7 @@ type HistoryEntry struct {
 	EventName         string
 	EventKey          string
 	EventClass        string
-	TerminalStatus    string
+	TerminalStatus    TerminalStatus
 	Body              json.RawMessage
 	BodyHash          string
 }
@@ -97,10 +97,10 @@ func History(ctx context.Context, c Client, id ExecutionID, opts ...HistoryOptio
 		// a missing execution from an empty page without another query.
 		return nil, newError(ErrNotFound, "history", "execution", string(id), "execution does not exist")
 	}
-	return historyEntries(rows), nil
+	return historyEntries(rows)
 }
 
-func historyEntries(rows []store.JournalRow) []HistoryEntry {
+func historyEntries(rows []store.JournalRow) ([]HistoryEntry, error) {
 	result := make([]HistoryEntry, len(rows))
 	for index, row := range rows {
 		entry := HistoryEntry{
@@ -134,9 +134,13 @@ func historyEntries(rows []store.JournalRow) []HistoryEntry {
 			entry.EventClass = *row.EventClass
 		}
 		if row.TerminalStatus != nil {
-			entry.TerminalStatus = *row.TerminalStatus
+			status, err := terminalStatusFromString(*row.TerminalStatus)
+			if err != nil {
+				return nil, newError(ErrInvalidState, "decode", "terminal status", *row.TerminalStatus, "stored terminal status is unknown")
+			}
+			entry.TerminalStatus = status
 		}
 		result[index] = entry
 	}
-	return result
+	return result, nil
 }

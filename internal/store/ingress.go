@@ -13,8 +13,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
+	"github.com/goware/flow/internal/durable"
+	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
+	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/goware/flow/internal/store/journalcodec"
 	"github.com/jackc/pgx/v5"
 )
@@ -111,7 +114,10 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
 		return StartResult{}, false, MapError("capture start time", err)
 	}
-	deadlineAt := deadlineAt(dbNow, request.Deadline)
+	deadlineAt, err := deadlineAt(dbNow, request.Deadline)
+	if err != nil {
+		return StartResult{}, false, err
+	}
 	var rootID *uuid.UUID
 	commandCount := 0
 	if request.Root != nil {
@@ -120,7 +126,7 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	}
 
 	var inserted uuid.UUID
-	err := tx.QueryRow(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_executions")+` (
+	err = tx.QueryRow(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_executions")+` (
 		execution_id,definition_name,definition_version,execution_key,key_scope,status,fail_fast,
 		start_fingerprint,input,metadata,metadata_canonical,
 		deadline_at,max_commands,command_count,open_commands,
@@ -159,7 +165,11 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	if len(journal.Journal) != 2 {
 		return StartResult{}, false, fmt.Errorf("%w: command start journal shape", flowerr.ErrInvalidState)
 	}
-	if err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position, dbNow, dbNow.Add(request.Root.InitialDelay)); err != nil {
+	nextAttemptAt, err := durable.AddExactDuration("initial delay", dbNow, request.Root.InitialDelay)
+	if err != nil {
+		return StartResult{}, false, err
+	}
+	if err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position, dbNow, nextAttemptAt); err != nil {
 		return StartResult{}, false, err
 	}
 	// Mirror the row this transaction just inserted instead of re-reading it.
@@ -230,12 +240,16 @@ func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time
 	if request.KeyScope != KeyScopePermanent {
 		keyScope = request.KeyScope
 	}
+	deadlineMilliseconds, err := durable.ExactMilliseconds("execution deadline", request.Deadline.Duration)
+	if err != nil {
+		return nil, err
+	}
 	body := journalcodec.ExecutionStartedBody{
 		V: 1, ExecutionID: request.ID.String(),
 		DefinitionName: request.DefinitionName, DefinitionVersion: request.DefinitionVersion,
 		ExecutionKey: request.Key, KeyScope: keyScope,
 		Input: json.RawMessage(request.Input.BytesCopy()), FailFast: request.FailFast,
-		DeadlineMode: request.Deadline.Mode, DeadlineDuration: request.Deadline.Duration.Milliseconds(),
+		DeadlineMode: request.Deadline.Mode, DeadlineDuration: deadlineMilliseconds,
 		DeadlineAt: clonePointer(deadlineAt), MaxCommands: request.MaxCommands,
 		Metadata: json.RawMessage(request.Metadata.BytesCopy()),
 	}
@@ -244,7 +258,11 @@ func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time
 		return nil, fmt.Errorf("encode execution start: %w", err)
 	}
 	entries := []JournalEntry{start}
-	created, err := commandCreatedEntry(*request.Root, dbNow, dbNow.Add(request.Root.InitialDelay))
+	nextAttemptAt, err := durable.AddExactDuration("initial delay", dbNow, request.Root.InitialDelay)
+	if err != nil {
+		return nil, err
+	}
+	created, err := commandCreatedEntry(*request.Root, dbNow, nextAttemptAt)
 	if err != nil {
 		return nil, err
 	}
@@ -255,14 +273,23 @@ func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time
 }
 
 func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt time.Time) (JournalEntry, error) {
+	if err := validateCommandCreate(command); err != nil {
+		return JournalEntry{}, err
+	}
 	var timeoutMS *int64
 	if command.AttemptTimeout > 0 {
-		value := command.AttemptTimeout.Milliseconds()
+		value, err := durable.ExactMilliseconds("attempt timeout", command.AttemptTimeout)
+		if err != nil {
+			return JournalEntry{}, err
+		}
 		timeoutMS = &value
 	}
 	var initialDelayMS *int64
 	if command.InitialDelay > 0 {
-		value := command.InitialDelay.Milliseconds()
+		value, err := durable.ExactMilliseconds("initial delay", command.InitialDelay)
+		if err != nil {
+			return JournalEntry{}, err
+		}
 		initialDelayMS = &value
 	}
 	initialState := "ready"
@@ -285,7 +312,10 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 		body.Waits = append(body.Waits, journalcodec.EventWaitBody{Name: wait.Name, Key: wait.Key})
 	}
 	if command.Within > 0 {
-		value := command.Within.Milliseconds()
+		value, err := durable.ExactMilliseconds("wait timeout", command.Within)
+		if err != nil {
+			return JournalEntry{}, err
+		}
 		body.WithinMS = &value
 	}
 	if command.ParentCommandID != nil {
@@ -300,14 +330,23 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 }
 
 func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.UUID, command CommandCreate, createdPosition int64, budgetStartedAt, nextAttemptAt time.Time) error {
+	if err := validateCommandCreate(command); err != nil {
+		return err
+	}
 	var timeoutMS *int64
 	if command.AttemptTimeout > 0 {
-		value := command.AttemptTimeout.Milliseconds()
+		value, err := durable.ExactMilliseconds("attempt timeout", command.AttemptTimeout)
+		if err != nil {
+			return err
+		}
 		timeoutMS = &value
 	}
 	var initialDelayMS *int64
 	if command.InitialDelay > 0 {
-		value := command.InitialDelay.Milliseconds()
+		value, err := durable.ExactMilliseconds("initial delay", command.InitialDelay)
+		if err != nil {
+			return err
+		}
 		initialDelayMS = &value
 	}
 	state := "ready"
@@ -336,7 +375,10 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	}
 	var withinMS *int64
 	if command.Within > 0 {
-		value := command.Within.Milliseconds()
+		value, err := durable.ExactMilliseconds("wait timeout", command.Within)
+		if err != nil {
+			return err
+		}
 		withinMS = &value
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_commands")+` (
@@ -344,11 +386,11 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 		args,declaration_fingerprint,state,unsatisfied_waits,
 		queue,attempt_timeout_ms,retry_policy,initial_delay_ms,
 		budget_started_at,next_attempt_at,wait_timeout_ms,created_position,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$20,$20)`,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$20,$20)`,
 		command.ID, executionID, command.Key, command.Name, command.Version,
 		command.ParentCommandID, command.Required, command.Args.Bytes,
 		command.DeclarationFingerprint[:], state, unsatisfiedWaits, command.Queue, timeoutMS,
-		string(command.RetryPolicy.Bytes), initialDelayMS,
+		command.RetryPolicy.Bytes, initialDelayMS,
 		acceptedBudget, acceptedNext, withinMS, createdPosition, budgetStartedAt,
 	)
 	if err != nil {
@@ -357,7 +399,10 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	if state == "pending" && unsatisfiedWaits > 0 {
 		var deadline *time.Time
 		if command.Within > 0 {
-			value := budgetStartedAt.Add(command.Within)
+			value, addErr := durable.AddExactDuration("wait timeout", budgetStartedAt, command.Within)
+			if addErr != nil {
+				return addErr
+			}
 			var executionDeadline *time.Time
 			if err := tx.QueryRow(ctx, `SELECT deadline_at FROM `+pgschema.Table(s.schema, "flow_executions")+`
 				WHERE execution_id=$1`, executionID).Scan(&executionDeadline); err != nil {
@@ -538,10 +583,7 @@ type CancelResult struct {
 	Created bool
 }
 
-type terminalFailure struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
+type terminalFailure = failure.Value
 
 type activeCommandAttempt struct {
 	ID               uuid.UUID
@@ -688,7 +730,16 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		return CancelResult{}, err
 	}
 	entries = append(entries, cancelledEntries...)
-	effectiveOpen := head.OpenCommands - 1 - len(failureEffects.cancelled)
+	effectiveOpen, err := durable.AddPostgresInteger("execution open commands", head.OpenCommands,
+		-1, 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return CancelResult{}, err
+	}
+	effectiveOpen, err = durable.AddPostgresInteger("execution open commands", effectiveOpen,
+		-len(failureEffects.cancelled), 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return CancelResult{}, err
+	}
 	executionFailed := required || head.Status == "failing"
 	terminalExecution := effectiveOpen == 0
 	if terminalExecution {
@@ -742,8 +793,8 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 			status = "failing"
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET status=$2,open_commands=open_commands-1-$4,updated_at=$3,status_at=CASE WHEN status<>$2 THEN $3 ELSE status_at END
-			WHERE execution_id=$1`, head.ID, status, semantic.DBNow(), len(failureEffects.cancelled)); err != nil {
+			SET status=$2,open_commands=$4,updated_at=$3,status_at=CASE WHEN status<>$2 THEN $3 ELSE status_at END
+			WHERE execution_id=$1`, head.ID, status, semantic.DBNow(), effectiveOpen); err != nil {
 			return CancelResult{}, MapError("update execution after command cancellation", err)
 		}
 	}
@@ -923,12 +974,15 @@ func isCommandTerminal(state string) bool {
 	}
 }
 
-func deadlineAt(now time.Time, spec DeadlineSpec) *time.Time {
+func deadlineAt(now time.Time, spec DeadlineSpec) (*time.Time, error) {
 	if spec.Mode == "none" {
-		return nil
+		return nil, nil
 	}
-	value := now.Add(spec.Duration)
-	return &value
+	value, err := durable.AddExactDuration("execution deadline", now, spec.Duration)
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
 }
 
 func validateStartRequest(request StartRequest) error {
@@ -948,11 +1002,51 @@ func validateStartRequest(request StartRequest) error {
 	if request.Deadline.Mode == "duration" && request.Deadline.Duration <= 0 {
 		return fmt.Errorf("%w: invalid execution deadline", flowerr.ErrInvalid)
 	}
+	if request.Deadline.Mode == "duration" {
+		if _, err := durable.ExactMilliseconds("execution deadline", request.Deadline.Duration); err != nil {
+			return err
+		}
+	}
+	if err := durable.PostgresInteger("definition version", request.DefinitionVersion, 1, durable.PostgresIntegerMax); err != nil {
+		return err
+	}
+	if err := durable.PostgresInteger("maximum commands", request.MaxCommands, 0, durable.PostgresIntegerMax); err != nil {
+		return err
+	}
 	if request.Root == nil {
 		return fmt.Errorf("%w: command root is required", flowerr.ErrInvalid)
 	}
 	if len(request.Root.Waits) > MaxCommandEventWaits {
 		return fmt.Errorf("%w: command exceeds event-wait limit", flowerr.ErrInvalid)
+	}
+	if err := validateCommandCreate(*request.Root); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCommandCreate(command CommandCreate) error {
+	if command.ID == uuid.Nil || command.Key == "" || command.Name == "" || command.Queue == "" ||
+		len(command.Args.Bytes) == 0 || len(command.RetryPolicy.Bytes) == 0 {
+		return fmt.Errorf("%w: incomplete command creation", flowerr.ErrInvalid)
+	}
+	if err := durable.PostgresInteger("command version", command.Version, 1, durable.PostgresIntegerMax); err != nil {
+		return err
+	}
+	if err := durable.PostgresInteger("unsatisfied waits", len(command.Waits), 0, durable.PostgresIntegerMax); err != nil {
+		return err
+	}
+	for field, value := range map[string]time.Duration{
+		"attempt timeout": command.AttemptTimeout,
+		"initial delay":   command.InitialDelay,
+		"wait timeout":    command.Within,
+	} {
+		if _, err := durable.ExactMilliseconds(field, value); err != nil {
+			return err
+		}
+	}
+	if _, err := retrypolicy.PublicFromCanonical(command.RetryPolicy.Bytes); err != nil {
+		return fmt.Errorf("%w: retry policy is invalid", flowerr.ErrInvalid)
 	}
 	return nil
 }

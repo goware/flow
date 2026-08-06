@@ -200,11 +200,11 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 	panicTrace, _ := Trace(ctx, runtime, panicHandle.ID)
 	retryAfterTrace, _ := Trace(ctx, runtime, retryAfterHandle.ID)
 	oversizedTrace, _ := Trace(ctx, runtime, oversizedHandle.ID)
-	if len(exhaustedTrace.Commands[0].Attempts) != 2 || exhaustedTrace.Commands[0].FailureCode != "worker_error" ||
-		panicTrace.Commands[0].Attempts[0].Classification != "panic" || panicTrace.Commands[0].FailureCode != "panic" ||
+	if len(exhaustedTrace.Commands[0].Attempts) != 2 || exhaustedTrace.Commands[0].Failure == nil || exhaustedTrace.Commands[0].Failure.Code != "worker_error" ||
+		panicTrace.Commands[0].Attempts[0].Classification != "panic" || panicTrace.Commands[0].Failure == nil || panicTrace.Commands[0].Failure.Code != "panic" ||
 		retryAfterTrace.Commands[0].Attempts[0].Classification != "retry_after" ||
 		retryAfterTrace.Commands[0].Attempts[0].NextAttemptAt == nil ||
-		oversizedTrace.Commands[0].FailureCode != "result_encode" {
+		oversizedTrace.Commands[0].Failure == nil || oversizedTrace.Commands[0].Failure.Code != "result_encode" {
 		t.Fatalf("edge traces exhausted=%#v panic=%#v retry-after=%#v oversized=%#v",
 			exhaustedTrace, panicTrace, retryAfterTrace, oversizedTrace)
 	}
@@ -341,13 +341,13 @@ func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var siblingStatus string
+			var siblingStatus CommandStatus
 			for _, command := range trace.Commands {
 				if command.Key == "z-sibling" {
 					siblingStatus = command.State
 				}
 			}
-			if siblingStatus != test.wantSibling {
+			if siblingStatus != CommandStatus(test.wantSibling) {
 				t.Fatalf("sibling status = %q, want %q", siblingStatus, test.wantSibling)
 			}
 			wantCalls := int32(0)
@@ -435,13 +435,13 @@ func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testi
 			if err != nil {
 				t.Fatal(err)
 			}
-			var lateState string
+			var lateState CommandStatus
 			for _, command := range trace.Commands {
 				if command.Key == "late-child" {
 					lateState = command.State
 				}
 			}
-			if lateState != string(test.childState) || lateCalls.Load() != test.childCalls {
+			if lateState != test.childState || lateCalls.Load() != test.childCalls {
 				t.Fatalf("late child state/calls=%s/%d want %s/%d", lateState, lateCalls.Load(), test.childState, test.childCalls)
 			}
 			var events int

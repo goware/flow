@@ -32,9 +32,9 @@ This document is the normative caller-visible behavioral contract. The architect
 `DefineCommand[A,R](name, version, options...)` creates an immutable typed command definition.
 
 - The name must be non-empty, contain no whitespace/control characters, and be at most 255 bytes.
-- The version must be positive.
+- The version must be positive and fit PostgreSQL's signed `integer` range while remaining a Go `int` in the public API.
 - `WithRetry` fixes the retry policy stored with every later declaration.
-- `WithTimeout` fixes a per-attempt timeout of at least one millisecond.
+- `WithTimeout` fixes a per-attempt timeout of at least one millisecond and exact whole-millisecond precision.
 - `WithQueue` selects a validated queue name; the default queue is `default`.
 - Duplicate or invalid definition options make the definition invalid. The error is reported when it is registered or used.
 
@@ -82,6 +82,8 @@ Options are:
 - `Within(d)`: bounds a gated root's wait and is invalid without `WaitFor`.
 
 Supplying a singleton option more than once is invalid, except repeated identical waits coalesce. Multiple waits are AND conditions.
+
+Every duration that becomes durable scheduling configuration—including execution deadlines, attempt timeouts, initial delays, wait budgets, retry elapsed/backoff values, and explicit retry-after delays—must be an exact multiple of one millisecond. Flow rejects fractional milliseconds instead of truncating them.
 
 ### 4.2 Permanent keys
 
@@ -228,7 +230,7 @@ Public policy construction supports:
 - `.Attempts(n)`: combine elapsed and attempt bounds; and
 - `.Backoff(delays...)`: replace the positive backoff sequence.
 
-Retry policy, timeout, and queue are copied into the durable command declaration and do not change when another runtime deploys different defaults.
+Retry policy, timeout, and queue are copied into the durable command declaration and do not change when another runtime deploys different defaults. Retry policy uses one canonical whole-millisecond representation and is stored as opaque bytes rather than a SQL-queryable JSON document.
 
 Worker conclusions are classified as follows:
 
@@ -258,6 +260,8 @@ running -> failing -> failed | cancelled | expired
 ```
 
 `failing` means a required command has reached an unsuccessful terminal state but active surviving work may still be settling.
+
+Public execution, command, queue, key-scope, and terminal-status fields use typed string constants. Unknown stored values fail explicit boundary decoding as `ErrInvalidState`.
 
 Command states are:
 
@@ -366,6 +370,8 @@ Flow owns exactly six `flow_` tables in one validated PostgreSQL schema:
 
 Applications must not use these tables as a write API. Semantic journal entries and current projections must remain transactionally consistent.
 
+Database constraints require a non-null root command and enforce same-execution ownership for roots, parents, delivery rows, event waits, and journal command references. Durable position references are positive, and journal causation must point to an earlier position.
+
 `Migrate` serializes migration execution with an advisory transaction lock, verifies checksums of already applied migrations, and applies each pending embedded migration in its own transaction. `MigrationFS` exposes schema-rendered SQL for an external transactional runner. `CheckSchema` verifies checksums, reader/writer compatibility, current version, and the exact six-table inventory without mutation.
 
 `New` fails with `ErrSchema` when the configured schema is absent, incomplete, modified, unknown, or incompatible.
@@ -404,7 +410,7 @@ Public Flow errors support `errors.Is` with these categories:
 - `ErrClosed`: a stopped runtime or closed transaction/client is used; and
 - `ErrSchema`: migration/schema state is missing, changed, or incompatible.
 
-`*flow.Error` adds bounded operation/resource/identifier/reason context and unwraps to its category. Store errors and observations must not expose raw SQL, driver details, payloads, secrets, or lease tokens. Persisted worker error messages are trimmed and bounded, but applications must still avoid putting secrets into returned errors.
+`*flow.Error` adds bounded operation/resource/identifier/reason context and unwraps to its category. Durable and public failure projections use one structured `Failure{Code, Message}` value while preserving separate latest-command, terminal-command, and execution-failure fields. Store errors and observations must not expose raw SQL, driver details, payloads, secrets, or lease tokens. Persisted worker error messages are trimmed and bounded, but applications must still avoid putting secrets into returned errors.
 
 Flow canonicalizes durable typed values as JSON and stores them in PostgreSQL; it does not provide field encryption or automatic redaction. Applications should store secrets and large objects behind stable references and apply database-level access control, encryption, backup, and retention policy appropriate to those values.
 

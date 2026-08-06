@@ -158,13 +158,13 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var optionalState string
+	var optionalState CommandStatus
 	for _, command := range trace.Commands {
 		if command.Key == "optional" {
 			optionalState = command.State
 		}
 	}
-	if len(trace.Commands) != 2 || optionalState != string(StatusExpired) {
+	if len(trace.Commands) != 2 || optionalState != CommandStatusExpired {
 		t.Fatalf("optional expiry trace=%+v", trace.Commands)
 	}
 
@@ -183,7 +183,7 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 			deadlineOptional = command
 		}
 	}
-	if deadlineOptional.State != string(StatusCancelled) || deadlineOptional.FailureCode != "execution_expired" {
+	if deadlineOptional.State != CommandStatusCancelled || deadlineOptional.Failure == nil || deadlineOptional.Failure.Code != "execution_expired" {
 		t.Fatalf("optional deadline trace=%+v", deadlineTrace.Commands)
 	}
 	if calls.Load() != 1 {
@@ -370,8 +370,8 @@ func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
 	for _, command := range trace.Commands {
 		states[command.Key] = command
 	}
-	if states["producer"].State != string(StatusFailed) || states["join"].State != string(StatusCancelled) ||
-		states["join"].FailureCode != "fail_fast" || joinCalls.Load() != 0 {
+	if states["producer"].State != CommandStatusFailed || states["join"].State != CommandStatusCancelled ||
+		states["join"].Failure == nil || states["join"].Failure.Code != "fail_fast" || joinCalls.Load() != 0 {
 		t.Fatalf("required failure trace=%+v join calls=%d", trace.Commands, joinCalls.Load())
 	}
 }
@@ -411,7 +411,7 @@ func TestWaitCanExpireWhileInitialDelayIsPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(trace.Commands) != 1 || trace.Commands[0].State != string(StatusExpired) || trace.Commands[0].FailureCode != "wait_expired" {
+	if len(trace.Commands) != 1 || trace.Commands[0].State != CommandStatusExpired || trace.Commands[0].Failure == nil || trace.Commands[0].Failure.Code != "wait_expired" {
 		t.Fatalf("expired gate trace=%+v", trace.Commands)
 	}
 	if err := event.Emit(ctx, runtime, exec.ID, "missing", None{}); !errors.Is(err, ErrTerminal) {

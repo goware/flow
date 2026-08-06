@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/goware/flow/internal/definition"
+	"github.com/goware/flow/internal/durable"
 )
 
 const defaultQueue = "default"
@@ -67,7 +68,8 @@ func DefineCommand[A, R any](name string, version int, opts ...CommandOption) Co
 		option.applyCommand(&state)
 	}
 	command.defaults = state.defaults
-	command.err = errors.Join(definition.ValidateBase(base), errors.Join(state.errs...))
+	command.err = errors.Join(definition.ValidateBase(base),
+		durable.PostgresInteger("command version", version, 1, durable.PostgresIntegerMax), errors.Join(state.errs...))
 	return command
 }
 
@@ -136,6 +138,10 @@ func WithTimeout(timeout time.Duration) CommandOption {
 		state.timeoutSet = true
 		if timeout < time.Millisecond {
 			state.errs = append(state.errs, errors.New("attempt timeout must be at least one millisecond"))
+			return
+		}
+		if _, err := durable.ExactMilliseconds("attempt timeout", timeout); err != nil {
+			state.errs = append(state.errs, err)
 			return
 		}
 		state.defaults.attemptTimeout = timeout

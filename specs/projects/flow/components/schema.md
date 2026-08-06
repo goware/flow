@@ -9,7 +9,7 @@ completed_at: 2026-08-04
 
 The store owns migrations, constraints, indexes, semantic transactions, queues, exact waits, fencing, idempotency, the immutable journal, and inspection projections. All objects use the configured schema and `flow_` prefix.
 
-Semantic mutations lock their execution first. Journal positions are gap-free and commit-ordered per execution. Immutable entries and projections commit together. Claims use no-wait `SKIP LOCKED`; durable timestamps come from PostgreSQL; canonical bodies and hashes make retries comparable.
+Semantic mutations lock their execution first. Journal positions are positive, gap-free, and commit-ordered per execution. Immutable entries and projections commit together. Claims use no-wait `SKIP LOCKED`; durable timestamps come from PostgreSQL; canonical bodies and retained identity hashes make retries comparable.
 
 ## Six-table inventory
 
@@ -22,7 +22,13 @@ Semantic mutations lock their execution first. Journal positions are gap-free an
 | `flow_journal` | immutable ordered semantic history and retained events |
 | `flow_schema_migrations` | checksummed migration records |
 
-There is one execution kind. Permanent and live-key uniqueness use `(definition_name, execution_key)`. A null parent identifies the root command; a non-null parent identifies a worker-staged sub-command.
+There is one execution kind. Permanent and live-key uniqueness use `(definition_name, execution_key)`. Every execution has a non-null root command owned by that execution. A null parent identifies the root command; a non-null parent identifies a worker-staged sub-command in the same execution. Composite foreign keys also prevent queue, event-wait, and journal command references from crossing execution ownership.
+
+## Durable types and vocabularies
+
+Go versions and counters remain `int`; public construction and store persistence validate them against PostgreSQL's signed `integer` range before binding or applying a transition. Duration-bearing configuration is accepted only at exact whole-millisecond precision. Millisecond columns remain `bigint`, and reads plus database-time additions use checked conversions.
+
+Retry policy is opaque canonical `bytea`; no SQL path parses, filters, or reserializes it. Execution status, command status, delivery state, key scope, and terminal status remain PostgreSQL `text` with named `CHECK` constraints synchronized with typed public constants and exhaustive decoders.
 
 ## Commands, waits, and journal
 
@@ -30,7 +36,22 @@ Command states are `pending`, `ready`, `running`, `retry_wait`, `succeeded`, `fa
 
 Wait rows are keyed by `(command_id,event_name,event_key)` and optionally reference `satisfied_position`. On creation the store checks retained events; on ingress it resolves matching unresolved rows. Claim materialization joins all wait rows to their exact application-event journal bodies in one query and validates a maximum of 256.
 
-Journal kinds are `execution_started`, `execution_failing`, `command_created`, `attempt_started`, `attempt_concluded`, and `event_recorded`. Event classes are application, command terminal, and execution terminal. Application events are immutable journal facts; no separate event-payload table exists.
+Journal kinds are `execution_started`, `execution_failing`, `command_created`, `attempt_started`, `attempt_concluded`, and `event_recorded`. Event classes are application, command terminal, and execution terminal. Application events are immutable journal facts; no separate event-payload table exists. All stored position references are positive, and causation must precede the current journal position.
+
+## Retained semantic projections
+
+The baseline deliberately retains the following columns after pruning redundant write-only hashes:
+
+| Column | Writer and reader | Invariant and replacement cost |
+|---|---|---|
+| `flow_executions.input` | start writes it; permanent-key equivalence reads it | exact accepted root input; replacement requires loading the root declaration or journal and changes start-idempotency coupling |
+| `flow_executions.metadata_canonical` | start writes it; permanent-key equivalence reads it while inspection queries `metadata` | exact bytes correspond to indexed metadata JSON; replacement requires recanonicalizing reads or changing identity semantics |
+| `flow_commands.declaration_fingerprint` | command creation writes the accepted declaration digest; identity, migration, and diagnostic paths retain it while replay validates the journal copy | covers the complete immutable declaration; replacement requires full field/wait comparison and benchmark evidence |
+| `flow_commands.result` | successful settlement writes the point-read result projection | non-null only for success and equal to the terminal journal result; removal makes result reads replay-dependent |
+| `flow_commands.last_error` | retry/recovery transitions write it; live trace reads it | latest operational failure and cleared by success; removal requires folding attempt history for live inspection |
+| `flow_commands.terminal_failure` | unsuccessful terminal transitions write it; terminal comparison/inspection reads it | stable unsuccessful terminal reason; removal couples idempotency and inspection to replay |
+
+The shared failure encoding does not merge `last_error`, `terminal_failure`, or execution `failure`: each describes a different lifecycle fact. The journal keeps the corresponding semantic history independently of these point-read projections.
 
 ## Transactions and maintenance
 
@@ -42,4 +63,4 @@ Bounded indexed maintenance recovers command leases, expires unresolved waits, a
 
 ## Migration policy
 
-This pre-release refactor rewrites baseline migrations. Existing development schemas from the removed architecture must be recreated. `CheckSchema` verifies migration checksums and the exact six-table inventory.
+This pre-release refactor rewrites baseline migrations. Existing development schemas from the removed architecture must be recreated. Once this baseline is released, the same changes require forward migrations rather than editing applied SQL. `CheckSchema` verifies migration checksums and the exact six-table inventory.

@@ -68,9 +68,9 @@ func TestCrossDecisionCommandKeyReuseIsAConflict(t *testing.T) {
 					continue
 				}
 				switch {
-				case command.State == string(StatusSucceeded):
+				case command.State == CommandStatusSucceeded:
 					succeeded++
-				case command.State == string(StatusFailed) && command.FailureCode == "invalid_decision":
+				case command.State == CommandStatusFailed && command.Failure != nil && command.Failure.Code == "invalid_decision":
 					conflicted++
 				}
 			}

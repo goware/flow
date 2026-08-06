@@ -105,7 +105,7 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(poisonedTrace.Commands) != 1 || poisonedTrace.Commands[0].FailureCode != "invalid_decision" {
+	if len(poisonedTrace.Commands) != 1 || poisonedTrace.Commands[0].Failure == nil || poisonedTrace.Commands[0].Failure.Code != "invalid_decision" {
 		t.Fatalf("poisoned commit trace=%+v", poisonedTrace)
 	}
 

@@ -119,6 +119,17 @@ Do not remove these in a mechanical pruning pass:
 
 For each candidate, document its writer, reader, invariant, replacement cost, and effect on idempotency/replay before making a schema change. A column with no SQL reader may still participate in an external migration or diagnostic contract, so update active documentation with the decision.
 
+Decision record (2026-08-05): all candidates are intentionally retained in the pre-release baseline. This is a retention decision, not a projection redesign.
+
+| Candidate | Writer | Reader | Invariant | Replacement cost | Idempotency/replay effect |
+|---|---|---|---|---|---|
+| `flow_executions.input` | accepted start | permanent-key equivalent-start comparison | exact accepted canonical root input | load and compare the root command or initial journal entry instead, adding coupling and a join/replay read | removing it would change start idempotency; replay keeps its separate journal copy |
+| `flow_executions.metadata_canonical` | accepted start | permanent-key equivalent-start comparison | exact canonical bytes correspond to indexed `metadata` JSON | canonicalize `metadata` after every read or replace exact byte identity with JSON semantics | removing it risks changing permanent-start identity; replay retains metadata in `execution_started` |
+| `flow_commands.declaration_fingerprint` | root/child command creation | declaration identity and diagnostic/migration consumers; replay validates the journal copy | digest covers the complete immutable declaration | compare every declaration field, including canonical bytes and wait rows, with benchmark evidence | removal would make redeclaration conflict checks more expensive and weaken direct projection diagnostics |
+| `flow_commands.result` | successful settlement | result/inspection projection consumers | non-null exactly for succeeded commands and identical to the terminal journal result | replay or join semantic history for every result point read | idempotency is unchanged, but point reads would become replay-dependent |
+| `flow_commands.last_error` | retry, failure, cancellation, and lease recovery | live trace/operational inspection | latest operational/retry failure; cleared by success and allowed before terminality | derive from attempt history plus operational state on each read | replay retains attempt failures, but live latest-error reads would require folding history |
+| `flow_commands.terminal_failure` | failed, cancelled, or expired terminal transition | terminal idempotency checks and inspection semantics | stable terminal failure for unsuccessful terminal commands; null otherwise | derive from the terminal journal event and redefine terminal comparison/read paths | removal would couple terminal idempotency and point reads to replay |
+
 ## Punchlist
 
 ### Current pruning slice
@@ -132,17 +143,17 @@ For each candidate, document its writer, reader, invariant, replacement cost, an
 
 ### Follow-up stages
 
-- [ ] Inventory every Go `int` to PostgreSQL `integer` write and add shared range validation.
-- [ ] Add boundary tests for accepted and rejected PostgreSQL integer values.
-- [ ] Inventory all durable duration paths and enforce exact whole milliseconds publicly and internally.
-- [ ] Add duration exactness and overflow tests.
-- [ ] Convert opaque retry policy storage from `jsonb` to canonical `bytea`.
-- [ ] Introduce typed public state aliases/constants and exhaustive conversions.
-- [ ] Consolidate structured failures without collapsing distinct lifecycle projections.
-- [ ] Make root identity non-null and same-execution.
-- [ ] Add composite ownership integrity for parents and dependent rows.
-- [ ] Complete positive position constraints and adversarial constraint tests.
-- [ ] Decide the future of `metadata_canonical` with an explicit replacement contract.
-- [ ] Re-evaluate `declaration_fingerprint` only with replacement and performance evidence.
-- [ ] Re-evaluate result/failure projections only as an explicit inspection-model redesign.
-- [ ] Run formatting, build/static checks, race-enabled tests, and update active schema/architecture documentation after every stage.
+- [x] Inventory every Go `int` to PostgreSQL `integer` write and add shared range validation.
+- [x] Add boundary tests for accepted and rejected PostgreSQL integer values.
+- [x] Inventory all durable duration paths and enforce exact whole milliseconds publicly and internally.
+- [x] Add duration exactness and overflow tests.
+- [x] Convert opaque retry policy storage from `jsonb` to canonical `bytea`.
+- [x] Introduce typed public state aliases/constants and exhaustive conversions.
+- [x] Consolidate structured failures without collapsing distinct lifecycle projections.
+- [x] Make root identity non-null and same-execution.
+- [x] Add composite ownership integrity for parents and dependent rows.
+- [x] Complete positive position constraints and adversarial constraint tests.
+- [x] Retain `metadata_canonical`; its exact identity contract and replacement cost are documented above.
+- [x] Retain `declaration_fingerprint`; replacement requires a full comparison design and benchmark evidence.
+- [x] Retain result/failure projections as distinct inspection/lifecycle semantics rather than redesigning them.
+- [x] Run formatting, build/static checks, race-enabled tests, and update active schema/architecture documentation after every stage.

@@ -31,6 +31,23 @@ func TestDecisionBufferCoalescesAndPoisonsConflicts(t *testing.T) {
 	}
 }
 
+func TestDecisionBufferUsesCanonicalRetryPolicyIdentity(t *testing.T) {
+	equivalentA := DefineCommand[decisionArgs, decisionResult]("decision_retry", 1, WithRetry(Attempts(2)))
+	equivalentB := DefineCommand[decisionArgs, decisionResult]("decision_retry", 1, WithRetry(Attempts(2)))
+	different := DefineCommand[decisionArgs, decisionResult]("decision_retry", 1, WithRetry(Attempts(3)))
+
+	scope := &Work[None]{scope: &scopeState{}}
+	Execute(scope, "child", equivalentA, decisionArgs{})
+	Execute(scope, "child", equivalentB, decisionArgs{})
+	if scope.scope.firstError != nil || len(scope.scope.decision.commands) != 1 {
+		t.Fatalf("equivalent canonical policies did not coalesce: %v", scope.scope.firstError)
+	}
+	Execute(scope, "child", different, decisionArgs{})
+	if !errors.Is(scope.scope.firstError, ErrConflict) {
+		t.Fatalf("different canonical policies error = %v, want ErrConflict", scope.scope.firstError)
+	}
+}
+
 func TestDecisionBufferRejectsInvalidOptions(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_options", 1)
 	scope := &Work[None]{scope: &scopeState{}}
@@ -127,8 +144,8 @@ func TestResultOfEnforcesTraceSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := ExecutionTrace{Commands: []TraceCommand{
-		{Key: "success", Name: command.Name(), Version: command.Version(), State: string(StatusSucceeded), Result: encoded.Bytes},
-		{Key: "failure", Name: command.Name(), Version: command.Version(), State: string(StatusFailed), FailureCode: "boom", FailureMessage: "failed"},
+		{Key: "success", Name: command.Name(), Version: command.Version(), State: CommandStatusSucceeded, Result: encoded.Bytes},
+		{Key: "failure", Name: command.Name(), Version: command.Version(), State: CommandStatusFailed, Failure: &Failure{Code: "boom", Message: "failed"}},
 	}}
 
 	result, err := ResultOf(source, "success", command)

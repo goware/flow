@@ -46,6 +46,12 @@ Flow does not replay the full journal on every claim. It also does not treat mut
 
 There is no sidecar broker, distributed lock service, or in-memory leader. PostgreSQL uniqueness, row locks, transactions, `SKIP LOCKED`, durable timestamps, and constraints define accepted state. Process-local channels and `LISTEN/NOTIFY` only reduce latency.
 
+### 2.5 Durable representation boundaries are explicit
+
+Public versions and counters remain Go `int`, but every value and computed transition is checked against PostgreSQL's signed `integer` range before SQL. Durable scheduling configuration has exact whole-millisecond precision: fractional milliseconds are rejected at public and store boundaries, and conversions from stored milliseconds are range-checked before timestamp arithmetic.
+
+Finite public states use typed string vocabularies with exhaustive boundary conversion. PostgreSQL stores the same vocabularies as `text` guarded by named `CHECK` constraints. Retry policies are opaque canonical bytes (`bytea`), because SQL never queries their fields. One shared structured failure value supplies execution, terminal-command, and latest-operational failure projections without collapsing those distinct lifecycle meanings.
+
 ## 3. Package and responsibility boundaries
 
 ```text
@@ -63,7 +69,8 @@ flow/
 └── internal/
     ├── canonical/          bounded canonical JSON and hashes
     ├── definition/         erased codecs and stable definition validation
-    ├── failure/            Permanent and RetryAfter wrappers
+    ├── durable/            PostgreSQL integer and exact-duration boundaries
+    ├── failure/            shared failure value plus Permanent/RetryAfter wrappers
     ├── replay/             pure semantic journal fold
     ├── retry/              persisted policy and deterministic decisions
     ├── pgschema/           validated schema/table rendering
@@ -86,11 +93,11 @@ One execution is the transaction and locking aggregate for all of its commands a
 Core invariants are:
 
 - every execution has exactly one root command;
-- every non-root command has exactly one parent in the same execution;
+- every root, parent, queue, wait, and journal command reference belongs to the same execution;
 - command keys are unique within the execution;
 - application-event identity is unique by execution/name/key;
 - semantic mutations acquire the execution row before dependent rows;
-- journal positions are consecutive and commit-ordered within the execution;
+- journal positions are positive, consecutive, and commit-ordered within the execution, and every causation position is positive and points backward;
 - journal entries and semantic projections commit together;
 - one active attempt/fence may own a running command;
 - only the owning attempt can settle;
@@ -103,7 +110,7 @@ Commands form a tree but readiness is not necessarily tree-shaped. A child can w
 
 ### 5.1 `flow_executions`
 
-This is the aggregate head and first lock for semantic mutation. It stores root definition identity, permanent/live key scope, canonical start identity, status, fail-fast, deadline, command/open counters, metadata, the next journal position, root command ID, and terminal failure.
+This is the aggregate head and first lock for semantic mutation. It stores root definition identity, permanent/live key scope, canonical start identity, accepted input, status, fail-fast, deadline, command/open counters, indexed metadata plus its exact canonical identity bytes, the next journal position, the non-null same-execution root command ID, and terminal failure.
 
 Keeping the journal allocator and counters on the locked aggregate row makes per-execution ordering simple: no independent sequence can advance without the same semantic lock.
 
@@ -111,7 +118,7 @@ Permanent-key uniqueness retains one non-empty `(definition name, execution key)
 
 ### 5.2 `flow_commands`
 
-This is the semantic command projection. It stores immutable declaration/provenance, canonical arguments and fingerprint, required/optional classification, retry/timeout/queue settings, wait/delay timing, current state, attempt counters, result/failures, terminal journal position, and timestamps.
+This is the semantic command projection. It stores immutable declaration/provenance, canonical arguments and fingerprint, required/optional classification, opaque canonical retry bytes, exact-millisecond timeout/wait/delay settings, current state, attempt counters, result/failures, terminal journal position, and timestamps.
 
 The projection avoids replay for common inspection and transition validation. Declaration fields are still represented in `command_created` history so replay can independently reconstruct the semantic command model.
 
@@ -245,7 +252,7 @@ On command creation, retained events can satisfy waits immediately. On later ing
 
 ## 11. Retry and failure transitions
 
-Retry policies are canonicalized into every command declaration. Decisions use PostgreSQL time, persisted budget start, consumed attempts, immutable policy, attempt identity, error classification, and execution deadline. Jitter is deterministic, so failover replicas calculate the same next time.
+Retry policies are canonicalized into every command declaration as opaque bytes with whole-millisecond elapsed/backoff fields. Decisions use PostgreSQL time, persisted budget start, consumed attempts, immutable policy, attempt identity, error classification, and execution deadline. Jitter is deterministic and rounded to a durable whole millisecond, so failover replicas calculate the same next time.
 
 Ordinary errors, requested delays, panics, and timeouts consume budget. Shutdown interruption and lease loss do not. Permanent errors terminate immediately. Attempt and elapsed bounds plus the execution deadline cap every retry.
 
@@ -328,7 +335,7 @@ Embedded migrations are rendered for one validated schema while table names reta
 
 ## 17. Data safety, retention, and operational limits
 
-Canonical command arguments/results, event payloads, metadata, retry settings, and journal bodies are stored in PostgreSQL. Hashes support identity comparison and invariant checking; they are not encryption. Applications must avoid putting secrets in keys, metadata, errors, or observer dimensions and should prefer stable references for sensitive/large values.
+Canonical command arguments/results, event payloads, metadata, retry settings, and journal bodies are stored in PostgreSQL. Retained start/declaration fingerprints and journal body hashes support identity comparison and invariant checking; redundant write-only projection hashes are not stored. These values are not encryption. Applications must avoid putting secrets in keys, metadata, errors, or observer dimensions and should prefer stable references for sensitive/large values.
 
 Structured Flow errors map database/constraint failures into safe sentinel categories without including raw SQL or driver details. Observers intentionally exclude payloads, results, SQL, connections, and lease tokens; delivery is bounded and non-blocking so monitoring cannot stall correctness.
 

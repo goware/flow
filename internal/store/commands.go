@@ -12,6 +12,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
+	"github.com/goware/flow/internal/durable"
+	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
@@ -44,7 +46,11 @@ func (s *Store) ProbeCommands(ctx context.Context, kinds []CommandKind, limit in
 		if kind.Name == "" || kind.Version <= 0 {
 			return nil, fmt.Errorf("%w: invalid command probe kind", flowerr.ErrInvalid)
 		}
-		names[index], versions[index] = kind.Name, int32(kind.Version)
+		version, err := durable.PostgresInteger32("command probe version", kind.Version, 1, durable.PostgresIntegerMax)
+		if err != nil {
+			return nil, err
+		}
+		names[index], versions[index] = kind.Name, version
 	}
 	rows, err := s.db.Conn.Query(ctx, `WITH handled(name,version) AS (
 		SELECT * FROM unnest($1::text[],$2::integer[])
@@ -157,6 +163,9 @@ func (s *Store) ClaimCommands(
 			candidate.Name == "" || candidate.Version <= 0 {
 			return ClaimBatchResult{}, fmt.Errorf("%w: incomplete or mixed-execution command claim batch", flowerr.ErrInvalid)
 		}
+		if err := durable.PostgresInteger("queue command version", candidate.Version, 1, durable.PostgresIntegerMax); err != nil {
+			return ClaimBatchResult{}, err
+		}
 		if _, duplicate := seen[candidate.CommandID]; duplicate {
 			return ClaimBatchResult{}, fmt.Errorf("%w: duplicate command in claim batch", flowerr.ErrInvalid)
 		}
@@ -164,6 +173,9 @@ func (s *Store) ClaimCommands(
 	}
 	if lease <= 0 || owner == "" {
 		return ClaimBatchResult{}, fmt.Errorf("%w: incomplete command claim", flowerr.ErrInvalid)
+	}
+	if _, err := durable.ExactMilliseconds("command lease", lease); err != nil {
+		return ClaimBatchResult{}, err
 	}
 	if hook == nil {
 		hook = fault.None{}
@@ -250,7 +262,7 @@ func (s *Store) claimCommandLocked(
 	var createdPosition int64
 	var required bool
 	err := semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.args,c.queue,c.attempt_timeout_ms,
-		c.retry_policy::text::bytea,c.created_at,c.budget_started_at,c.attempt_ordinal,c.consumed_attempts,
+		c.retry_policy,c.created_at,c.budget_started_at,c.attempt_ordinal,c.consumed_attempts,
 		c.created_position,c.required,c.state,q.state,q.next_run_at
 		FROM `+pgschema.Table(s.schema, "flow_command_queue")+` q
 		JOIN `+pgschema.Table(s.schema, "flow_commands")+` c ON c.command_id=q.command_id
@@ -278,12 +290,27 @@ func (s *Store) claimCommandLocked(
 		return nil, false, fmt.Errorf("%w: stored retry policy is invalid", flowerr.ErrInvalidState)
 	}
 	policyValue := retrypolicy.ValueOf(policy)
-	if policyValue.MaxElapsed != nil && !semantic.DBNow().Before(budgetStartedAt.Add(*policyValue.MaxElapsed)) {
+	retryDeadline := time.Time{}
+	if policyValue.MaxElapsed != nil {
+		retryDeadline, err = durable.AddExactDuration("retry elapsed bound", budgetStartedAt, *policyValue.MaxElapsed)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if policyValue.MaxElapsed != nil && !semantic.DBNow().Before(retryDeadline) {
 		if err := s.failBeforeClaimLocked(ctx, semantic, candidate.CommandID, key, required,
 			"retry_elapsed", "retry elapsed budget expired", createdPosition); err != nil {
 			return nil, false, err
 		}
 		return nil, false, nil
+	}
+	attempt, err := durable.AddPostgresInteger("attempt ordinal", ordinal, 1, 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return nil, false, err
+	}
+	leaseMilliseconds, err := durable.ExactMilliseconds("command lease", lease)
+	if err != nil {
+		return nil, false, err
 	}
 
 	if err := hook.Hit(ctx, fault.ClaimBeforeJournal); err != nil {
@@ -292,8 +319,8 @@ func (s *Store) claimCommandLocked(
 	attemptID, token := uuid.New(), uuid.New()
 	started, err := NewJournalEntry(AttemptStarted, journalcodec.AttemptStartedBody{
 		V: 1, AttemptID: attemptID.String(), CommandID: candidate.CommandID.String(), CommandKey: key,
-		Attempt: ordinal + 1, StartedAt: semantic.DBNow(), Worker: owner,
-		LeaseDurationMS: lease.Milliseconds(), ConsumedAttempts: consumed, BudgetStartedAt: budgetStartedAt,
+		Attempt: attempt, StartedAt: semantic.DBNow(), Worker: owner,
+		LeaseDurationMS: leaseMilliseconds, ConsumedAttempts: consumed, BudgetStartedAt: budgetStartedAt,
 	})
 	if err != nil {
 		return nil, false, err
@@ -305,7 +332,10 @@ func (s *Store) claimCommandLocked(
 	if err != nil {
 		return nil, false, err
 	}
-	leaseExpiresAt := semantic.DBNow().Add(lease)
+	leaseExpiresAt, err := durable.AddExactDuration("command lease", semantic.DBNow(), lease)
+	if err != nil {
+		return nil, false, err
+	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+`
 		SET state='running',active_attempt_id=$2,lease_token=$3,lease_owner=$4,
 		    lease_started_at=$5,lease_expires_at=$6
@@ -319,14 +349,17 @@ func (s *Store) claimCommandLocked(
 	}
 	var attemptTimeout time.Duration
 	if timeoutMS != nil {
-		attemptTimeout = time.Duration(*timeoutMS) * time.Millisecond
+		attemptTimeout, err = durable.MillisecondsDuration("stored command attempt timeout", *timeoutMS)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: invalid stored command attempt timeout", flowerr.ErrInvalidState)
+		}
 	}
 	return &ClaimedCommand{
 		CommandID: candidate.CommandID, ExecutionID: candidate.ExecutionID, CommandKey: key,
 		Name: name, Version: version, Queue: queue, Args: slices.Clone(args), EventInputs: eventInputs,
 		RetryMaxElapsed: clonePointer(policyValue.MaxElapsed),
 		AttemptTimeout:  attemptTimeout, CreatedAt: createdAt, BudgetStartedAt: budgetStartedAt,
-		ExecutionDeadline: clonePointer(executionDeadline), Attempt: ordinal + 1, ConsumedAttempts: consumed,
+		ExecutionDeadline: clonePointer(executionDeadline), Attempt: attempt, ConsumedAttempts: consumed,
 		AttemptID: attemptID, LeaseToken: token, DBNow: semantic.DBNow(), LeaseExpiresAt: leaseExpiresAt,
 		AttemptStartedPosition: journal.Journal[0].Position,
 	}, false, nil
@@ -433,7 +466,16 @@ func (s *Store) failBeforeClaimLocked(
 	}
 	entries = append(entries, cancelledEntries...)
 	executionFailed := required || head.Status == "failing"
-	effectiveOpen := head.OpenCommands - 1 - len(failureEffects.cancelled)
+	effectiveOpen, err := durable.AddPostgresInteger("execution open commands", head.OpenCommands,
+		-1, 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return err
+	}
+	effectiveOpen, err = durable.AddPostgresInteger("execution open commands", effectiveOpen,
+		-len(failureEffects.cancelled), 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return err
+	}
 	terminalExecution := effectiveOpen == 0
 	if terminalExecution {
 		status, eventName, reason := "succeeded", "flow.execution_succeeded", ""
@@ -481,11 +523,11 @@ func (s *Store) failBeforeClaimLocked(
 		}
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-		SET status=$2,open_commands=open_commands-1-$5,failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
+		SET status=$2,open_commands=$5,failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
 		    finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 		    updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END
 		WHERE execution_id=$1`, semantic.ExecutionID(), status, jsonString(failure), semantic.DBNow(),
-		len(failureEffects.cancelled), executionFailed); err != nil {
+		effectiveOpen, executionFailed); err != nil {
 		return MapError("update execution after pre-claim failure", err)
 	}
 	return nil
@@ -509,6 +551,10 @@ func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, d
 	if duration <= 0 {
 		return nil, fmt.Errorf("%w: lease duration must be positive", flowerr.ErrInvalid)
 	}
+	durationMilliseconds, err := durable.ExactMilliseconds("lease duration", duration)
+	if err != nil {
+		return nil, err
+	}
 	commandIDs := make([]uuid.UUID, len(leases))
 	attemptIDs := make([]uuid.UUID, len(leases))
 	tokens := make([]uuid.UUID, len(leases))
@@ -525,7 +571,7 @@ func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, d
 		  AND q.state='running' AND q.lease_expires_at>n.now
 		RETURNING q.command_id,q.lease_expires_at
 	)
-	SELECT command_id,lease_expires_at FROM renewed`, commandIDs, attemptIDs, tokens, duration.Milliseconds())
+	SELECT command_id,lease_expires_at FROM renewed`, commandIDs, attemptIDs, tokens, durationMilliseconds)
 	if err != nil {
 		return nil, MapError("renew command leases", err)
 	}
@@ -605,8 +651,7 @@ type CommandConclusion struct {
 	Claim          ClaimedCommand
 	Classification retrypolicy.ErrorClass
 	ExplicitDelay  *time.Duration
-	ErrorCode      string
-	ErrorMessage   string
+	Failure        failure.Value
 }
 
 type SettleResult struct {
@@ -728,7 +773,10 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		entries = append(entries, entry)
 	}
 	for _, child := range request.Children {
-		next := semantic.DBNow().Add(child.InitialDelay)
+		next, addErr := durable.AddExactDuration("initial delay", semantic.DBNow(), child.InitialDelay)
+		if addErr != nil {
+			return SettleResult{}, addErr
+		}
 		created, createErr := commandCreatedEntry(child, next, next)
 		if createErr != nil {
 			return SettleResult{}, createErr
@@ -773,7 +821,21 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if cancelStagedChildren {
 		effectiveChildren = 0
 	}
-	effectiveOpen := fence.Head.OpenCommands - 1 + effectiveChildren
+	effectiveOpen, err := durable.AddPostgresInteger("execution open commands", fence.Head.OpenCommands,
+		-1, 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return SettleResult{}, err
+	}
+	effectiveOpen, err = durable.AddPostgresInteger("execution open commands", effectiveOpen,
+		effectiveChildren, 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return SettleResult{}, err
+	}
+	commandCount, err := durable.AddPostgresInteger("execution command count", fence.Head.CommandCount,
+		len(request.Children), 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return SettleResult{}, err
+	}
 	terminalExecution := effectiveOpen == 0
 	terminalStatus := "succeeded"
 	terminalName := "flow.execution_succeeded"
@@ -807,7 +869,10 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		return SettleResult{}, MapError("remove successful command queue row", err)
 	}
 	for index, child := range request.Children {
-		next := semantic.DBNow().Add(child.InitialDelay)
+		next, addErr := durable.AddExactDuration("initial delay", semantic.DBNow(), child.InitialDelay)
+		if addErr != nil {
+			return SettleResult{}, addErr
+		}
 		if err := s.insertCommand(ctx, semantic.PGX(), semantic.ExecutionID(), child,
 			journal.Journal[1+len(request.Events)+index].Position, next, next); err != nil {
 			return SettleResult{}, err
@@ -834,14 +899,14 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	}
 	if terminalExecution {
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET status=$3,open_commands=0,command_count=command_count+$4,finished_at=$2,updated_at=$2,status_at=$2
-			WHERE execution_id=$1`, semantic.ExecutionID(), semantic.DBNow(), terminalStatus, len(request.Children)); err != nil {
+			SET status=$3,open_commands=$4,command_count=$5,finished_at=$2,updated_at=$2,status_at=$2
+			WHERE execution_id=$1`, semantic.ExecutionID(), semantic.DBNow(), terminalStatus, effectiveOpen, commandCount); err != nil {
 			return SettleResult{}, MapError("complete direct execution", err)
 		}
 	} else {
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET open_commands=open_commands-1+$3,command_count=command_count+$4,
-			    updated_at=$2 WHERE execution_id=$1`, semantic.ExecutionID(), semantic.DBNow(), effectiveChildren, len(request.Children)); err != nil {
+			SET open_commands=$3,command_count=$4,
+			    updated_at=$2 WHERE execution_id=$1`, semantic.ExecutionID(), semantic.DBNow(), effectiveOpen, commandCount); err != nil {
 			return SettleResult{}, MapError("update execution after command success", err)
 		}
 	}
@@ -873,11 +938,31 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 
 func (s *Store) validateSuccessfulDecision(ctx context.Context, semantic *SemanticTx, fence commandFence, request CommandSuccess) error {
 	if len(request.Children) > 0 {
-		if fence.Head.MaxCommands > 0 && fence.Head.CommandCount+len(request.Children) > fence.Head.MaxCommands {
+		if err := durable.PostgresInteger("child command count", len(request.Children), 0, durable.PostgresIntegerMax); err != nil {
+			return err
+		}
+		commandCount, err := durable.AddPostgresInteger("execution command count", fence.Head.CommandCount,
+			len(request.Children), 0, durable.PostgresIntegerMax)
+		if err != nil {
+			return err
+		}
+		if fence.Head.MaxCommands > 0 && commandCount > fence.Head.MaxCommands {
 			return fmt.Errorf("%w: execution command ceiling exceeded", flowerr.ErrInvalidState)
+		}
+		openCommands, err := durable.AddPostgresInteger("execution open commands", fence.Head.OpenCommands,
+			-1, 0, durable.PostgresIntegerMax)
+		if err != nil {
+			return err
+		}
+		if _, err := durable.AddPostgresInteger("execution open commands", openCommands,
+			len(request.Children), 0, durable.PostgresIntegerMax); err != nil {
+			return err
 		}
 		keys := make([]string, len(request.Children))
 		for index, child := range request.Children {
+			if err := validateCommandCreate(child); err != nil {
+				return err
+			}
 			if child.ParentCommandID == nil || *child.ParentCommandID != request.Claim.CommandID {
 				return fmt.Errorf("%w: invalid worker-spawned child", flowerr.ErrInvalid)
 			}
@@ -896,6 +981,14 @@ func (s *Store) validateSuccessfulDecision(ctx context.Context, semantic *Semant
 }
 
 func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConclusion, hook fault.Hook) (SettleResult, error) {
+	if request.ExplicitDelay != nil {
+		if *request.ExplicitDelay <= 0 {
+			return SettleResult{}, fmt.Errorf("%w: retry-after delay must be positive", flowerr.ErrInvalid)
+		}
+		if _, err := durable.ExactMilliseconds("retry-after delay", *request.ExplicitDelay); err != nil {
+			return SettleResult{}, err
+		}
+	}
 	if hook == nil {
 		hook = fault.None{}
 	}
@@ -933,10 +1026,13 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 	if err != nil {
 		return SettleResult{}, fmt.Errorf("%w: retry decision: %s", flowerr.ErrInvalidState, err)
 	}
+	if err := durable.PostgresInteger("consumed attempts", decision.ConsumedAttempts, 0, durable.PostgresIntegerMax); err != nil {
+		return SettleResult{}, err
+	}
 	if decision.Retry && decision.NextAttemptAt.IsZero() {
 		decision.NextAttemptAt = semantic.DBNow()
 	}
-	failure := safeAttemptError(request.ErrorCode, request.ErrorMessage)
+	failure := safeAttemptError(request.Failure.Code, request.Failure.Message)
 	var next *time.Time
 	if decision.Retry {
 		next = clonePointer(&decision.NextAttemptAt)
@@ -959,6 +1055,7 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 	cancelledOffset := 0
 	terminalExecution := false
 	executionFailed := false
+	effectiveOpen := fence.Head.OpenCommands
 	if !decision.Retry {
 		if fence.Required {
 			failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, request.Claim.CommandID, "failed", fence.Head.FailFast)
@@ -999,7 +1096,16 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 			return SettleResult{}, err
 		}
 		entries = append(entries, cancelledEntries...)
-		effectiveOpen := fence.Head.OpenCommands - 1 - len(failureEffects.cancelled)
+		effectiveOpen, err = durable.AddPostgresInteger("execution open commands", fence.Head.OpenCommands,
+			-1, 0, durable.PostgresIntegerMax)
+		if err != nil {
+			return SettleResult{}, err
+		}
+		effectiveOpen, err = durable.AddPostgresInteger("execution open commands", effectiveOpen,
+			-len(failureEffects.cancelled), 0, durable.PostgresIntegerMax)
+		if err != nil {
+			return SettleResult{}, err
+		}
 		terminalExecution = effectiveOpen == 0
 		if terminalExecution {
 			status, eventName, reason := "succeeded", "flow.execution_succeeded", ""
@@ -1064,12 +1170,12 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 			}
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-			SET status=$2,open_commands=open_commands-1-$5,
+			SET status=$2,open_commands=$5,
 			    failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
 			    finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 			    updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END
 			WHERE execution_id=$1`, semantic.ExecutionID(), status, jsonString(failure), semantic.DBNow(),
-			len(failureEffects.cancelled), executionFailed); err != nil {
+			effectiveOpen, executionFailed); err != nil {
 			return SettleResult{}, MapError("update execution after command failure", err)
 		}
 	}
@@ -1105,7 +1211,7 @@ func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, clai
 	}
 	var activeAttempt, token *uuid.UUID
 	err = semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.state,c.required,c.attempt_ordinal,
-		c.consumed_attempts,c.budget_started_at,c.retry_policy::text::bytea,
+		c.consumed_attempts,c.budget_started_at,c.retry_policy,
 		q.state,q.active_attempt_id,q.lease_token,q.lease_expires_at,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
 		 WHERE execution_id=c.execution_id AND attempt_id=$2 AND entry_kind='attempt_started')

@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/durable"
+	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/jackc/pgx/v5"
 )
@@ -251,7 +254,16 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return false, err
 	}
 	entries = append(entries, cancelledEntries...)
-	effectiveOpen := head.OpenCommands - 1 - len(failureEffects.cancelled)
+	effectiveOpen, err := durable.AddPostgresInteger("execution open commands", head.OpenCommands,
+		-1, 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return false, err
+	}
+	effectiveOpen, err = durable.AddPostgresInteger("execution open commands", effectiveOpen,
+		-len(failureEffects.cancelled), 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return false, err
+	}
 	terminalExecution := effectiveOpen == 0
 	if terminalExecution {
 		status, name, reason := "succeeded", "flow.execution_succeeded", ""
@@ -295,11 +307,11 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		}
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-		SET status=$2,open_commands=open_commands-1-$5,
+		SET status=$2,open_commands=$5,
 		failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
 		finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 		updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END WHERE execution_id=$1`,
-		head.ID, status, jsonString(failure), semantic.DBNow(), len(failureEffects.cancelled), executionFailed); err != nil {
+		head.ID, status, jsonString(failure), semantic.DBNow(), effectiveOpen, executionFailed); err != nil {
 		return false, MapError("update execution after wait expiry", err)
 	}
 	if err := semantic.Commit(ctx); err != nil {
@@ -410,8 +422,14 @@ func (s *Store) loadReadinessCommands(ctx context.Context, semantic *SemanticTx)
 			&item.waitStartedAt, &waitTimeoutMS); err != nil {
 			return nil, MapError("scan readiness command", err)
 		}
-		item.initialDelay = time.Duration(delayMS) * time.Millisecond
-		item.waitTimeout = time.Duration(waitTimeoutMS) * time.Millisecond
+		item.initialDelay, err = durable.MillisecondsDuration("stored command initial delay", delayMS)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid command initial delay", flowerr.ErrInvalidState)
+		}
+		item.waitTimeout, err = durable.MillisecondsDuration("stored command wait timeout", waitTimeoutMS)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid command wait timeout", flowerr.ErrInvalidState)
+		}
 		result = append(result, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -445,7 +463,11 @@ func (s *Store) applyReadinessResolution(
 	for _, command := range resolution.ready {
 		nextRun := semantic.DBNow()
 		if command.initialDelay > 0 {
-			nextRun = command.createdAt.Add(command.initialDelay)
+			var err error
+			nextRun, err = durable.AddExactDuration("command initial delay", command.createdAt, command.initialDelay)
+			if err != nil {
+				return fmt.Errorf("%w: invalid stored command initial delay", flowerr.ErrInvalidState)
+			}
 			if nextRun.Before(semantic.DBNow()) {
 				nextRun = semantic.DBNow()
 			}
@@ -470,7 +492,10 @@ func (s *Store) applyReadinessResolution(
 	for _, command := range resolution.waiting {
 		var deadline *time.Time
 		if command.waitTimeout > 0 {
-			value := semantic.DBNow().Add(command.waitTimeout)
+			value, err := durable.AddExactDuration("command wait timeout", semantic.DBNow(), command.waitTimeout)
+			if err != nil {
+				return fmt.Errorf("%w: invalid stored command wait timeout", flowerr.ErrInvalidState)
+			}
 			var executionDeadline *time.Time
 			if err := semantic.PGX().QueryRow(ctx, `SELECT deadline_at FROM `+pgschema.Table(s.schema, "flow_executions")+`
 				WHERE execution_id=$1`, semantic.ExecutionID()).Scan(&executionDeadline); err != nil {
