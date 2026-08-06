@@ -256,6 +256,28 @@ func TestStoreValidation(t *testing.T) {
 
 	tx, err = repository.BeginSemantic(ctx, id, store.LockBlocking)
 	if err != nil {
+		t.Fatalf("BeginSemantic(causation validation) error = %v", err)
+	}
+	futureCausation := int64(100)
+	futureEntry, _ := store.NewJournalEntry(store.ExecutionStarted, map[string]int{"v": 1})
+	futureEntry.CausationPosition = &futureCausation
+	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{futureEntry}}); !errors.Is(err, flow.ErrInvalidState) {
+		t.Fatalf("Apply(future causation) error = %v, want invalid state", err)
+	}
+	if err := tx.Commit(ctx); !errors.Is(err, flow.ErrInvalidState) {
+		t.Fatalf("Commit(future causation) error = %v, want invalid state", err)
+	}
+	var allocatorAfterCausation int64
+	if err := db.Conn.QueryRow(ctx, `SELECT next_journal_position FROM `+
+		pgschema.Table(schema, "flow_executions")+` WHERE execution_id=$1`, id).Scan(&allocatorAfterCausation); err != nil {
+		t.Fatalf("read allocator after causation rejection: %v", err)
+	}
+	if allocatorAfterCausation != 1 {
+		t.Fatalf("allocator after causation rejection = %d, want 1", allocatorAfterCausation)
+	}
+
+	tx, err = repository.BeginSemantic(ctx, id, store.LockBlocking)
+	if err != nil {
 		t.Fatalf("BeginSemantic(database validation) error = %v", err)
 	}
 	invalidEntry, err := store.NewJournalEntry(store.EventRecorded, map[string]int{"v": 1})

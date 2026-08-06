@@ -169,8 +169,14 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	if err != nil {
 		return StartResult{}, false, err
 	}
-	if err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position, dbNow, nextAttemptAt); err != nil {
+	rootReady, err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position, dbNow, nextAttemptAt)
+	if err != nil {
 		return StartResult{}, false, err
+	}
+	if rootReady && !nextAttemptAt.After(dbNow) {
+		if err := semantic.NotifyRunnableCommands(ctx); err != nil {
+			return StartResult{}, false, err
+		}
 	}
 	// Mirror the row this transaction just inserted instead of re-reading it.
 	return StartResult{Row: ExecutionRow{
@@ -329,15 +335,15 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 	return entry, nil
 }
 
-func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.UUID, command CommandCreate, createdPosition int64, budgetStartedAt, nextAttemptAt time.Time) error {
+func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.UUID, command CommandCreate, createdPosition int64, budgetStartedAt, nextAttemptAt time.Time) (bool, error) {
 	if err := validateCommandCreate(command); err != nil {
-		return err
+		return false, err
 	}
 	var timeoutMS *int64
 	if command.AttemptTimeout > 0 {
 		value, err := durable.ExactMilliseconds("attempt timeout", command.AttemptTimeout)
 		if err != nil {
-			return err
+			return false, err
 		}
 		timeoutMS = &value
 	}
@@ -345,7 +351,7 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	if command.InitialDelay > 0 {
 		value, err := durable.ExactMilliseconds("initial delay", command.InitialDelay)
 		if err != nil {
-			return err
+			return false, err
 		}
 		initialDelayMS = &value
 	}
@@ -363,7 +369,7 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 			continue
 		}
 		if err != nil {
-			return MapError("find retained event for command wait", err)
+			return false, MapError("find retained event for command wait", err)
 		}
 		waitPositions[index] = position
 	}
@@ -378,7 +384,7 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	if command.Within > 0 {
 		value, err := durable.ExactMilliseconds("wait timeout", command.Within)
 		if err != nil {
-			return err
+			return false, err
 		}
 		withinMS = &value
 	}
@@ -395,19 +401,19 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 		acceptedBudget, acceptedNext, withinMS, createdPosition, budgetStartedAt,
 	)
 	if err != nil {
-		return MapError("insert command", err)
+		return false, MapError("insert command", err)
 	}
 	if state == "pending" && unsatisfiedWaits > 0 {
 		var deadline *time.Time
 		if command.Within > 0 {
 			value, addErr := durable.AddExactDuration("wait timeout", budgetStartedAt, command.Within)
 			if addErr != nil {
-				return addErr
+				return false, addErr
 			}
 			var executionDeadline *time.Time
 			if err := tx.QueryRow(ctx, `SELECT deadline_at FROM `+pgschema.Table(s.schema, "flow_executions")+`
 				WHERE execution_id=$1`, executionID).Scan(&executionDeadline); err != nil {
-				return MapError("load execution deadline for initial wait", err)
+				return false, MapError("load execution deadline for initial wait", err)
 			}
 			if executionDeadline != nil && executionDeadline.Before(value) {
 				value = *executionDeadline
@@ -416,7 +422,7 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 		}
 		if _, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
 			SET wait_started_at=$2,wait_deadline_at=$3 WHERE command_id=$1`, command.ID, budgetStartedAt, deadline); err != nil {
-			return MapError("start initial command wait", err)
+			return false, MapError("start initial command wait", err)
 		}
 	}
 	if state == "ready" {
@@ -425,7 +431,7 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 			VALUES ($1,$2,$3,$4,$5,'ready',$6)`,
 			command.ID, executionID, command.Queue, command.Name, command.Version, nextAttemptAt)
 		if err != nil {
-			return MapError("enqueue command", err)
+			return false, MapError("enqueue command", err)
 		}
 	}
 	for index, wait := range command.Waits {
@@ -436,10 +442,10 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 		if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_event_waits")+`
 			(command_id,execution_id,event_name,event_key,satisfied_position)
 			VALUES ($1,$2,$3,$4,$5)`, command.ID, executionID, wait.Name, wait.Key, satisfied); err != nil {
-			return MapError("insert command event wait", err)
+			return false, MapError("insert command event wait", err)
 		}
 	}
-	return nil
+	return state == "ready", nil
 }
 
 type ExecutionHead struct {
@@ -575,8 +581,14 @@ func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event Appl
 	if err != nil {
 		return false, err
 	}
-	if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
+	immediatelyRunnable, err := s.applyReadinessResolution(ctx, semantic, resolution)
+	if err != nil {
 		return false, err
+	}
+	if immediatelyRunnable {
+		if err := semantic.NotifyRunnableCommands(ctx); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }
@@ -774,7 +786,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 			"cancelled by fail-fast after required command cancellation"); err != nil {
 			return CancelResult{}, err
 		}
-	} else if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
+	} else if _, err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 		return CancelResult{}, err
 	}
 

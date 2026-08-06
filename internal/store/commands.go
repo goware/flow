@@ -509,7 +509,7 @@ func (s *Store) failBeforeClaimLocked(
 			"cancelled by fail-fast after required command failure"); err != nil {
 			return err
 		}
-	} else if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
+	} else if _, err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 		return err
 	}
 	status := head.Status
@@ -647,6 +647,60 @@ type CommandSuccess struct {
 	Commit   func(pgx.Tx) error
 }
 
+type successfulSettlementJournalLayout struct {
+	applicationEventStart int
+	applicationEventCount int
+	childCreatedStart     int
+	childCreatedCount     int
+	parentTerminal        int
+}
+
+func newSuccessfulSettlementJournalLayout(applicationEvents, children int) successfulSettlementJournalLayout {
+	applicationEventStart := 1
+	childCreatedStart := applicationEventStart + applicationEvents
+	return successfulSettlementJournalLayout{
+		applicationEventStart: applicationEventStart,
+		applicationEventCount: applicationEvents,
+		childCreatedStart:     childCreatedStart,
+		childCreatedCount:     children,
+		parentTerminal:        childCreatedStart + children,
+	}
+}
+
+func (layout successfulSettlementJournalLayout) validateAccepted(result ApplyResult) error {
+	if len(result.Journal) <= layout.parentTerminal || result.Journal[0].Kind != AttemptConcluded {
+		return fmt.Errorf("%w: successful settlement journal shape differs", flowerr.ErrInvalidState)
+	}
+	for index := 0; index < layout.applicationEventCount; index++ {
+		row := result.Journal[layout.applicationEventStart+index]
+		if row.Kind != EventRecorded || row.EventClass == nil || *row.EventClass != "application" {
+			return fmt.Errorf("%w: successful settlement application-event mapping differs", flowerr.ErrInvalidState)
+		}
+	}
+	for index := 0; index < layout.childCreatedCount; index++ {
+		if result.Journal[layout.childCreatedStart+index].Kind != CommandCreated {
+			return fmt.Errorf("%w: successful settlement child mapping differs", flowerr.ErrInvalidState)
+		}
+	}
+	terminal := result.Journal[layout.parentTerminal]
+	if terminal.Kind != EventRecorded || terminal.EventClass == nil || *terminal.EventClass != "command_terminal" {
+		return fmt.Errorf("%w: successful settlement parent-terminal mapping differs", flowerr.ErrInvalidState)
+	}
+	return nil
+}
+
+func (layout successfulSettlementJournalLayout) applicationEventPosition(result ApplyResult, index int) int64 {
+	return result.Journal[layout.applicationEventStart+index].Position
+}
+
+func (layout successfulSettlementJournalLayout) childCreatedPosition(result ApplyResult, index int) int64 {
+	return result.Journal[layout.childCreatedStart+index].Position
+}
+
+func (layout successfulSettlementJournalLayout) parentTerminalPosition(result ApplyResult) int64 {
+	return result.Journal[layout.parentTerminal].Position
+}
+
 type CommandConclusion struct {
 	Claim          ClaimedCommand
 	Classification retrypolicy.ErrorClass
@@ -731,22 +785,7 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err := s.validateSuccessfulDecision(ctx, semantic, fence, request); err != nil {
 		return SettleResult{}, err
 	}
-	firstPosition, err := semantic.nextJournalPosition(ctx)
-	if err != nil {
-		return SettleResult{}, err
-	}
-	var waitUpdates []waitUpdate
-	for index, event := range request.Events {
-		waits, matchErr := s.matchingWaitsLocked(ctx, semantic, event.Name, event.Key, firstPosition+1+int64(index))
-		if matchErr != nil {
-			return SettleResult{}, matchErr
-		}
-		waitUpdates = append(waitUpdates, waits...)
-	}
-	resolution, err := s.resolveReadinessLocked(ctx, semantic, map[uuid.UUID]string{request.Claim.CommandID: "succeeded"}, waitUpdates)
-	if err != nil {
-		return SettleResult{}, err
-	}
+	layout := newSuccessfulSettlementJournalLayout(len(request.Events), len(request.Children))
 
 	concluded, err := NewJournalEntry(AttemptConcluded, journalcodec.AttemptConcludedBody{
 		V: 1, AttemptID: request.Claim.AttemptID.String(), CommandID: request.Claim.CommandID.String(),
@@ -803,6 +842,9 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	succeeded.CausationBatchIndex = &zero
 	entries = append(entries, succeeded)
 	parentTerminalIndex := len(entries) - 1
+	if parentTerminalIndex != layout.parentTerminal {
+		return SettleResult{}, fmt.Errorf("%w: successful settlement journal construction differs", flowerr.ErrInvalidState)
+	}
 	cancelStagedChildren := fence.Head.Status == "failing" && fence.Head.FailFast
 	childCancellationIndexes := make([]int, len(request.Children))
 	if cancelStagedChildren {
@@ -855,6 +897,23 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err != nil {
 		return SettleResult{}, err
 	}
+	if err := layout.validateAccepted(journal); err != nil {
+		return SettleResult{}, err
+	}
+	var waitUpdates []waitUpdate
+	for index, event := range request.Events {
+		waits, matchErr := s.matchingWaitsLocked(ctx, semantic, event.Name, event.Key,
+			layout.applicationEventPosition(journal, index))
+		if matchErr != nil {
+			return SettleResult{}, matchErr
+		}
+		waitUpdates = append(waitUpdates, waits...)
+	}
+	resolution, err := s.resolveReadinessLocked(ctx, semantic,
+		map[uuid.UUID]string{request.Claim.CommandID: "succeeded"}, waitUpdates)
+	if err != nil {
+		return SettleResult{}, err
+	}
 	if err := hook.Hit(ctx, fault.SettleAfterAttempt); err != nil {
 		return SettleResult{}, err
 	}
@@ -862,20 +921,25 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		SET state='succeeded',result=$2,last_error=NULL,terminal_failure=NULL,
 		    terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
 		WHERE command_id=$1`, request.Claim.CommandID, request.Result.Bytes,
-		journal.Journal[parentTerminalIndex].Position, semantic.DBNow()); err != nil {
+		layout.parentTerminalPosition(journal), semantic.DBNow()); err != nil {
 		return SettleResult{}, MapError("settle successful command", err)
 	}
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, request.Claim.CommandID); err != nil {
 		return SettleResult{}, MapError("remove successful command queue row", err)
 	}
+	immediatelyRunnable := false
 	for index, child := range request.Children {
 		next, addErr := durable.AddExactDuration("initial delay", semantic.DBNow(), child.InitialDelay)
 		if addErr != nil {
 			return SettleResult{}, addErr
 		}
-		if err := s.insertCommand(ctx, semantic.PGX(), semantic.ExecutionID(), child,
-			journal.Journal[1+len(request.Events)+index].Position, next, next); err != nil {
+		childReady, err := s.insertCommand(ctx, semantic.PGX(), semantic.ExecutionID(), child,
+			layout.childCreatedPosition(journal, index), next, next)
+		if err != nil {
 			return SettleResult{}, err
+		}
+		if childReady && !cancelStagedChildren && !next.After(semantic.DBNow()) {
+			immediatelyRunnable = true
 		}
 		if cancelStagedChildren {
 			failure := terminalFailure{Code: "fail_fast", Message: "cancelled because the execution is failing"}
@@ -894,9 +958,11 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err := hook.Hit(ctx, fault.SettleAfterChildren); err != nil {
 		return SettleResult{}, err
 	}
-	if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
+	releasedRunnable, err := s.applyReadinessResolution(ctx, semantic, resolution)
+	if err != nil {
 		return SettleResult{}, err
 	}
+	immediatelyRunnable = immediatelyRunnable || releasedRunnable
 	if terminalExecution {
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
 			SET status=$3,open_commands=$4,command_count=$5,finished_at=$2,updated_at=$2,status_at=$2
@@ -921,6 +987,11 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 			return SettleResult{}, &CommitFunctionError{Err: err}
 		}
 		if err := hook.Hit(ctx, fault.SettleAfterCommitFunction); err != nil {
+			return SettleResult{}, err
+		}
+	}
+	if immediatelyRunnable {
+		if err := semantic.NotifyRunnableCommands(ctx); err != nil {
 			return SettleResult{}, err
 		}
 	}
@@ -1156,7 +1227,7 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 				"cancelled by fail-fast after required command failure"); err != nil {
 				return SettleResult{}, err
 			}
-		} else if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
+		} else if _, err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 			return SettleResult{}, err
 		}
 		status := fence.Head.Status
@@ -1181,6 +1252,11 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 	}
 	if err := hook.Hit(ctx, fault.SettleAfterEvents); err != nil {
 		return SettleResult{}, err
+	}
+	if decision.Retry && !decision.NextAttemptAt.After(semantic.DBNow()) {
+		if err := semantic.NotifyRunnableCommands(ctx); err != nil {
+			return SettleResult{}, err
+		}
 	}
 	if err := hook.Hit(ctx, fault.SettleBeforeCommit); err != nil {
 		return SettleResult{}, err
@@ -1541,6 +1617,9 @@ func (s *Store) RecoverExpiredCommandLease(ctx context.Context, candidate Expire
 		    lease_started_at=NULL,lease_expires_at=NULL WHERE command_id=$1`,
 		candidate.CommandID, semantic.DBNow()); err != nil {
 		return false, MapError("recover expired command delivery", err)
+	}
+	if err := semantic.NotifyRunnableCommands(ctx); err != nil {
+		return false, err
 	}
 	if err := semantic.Commit(ctx); err != nil {
 		return false, err

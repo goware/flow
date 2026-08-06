@@ -205,8 +205,14 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		if err != nil {
 			return false, err
 		}
-		if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
+		immediatelyRunnable, err := s.applyReadinessResolution(ctx, semantic, resolution)
+		if err != nil {
 			return false, err
+		}
+		if immediatelyRunnable {
+			if err := semantic.NotifyRunnableCommands(ctx); err != nil {
+				return false, err
+			}
 		}
 		if err := semantic.Commit(ctx); err != nil {
 			return false, err
@@ -294,7 +300,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 			"cancelled by fail-fast after required command expiry"); err != nil {
 			return false, err
 		}
-	} else if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
+	} else if _, err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
 		return false, err
 	}
 	status := head.Status
@@ -345,7 +351,7 @@ func (s *Store) applyFailureResolution(
 	cancelledOffset int,
 	reason string,
 ) error {
-	if err := s.applyReadinessResolution(ctx, semantic, resolution.readinessResolution); err != nil {
+	if _, err := s.applyReadinessResolution(ctx, semantic, resolution.readinessResolution); err != nil {
 		return err
 	}
 	failure := terminalFailure{Code: "fail_fast", Message: reason}
@@ -443,13 +449,14 @@ func (s *Store) applyReadinessResolution(
 	ctx context.Context,
 	semantic *SemanticTx,
 	resolution readinessResolution,
-) error {
+) (bool, error) {
+	immediatelyRunnable := false
 	for _, wait := range resolution.waits {
 		commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_event_waits")+`
 			SET satisfied_position=$4 WHERE command_id=$1 AND event_name=$2 AND event_key=$3
 			AND satisfied_position IS NULL`, wait.commandID, wait.name, wait.key, wait.position)
 		if err != nil {
-			return MapError("satisfy command event wait", err)
+			return false, MapError("satisfy command event wait", err)
 		}
 		if commandTag.RowsAffected() > 0 {
 			if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
@@ -457,7 +464,7 @@ func (s *Store) applyReadinessResolution(
 				    unsatisfied_waits=GREATEST(0,unsatisfied_waits-1),updated_at=$2,
 				    status_at=CASE WHEN state='pending' AND unsatisfied_waits=1 THEN $2 ELSE status_at END
 				WHERE command_id=$1`, wait.commandID, semantic.DBNow()); err != nil {
-				return MapError("update satisfied wait count", err)
+				return false, MapError("update satisfied wait count", err)
 			}
 		}
 	}
@@ -467,7 +474,7 @@ func (s *Store) applyReadinessResolution(
 			var err error
 			nextRun, err = durable.AddExactDuration("command initial delay", command.createdAt, command.initialDelay)
 			if err != nil {
-				return fmt.Errorf("%w: invalid stored command initial delay", flowerr.ErrInvalidState)
+				return false, fmt.Errorf("%w: invalid stored command initial delay", flowerr.ErrInvalidState)
 			}
 			if nextRun.Before(semantic.DBNow()) {
 				nextRun = semantic.DBNow()
@@ -478,7 +485,7 @@ func (s *Store) applyReadinessResolution(
 			WHERE command_id=$1 AND state IN ('pending','ready') AND unsatisfied_waits=0
 			AND budget_started_at IS NULL`, command.id, nextRun, semantic.DBNow())
 		if err != nil {
-			return MapError("make gated command ready", err)
+			return false, MapError("make gated command ready", err)
 		}
 		if commandTag.RowsAffected() > 0 {
 			_, err = semantic.PGX().Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_queue")+`
@@ -486,7 +493,10 @@ func (s *Store) applyReadinessResolution(
 				VALUES ($1,$2,$3,$4,$5,'ready',$6) ON CONFLICT (command_id) DO NOTHING`,
 				command.id, semantic.ExecutionID(), command.queue, command.name, command.version, nextRun)
 			if err != nil {
-				return MapError("enqueue gated command", err)
+				return false, MapError("enqueue gated command", err)
+			}
+			if !nextRun.After(semantic.DBNow()) {
+				immediatelyRunnable = true
 			}
 		}
 	}
@@ -495,12 +505,12 @@ func (s *Store) applyReadinessResolution(
 		if command.waitTimeout > 0 {
 			value, err := durable.AddExactDuration("command wait timeout", semantic.DBNow(), command.waitTimeout)
 			if err != nil {
-				return fmt.Errorf("%w: invalid stored command wait timeout", flowerr.ErrInvalidState)
+				return false, fmt.Errorf("%w: invalid stored command wait timeout", flowerr.ErrInvalidState)
 			}
 			var executionDeadline *time.Time
 			if err := semantic.PGX().QueryRow(ctx, `SELECT deadline_at FROM `+pgschema.Table(s.schema, "flow_executions")+`
 				WHERE execution_id=$1`, semantic.ExecutionID()).Scan(&executionDeadline); err != nil {
-				return MapError("load execution deadline for wait", err)
+				return false, MapError("load execution deadline for wait", err)
 			}
 			if executionDeadline != nil && executionDeadline.Before(value) {
 				value = *executionDeadline
@@ -511,10 +521,10 @@ func (s *Store) applyReadinessResolution(
 			SET wait_started_at=COALESCE(wait_started_at,$2),wait_deadline_at=COALESCE(wait_deadline_at,$3),updated_at=$2
 			WHERE command_id=$1 AND state='pending' AND unsatisfied_waits>0`,
 			command.id, semantic.DBNow(), deadline); err != nil {
-			return MapError("start command event wait", err)
+			return false, MapError("start command event wait", err)
 		}
 	}
-	return nil
+	return immediatelyRunnable, nil
 }
 
 func (s *Store) matchingWaitsLocked(

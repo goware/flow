@@ -247,3 +247,46 @@ counter update eligible for a PostgreSQL HOT update when its heap page has
 space. This is structural eligibility rather than a cumulative-statistics
 assertion; updates that also change `state` can still require index maintenance
 because `state` participates in the partial wait-deadline index predicate.
+
+## Phase 2 journal and notification evidence
+
+The Phase 2 working tree was measured from parent commit `2ddc834` with the
+same machine, PostgreSQL durability settings, 12-connection test pool, and
+16-worker lifecycle runtime as the baseline. The database password was supplied
+through the existing test environment and was not printed or recorded.
+
+```text
+go test -run '^$' \
+  -bench 'Benchmark(ExecutionIngressNotification|IndependentCommandLifecycle)$' \
+  -benchmem -benchtime=3s -count=5 .
+```
+
+| Workload | Baseline median (range) | Phase 2 median (range) |
+|---|---:|---:|
+| execution ingress, poll-only | 4.167 ms (4.060-4.341) | 4.342 ms (4.057-4.468) |
+| execution ingress, notification mode | 4.261 ms (4.083-4.320) | 4.257 ms (4.130-4.477) |
+| independent lifecycle, 1 producer | 162.2 commands/s (161.2-165.5) | 160.5 commands/s (157.0-164.4) |
+| independent lifecycle, 4 producers | 176.1 commands/s (174.4-180.4) | 176.0 commands/s (174.8-178.6) |
+| independent lifecycle, 16 producers | 170.2 commands/s (167.2-173.7) | 169.6 commands/s (168.0-173.0) |
+
+The samples overlap and show no material lifecycle-throughput change in this
+phase. Poll-only ingress had a higher median but overlapping range; notification
+ingress and all three complete-lifecycle rates remained within ordinary
+repeated-sample variance. The Phase 2 benefit is therefore recorded as a
+structural hot-path reduction and semantic notification correction, not as a
+throughput multiplier. Later readiness and batching phases target the dominant
+remaining lifecycle work.
+
+Source scans and PostgreSQL tests establish the structural result:
+
+- journal allocation has no next-position pre-read and reserves each batch with
+  one allocator `UPDATE ... RETURNING`;
+- successful settlement maps normalized staged events, child declarations, and
+  the parent terminal event from the accepted journal rows before projection
+  updates;
+- generic journal append contains no `pg_notify` call;
+- the only store-level `pg_notify` is behind the explicit transactional
+  runnable-command helper; and
+- commit/rollback, remote root and event wake, unrelated-event no-op, claim,
+  terminal settlement, immediate retry, lease recovery, gap-free rollback, and
+  same-decision staged-event/new-child position tests pass against PostgreSQL.

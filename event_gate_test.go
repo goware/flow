@@ -232,15 +232,27 @@ func TestWorkerEventSatisfiesNewChildGateInSameDecision(t *testing.T) {
 		t.Fatalf("child calls=%d", childCalls.Load())
 	}
 	var waitStarted *time.Time
-	var satisfied int
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.wait_started_at,
-		count(*) FILTER (WHERE w.satisfied_position IS NOT NULL) FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
+	var satisfiedPosition, childCreatedPosition int64
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.wait_started_at,w.satisfied_position,c.created_position
+		FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 		JOIN `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w USING (command_id)
-		WHERE c.execution_id=$1 AND c.command_key='child' GROUP BY c.command_id`, exec.ID).Scan(&waitStarted, &satisfied); err != nil {
+		WHERE c.execution_id=$1 AND c.command_key='child'`, exec.ID).
+		Scan(&waitStarted, &satisfiedPosition, &childCreatedPosition); err != nil {
 		t.Fatal(err)
 	}
-	if waitStarted != nil || satisfied != 1 {
-		t.Fatalf("retained child wait started=%v satisfied=%d", waitStarted, satisfied)
+	var applicationPosition, parentTerminalPosition int64
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT
+		(SELECT position FROM `+pgschema.Table(database.Schema, "flow_journal")+`
+		 WHERE execution_id=$1 AND event_class='application' AND event_name=$2 AND event_key='ready'),
+		(SELECT terminal_position FROM `+pgschema.Table(database.Schema, "flow_commands")+`
+		 WHERE command_id=$3)`, exec.ID, event.Name(), exec.RootCommandID).
+		Scan(&applicationPosition, &parentTerminalPosition); err != nil {
+		t.Fatal(err)
+	}
+	if waitStarted != nil || satisfiedPosition != applicationPosition ||
+		childCreatedPosition != applicationPosition+1 || parentTerminalPosition != childCreatedPosition+1 {
+		t.Fatalf("same-decision positions wait_started=%v satisfied=%d event=%d child=%d parent_terminal=%d",
+			waitStarted, satisfiedPosition, applicationPosition, childCreatedPosition, parentTerminalPosition)
 	}
 }
 

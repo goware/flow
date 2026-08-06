@@ -1377,13 +1377,13 @@ This plan is complete when all of the following are true:
 
 ### Journal and notifications
 
-- [ ] Replace select-then-reserve with one allocator `UPDATE ... RETURNING`.
-- [ ] Remove success settlement's pre-read of the next journal position.
-- [ ] Make accepted journal position mapping explicit and tested.
-- [ ] Remove `pg_notify` from generic journal append.
-- [ ] Add one explicit transactional runnable-work notification helper.
-- [ ] Audit and classify every journal-apply call site for notification intent.
-- [ ] Add commit, rollback, remote wake, no-op event, claim, and terminal notification tests.
+- [x] Replace select-then-reserve with one allocator `UPDATE ... RETURNING`.
+- [x] Remove success settlement's pre-read of the next journal position.
+- [x] Make accepted journal position mapping explicit and tested.
+- [x] Remove `pg_notify` from generic journal append.
+- [x] Add one explicit transactional runnable-work notification helper.
+- [x] Audit and classify every journal-apply call site for notification intent.
+- [x] Add commit, rollback, remote wake, no-op event, claim, and terminal notification tests.
 
 ### Incremental readiness
 
