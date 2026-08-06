@@ -162,7 +162,8 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	// expiry maintenance observes the row later.
 	rows, err := semantic.PGX().Query(ctx, `SELECT w.event_name,w.event_key,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+` j
-		 WHERE j.execution_id=w.execution_id AND j.event_namespace='application'
+		 WHERE j.execution_id=w.execution_id AND j.entry_kind='event_recorded'
+		 AND j.event_class='application' AND j.event_namespace='application'
 		 AND j.event_name=w.event_name AND j.event_key=w.event_key AND j.recorded_at<=$3
 		 ORDER BY position LIMIT 1)
 		FROM `+pgschema.Table(s.schema, "flow_command_event_waits")+` w

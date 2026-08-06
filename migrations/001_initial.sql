@@ -49,7 +49,7 @@ CREATE INDEX flow_executions_list_idx
 
 CREATE INDEX flow_executions_key_prefix_idx
     ON {{schema}}.flow_executions
-       (definition_name, execution_key text_pattern_ops, created_at DESC, execution_id DESC);
+       (definition_name, execution_key text_pattern_ops);
 
 CREATE INDEX flow_executions_status_idx
     ON {{schema}}.flow_executions (status, created_at DESC, execution_id DESC);
@@ -104,7 +104,9 @@ CREATE TABLE {{schema}}.flow_commands (
     status_at               timestamptz NOT NULL,
     finished_at             timestamptz,
 
-    CONSTRAINT flow_commands_execution_key_uq UNIQUE (execution_id, command_key),
+    CONSTRAINT flow_commands_execution_key_uq UNIQUE (execution_id, command_key)
+        INCLUDE (command_id, name, version, parent_command_id, required,
+                 state, unsatisfied_waits, terminal_position),
     CONSTRAINT flow_commands_execution_command_uq UNIQUE (execution_id, command_id),
     CONSTRAINT flow_commands_parent_execution_fk
         FOREIGN KEY (execution_id, parent_command_id)
@@ -138,18 +140,9 @@ CREATE TABLE {{schema}}.flow_commands (
     CONSTRAINT flow_commands_attempt_counts_ck CHECK (consumed_attempts <= attempt_ordinal)
 );
 
-CREATE INDEX flow_commands_execution_idx
-    ON {{schema}}.flow_commands (execution_id, command_key)
-    INCLUDE (command_id, name, version, parent_command_id, required,
-             state, unsatisfied_waits, terminal_position);
-
 CREATE INDEX flow_commands_parent_idx
-    ON {{schema}}.flow_commands (parent_command_id, command_key)
+    ON {{schema}}.flow_commands (parent_command_id)
     WHERE parent_command_id IS NOT NULL;
-
-CREATE INDEX flow_commands_terminal_idx
-    ON {{schema}}.flow_commands (execution_id, terminal_position)
-    WHERE terminal_position IS NOT NULL;
 
 CREATE INDEX flow_commands_wait_deadline_idx
     ON {{schema}}.flow_commands (wait_deadline_at, command_id)
@@ -251,7 +244,6 @@ CREATE TABLE {{schema}}.flow_journal (
     body_hash          bytea NOT NULL CHECK (octet_length(body_hash) = 32),
 
     PRIMARY KEY (execution_id, position),
-    CONSTRAINT flow_journal_entry_id_uq UNIQUE (entry_id),
     CONSTRAINT flow_journal_command_execution_fk
         FOREIGN KEY (execution_id, command_id)
         REFERENCES {{schema}}.flow_commands(execution_id, command_id) ON DELETE RESTRICT
@@ -304,10 +296,6 @@ CREATE TABLE {{schema}}.flow_journal (
             ('succeeded', 'failed', 'cancelled', 'expired'))
 );
 
-CREATE UNIQUE INDEX flow_journal_event_id_uq
-    ON {{schema}}.flow_journal (event_id)
-    WHERE event_id IS NOT NULL;
-
 CREATE UNIQUE INDEX flow_journal_application_event_key_uq
     ON {{schema}}.flow_journal (execution_id, event_namespace, event_name, event_key)
     WHERE entry_kind = 'event_recorded'
@@ -330,21 +318,12 @@ CREATE UNIQUE INDEX flow_journal_execution_failing_uq
     ON {{schema}}.flow_journal (execution_id)
     WHERE entry_kind = 'execution_failing';
 
-CREATE UNIQUE INDEX flow_journal_attempt_started_uq
-    ON {{schema}}.flow_journal (attempt_id)
-    WHERE entry_kind = 'attempt_started';
-
-CREATE UNIQUE INDEX flow_journal_attempt_concluded_uq
-    ON {{schema}}.flow_journal (attempt_id)
-    WHERE entry_kind = 'attempt_concluded';
-
-CREATE INDEX flow_journal_event_lookup_idx
-    ON {{schema}}.flow_journal
-       (execution_id, event_namespace, event_name, event_key, position)
-    WHERE entry_kind = 'event_recorded';
+CREATE UNIQUE INDEX flow_journal_attempt_kind_uq
+    ON {{schema}}.flow_journal (attempt_id, entry_kind)
+    WHERE entry_kind IN ('attempt_started', 'attempt_concluded');
 
 CREATE INDEX flow_journal_command_events_idx
-    ON {{schema}}.flow_journal (command_id, position)
+    ON {{schema}}.flow_journal (command_id)
     WHERE command_id IS NOT NULL;
 
 CREATE TABLE {{schema}}.flow_schema_migrations (

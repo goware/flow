@@ -38,6 +38,8 @@ Wait rows are keyed by `(command_id,event_name,event_key)` and optionally refere
 
 Journal kinds are `execution_started`, `execution_failing`, `command_created`, `attempt_started`, `attempt_concluded`, and `event_recorded`. Event classes are application, command terminal, and execution terminal. Application events are immutable journal facts; no separate event-payload table exists. All stored position references are positive, and causation must precede the current journal position.
 
+Indexes are kept deliberately narrow. Primary and unique indexes enforce public execution, command, application-event, lifecycle, and same-execution ownership invariants; random journal entry/event UUIDs are retained data but are not separately indexed because no lookup, foreign key, or idempotency contract consumes them. One partial `(attempt_id, entry_kind)` guard permits one start and one conclusion per attempt. Exact application-event reads state the identity-index predicate, and maintenance, queue, and wait indexes cover only their bounded hot probes. The metadata GIN index remains because containment filtering is a documented indexed inspection feature.
+
 ## Retained semantic projections
 
 The baseline deliberately retains the following columns after pruning redundant write-only hashes:

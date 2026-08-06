@@ -355,7 +355,8 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 	for index, wait := range command.Waits {
 		var position int64
 		err := tx.QueryRow(ctx, `SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
-			WHERE execution_id=$1 AND event_namespace='application' AND event_name=$2 AND event_key=$3
+			WHERE execution_id=$1 AND entry_kind='event_recorded' AND event_class='application'
+			AND event_namespace='application' AND event_name=$2 AND event_key=$3
 			ORDER BY position LIMIT 1`, executionID, wait.Name, wait.Key).Scan(&position)
 		if errors.Is(err, pgx.ErrNoRows) {
 			unsatisfiedWaits++
@@ -520,7 +521,8 @@ type ExistingEvent struct {
 func (s *Store) LookupApplicationEvent(ctx context.Context, tx pgx.Tx, executionID uuid.UUID, name, key string) (ExistingEvent, error) {
 	var row pgx.Row
 	query := `SELECT event_id,body FROM ` + pgschema.Table(s.schema, "flow_journal") + `
-		WHERE execution_id=$1 AND event_namespace='application' AND event_name=$2 AND event_key=$3`
+		WHERE execution_id=$1 AND entry_kind='event_recorded' AND event_class='application'
+		AND event_namespace='application' AND event_name=$2 AND event_key=$3`
 	if tx != nil {
 		row = tx.QueryRow(ctx, query, executionID, name, key)
 	} else {

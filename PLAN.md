@@ -130,6 +130,14 @@ Decision record (2026-08-05): all candidates are intentionally retained in the p
 | `flow_commands.last_error` | retry, failure, cancellation, and lease recovery | live trace/operational inspection | latest operational/retry failure; cleared by success and allowed before terminality | derive from attempt history plus operational state on each read | replay retains attempt failures, but live latest-error reads would require folding history |
 | `flow_commands.terminal_failure` | failed, cancelled, or expired terminal transition | terminal idempotency checks and inspection semantics | stable terminal failure for unsuccessful terminal commands; null otherwise | derive from the terminal journal event and redefine terminal comparison/read paths | removal would couple terminal idempotency and point reads to replay |
 
+## Stage 8 — index pruning and guard consolidation
+
+Keep indexes that implement public identity, same-execution ownership, hot queue/maintenance probes, exact unresolved-wait matching, history order, and indexed inspection. Remove indexes that duplicate an identical key, index a random UUID with no lookup or foreign-key consumer, or support no current predicate/order path.
+
+Merge the command execution covering index into the `(execution_id, command_key)` unique constraint with `INCLUDE`. Consolidate the two attempt-kind uniqueness indexes into one `(attempt_id, entry_kind)` partial unique index. Application-event reads must state the complete application-event predicate so the identity index serves both idempotency and retained-event lookup; the broader journal event lookup index can then be removed.
+
+Narrow supporting indexes when suffix columns cannot contribute to the current predicate or ordering. Retain the metadata GIN index because metadata containment is an active indexed inspection contract; production usage statistics may inform a later released-schema migration, but the baseline should not silently make that API scan-bound.
+
 ## Punchlist
 
 ### Current pruning slice
@@ -156,4 +164,10 @@ Decision record (2026-08-05): all candidates are intentionally retained in the p
 - [x] Retain `metadata_canonical`; its exact identity contract and replacement cost are documented above.
 - [x] Retain `declaration_fingerprint`; replacement requires a full comparison design and benchmark evidence.
 - [x] Retain result/failure projections as distinct inspection/lifecycle semantics rather than redesigning them.
+- [x] Remove unused terminal-position and duplicate command execution indexes.
+- [x] Remove unconsumed journal entry/event UUID uniqueness indexes.
+- [x] Consolidate attempt-started/concluded uniqueness into one attempt-kind guard.
+- [x] Route exact application-event reads through the application-event identity index and remove the broader lookup index.
+- [x] Narrow key-prefix, parent-command, and journal-command supporting indexes.
+- [x] Retain the metadata GIN index for the documented indexed containment filter.
 - [x] Run formatting, build/static checks, race-enabled tests, and update active schema/architecture documentation after every stage.

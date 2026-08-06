@@ -25,7 +25,7 @@ func TestSQLErrorMapping(t *testing.T) {
 		{name: "idempotency", err: &pgconn.PgError{Code: "23505", ConstraintName: "flow_executions_idempotency_uq", Detail: "secret"}, want: flow.ErrConflict},
 		{name: "foreign key", err: &pgconn.PgError{Code: "23503", ConstraintName: "some_fk", Detail: "secret"}, want: flow.ErrNotFound},
 		{name: "check", err: &pgconn.PgError{Code: "23514", ConstraintName: "flow_commands_state_ck", Detail: "secret"}, want: flow.ErrInvalid},
-		{name: "internal unique", err: &pgconn.PgError{Code: "23505", ConstraintName: "flow_journal_entry_id_uq", Detail: "secret"}, want: flow.ErrInvalidState},
+		{name: "internal unique", err: &pgconn.PgError{Code: "23505", ConstraintName: "flow_journal_command_terminal_uq", Detail: "secret"}, want: flow.ErrInvalidState},
 		{name: "serialization", err: &pgconn.PgError{Code: "40001", Detail: "secret"}, want: store.ErrTransient},
 		{name: "connection", err: &pgconn.PgError{Code: "08006", Detail: "secret"}, want: store.ErrTransient},
 		{name: "unknown", err: errors.New("driver includes secret"), want: store.ErrTransient},

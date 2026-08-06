@@ -50,8 +50,8 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	).Scan(&indexes); err != nil {
 		t.Fatalf("count indexes: %v", err)
 	}
-	if indexes < 25 {
-		t.Fatalf("Flow index count = %d, want at least 25", indexes)
+	if indexes != 28 {
+		t.Fatalf("Flow index count = %d, want 28", indexes)
 	}
 	if err := database.DB.Conn.QueryRow(ctx,
 		`SELECT count(*) FROM `+quoteIdentifier(database.Schema)+`.flow_schema_migrations`,
@@ -72,6 +72,63 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	}
 	if bytes.Contains(rendered, []byte(migrationToken)) || !bytes.Contains(rendered, []byte(quoteIdentifier(database.Schema)+`.flow_executions`)) {
 		t.Fatal("MigrationFS did not safely render the configured schema")
+	}
+}
+
+func TestMigrationPrunesAndNarrowsIndexes(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	removed := []string{
+		"flow_commands_execution_idx",
+		"flow_commands_terminal_idx",
+		"flow_journal_entry_id_uq",
+		"flow_journal_event_id_uq",
+		"flow_journal_attempt_started_uq",
+		"flow_journal_attempt_concluded_uq",
+		"flow_journal_event_lookup_idx",
+	}
+	var remaining int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_indexes
+		WHERE schemaname=$1 AND indexname=ANY($2::text[])`, database.Schema, removed).Scan(&remaining); err != nil {
+		t.Fatalf("inspect removed indexes: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("redundant indexes remaining = %d, want 0", remaining)
+	}
+
+	type indexShape struct {
+		name       string
+		keyColumns int
+		allColumns int
+		unique     bool
+	}
+	want := []indexShape{
+		{name: "flow_executions_key_prefix_idx", keyColumns: 2, allColumns: 2},
+		{name: "flow_commands_execution_key_uq", keyColumns: 2, allColumns: 10, unique: true},
+		{name: "flow_commands_parent_idx", keyColumns: 1, allColumns: 1},
+		{name: "flow_journal_attempt_kind_uq", keyColumns: 2, allColumns: 2, unique: true},
+		{name: "flow_journal_command_events_idx", keyColumns: 1, allColumns: 1},
+	}
+	for _, expected := range want {
+		actual := indexShape{name: expected.name}
+		err := database.DB.Conn.QueryRow(ctx, `SELECT i.indnkeyatts,i.indnatts,i.indisunique
+			FROM pg_catalog.pg_index i
+			JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+			WHERE n.nspname=$1 AND c.relname=$2`, database.Schema, expected.name).
+			Scan(&actual.keyColumns, &actual.allColumns, &actual.unique)
+		if err != nil {
+			t.Fatalf("inspect index %s: %v", expected.name, err)
+		}
+		if actual != expected {
+			t.Fatalf("index %s shape = %#v, want %#v", expected.name, actual, expected)
+		}
 	}
 }
 
