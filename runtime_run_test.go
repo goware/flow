@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/fault"
+	"github.com/goware/flow/internal/testpg"
 )
 
 func TestWakeHubBroadcastsOneGenerationToEveryScheduler(t *testing.T) {
@@ -29,7 +31,7 @@ func TestWakeHubBroadcastsOneGenerationToEveryScheduler(t *testing.T) {
 	}
 }
 
-func TestLeaseRenewalResultCannotCancelWorkOutsideItsSnapshot(t *testing.T) {
+func TestLeaseRenewalResultCannotChangeWorkOutsideItsSnapshot(t *testing.T) {
 	active := newActiveCommands()
 	oldID, newID, replacedID := uuid.New(), uuid.New(), uuid.New()
 	oldAttempt, newAttempt, replacedAttempt, replacementAttempt := uuid.New(), uuid.New(), uuid.New(), uuid.New()
@@ -55,11 +57,21 @@ func TestLeaseRenewalResultCannotCancelWorkOutsideItsSnapshot(t *testing.T) {
 		t.Fatal("replacement command attempt missing")
 	}
 
-	active.cancelUnrenewed(map[uuid.UUID]uuid.UUID{oldID: oldAttempt, replacedID: replacedAttempt}, map[uuid.UUID]struct{}{})
+	if !active.cancelLost(oldID, oldAttempt) {
+		t.Fatal("the definitely lost snapshotted attempt was not cancelled")
+	}
+	if active.cancelLost(replacedID, replacedAttempt) {
+		t.Fatal("an older result cancelled a newer command attempt")
+	}
+	for _, command := range active.snapshot() {
+		if command.commandID == oldID {
+			t.Fatal("a locally cancelled attempt remained eligible for renewal")
+		}
+	}
 	select {
 	case <-oldCancelled:
 	default:
-		t.Fatal("an attempted but unrenewed lease was not cancelled")
+		t.Fatal("a definitely lost lease was not cancelled")
 	}
 	select {
 	case <-newCancelled:
@@ -70,5 +82,288 @@ func TestLeaseRenewalResultCannotCancelWorkOutsideItsSnapshot(t *testing.T) {
 	case <-replacementCancelled:
 		t.Fatal("a newer attempt for a snapshotted command was cancelled")
 	default:
+	}
+}
+
+func TestActiveCommandUncertainRenewalKeepsOldDeadline(t *testing.T) {
+	active := newActiveCommands()
+	commandID, attemptID := uuid.New(), uuid.New()
+	cancelled := make(chan struct{}, 1)
+	oldDeadline := time.Now().Add(30 * time.Millisecond)
+	active.register(activeCommand{
+		commandID: commandID, attemptID: attemptID, token: uuid.New(), localExpiry: oldDeadline,
+		cancel: func(error) { cancelled <- struct{}{} },
+	})
+
+	values := active.snapshot()
+	if len(values) != 1 || !values[0].localExpiry.Equal(oldDeadline) {
+		t.Fatalf("uncertain renewal deadline = %v, want %v", values, oldDeadline)
+	}
+	if got := active.cancelExpired(); got != 0 {
+		t.Fatalf("cancelExpired() before deadline = %d", got)
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("uncertain attempt cancelled before its prior deadline")
+	default:
+	}
+	time.Sleep(time.Until(oldDeadline) + 5*time.Millisecond)
+	if got := active.cancelExpired(); got != 1 {
+		t.Fatalf("cancelExpired() at deadline = %d, want 1", got)
+	}
+	if got := active.cancelExpired(); got != 0 {
+		t.Fatalf("cancelExpired() repeated cancellation = %d", got)
+	}
+	if len(active.snapshot()) != 0 {
+		t.Fatal("expired local attempt remained eligible for renewal")
+	}
+}
+
+func TestLeaseServiceIntervalsStayInsideLeaseWindow(t *testing.T) {
+	for _, lease := range []time.Duration{30 * time.Millisecond, 120 * time.Millisecond, 60 * time.Second} {
+		if timeout := commandRenewalTimeout(lease); timeout <= 0 || timeout >= lease {
+			t.Fatalf("commandRenewalTimeout(%s) = %s", lease, timeout)
+		}
+		if interval := leaseWatchdogInterval(lease); interval <= 0 || interval >= lease {
+			t.Fatalf("leaseWatchdogInterval(%s) = %s", lease, interval)
+		}
+	}
+}
+
+func TestLeaseRenewalErrorIsObservedWithoutFalseSuccess(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	command := DefineCommand[None, None]("runtime.renewal_observation", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+		WithWorkerConcurrency(1), WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(120*time.Millisecond),
+		WithShutdownGrace(time.Second), WithObserver(observer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
+		if point == fault.RenewBeforeResult {
+			return fault.Injected(point)
+		}
+		return nil
+	})
+	started := make(chan struct{}, 1)
+	if err := runtime.Register(Handle(command, func(ctx context.Context, _ *Work[None]) (None, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return None{}, ctx.Err()
+	})); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	if _, err := command.With(runtime).Execute(ctx, "renewal/observation", None{}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("handler did not start")
+	}
+	waitForObservation(t, observer, "renew", "error", 1, 2*time.Second)
+	waitForObservation(t, observer, "local_cancel", "expired", 1, 2*time.Second)
+	for _, observation := range observer.snapshot() {
+		if observation.Operation == "renew" && observation.Outcome == "ok" {
+			cancel()
+			t.Fatalf("renewal error was followed by success: %#v", observer.snapshot())
+		}
+	}
+	stopRuntime(t, cancel, runResult)
+}
+
+func TestLockedSettlementIsUncertainWhileUnrelatedLeaseRenews(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	settling := DefineCommand[None, None]("runtime.locked_renewal_settling", 1)
+	unrelated := DefineCommand[None, None]("runtime.locked_renewal_unrelated", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+		WithWorkerConcurrency(2), WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond),
+		WithObserver(observer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitStarted := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	commitCancelled := make(chan struct{}, 1)
+	unrelatedStarted := make(chan struct{})
+	releaseUnrelated := make(chan struct{})
+	if err := runtime.Register(
+		Handle(settling, func(context.Context, *Work[None]) (None, error) {
+			return None{}, nil
+		}, WithCommit(func(ctx context.Context, _ Tx, _ Commit[None, None]) error {
+			close(commitStarted)
+			select {
+			case <-releaseCommit:
+				return nil
+			case <-ctx.Done():
+				commitCancelled <- struct{}{}
+				return ctx.Err()
+			}
+		})),
+		Handle(unrelated, func(context.Context, *Work[None]) (None, error) {
+			close(unrelatedStarted)
+			<-releaseUnrelated
+			return None{}, nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	defer func() {
+		select {
+		case <-releaseCommit:
+		default:
+			close(releaseCommit)
+		}
+		select {
+		case <-releaseUnrelated:
+		default:
+			close(releaseUnrelated)
+		}
+		stopRuntime(t, cancel, runResult)
+	}()
+	settlingExecution, err := settling.With(runtime).Execute(ctx, "renewal/locked-settlement", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedExecution, err := unrelated.With(runtime).Execute(ctx, "renewal/unrelated", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-commitStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("settlement callback did not start")
+	}
+	select {
+	case <-unrelatedStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("unrelated handler did not start")
+	}
+	waitForObservation(t, observer, "renew_result", "uncertain", 1, 2*time.Second)
+	waitForObservation(t, observer, "renew_result", "renewed", 1, 2*time.Second)
+	select {
+	case <-commitCancelled:
+		t.Fatal("locked settlement was cancelled merely because renewal skipped its row")
+	default:
+	}
+	close(releaseCommit)
+	close(releaseUnrelated)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, settlingExecution.ID, "succeeded", 3*time.Second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, unrelatedExecution.ID, "succeeded", 3*time.Second)
+	for _, executionID := range []ExecutionID{settlingExecution.ID, unrelatedExecution.ID} {
+		trace, err := Trace(ctx, runtime, executionID)
+		if err != nil || len(trace.Commands) != 1 || len(trace.Commands[0].Attempts) != 1 {
+			t.Fatalf("trace %s = %#v, %v", executionID, trace, err)
+		}
+	}
+}
+
+func TestLeaseWatchdogCancelsAfterPoolStarvationAndAllowsTakeover(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.OpenWithMaxConns(t, 2)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	command := DefineCommand[None, None]("runtime.renewal_pool_starvation", 1)
+	first, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+		WithWorkerConcurrency(1), WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(120*time.Millisecond),
+		WithShutdownGrace(time.Second), WithObserver(observer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	if err := first.Register(Handle(command, func(ctx context.Context, _ *Work[None]) (None, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return None{}, ctx.Err()
+	})); err != nil {
+		t.Fatal(err)
+	}
+	cancelFirst, firstResult := startRuntime(t, first)
+	execution, err := command.With(first).Execute(ctx, "renewal/pool-starvation", None{})
+	if err != nil {
+		cancelFirst()
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		cancelFirst()
+		t.Fatal("first handler did not start")
+	}
+	connectionOne, err := database.DB.Conn.Acquire(ctx)
+	if err != nil {
+		cancelFirst()
+		t.Fatal(err)
+	}
+	connectionTwo, err := database.DB.Conn.Acquire(ctx)
+	if err != nil {
+		connectionOne.Release()
+		cancelFirst()
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			connectionOne.Release()
+			connectionTwo.Release()
+		}
+	}()
+	waitForObservation(t, observer, "renew", "error", 1, 2*time.Second)
+	waitForObservation(t, observer, "local_cancel", "expired", 1, 2*time.Second)
+	cancelFirst()
+	connectionOne.Release()
+	connectionTwo.Release()
+	released = true
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatalf("first Run() error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first runtime did not drain after pool capacity returned")
+	}
+
+	second, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+		WithWorkerConcurrency(1), WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(120*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	cancelSecond, secondResult := startRuntime(t, second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	stopRuntime(t, cancelSecond, secondResult)
+	trace, err := Trace(ctx, mustReader(t, database), execution.ID)
+	if err != nil || len(trace.Commands) != 1 || len(trace.Commands[0].Attempts) != 2 ||
+		trace.Commands[0].Attempts[1].Classification != "succeeded" {
+		t.Fatalf("pool-starvation trace = %#v, %v", trace, err)
 	}
 }

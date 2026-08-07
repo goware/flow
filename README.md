@@ -160,6 +160,8 @@ FLOW_EXAMPLE_DATABASE_URL='postgres://postgres@localhost/postgres?sslmode=disabl
 
 - Claims match exact registered command name/version pairs. Unknown work remains durable until a compatible worker appears.
 - Workers are at-least-once at the application boundary; settlement is fenced and durable progression commits once. External effects still need stable idempotency keys.
+- Lease renewal is bounded and skip-locked: one busy settlement cannot block unrelated renewals. A locked row remains uncertain until settlement, a later renewal, or the conservative local-expiry watchdog resolves it.
+- Deadline, wait-expiry, and lease-recovery maintenance drains full progressing pages promptly but remains sequential and bounded; locked/no-op pages fall back to polling.
 - Required command failure enters reduced fail-fast by default. `flow.WithFailFast(false)` lets remaining work continue.
 - Execution deadlines, retries, queues, concurrency limits, graceful shutdown, polling, notification hints, observers, history, trace, cancellation, and caller-owned transactions are supported.
 - Publishers may use a `Runtime` without calling `Run` or registering workers. Worker pools may be deployed independently.

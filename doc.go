@@ -14,6 +14,11 @@
 // goroutines. A Runtime not passed to Run remains a lightweight Client for API
 // and publisher processes.
 //
+// Renewal calls are internally time-bounded and skip rows held by another Flow
+// transaction so one settlement cannot delay unrelated attempts. A process-local
+// watchdog conservatively cancels attempts whose last known lease window expires;
+// PostgreSQL attempt ID/token fencing remains the durable ownership authority.
+//
 // Definitions are immutable values and registration is runtime-local; flow
 // keeps no process-global registry. Application handlers should use stable
 // idempotency keys for external effects because invocation remains at-least-once

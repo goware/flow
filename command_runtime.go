@@ -257,6 +257,10 @@ func (r *Runtime) claimExecutionGroup(
 ) (store.ClaimBatchResult, error) {
 	started := time.Now()
 	result, err := r.store.ClaimCommands(ctx, group, r.commandLease, r.replicaName(), r.faults)
+	for index := range result.Commands {
+		window := max(time.Duration(0), result.Commands[index].LeaseExpiresAt.Sub(result.Commands[index].DBNow))
+		result.Commands[index].LocalLeaseExpiresAt = started.Add(window)
+	}
 	if err != nil && len(result.Commands) > 0 {
 		resolveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), min(5*time.Second, max(100*time.Millisecond, r.commandLease/2)))
 		defer cancel()
@@ -392,7 +396,10 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		workerCtx, cancel = context.WithTimeoutCause(baseCtx, max(0, remaining), errAttemptTimeout)
 		cancelDeadline = cancel
 	}
-	localLeaseExpiry := time.Now().Add(max(0, claim.LeaseExpiresAt.Sub(claim.DBNow)))
+	localLeaseExpiry := claim.LocalLeaseExpiresAt
+	if localLeaseExpiry.IsZero() {
+		localLeaseExpiry = time.Now().Add(max(time.Duration(0), claim.LeaseExpiresAt.Sub(claim.DBNow)))
+	}
 	r.active.register(activeCommand{
 		commandID: claim.CommandID, attemptID: claim.AttemptID, token: claim.LeaseToken,
 		localExpiry: localLeaseExpiry, cancel: cancelCause,
