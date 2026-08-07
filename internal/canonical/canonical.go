@@ -101,6 +101,226 @@ func Decode(data []byte, dst any) error {
 	return nil
 }
 
+// ValidateCanonical validates one complete JSON value and requires that its
+// bytes already use Flow's canonical representation. It does not construct a
+// second canonical byte slice.
+func ValidateCanonical(raw []byte, maxBytes int) error {
+	if maxBytes > 0 && len(raw) > maxBytes {
+		return fmt.Errorf("%w: %d > %d", ErrTooLarge, len(raw), maxBytes)
+	}
+	if !utf8.Valid(raw) {
+		return fmt.Errorf("%w: invalid UTF-8", ErrInvalidJSON)
+	}
+	validator := canonicalValidator{raw: raw}
+	if err := validator.value(0); err != nil {
+		return err
+	}
+	if validator.offset != len(raw) {
+		return fmt.Errorf("%w: trailing or noncanonical data", ErrInvalidJSON)
+	}
+	return nil
+}
+
+type canonicalValidator struct {
+	raw    []byte
+	offset int
+}
+
+func (v *canonicalValidator) value(depth int) error {
+	if depth > DefaultMaxDepth {
+		return ErrTooDeep
+	}
+	if v.offset >= len(v.raw) {
+		return fmt.Errorf("%w: missing value", ErrInvalidJSON)
+	}
+	switch v.raw[v.offset] {
+	case '{':
+		return v.object(depth)
+	case '[':
+		return v.array(depth)
+	case '"':
+		_, err := v.string(false)
+		return err
+	case 'n':
+		return v.literal("null")
+	case 't':
+		return v.literal("true")
+	case 'f':
+		return v.literal("false")
+	default:
+		return v.number()
+	}
+}
+
+func (v *canonicalValidator) object(depth int) error {
+	v.offset++
+	if v.consume('}') {
+		return nil
+	}
+	var previous string
+	for index := 0; ; index++ {
+		key, err := v.string(true)
+		if err != nil {
+			return err
+		}
+		if index > 0 && compareUTF16(previous, key) >= 0 {
+			return fmt.Errorf("%w: object keys are duplicated or not canonical", ErrInvalidJSON)
+		}
+		previous = key
+		if !v.consume(':') {
+			return fmt.Errorf("%w: object key has no value", ErrInvalidJSON)
+		}
+		if err := v.value(depth + 1); err != nil {
+			return err
+		}
+		if v.consume('}') {
+			return nil
+		}
+		if !v.consume(',') {
+			return fmt.Errorf("%w: object is not canonical", ErrInvalidJSON)
+		}
+	}
+}
+
+func (v *canonicalValidator) array(depth int) error {
+	v.offset++
+	if v.consume(']') {
+		return nil
+	}
+	for {
+		if err := v.value(depth + 1); err != nil {
+			return err
+		}
+		if v.consume(']') {
+			return nil
+		}
+		if !v.consume(',') {
+			return fmt.Errorf("%w: array is not canonical", ErrInvalidJSON)
+		}
+	}
+}
+
+func (v *canonicalValidator) string(decode bool) (string, error) {
+	if !v.consume('"') {
+		return "", fmt.Errorf("%w: expected string", ErrInvalidJSON)
+	}
+	start := v.offset - 1
+	for v.offset < len(v.raw) {
+		current := v.raw[v.offset]
+		v.offset++
+		switch current {
+		case '"':
+			if !decode {
+				return "", nil
+			}
+			decoded, err := strconv.Unquote(string(v.raw[start:v.offset]))
+			if err != nil {
+				return "", fmt.Errorf("%w: invalid string", ErrInvalidJSON)
+			}
+			return decoded, nil
+		case '\\':
+			if v.offset >= len(v.raw) {
+				return "", fmt.Errorf("%w: incomplete escape", ErrInvalidJSON)
+			}
+			escape := v.raw[v.offset]
+			v.offset++
+			switch escape {
+			case '"', '\\', 'b', 't', 'n', 'f', 'r':
+			case 'u':
+				if v.offset+4 > len(v.raw) {
+					return "", fmt.Errorf("%w: incomplete unicode escape", ErrInvalidJSON)
+				}
+				digits := v.raw[v.offset : v.offset+4]
+				code, err := parseHex4(digits)
+				if err != nil || digits[0] != '0' || digits[1] != '0' || code >= 0x20 ||
+					code == '\b' || code == '\t' || code == '\n' || code == '\f' || code == '\r' ||
+					!lowerHex(digits[2]) || !lowerHex(digits[3]) {
+					return "", fmt.Errorf("%w: noncanonical unicode escape", ErrInvalidJSON)
+				}
+				v.offset += 4
+			default:
+				return "", fmt.Errorf("%w: noncanonical escape", ErrInvalidJSON)
+			}
+		default:
+			if current < 0x20 {
+				return "", fmt.Errorf("%w: unescaped control character", ErrInvalidJSON)
+			}
+		}
+	}
+	return "", fmt.Errorf("%w: unterminated string", ErrInvalidJSON)
+}
+
+func (v *canonicalValidator) number() error {
+	start := v.offset
+	v.consume('-')
+	if v.offset >= len(v.raw) {
+		return fmt.Errorf("%w: incomplete number", ErrInvalidJSON)
+	}
+	if v.consume('0') {
+		if v.offset < len(v.raw) && v.raw[v.offset] >= '0' && v.raw[v.offset] <= '9' {
+			return fmt.Errorf("%w: leading zero", ErrInvalidJSON)
+		}
+	} else {
+		if v.raw[v.offset] < '1' || v.raw[v.offset] > '9' {
+			return fmt.Errorf("%w: invalid number", ErrInvalidJSON)
+		}
+		for v.offset < len(v.raw) && v.raw[v.offset] >= '0' && v.raw[v.offset] <= '9' {
+			v.offset++
+		}
+	}
+	if v.consume('.') {
+		fractionStart := v.offset
+		for v.offset < len(v.raw) && v.raw[v.offset] >= '0' && v.raw[v.offset] <= '9' {
+			v.offset++
+		}
+		if v.offset == fractionStart {
+			return fmt.Errorf("%w: incomplete fraction", ErrInvalidJSON)
+		}
+	}
+	if v.offset < len(v.raw) && (v.raw[v.offset] == 'e' || v.raw[v.offset] == 'E') {
+		v.offset++
+		if v.offset < len(v.raw) && (v.raw[v.offset] == '+' || v.raw[v.offset] == '-') {
+			v.offset++
+		}
+		exponentStart := v.offset
+		for v.offset < len(v.raw) && v.raw[v.offset] >= '0' && v.raw[v.offset] <= '9' {
+			v.offset++
+		}
+		if v.offset == exponentStart {
+			return fmt.Errorf("%w: incomplete exponent", ErrInvalidJSON)
+		}
+	}
+	rawNumber := string(v.raw[start:v.offset])
+	canonical, err := canonicalNumber(json.Number(rawNumber))
+	if err != nil {
+		return err
+	}
+	if canonical != rawNumber {
+		return fmt.Errorf("%w: noncanonical number", ErrInvalidJSON)
+	}
+	return nil
+}
+
+func (v *canonicalValidator) literal(literal string) error {
+	if len(v.raw)-v.offset < len(literal) || string(v.raw[v.offset:v.offset+len(literal)]) != literal {
+		return fmt.Errorf("%w: invalid literal", ErrInvalidJSON)
+	}
+	v.offset += len(literal)
+	return nil
+}
+
+func (v *canonicalValidator) consume(want byte) bool {
+	if v.offset >= len(v.raw) || v.raw[v.offset] != want {
+		return false
+	}
+	v.offset++
+	return true
+}
+
+func lowerHex(value byte) bool {
+	return value >= '0' && value <= '9' || value >= 'a' && value <= 'f'
+}
+
 func decodeValue(dec *json.Decoder, depth int) (any, error) {
 	if depth > DefaultMaxDepth {
 		return nil, ErrTooDeep

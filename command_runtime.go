@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -427,16 +426,13 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 	scope := &workScope{args: args, info: info}
 	if len(claim.EventInputs) > 0 {
-		scope.state.eventInputs = make(map[string]eventInputSnapshot, len(claim.EventInputs))
-		for _, input := range claim.EventInputs {
-			identity := input.Name + "\x00" + input.Key
-			if _, duplicate := scope.state.eventInputs[identity]; duplicate {
-				r.concludeClaim(workerCtx, claim, classifiedConclusion{
-					class: retrypolicy.ClassPermanent, code: "event_input_decode", message: "claimed command contains duplicate event inputs",
-				})
-				return
-			}
-			scope.state.eventInputs[identity] = eventInputSnapshot{position: input.Position, payload: slices.Clone(input.Payload)}
+		var duplicate bool
+		scope.state.eventInputs, duplicate = claimedEventInputSnapshots(claim.EventInputs)
+		if duplicate {
+			r.concludeClaim(workerCtx, claim, classifiedConclusion{
+				class: retrypolicy.ClassPermanent, code: "event_input_decode", message: "claimed command contains duplicate event inputs",
+			})
+			return
 		}
 	}
 	workerCtx = withAttemptScope(workerCtx, &scope.state)
@@ -542,6 +538,20 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 }
 
+func claimedEventInputSnapshots(inputs []store.ClaimedEventInput) (map[string]eventInputSnapshot, bool) {
+	snapshots := make(map[string]eventInputSnapshot, len(inputs))
+	for _, input := range inputs {
+		identity := input.Name + "\x00" + input.Key
+		if _, duplicate := snapshots[identity]; duplicate {
+			return nil, true
+		}
+		// Claim materialization allocated this payload from the immutable journal
+		// body. Ownership transfers directly into the private attempt snapshot.
+		snapshots[identity] = eventInputSnapshot{position: input.Position, payload: input.Payload}
+	}
+	return snapshots, false
+}
+
 func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]store.ApplicationEvent, []store.CommandCreate, error) {
 	if err := validateDecisionCommands(scope.state.decision); err != nil {
 		return nil, nil, err
@@ -550,7 +560,7 @@ func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]stor
 	events := make([]store.ApplicationEvent, 0, len(stagedEvents))
 	for _, staged := range stagedEvents {
 		body, err := canonical.Marshal(journalcodec.ApplicationEventBody{
-			V: 1, Payload: json.RawMessage(staged.payload.BytesCopy()),
+			V: journalcodec.ApplicationEventBodyVersion, Payload: json.RawMessage(staged.payload.BytesCopy()),
 		}, 0)
 		if err != nil {
 			return nil, nil, newError(ErrInvalid, "settle", "event", staged.key, "event body cannot be journaled")

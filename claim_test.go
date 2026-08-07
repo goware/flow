@@ -2,15 +2,19 @@ package flow
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/pgschema"
+	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/store/journalcodec"
 	"github.com/goware/flow/internal/testpg"
@@ -220,6 +224,173 @@ func TestClaimBatchGroupsEventInputsByCommand(t *testing.T) {
 		default:
 			t.Fatalf("unexpected command key %q", command.CommandKey)
 		}
+	}
+}
+
+func TestClaimEventInputSnapshotIntegrity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		body             func() []byte
+		retainStoredHash bool
+		selectorMismatch bool
+	}{
+		{name: "body hash mismatch", body: func() []byte { return []byte(`{"payload":"changed","v":1}`) }, retainStoredHash: true},
+		{name: "malformed body", body: func() []byte { return []byte(`{"payload":`) }},
+		{name: "trailing data", body: func() []byte { return []byte(`{"payload":"stable","v":1}{}`) }},
+		{name: "duplicate envelope key", body: func() []byte {
+			return []byte(`{"payload":"first","payload":"second","v":1}`)
+		}},
+		{name: "nested duplicate payload key", body: func() []byte {
+			return []byte(`{"payload":{"key":1,"key":2},"v":1}`)
+		}},
+		{name: "noncanonical nested payload", body: func() []byte {
+			return []byte(`{"payload":{"z":1,"a":2},"v":1}`)
+		}},
+		{name: "missing version", body: func() []byte { return []byte(`{"payload":"stable"}`) }},
+		{name: "zero version", body: func() []byte { return []byte(`{"payload":"stable","v":0}`) }},
+		{name: "unknown version", body: func() []byte { return []byte(`{"payload":"stable","v":2}`) }},
+		{name: "missing payload", body: func() []byte { return []byte(`{"v":1}`) }},
+		{name: "oversized payload", body: func() []byte {
+			return []byte(`{"payload":"` + strings.Repeat("x", journalcodec.MaxApplicationEventPayloadBytes) + `","v":1}`)
+		}},
+		{name: "selector mismatch", selectorMismatch: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database := testpg.Open(t)
+			ctx := context.Background()
+			if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+				t.Fatal(err)
+			}
+			suffix := strings.ReplaceAll(tt.name, " ", "_")
+			event := DefineEvent[string]("claim.snapshot_integrity_event_" + suffix)
+			command := DefineCommand[None, None]("claim.snapshot_integrity_command_"+suffix, 1)
+			runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			execution, err := command.With(runtime).Execute(ctx, "claim/snapshot/integrity/"+suffix, None{}, WaitFor(event, "input"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := event.Emit(ctx, runtime, execution.ID, "input", "stable"); err != nil {
+				t.Fatal(err)
+			}
+			candidates := probeClaimCandidates(t, runtime,
+				[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1)
+			if tt.selectorMismatch {
+				if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_journal")+`
+					SET event_key='different' WHERE execution_id=$1 AND event_class='application'`, execution.ID); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				body := tt.body()
+				if tt.retainStoredHash {
+					if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_journal")+`
+						SET body=$2 WHERE execution_id=$1 AND event_class='application'`, execution.ID, body); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					digest := sha256.Sum256(body)
+					if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_journal")+`
+						SET body=$2,body_hash=$3 WHERE execution_id=$1 AND event_class='application'`,
+						execution.ID, body, digest[:]); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if _, err := runtime.store.ClaimCommand(ctx, candidates[0], time.Minute, "snapshot-integrity", fault.None{}); !errors.Is(err, ErrInvalidState) {
+				t.Fatalf("ClaimCommand() error=%v, want ErrInvalidState", err)
+			}
+			var commandState, queueState string
+			var activeFence bool
+			var starts int
+			if err := database.DB.Conn.QueryRow(ctx, `SELECT c.state,q.state,
+				(q.active_attempt_id IS NOT NULL OR q.lease_token IS NOT NULL),
+				(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
+				 WHERE execution_id=$1 AND entry_kind='attempt_started')
+			FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
+			JOIN `+pgschema.Table(database.Schema, "flow_command_queue")+` q ON q.command_id=c.command_id
+			WHERE c.command_id=$2`, execution.ID, execution.RootCommandID).
+				Scan(&commandState, &queueState, &activeFence, &starts); err != nil {
+				t.Fatal(err)
+			}
+			if commandState != "ready" || queueState != "ready" || activeFence || starts != 0 {
+				t.Fatalf("failed claim changed projections: command=%s queue=%s fence=%t starts=%d",
+					commandState, queueState, activeFence, starts)
+			}
+		})
+	}
+}
+
+func TestClaimEventInputSnapshotStableAcrossRetryAndLeaseTakeover(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	event := DefineEvent[string]("claim.snapshot_stability_event")
+	command := DefineCommand[None, None]("claim.snapshot_stability_command", 1, WithRetry(Attempts(3)))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := command.With(runtime).Execute(ctx, "claim/snapshot/stability", None{}, WaitFor(event, "input"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := event.Emit(ctx, runtime, execution.ID, "input", "stable"); err != nil {
+		t.Fatal(err)
+	}
+	claimNext := func() store.ClaimedCommand {
+		candidates := probeClaimCandidates(t, runtime,
+			[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1)
+		result, err := runtime.store.ClaimCommand(ctx, candidates[0], time.Minute, "snapshot-stability", fault.None{})
+		if err != nil || result.Command == nil {
+			t.Fatalf("ClaimCommand() = %+v, %v", result, err)
+		}
+		if len(result.Command.EventInputs) != 1 {
+			t.Fatalf("ClaimCommand() inputs=%d", len(result.Command.EventInputs))
+		}
+		return *result.Command
+	}
+
+	first := claimNext()
+	wantPayload := append([]byte(nil), first.EventInputs[0].Payload...)
+	wantPosition := first.EventInputs[0].Position
+	first.EventInputs[0].Payload[0] = '!'
+	if _, err := runtime.store.SettleCommandConclusion(ctx, store.CommandConclusion{
+		Claim: first, Classification: retrypolicy.ClassInterrupted,
+		Failure: failure.Value{Code: "interrupted", Message: "retry snapshot"},
+	}, fault.None{}); err != nil {
+		t.Fatal(err)
+	}
+
+	retry := claimNext()
+	if retry.EventInputs[0].Position != wantPosition || string(retry.EventInputs[0].Payload) != string(wantPayload) {
+		t.Fatalf("retry snapshot position=%d payload=%s, want %d/%s", retry.EventInputs[0].Position,
+			retry.EventInputs[0].Payload, wantPosition, wantPayload)
+	}
+	retry.EventInputs[0].Payload[0] = '!'
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_command_queue")+`
+		SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, retry.CommandID); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := runtime.store.RecoverExpiredCommandLease(ctx, store.ExpiredLeaseCandidate{
+		CommandID: retry.CommandID, ExecutionID: retry.ExecutionID,
+	})
+	if err != nil || !changed {
+		t.Fatalf("RecoverExpiredCommandLease() = %t, %v", changed, err)
+	}
+
+	takeover := claimNext()
+	if takeover.EventInputs[0].Position != wantPosition || string(takeover.EventInputs[0].Payload) != string(wantPayload) {
+		t.Fatalf("takeover snapshot position=%d payload=%s, want %d/%s", takeover.EventInputs[0].Position,
+			takeover.EventInputs[0].Payload, wantPosition, wantPayload)
 	}
 }
 

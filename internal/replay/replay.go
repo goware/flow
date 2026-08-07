@@ -3,6 +3,7 @@
 package replay
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/store/journalcodec"
@@ -109,6 +111,13 @@ func (state *Execution) Apply(row store.JournalRow) error {
 	}
 	if sha256.Sum256(row.Body) != row.BodyHash {
 		return fmt.Errorf("journal body hash differs at position %d", row.Position)
+	}
+	canonicalBody, err := canonical.Canonicalize(row.Body, 0)
+	if err != nil {
+		return fmt.Errorf("journal body is invalid at position %d: %w", row.Position, err)
+	}
+	if !bytes.Equal(canonicalBody.Bytes, row.Body) {
+		return fmt.Errorf("journal body is noncanonical at position %d", row.Position)
 	}
 	if state.LastPosition == 0 {
 		if row.Position != 1 || row.Kind != store.ExecutionStarted {
@@ -287,6 +296,9 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Events = append(state.Events, event)
 		switch *row.EventClass {
 		case "application":
+			if _, err := journalcodec.DecodeApplicationEvent(row.Body); err != nil {
+				return fmt.Errorf("application event body is invalid: %w", err)
+			}
 			// Exact wait readiness is projected operationally from retained rows.
 		case "command_terminal":
 			if row.CommandID == nil || row.TerminalStatus == nil {

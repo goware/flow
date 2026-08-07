@@ -23,7 +23,7 @@ import (
 
 const (
 	maxCommandArgumentBytes   = 256 << 10
-	maxApplicationEventBytes  = 64 << 10
+	maxApplicationEventBytes  = journalcodec.MaxApplicationEventPayloadBytes
 	maxCommandEventWaits      = 256
 	maxExecutionMetadataBytes = 16 << 10
 	maxExecutionKeyBytes      = 1024
@@ -289,7 +289,9 @@ func (event Event[T]) emitExternal(ctx context.Context, c Client, id ExecutionID
 	if err != nil {
 		return err
 	}
-	body, err := canonical.Marshal(journalcodec.ApplicationEventBody{V: 1, Payload: json.RawMessage(encoded.BytesCopy())}, 0)
+	body, err := canonical.Marshal(journalcodec.ApplicationEventBody{
+		V: journalcodec.ApplicationEventBodyVersion, Payload: json.RawMessage(encoded.BytesCopy()),
+	}, 0)
 	if err != nil {
 		return newError(ErrInvalid, "emit", "event", event.def.Name, "payload cannot be journaled")
 	}

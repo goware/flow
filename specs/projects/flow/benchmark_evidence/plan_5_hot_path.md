@@ -504,3 +504,40 @@ locked sibling, mixed versions and queues, zero and 256 event-input snapshots,
 required elapsed-budget fail-fast with survivor/counter/journal-order assertions,
 malformed durable policy and malformed event-input rollback, ambiguous multi-fence
 ownership resolution, and two competing replicas without duplicate active fences.
+
+## Phase 6 event-input snapshot evidence
+
+The Phase 6 working tree was measured from parent commit `2be3c8e` on the same
+host, PostgreSQL 18.1 instance, durability settings, and 12-connection test pool
+described above. Database credentials were supplied through the existing test
+environment and were not printed or recorded.
+
+```text
+go test -run '^$' \
+  -bench 'Benchmark(EventSnapshotMaterialization|GetEventValueLookup)' \
+  -benchmem -benchtime=3s -count=5 .
+```
+
+The final command completed successfully in 194.790 seconds. Times and allocation
+figures are medians with complete five-sample ranges.
+
+| Inputs and canonical payload | Baseline median | Phase 6 median | Phase 6 five-sample range |
+|---|---:|---:|---:|
+| 1 x 1 KiB | 4.108 ms; 66,947 B/op; 1,208 allocs/op | 3.862 ms; 55,902 B/op; 1,187 allocs/op | 3.722-4.144 ms; 55,705-55,978 B/op; 1,187-1,188 allocs/op |
+| 32 x 1 KiB | 5.457 ms; 687,873 B/op; 4,074 allocs/op | 4.215 ms; 233,134 B/op; 2,373 allocs/op | 4.011-4.347 ms; 231,308-233,500 B/op; 2,373-2,374 allocs/op |
+| 256 x 1 KiB | 13.820 ms; 4,989,091 B/op; 24,708 allocs/op | 6.864 ms; 1,508,570 B/op; 10,908 allocs/op | 6.715-6.937 ms; 1,507,708-1,509,167 B/op; 10,907-10,908 allocs/op |
+| 256 x 64 KiB | 380.581 ms; 389,806,639 B/op; 31,161 allocs/op | 84.854 ms; 103,026,359 B/op; 12,536 allocs/op | 81.401-88.824 ms; 103,003,653-103,082,471 B/op; 12,530-12,537 allocs/op |
+
+`BenchmarkGetEventValueLookup256` remained an in-memory typed lookup and measured
+701.1 ns/op, 2,448 B/op, and 7 allocations/op at the median (636.4-747.8 ns/op;
+bytes and allocation count were identical across all samples).
+
+The adversarial 16 MiB snapshot now uses about 74% fewer allocated bytes and
+78% less claim time than the baseline; its allocation count fell by about 60%.
+The hot path hashes the retained body directly, performs one typed versioned
+envelope decode, validates the nested payload's canonical form without producing
+a second canonical payload copy, and transfers the decoded allocation into the
+private attempt snapshot. Flow's journal append still canonicalizes and verifies
+every body at the accepted write boundary, while replay deliberately reconstructs
+canonical history for stronger corruption diagnostics. No payload table or
+column was added.

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/pgschema"
+	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -633,6 +634,24 @@ func TestRuntimeReleasesDatabaseConnectionBeforeWorker(t *testing.T) {
 	}
 	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	stopRuntime(t, cancelRun, runResult)
+}
+
+func TestClaimedEventInputSnapshotsRejectDuplicates(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{"value":"stable"}`)
+	inputs := []store.ClaimedEventInput{
+		{Name: "event", Key: "key", Position: 7, Payload: payload},
+	}
+	snapshots, duplicate := claimedEventInputSnapshots(inputs)
+	if duplicate || len(snapshots) != 1 || snapshots["event\x00key"].position != 7 ||
+		string(snapshots["event\x00key"].payload) != string(payload) {
+		t.Fatalf("claimedEventInputSnapshots() = %#v, duplicate=%t", snapshots, duplicate)
+	}
+	inputs = append(inputs, store.ClaimedEventInput{Name: "event", Key: "key", Position: 8, Payload: []byte(`null`)})
+	if snapshots, duplicate := claimedEventInputSnapshots(inputs); !duplicate || snapshots != nil {
+		t.Fatalf("duplicate snapshots = %#v, duplicate=%t", snapshots, duplicate)
+	}
 }
 
 func TestRuntimeQueueConcurrencyAndFairSelection(t *testing.T) {

@@ -1425,12 +1425,12 @@ This plan is complete when all of the following are true:
 
 ### Event-input snapshots
 
-- [ ] Replace full body recanonicalization with direct SHA-256 verification.
-- [ ] Decode the versioned application-event body once.
-- [ ] Validate and copy the already-canonical payload once.
-- [ ] Retain full replay/integrity diagnostics.
-- [ ] Add malformed/hash/version/size/selector/retry/takeover tests.
-- [ ] Record before/after time and allocation measurements for all snapshot sizes.
+- [x] Replace full body recanonicalization with direct SHA-256 verification.
+- [x] Decode the versioned application-event body once.
+- [x] Validate and copy the already-canonical payload once.
+- [x] Retain full replay/integrity diagnostics.
+- [x] Add malformed/hash/version/size/selector/retry/takeover tests.
+- [x] Record before/after time and allocation measurements for all snapshot sizes.
 
 ### Documentation and release
 

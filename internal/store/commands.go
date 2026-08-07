@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -511,20 +512,15 @@ func (s *Store) loadClaimedEventInputBatch(
 			*namespace != "application" || *class != "application" || *journalName != name || *journalKey != key {
 			return nil, fmt.Errorf("%w: command event input has an invalid satisfying journal row", flowerr.ErrInvalidState)
 		}
-		canonicalBody, err := canonical.Canonicalize(body, 0)
-		if err != nil || !bytes.Equal(canonicalBody.Digest[:], bodyHash) {
+		if digest := sha256.Sum256(body); !bytes.Equal(digest[:], bodyHash) {
 			return nil, fmt.Errorf("%w: command event input body is invalid", flowerr.ErrInvalidState)
 		}
-		decoded, err := journalcodec.Decode[journalcodec.ApplicationEventBody](canonicalBody.Bytes)
+		decoded, err := journalcodec.DecodeApplicationEvent(body)
 		if err != nil {
 			return nil, fmt.Errorf("%w: command event input body cannot be decoded", flowerr.ErrInvalidState)
 		}
-		payload, err := canonical.Canonicalize(decoded.Payload, 64<<10)
-		if err != nil {
-			return nil, fmt.Errorf("%w: command event input payload is invalid", flowerr.ErrInvalidState)
-		}
 		inputs[commandID] = append(inputs[commandID], ClaimedEventInput{
-			Name: name, Key: key, Position: *position, Payload: payload.BytesCopy(),
+			Name: name, Key: key, Position: *position, Payload: decoded.Payload,
 		})
 	}
 	if err := rows.Err(); err != nil {

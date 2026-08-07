@@ -24,6 +24,9 @@ func TestCanonicalRFC8785Vectors(t *testing.T) {
 	if string(got.Bytes) != want {
 		t.Fatalf("Canonicalize() = %s, want %s", got.Bytes, want)
 	}
+	if err := ValidateCanonical(got.Bytes, 0); err != nil {
+		t.Fatalf("ValidateCanonical() error = %v", err)
+	}
 
 	again, err := Canonicalize(got.Bytes, 0)
 	if err != nil {
@@ -49,6 +52,9 @@ func TestCanonicalUTF16KeyOrder(t *testing.T) {
 	want := `{"\r":7,"1":6,"":5,"ö":4,"€":3,"😀":2,"דּ":1}`
 	if string(value.Bytes) != want {
 		t.Fatalf("UTF-16 key order = %s, want %s", value.Bytes, want)
+	}
+	if err := ValidateCanonical(value.Bytes, 0); err != nil {
+		t.Fatalf("ValidateCanonical() error = %v", err)
 	}
 }
 
@@ -96,6 +102,42 @@ func TestCanonicalValidation(t *testing.T) {
 	}
 }
 
+func TestValidateCanonical(t *testing.T) {
+	t.Parallel()
+
+	valid := []string{
+		`null`, `true`, `false`, `0`, `-1`, `0.000001`, `1e+21`,
+		`"plain"`, `"quote\"slash\\controls\b\t\n\f\r\u000f"`,
+		`[null,{"a":1,"b":[true,false]}]`,
+		`{"\r":7,"1":6,"":5,"ö":4,"€":3,"😀":2,"דּ":1}`,
+	}
+	for _, raw := range valid {
+		if err := ValidateCanonical([]byte(raw), 0); err != nil {
+			t.Errorf("ValidateCanonical(%s) error = %v", raw, err)
+		}
+	}
+
+	invalid := []string{
+		``, ` `, `null `, `01`, `-0`, `1.0`, `1E+21`, `1e21`,
+		`"\/"`, `"\u0061"`, `"\u0008"`, `"\u000F"`,
+		`{"b":1,"a":2}`, `{"a":1,"a":2}`,
+		`{"outer":{"nested":1,"nested":2}}`,
+		`[1, 2]`, `[1,]`, `{"a":1,}`,
+	}
+	for _, raw := range invalid {
+		if err := ValidateCanonical([]byte(raw), 0); !errors.Is(err, ErrInvalidJSON) {
+			t.Errorf("ValidateCanonical(%s) error = %v, want ErrInvalidJSON", raw, err)
+		}
+	}
+	if err := ValidateCanonical([]byte(`{"long":true}`), 5); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("large ValidateCanonical() error = %v, want ErrTooLarge", err)
+	}
+	tooDeep := strings.Repeat("[", DefaultMaxDepth+2) + "0" + strings.Repeat("]", DefaultMaxDepth+2)
+	if err := ValidateCanonical([]byte(tooDeep), 0); !errors.Is(err, ErrTooDeep) {
+		t.Fatalf("deep ValidateCanonical() error = %v, want ErrTooDeep", err)
+	}
+}
+
 func TestCanonicalRFC8785NumberSamples(t *testing.T) {
 	t.Parallel()
 
@@ -125,6 +167,9 @@ func TestCanonicalRFC8785NumberSamples(t *testing.T) {
 			}
 			if string(got.Bytes) != want {
 				t.Fatalf("Canonicalize(%s) = %s, want %s", input, got.Bytes, want)
+			}
+			if err := ValidateCanonical(got.Bytes, 0); err != nil {
+				t.Fatalf("ValidateCanonical(%s) error = %v", got.Bytes, err)
 			}
 		})
 	}

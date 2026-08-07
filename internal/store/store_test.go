@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/goware/flow"
+	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
@@ -241,6 +242,16 @@ func TestStoreValidation(t *testing.T) {
 	badHash.Body.Digest[0]++
 	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{badHash}}); !errors.Is(err, flow.ErrInvalid) {
 		t.Fatalf("Apply(invalid hash) error = %v", err)
+	}
+	noncanonical := validEntry
+	noncanonical.Body = canonical.Value{Bytes: []byte(`{ "v": 1 }`), Digest: sha256.Sum256([]byte(`{ "v": 1 }`))}
+	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{noncanonical}}); !errors.Is(err, flow.ErrInvalid) {
+		t.Fatalf("Apply(noncanonical matching hash) error = %v", err)
+	}
+	duplicateKey := validEntry
+	duplicateKey.Body = canonical.Value{Bytes: []byte(`{"v":1,"v":1}`), Digest: sha256.Sum256([]byte(`{"v":1,"v":1}`))}
+	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{duplicateKey}}); !errors.Is(err, flow.ErrInvalid) {
+		t.Fatalf("Apply(duplicate-key matching hash) error = %v", err)
 	}
 	causePosition := int64(1)
 	positionAsIndex := 0
