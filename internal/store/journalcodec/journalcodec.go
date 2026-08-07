@@ -3,6 +3,7 @@
 package journalcodec
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +60,11 @@ type ApplicationEventBody struct {
 	V       int             `json:"v"`
 	Payload json.RawMessage `json:"payload"`
 }
+
+const (
+	ApplicationEventBodyVersion     = 1
+	MaxApplicationEventPayloadBytes = 64 << 10
+)
 
 type TerminalEventBody struct {
 	V          int    `json:"v"`
@@ -124,6 +130,34 @@ func Decode[T any](body []byte) (T, error) {
 	var decoded T
 	if err := canonical.Decode(body, &decoded); err != nil {
 		return zero, err
+	}
+	return decoded, nil
+}
+
+// DecodeApplicationEvent decodes the hot-path application-event envelope once.
+// The exact envelope check relies on Flow's canonical journal write boundary;
+// replay separately reconstructs canonical bodies for full diagnostics.
+func DecodeApplicationEvent(body []byte) (ApplicationEventBody, error) {
+	var decoded ApplicationEventBody
+	if err := canonical.Decode(body, &decoded); err != nil {
+		return ApplicationEventBody{}, err
+	}
+	if decoded.V != ApplicationEventBodyVersion {
+		return ApplicationEventBody{}, fmt.Errorf("%w: unsupported application event body version %d", ErrVersion, decoded.V)
+	}
+	if len(decoded.Payload) == 0 {
+		return ApplicationEventBody{}, errors.New("application event body requires payload")
+	}
+	if err := canonical.ValidateCanonical(decoded.Payload, MaxApplicationEventPayloadBytes); err != nil {
+		return ApplicationEventBody{}, fmt.Errorf("application event payload is not canonical: %w", err)
+	}
+	prefix := []byte(`{"payload":`)
+	suffix := []byte(`,"v":1}`)
+	if len(body) != len(prefix)+len(decoded.Payload)+len(suffix) ||
+		!bytes.Equal(body[:len(prefix)], prefix) ||
+		!bytes.Equal(body[len(prefix):len(prefix)+len(decoded.Payload)], decoded.Payload) ||
+		!bytes.Equal(body[len(body)-len(suffix):], suffix) {
+		return ApplicationEventBody{}, errors.New("application event body has a noncanonical envelope")
 	}
 	return decoded, nil
 }

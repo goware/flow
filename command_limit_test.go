@@ -43,7 +43,7 @@ func TestCommandCeilingRejectsWorkerBatchAtomically(t *testing.T) {
 			t.Fatal(err)
 		}
 		stopRuntime(t, cancel, result)
-		if len(trace.Commands) != 1 || trace.Execution.CommandCount != 1 || trace.Commands[0].FailureCode != "invalid_decision" {
+		if len(trace.Commands) != 1 || trace.Execution.CommandCount != 1 || trace.Commands[0].Failure == nil || trace.Commands[0].Failure.Code != "invalid_decision" {
 			t.Fatalf("worker ceiling trace = %#v", trace)
 		}
 	})

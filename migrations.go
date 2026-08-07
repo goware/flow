@@ -14,6 +14,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/pgkit/v2"
@@ -260,6 +261,15 @@ func prepareMigrations(opts ...MigrateOption) (migrationOptions, []migrationUnit
 	}
 	units := make([]migrationUnit, 0, len(migrationFiles))
 	for _, file := range migrationFiles {
+		for field, value := range map[string]int{
+			"migration version":      file.version,
+			"minimum reader version": file.minReader,
+			"minimum writer version": file.minWriter,
+		} {
+			if err := durable.PostgresInteger(field, value, 1, durable.PostgresIntegerMax); err != nil {
+				return migrationOptions{}, nil, newError(ErrInvalid, "configure", "migration", file.path, err.Error())
+			}
+		}
 		source, err := embeddedMigrations.ReadFile(file.path)
 		if err != nil {
 			return migrationOptions{}, nil, fmt.Errorf("flow migration %s: %w", file.path, err)

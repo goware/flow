@@ -32,9 +32,9 @@ This document is the normative caller-visible behavioral contract. The architect
 `DefineCommand[A,R](name, version, options...)` creates an immutable typed command definition.
 
 - The name must be non-empty, contain no whitespace/control characters, and be at most 255 bytes.
-- The version must be positive.
+- The version must be positive and fit PostgreSQL's signed `integer` range while remaining a Go `int` in the public API.
 - `WithRetry` fixes the retry policy stored with every later declaration.
-- `WithTimeout` fixes a per-attempt timeout of at least one millisecond.
+- `WithTimeout` fixes a per-attempt timeout of at least one millisecond and exact whole-millisecond precision.
 - `WithQueue` selects a validated queue name; the default queue is `default`.
 - Duplicate or invalid definition options make the definition invalid. The error is reported when it is registered or used.
 
@@ -82,6 +82,8 @@ Options are:
 - `Within(d)`: bounds a gated root's wait and is invalid without `WaitFor`.
 
 Supplying a singleton option more than once is invalid, except repeated identical waits coalesce. Multiple waits are AND conditions.
+
+Every duration that becomes durable scheduling configuration—including execution deadlines, attempt timeouts, initial delays, wait budgets, retry elapsed/backoff values, and explicit retry-after delays—must be an exact multiple of one millisecond. Flow rejects fractional milliseconds instead of truncating them.
 
 ### 4.2 Permanent keys
 
@@ -150,6 +152,30 @@ Sibling/external data may be supplied through:
 
 `ResultOf(trace, key, command)` is an inspection helper that decodes a successful command result from an `ExecutionTrace`. It fails permanently for a missing command, mismatched definition, non-successful command, or undecodable result. It is not worker-time dataflow.
 
+### 5.3 Composition granularity
+
+A command should represent an independent retry, side-effect, isolation,
+timeout, queue-ownership, or useful parallelism boundary. Small deterministic
+transformations should stay inside the worker that owns them. Several small
+writes to the same PostgreSQL database may share one `WithCommit` callback;
+creating a durable command for each microstep adds a lifecycle without adding a
+meaningful boundary.
+
+One execution is one serialized semantic aggregate. Causally related work
+belongs in one execution; independent bulk items or shards should use separate
+executions instead of a tenant-wide or global execution. The default
+1,000-command ceiling is a safety limit rather than a normal target. Executions
+in the tens or low hundreds are the ordinary shape; this guidance does not add
+a hard limit beyond the configured ceiling.
+
+Very large fan-outs should be chunked into bounded batch commands when one
+enormous atomic child declaration is unnecessary. Large all-of inputs should
+use hierarchical join commands. Parent-produced data should be passed directly
+in child arguments, exact events should carry sibling/cross-branch/external
+facts, and related events and children should be staged together when they form
+one atomic decision. Large or sensitive documents should remain in application
+storage behind stable references.
+
 ## 6. Application events and exact inputs
 
 Application-event identity is `(execution ID, event name, event key)`. The event key must be non-empty, stable, valid UTF-8 without surrounding whitespace, and at most 1024 bytes.
@@ -187,6 +213,11 @@ All waits are exact AND gates. A command is claimable only when:
 
 At most 256 exact waits may be declared on one command. The store records each satisfying journal position. Claim materialization loads every selector and its canonical event body in one bounded query before releasing the connection.
 
+Accepted event ingress updates only matching unresolved reverse-wait rows,
+decrements the affected commands' `unsatisfied_waits` counters, and queues only
+commands whose final wait was satisfied. Unrelated retained commands are not
+part of ordinary event readiness resolution.
+
 `GetEventValue(work, event, key)`:
 
 - does not block;
@@ -217,6 +248,12 @@ Only the still-current attempt ID and lease token may settle. A lost or already 
 
 If the callback returns an error, the entire success transaction rolls back. `Permanent` and `RetryAfter` retain their normal classifications; invalid/conflict/state/payload Flow errors are permanent invalid decisions; other errors are retryable. The callback may run again on a later attempt, so it must not perform non-transactional effects as though they were exactly once.
 
+The callback should contain only short same-database work. It must not perform
+remote calls, and unnecessarily long SQL holds the execution lock and delays
+other semantic mutations for that execution. Normalized staged events,
+children, waits, and initially ready queue rows are prepared completely and
+persisted with bounded set-oriented operations inside the same settlement.
+
 ## 8. Retry, timeout, and fencing
 
 The default command retry policy permits five consumed attempts with backoff steps of 1 second, 5 seconds, 30 seconds, and 2 minutes. Later attempts reuse the final step. Backoff applies deterministic 20% proportional jitter derived from the attempt identity and persisted policy.
@@ -228,7 +265,7 @@ Public policy construction supports:
 - `.Attempts(n)`: combine elapsed and attempt bounds; and
 - `.Backoff(delays...)`: replace the positive backoff sequence.
 
-Retry policy, timeout, and queue are copied into the durable command declaration and do not change when another runtime deploys different defaults.
+Retry policy, timeout, and queue are copied into the durable command declaration and do not change when another runtime deploys different defaults. Retry policy uses one canonical whole-millisecond representation and is stored as opaque bytes rather than a SQL-queryable JSON document.
 
 Worker conclusions are classified as follows:
 
@@ -258,6 +295,8 @@ running -> failing -> failed | cancelled | expired
 ```
 
 `failing` means a required command has reached an unsuccessful terminal state but active surviving work may still be settling.
+
+Public execution, command, queue, key-scope, and terminal-status fields use typed string constants. Unknown stored values fail explicit boundary decoding as `ErrInvalidState`.
 
 Command states are:
 
@@ -309,6 +348,10 @@ Cancellation through `runtime.InTx(tx)` remains uncommitted until the caller com
 
 All Flow operations in one transaction must reuse the same transaction client. Semantic operations touching existing executions must request execution locks in ascending `ExecutionID` order. Callers must perform Flow operations before application-table writes so all participating code follows the global execution-first lock discipline.
 
+The caller should commit or roll back promptly after the Flow operations and
+associated application writes. Every acquired execution lock remains held for
+the lifetime of the caller-owned transaction.
+
 Starts create their execution row and therefore do not enter the existing-execution order until later operations address that execution. Multi-execution workflows are not settled atomically by Flow itself; explicit caller transactions are the only cross-execution/application-write boundary.
 
 ## 12. Runtime and deployment
@@ -347,6 +390,18 @@ Public options are:
 
 Polling is the correctness path. Notifications are transactional latency hints; malformed/lost hints, listener disconnects, transaction-pooling proxies, and disabled notifications do not lose work.
 
+Flow emits a wake hint only when a committed transition creates work that is
+immediately runnable. Journal-only transitions, claims, terminal settlements
+without follow-up work, unmatched events, and work scheduled for the future do
+not require a hint.
+
+The scheduler may claim selected groups from independent executions
+concurrently using an internal bound derived from worker capacity and the
+database pool while retaining capacity for maintenance. Candidates from one
+execution remain in one serialized claim transaction, where eligible attempts,
+event inputs, journal entries, and command/queue projection changes are handled
+as bounded sets. This policy adds no public concurrency setting.
+
 Global and named-queue concurrency limits are process-local. PostgreSQL claims and fences coordinate all replicas. The named-queue limit shares the runtime's global capacity.
 
 `Stop(ctx)` initiates shutdown and waits for `Run` to finish or for the supplied context to end. Run-context cancellation does the same. The scheduler stops claiming first, waits through the grace period, then interrupts remaining handlers. Shutdown interruption does not consume retry budget. The caller-owned database pool is never closed.
@@ -365,6 +420,14 @@ Flow owns exactly six `flow_` tables in one validated PostgreSQL schema:
 6. `flow_schema_migrations`.
 
 Applications must not use these tables as a write API. Semantic journal entries and current projections must remain transactionally consistent.
+
+Every accepted journal write is canonicalized and its hash verified before
+persistence. Claim materialization verifies the retained body hash, decodes the
+bounded application-event body once, and validates the canonical payload before
+giving it to a worker. Full replay independently verifies hashes and
+re-canonicalizes retained bodies for stronger history diagnostics.
+
+Database constraints require a non-null root command and enforce same-execution ownership for roots, parents, delivery rows, event waits, and journal command references. Durable position references are positive, and journal causation must point to an earlier position.
 
 `Migrate` serializes migration execution with an advisory transaction lock, verifies checksums of already applied migrations, and applies each pending embedded migration in its own transaction. `MigrationFS` exposes schema-rendered SQL for an external transactional runner. `CheckSchema` verifies checksums, reader/writer compatibility, current version, and the exact six-table inventory without mutation.
 
@@ -404,7 +467,7 @@ Public Flow errors support `errors.Is` with these categories:
 - `ErrClosed`: a stopped runtime or closed transaction/client is used; and
 - `ErrSchema`: migration/schema state is missing, changed, or incompatible.
 
-`*flow.Error` adds bounded operation/resource/identifier/reason context and unwraps to its category. Store errors and observations must not expose raw SQL, driver details, payloads, secrets, or lease tokens. Persisted worker error messages are trimmed and bounded, but applications must still avoid putting secrets into returned errors.
+`*flow.Error` adds bounded operation/resource/identifier/reason context and unwraps to its category. Durable and public failure projections use one structured `Failure{Code, Message}` value while preserving separate latest-command, terminal-command, and execution-failure fields. Store errors and observations must not expose raw SQL, driver details, payloads, secrets, or lease tokens. Persisted worker error messages are trimmed and bounded, but applications must still avoid putting secrets into returned errors.
 
 Flow canonicalizes durable typed values as JSON and stores them in PostgreSQL; it does not provide field encryption or automatic redaction. Applications should store secrets and large objects behind stable references and apply database-level access control, encryption, backup, and retention policy appropriate to those values.
 

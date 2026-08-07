@@ -11,6 +11,7 @@ import (
 
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/replay"
+	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/goware/flow/internal/testpg"
 	"github.com/jackc/pgx/v5"
 )
@@ -236,15 +237,21 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if err != nil || repeated.Created || repeated.ID != execs[0].ID {
 		t.Fatalf("start under changed defaults = %#v, %v", repeated, err)
 	}
-	var maxCommands, acceptedAttempts int
+	var maxCommands int
 	var queue string
 	var timeoutMS int64
+	var retryPolicy []byte
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT e.max_commands,c.queue,
-		(c.retry_policy->>'max_attempts')::integer,c.attempt_timeout_ms FROM `+
+		c.retry_policy,c.attempt_timeout_ms FROM `+
 		pgschema.Table(database.Schema, "flow_executions")+` e JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c USING (execution_id)
-		WHERE e.execution_id=$1`, execs[0].ID).Scan(&maxCommands, &queue, &acceptedAttempts, &timeoutMS); err != nil {
+		WHERE e.execution_id=$1`, execs[0].ID).Scan(&maxCommands, &queue, &retryPolicy, &timeoutMS); err != nil {
 		t.Fatalf("read accepted defaults: %v", err)
 	}
+	policy, err := retrypolicy.PublicFromCanonical(retryPolicy)
+	if err != nil {
+		t.Fatalf("decode accepted retry policy: %v", err)
+	}
+	acceptedAttempts := *retrypolicy.ValueOf(policy).MaxAttempts
 	if maxCommands != 1 || queue != "original" || acceptedAttempts != 3 || timeoutMS != 111 {
 		t.Fatalf("accepted defaults = max %d queue %s attempts %d timeout %dms",
 			maxCommands, queue, acceptedAttempts, timeoutMS)

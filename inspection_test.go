@@ -87,7 +87,7 @@ func TestExecutionInspectionAndStablePagination(t *testing.T) {
 		}
 	}
 	filtered, err := ListExecutions(ctx, runtime, ExecutionFilter{
-		Type: command.Name(), Metadata: map[string]string{"bucket": "1"}, Statuses: []string{"running"}, PageSize: 10,
+		Type: command.Name(), Metadata: map[string]string{"bucket": "1"}, Statuses: []ExecutionStatus{ExecutionStatusRunning}, PageSize: 10,
 	})
 	if err != nil || len(filtered.Executions) != 2 {
 		t.Fatalf("filtered list = %#v, %v", filtered, err)
@@ -96,7 +96,7 @@ func TestExecutionInspectionAndStablePagination(t *testing.T) {
 	if err != nil || len(literalWildcard.Executions) != 0 {
 		t.Fatalf("literal wildcard prefix list = %#v, %v", literalWildcard, err)
 	}
-	if _, err := ListExecutions(ctx, runtime, ExecutionFilter{Statuses: []string{"unknown"}}); !errors.Is(err, ErrInvalid) {
+	if _, err := ListExecutions(ctx, runtime, ExecutionFilter{Statuses: []ExecutionStatus{"unknown"}}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("invalid status error = %v", err)
 	}
 	if _, err := ListExecutions(ctx, runtime, ExecutionFilter{Cursor: "not-a-cursor"}); !errors.Is(err, ErrInvalid) {

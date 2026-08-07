@@ -4,51 +4,34 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/durable"
+	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/jackc/pgx/v5"
 )
 
-// readinessCommand is the small projection needed to release exact event
-// gates. Event waits and the initial delay are independent prerequisites.
-type readinessCommand struct {
-	id               uuid.UUID
-	key              string
-	name             string
-	version          int
-	queue            string
-	state            string
-	required         bool
-	createdPosition  int64
-	unsatisfiedWaits int
-	initialDelay     time.Duration
-	createdAt        time.Time
-	waitStartedAt    *time.Time
-	waitTimeout      time.Duration
+type acceptedEventPosition struct {
+	name     string
+	key      string
+	position int64
 }
 
-type waitUpdate struct {
-	commandID uuid.UUID
-	name      string
-	key       string
-	position  int64
-}
-
-type readinessResolution struct {
-	waits   []waitUpdate
-	ready   []readinessCommand
-	waiting []readinessCommand
+type failureCommand struct {
+	id    uuid.UUID
+	key   string
+	state string
 }
 
 // failureResolution describes the pending work cancelled by fail-fast.
 // Attempts already running are deliberately left alone and may settle.
 type failureResolution struct {
-	readinessResolution
-	survivors []readinessCommand
-	cancelled []readinessCommand
+	survivors []failureCommand
+	cancelled []failureCommand
 }
 
 func (s *Store) resolveRequiredFailureLocked(
@@ -67,20 +50,24 @@ func (s *Store) resolveRequiredFailuresLocked(
 	baseOverrides map[uuid.UUID]string,
 	failFast bool,
 ) (failureResolution, error) {
-	readiness, err := s.resolveReadinessLocked(ctx, semantic, baseOverrides, nil)
-	if err != nil {
-		return failureResolution{}, err
-	}
-	result := failureResolution{readinessResolution: readiness}
 	if !failFast {
-		return result, nil
+		return failureResolution{}, nil
 	}
-	commands, err := s.loadReadinessCommands(ctx, semantic)
+	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,state
+		FROM `+pgschema.Table(s.schema, "flow_commands")+`
+		WHERE execution_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired')
+		ORDER BY command_key FOR UPDATE`, semantic.ExecutionID())
 	if err != nil {
-		return failureResolution{}, err
+		return failureResolution{}, MapError("lock fail-fast commands", err)
 	}
-	for _, command := range commands {
-		if _, failed := baseOverrides[command.id]; failed || isCommandTerminal(command.state) {
+	defer rows.Close()
+	result := failureResolution{}
+	for rows.Next() {
+		var command failureCommand
+		if err := rows.Scan(&command.id, &command.key, &command.state); err != nil {
+			return failureResolution{}, MapError("scan fail-fast command", err)
+		}
+		if _, failed := baseOverrides[command.id]; failed {
 			continue
 		}
 		if command.state == "running" {
@@ -89,8 +76,9 @@ func (s *Store) resolveRequiredFailuresLocked(
 		}
 		result.cancelled = append(result.cancelled, command)
 	}
-	sort.Slice(result.survivors, func(i, j int) bool { return result.survivors[i].key < result.survivors[j].key })
-	sort.Slice(result.cancelled, func(i, j int) bool { return result.cancelled[i].key < result.cancelled[j].key })
+	if err := rows.Err(); err != nil {
+		return failureResolution{}, MapError("read fail-fast commands", err)
+	}
 	return result, nil
 }
 
@@ -159,7 +147,8 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	// expiry maintenance observes the row later.
 	rows, err := semantic.PGX().Query(ctx, `SELECT w.event_name,w.event_key,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+` j
-		 WHERE j.execution_id=w.execution_id AND j.event_namespace='application'
+		 WHERE j.execution_id=w.execution_id AND j.entry_kind='event_recorded'
+		 AND j.event_class='application' AND j.event_namespace='application'
 		 AND j.event_name=w.event_name AND j.event_key=w.event_key AND j.recorded_at<=$3
 		 ORDER BY position LIMIT 1)
 		FROM `+pgschema.Table(s.schema, "flow_command_event_waits")+` w
@@ -192,17 +181,19 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	}
 	rows.Close()
 	if missing == 0 && len(accepted) > 0 {
-		updates := make([]waitUpdate, 0, len(accepted))
+		events := make([]acceptedEventPosition, 0, len(accepted))
 		for _, wait := range accepted {
-			updates = append(updates, waitUpdate{commandID: candidate.CommandID,
+			events = append(events, acceptedEventPosition{
 				name: wait.name, key: wait.key, position: *wait.position})
 		}
-		resolution, err := s.resolveReadinessLocked(ctx, semantic, nil, updates)
+		immediatelyRunnable, err := s.resolveEventReadinessLocked(ctx, semantic, events)
 		if err != nil {
 			return false, err
 		}
-		if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
-			return false, err
+		if immediatelyRunnable {
+			if err := semantic.NotifyRunnableCommands(ctx); err != nil {
+				return false, err
+			}
 		}
 		if err := semantic.Commit(ctx); err != nil {
 			return false, err
@@ -210,13 +201,9 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return true, nil
 	}
 
-	resolution := readinessResolution{}
 	failureEffects := failureResolution{}
 	if required {
 		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, candidate.CommandID, "expired", head.FailFast)
-		resolution = failureEffects.readinessResolution
-	} else {
-		resolution, err = s.resolveReadinessLocked(ctx, semantic, map[uuid.UUID]string{candidate.CommandID: "expired"}, nil)
 	}
 	if err != nil {
 		return false, err
@@ -251,7 +238,16 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return false, err
 	}
 	entries = append(entries, cancelledEntries...)
-	effectiveOpen := head.OpenCommands - 1 - len(failureEffects.cancelled)
+	effectiveOpen, err := durable.AddPostgresInteger("execution open commands", head.OpenCommands,
+		-1, 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return false, err
+	}
+	effectiveOpen, err = durable.AddPostgresInteger("execution open commands", effectiveOpen,
+		-len(failureEffects.cancelled), 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return false, err
+	}
 	terminalExecution := effectiveOpen == 0
 	if terminalExecution {
 		status, name, reason := "succeeded", "flow.execution_succeeded", ""
@@ -277,12 +273,10 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return false, MapError("expire command wait", err)
 	}
 	if required {
-		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, 0, cancelledOffset,
+		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
 			"cancelled by fail-fast after required command expiry"); err != nil {
 			return false, err
 		}
-	} else if err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
-		return false, err
 	}
 	status := head.Status
 	if required {
@@ -295,11 +289,11 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		}
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
-		SET status=$2,open_commands=open_commands-1-$5,
+		SET status=$2,open_commands=$5,
 		failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
 		finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 		updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END WHERE execution_id=$1`,
-		head.ID, status, jsonString(failure), semantic.DBNow(), len(failureEffects.cancelled), executionFailed); err != nil {
+		head.ID, status, jsonString(failure), semantic.DBNow(), effectiveOpen, executionFailed); err != nil {
 		return false, MapError("update execution after wait expiry", err)
 	}
 	if err := semantic.Commit(ctx); err != nil {
@@ -328,198 +322,198 @@ func (s *Store) applyFailureResolution(
 	semantic *SemanticTx,
 	resolution failureResolution,
 	journal ApplyResult,
-	_ int,
 	cancelledOffset int,
 	reason string,
 ) error {
-	if err := s.applyReadinessResolution(ctx, semantic, resolution.readinessResolution); err != nil {
-		return err
+	if len(resolution.cancelled) == 0 {
+		return nil
 	}
 	failure := terminalFailure{Code: "fail_fast", Message: reason}
+	commandIDs := make([]uuid.UUID, len(resolution.cancelled))
+	positions := make([]int64, len(resolution.cancelled))
 	for index, command := range resolution.cancelled {
-		position := journal.Journal[cancelledOffset+index].Position
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-			SET state='cancelled',last_error=$2::jsonb,terminal_failure=$2::jsonb,terminal_position=$3,
-			    finished_at=$4,updated_at=$4,status_at=$4
-			WHERE command_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired')`,
-			command.id, jsonString(failure), position, semantic.DBNow()); err != nil {
-			return MapError("cancel command after fail-fast", err)
+		journalIndex := cancelledOffset + index
+		if journalIndex < 0 || journalIndex >= len(journal.Journal) {
+			return fmt.Errorf("%w: fail-fast journal mapping is invalid", flowerr.ErrInvalidState)
 		}
-		if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+`
-			WHERE command_id=$1`, command.id); err != nil {
-			return MapError("remove fail-fast cancelled command", err)
-		}
+		commandIDs[index] = command.id
+		positions[index] = journal.Journal[journalIndex].Position
+	}
+	commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+` AS c
+		SET state='cancelled',last_error=$4::jsonb,terminal_failure=$4::jsonb,
+		    terminal_position=cancelled.position,finished_at=$5,updated_at=$5,status_at=$5
+		FROM unnest($1::uuid[],$2::bigint[]) AS cancelled(command_id,position)
+		WHERE c.execution_id=$3 AND c.command_id=cancelled.command_id
+		AND c.state NOT IN ('succeeded','failed','cancelled','expired')`,
+		commandIDs, positions, semantic.ExecutionID(), jsonString(failure), semantic.DBNow())
+	if err != nil {
+		return MapError("cancel commands after fail-fast", err)
+	}
+	if commandTag.RowsAffected() != int64(len(commandIDs)) {
+		return fmt.Errorf("%w: fail-fast cancellation set changed", flowerr.ErrInvalidState)
+	}
+	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+`
+		WHERE execution_id=$1 AND command_id=ANY($2::uuid[])`, semantic.ExecutionID(), commandIDs); err != nil {
+		return MapError("remove fail-fast cancelled commands", err)
 	}
 	return nil
 }
 
-// resolveReadinessLocked calculates exact-wait releases without mutating
-// storage. Overrides describe terminal states accepted by the transaction.
-func (s *Store) resolveReadinessLocked(
+func (s *Store) resolveEventReadinessLocked(
 	ctx context.Context,
 	semantic *SemanticTx,
-	overrides map[uuid.UUID]string,
-	waits []waitUpdate,
-) (readinessResolution, error) {
-	commands, err := s.loadReadinessCommands(ctx, semantic)
-	if err != nil {
-		return readinessResolution{}, err
+	events []acceptedEventPosition,
+) (bool, error) {
+	if len(events) == 0 {
+		return false, nil
 	}
-	byID := make(map[uuid.UUID]*readinessCommand, len(commands))
-	for index := range commands {
-		byID[commands[index].id] = &commands[index]
-	}
-	for id, state := range overrides {
-		if command := byID[id]; command != nil {
-			command.state = state
+	names := make([]string, 0, len(events))
+	keys := make([]string, 0, len(events))
+	positions := make([]int64, 0, len(events))
+	seen := make(map[string]int64, len(events))
+	for _, event := range events {
+		if event.name == "" || event.key == "" || event.position < 1 {
+			return false, fmt.Errorf("%w: invalid accepted event position", flowerr.ErrInvalidState)
 		}
-	}
-	resolution := readinessResolution{waits: waits}
-	for _, wait := range waits {
-		if command := byID[wait.commandID]; command != nil && command.unsatisfiedWaits > 0 {
-			command.unsatisfiedWaits--
+		identity := event.name + "\x00" + event.key
+		if prior, ok := seen[identity]; ok {
+			if prior != event.position {
+				return false, fmt.Errorf("%w: accepted event identity has multiple positions", flowerr.ErrInvalidState)
+			}
+			continue
 		}
+		seen[identity] = event.position
+		names = append(names, event.name)
+		keys = append(keys, event.key)
+		positions = append(positions, event.position)
 	}
-	for index := range commands {
-		command := &commands[index]
-		if command.state == "pending" && command.unsatisfiedWaits == 0 {
-			resolution.ready = append(resolution.ready, *command)
-		} else if command.state == "pending" && command.unsatisfiedWaits > 0 && command.waitStartedAt == nil {
-			resolution.waiting = append(resolution.waiting, *command)
-		}
-	}
-	sort.Slice(resolution.ready, func(i, j int) bool { return resolution.ready[i].key < resolution.ready[j].key })
-	sort.Slice(resolution.waiting, func(i, j int) bool { return resolution.waiting[i].key < resolution.waiting[j].key })
-	return resolution, nil
-}
 
-func (s *Store) loadReadinessCommands(ctx context.Context, semantic *SemanticTx) ([]readinessCommand, error) {
-	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,name,version,queue,state,required,created_position,
-		unsatisfied_waits,COALESCE(initial_delay_ms,0),created_at,wait_started_at,COALESCE(wait_timeout_ms,0)
-		FROM `+pgschema.Table(s.schema, "flow_commands")+` WHERE execution_id=$1 ORDER BY command_key`, semantic.ExecutionID())
+	rows, err := semantic.PGX().Query(ctx, s.satisfyMatchingEventWaitsSQL(),
+		semantic.ExecutionID(), names, keys, positions)
 	if err != nil {
-		return nil, MapError("load readiness commands", err)
+		return false, MapError("satisfy matching command event waits", err)
 	}
-	defer rows.Close()
-	var result []readinessCommand
+	newlySatisfied := make(map[uuid.UUID]int)
 	for rows.Next() {
-		var item readinessCommand
-		var delayMS, waitTimeoutMS int64
-		if err := rows.Scan(&item.id, &item.key, &item.name, &item.version, &item.queue, &item.state,
-			&item.required, &item.createdPosition, &item.unsatisfiedWaits, &delayMS, &item.createdAt,
-			&item.waitStartedAt, &waitTimeoutMS); err != nil {
-			return nil, MapError("scan readiness command", err)
+		var commandID uuid.UUID
+		if err := rows.Scan(&commandID); err != nil {
+			rows.Close()
+			return false, MapError("scan satisfied command event wait", err)
 		}
-		item.initialDelay = time.Duration(delayMS) * time.Millisecond
-		item.waitTimeout = time.Duration(waitTimeoutMS) * time.Millisecond
-		result = append(result, item)
+		newlySatisfied[commandID]++
 	}
 	if err := rows.Err(); err != nil {
-		return nil, MapError("read readiness commands", err)
+		rows.Close()
+		return false, MapError("read satisfied command event waits", err)
 	}
-	return result, nil
-}
+	rows.Close()
+	if len(newlySatisfied) == 0 {
+		return false, nil
+	}
 
-func (s *Store) applyReadinessResolution(
-	ctx context.Context,
-	semantic *SemanticTx,
-	resolution readinessResolution,
-) error {
-	for _, wait := range resolution.waits {
-		commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_event_waits")+`
-			SET satisfied_position=$4 WHERE command_id=$1 AND event_name=$2 AND event_key=$3
-			AND satisfied_position IS NULL`, wait.commandID, wait.name, wait.key, wait.position)
-		if err != nil {
-			return MapError("satisfy command event wait", err)
-		}
-		if commandTag.RowsAffected() > 0 {
-			if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-				SET state=CASE WHEN state='pending' AND unsatisfied_waits=1 THEN 'ready' ELSE state END,
-				    unsatisfied_waits=GREATEST(0,unsatisfied_waits-1),updated_at=$2,
-				    status_at=CASE WHEN state='pending' AND unsatisfied_waits=1 THEN $2 ELSE status_at END
-				WHERE command_id=$1`, wait.commandID, semantic.DBNow()); err != nil {
-				return MapError("update satisfied wait count", err)
-			}
-		}
+	commandIDs := make([]uuid.UUID, 0, len(newlySatisfied))
+	for commandID := range newlySatisfied {
+		commandIDs = append(commandIDs, commandID)
 	}
-	for _, command := range resolution.ready {
-		nextRun := semantic.DBNow()
-		if command.initialDelay > 0 {
-			nextRun = command.createdAt.Add(command.initialDelay)
-			if nextRun.Before(semantic.DBNow()) {
-				nextRun = semantic.DBNow()
-			}
-		}
-		commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-			SET state='ready',budget_started_at=$2,next_attempt_at=$2,updated_at=$3,status_at=$3
-			WHERE command_id=$1 AND state IN ('pending','ready') AND unsatisfied_waits=0
-			AND budget_started_at IS NULL`, command.id, nextRun, semantic.DBNow())
-		if err != nil {
-			return MapError("make gated command ready", err)
-		}
-		if commandTag.RowsAffected() > 0 {
-			_, err = semantic.PGX().Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_queue")+`
-				(command_id,execution_id,queue,name,version,state,next_run_at,updated_at)
-				VALUES ($1,$2,$3,$4,$5,'ready',$6,$7) ON CONFLICT (command_id) DO NOTHING`,
-				command.id, semantic.ExecutionID(), command.queue, command.name, command.version, nextRun, semantic.DBNow())
-			if err != nil {
-				return MapError("enqueue gated command", err)
-			}
-		}
+	sort.Slice(commandIDs, func(i, j int) bool { return commandIDs[i].String() < commandIDs[j].String() })
+	counts := make([]int32, len(commandIDs))
+	for index, commandID := range commandIDs {
+		counts[index] = int32(newlySatisfied[commandID])
 	}
-	for _, command := range resolution.waiting {
-		var deadline *time.Time
-		if command.waitTimeout > 0 {
-			value := semantic.DBNow().Add(command.waitTimeout)
-			var executionDeadline *time.Time
-			if err := semantic.PGX().QueryRow(ctx, `SELECT deadline_at FROM `+pgschema.Table(s.schema, "flow_executions")+`
-				WHERE execution_id=$1`, semantic.ExecutionID()).Scan(&executionDeadline); err != nil {
-				return MapError("load execution deadline for wait", err)
-			}
-			if executionDeadline != nil && executionDeadline.Before(value) {
-				value = *executionDeadline
-			}
-			deadline = &value
-		}
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-			SET wait_started_at=COALESCE(wait_started_at,$2),wait_deadline_at=COALESCE(wait_deadline_at,$3),updated_at=$2
-			WHERE command_id=$1 AND state='pending' AND unsatisfied_waits>0`,
-			command.id, semantic.DBNow(), deadline); err != nil {
-			return MapError("start command event wait", err)
-		}
-	}
-	return nil
-}
 
-func (s *Store) matchingWaitsLocked(
-	ctx context.Context,
-	semantic *SemanticTx,
-	name, key string,
-	position int64,
-) ([]waitUpdate, error) {
-	rows, err := semantic.PGX().Query(ctx, `SELECT w.command_id,w.event_name,w.event_key
-		FROM `+pgschema.Table(s.schema, "flow_command_event_waits")+` w
-		JOIN `+pgschema.Table(s.schema, "flow_commands")+` c USING (command_id)
-		WHERE w.execution_id=$1 AND w.event_name=$2 AND w.event_key=$3
-		AND w.satisfied_position IS NULL AND (c.wait_deadline_at IS NULL OR $4<=c.wait_deadline_at)
-		ORDER BY w.command_id FOR UPDATE OF w`, semantic.ExecutionID(), name, key, semantic.DBNow())
+	rows, err = semantic.PGX().Query(ctx, `WITH satisfied(command_id,satisfied_count) AS (
+		SELECT * FROM unnest($2::uuid[],$3::integer[])
+	)
+	UPDATE `+pgschema.Table(s.schema, "flow_commands")+` AS c
+	SET unsatisfied_waits=c.unsatisfied_waits-satisfied.satisfied_count,
+	    state=CASE WHEN c.state='pending' AND c.unsatisfied_waits=satisfied.satisfied_count THEN 'ready' ELSE c.state END,
+	    budget_started_at=CASE
+	      WHEN c.state='pending' AND c.unsatisfied_waits=satisfied.satisfied_count
+	      THEN GREATEST($4::timestamptz,c.created_at+COALESCE(c.initial_delay_ms,0)*INTERVAL '1 millisecond')
+	      ELSE c.budget_started_at END,
+	    next_attempt_at=CASE
+	      WHEN c.state='pending' AND c.unsatisfied_waits=satisfied.satisfied_count
+	      THEN GREATEST($4::timestamptz,c.created_at+COALESCE(c.initial_delay_ms,0)*INTERVAL '1 millisecond')
+	      ELSE c.next_attempt_at END,
+	    updated_at=$4,
+	    status_at=CASE WHEN c.state='pending' AND c.unsatisfied_waits=satisfied.satisfied_count THEN $4 ELSE c.status_at END
+	FROM satisfied
+	WHERE c.execution_id=$1 AND c.command_id=satisfied.command_id
+	  AND c.unsatisfied_waits>=satisfied.satisfied_count
+	RETURNING c.command_id,c.state,c.next_attempt_at`,
+		semantic.ExecutionID(), commandIDs, counts, semantic.DBNow())
 	if err != nil {
-		return nil, MapError("lock matching command waits", err)
+		return false, MapError("apply satisfied command wait counts", err)
 	}
-	defer rows.Close()
-	var waits []waitUpdate
+	releasedIDs := make([]uuid.UUID, 0, len(commandIDs))
+	releasedNext := make([]time.Time, 0, len(commandIDs))
+	updated := 0
 	for rows.Next() {
-		var wait waitUpdate
-		if err := rows.Scan(&wait.commandID, &wait.name, &wait.key); err != nil {
-			return nil, MapError("scan matching command wait", err)
+		var commandID uuid.UUID
+		var state string
+		var nextAttemptAt *time.Time
+		if err := rows.Scan(&commandID, &state, &nextAttemptAt); err != nil {
+			rows.Close()
+			return false, MapError("scan satisfied command wait count", err)
 		}
-		wait.position = position
-		waits = append(waits, wait)
+		updated++
+		if state == "ready" {
+			if nextAttemptAt == nil {
+				rows.Close()
+				return false, fmt.Errorf("%w: released command has no next attempt", flowerr.ErrInvalidState)
+			}
+			releasedIDs = append(releasedIDs, commandID)
+			releasedNext = append(releasedNext, *nextAttemptAt)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, MapError("read matching command waits", err)
+		rows.Close()
+		return false, MapError("read satisfied command wait counts", err)
 	}
-	return waits, nil
+	rows.Close()
+	if updated != len(commandIDs) {
+		return false, fmt.Errorf("%w: satisfied wait count exceeds command projection", flowerr.ErrInvalidState)
+	}
+	if len(releasedIDs) == 0 {
+		return false, nil
+	}
+	commandTag, err := semantic.PGX().Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_queue")+`
+		(command_id,execution_id,queue,name,version,state,next_run_at)
+		SELECT c.command_id,c.execution_id,c.queue,c.name,c.version,'ready',c.next_attempt_at
+		FROM `+pgschema.Table(s.schema, "flow_commands")+` AS c
+		WHERE c.execution_id=$1 AND c.command_id=ANY($2::uuid[]) AND c.state='ready' AND c.unsatisfied_waits=0
+		ON CONFLICT (command_id) DO NOTHING`,
+		semantic.ExecutionID(), releasedIDs)
+	if err != nil {
+		return false, MapError("enqueue released commands", err)
+	}
+	if commandTag.RowsAffected() != int64(len(releasedIDs)) {
+		return false, fmt.Errorf("%w: released command queue set changed", flowerr.ErrInvalidState)
+	}
+	for _, nextRun := range releasedNext {
+		if !nextRun.After(semantic.DBNow()) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Store) satisfyMatchingEventWaitsSQL() string {
+	return `WITH incoming(event_name,event_key,position) AS (
+		SELECT * FROM unnest($2::text[],$3::text[],$4::bigint[])
+	)
+	UPDATE ` + pgschema.Table(s.schema, "flow_command_event_waits") + ` AS w
+	SET satisfied_position=incoming.position
+	FROM incoming, ` + pgschema.Table(s.schema, "flow_journal") + ` AS j,
+	     ` + pgschema.Table(s.schema, "flow_commands") + ` AS c
+	WHERE w.execution_id=$1 AND w.event_name=incoming.event_name AND w.event_key=incoming.event_key
+	  AND w.satisfied_position IS NULL
+	  AND j.execution_id=$1 AND j.position=incoming.position
+	  AND j.entry_kind='event_recorded' AND j.event_class='application'
+	  AND j.event_namespace='application' AND j.event_name=incoming.event_name AND j.event_key=incoming.event_key
+	  AND c.execution_id=w.execution_id AND c.command_id=w.command_id
+	  AND (c.wait_deadline_at IS NULL OR j.recorded_at<=c.wait_deadline_at)
+	RETURNING w.command_id`
 }
 
 func graphNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }

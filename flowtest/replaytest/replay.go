@@ -54,13 +54,12 @@ func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.Execut
 		t.Fatalf("replay.Fold() error = %v", err)
 	}
 	if projected.ID.String() != string(live.ID) || projected.DefinitionName != live.Type || projected.DefinitionVersion != live.Version ||
-		projected.ExecutionKey != live.Key || projected.Status != live.Status || projected.CommandCount != live.CommandCount ||
-		projected.OpenCommands != live.OpenCommands ||
-		projected.FailureCode != live.FailureCode || projected.FailureMessage != live.FailureMessage {
+		projected.ExecutionKey != live.Key || projected.Status != string(live.Status) || projected.CommandCount != live.CommandCount ||
+		projected.OpenCommands != live.OpenCommands || !equalFailure(projected.Failure, live.Failure) {
 		t.Fatalf("replay/live execution mismatch:\nreplay=%#v\nlive=%#v", projected, live)
 	}
 
-	commandRows, err := db.Conn.Query(ctx, `SELECT command_id,state,result,terminal_position FROM `+
+	commandRows, err := db.Conn.Query(ctx, `SELECT command_id,state,result,terminal_position,retry_policy,declaration_fingerprint FROM `+
 		pgschema.Table(schema, "flow_commands")+` WHERE execution_id=$1`, executionID)
 	if err != nil {
 		t.Fatalf("query live commands: %v", err)
@@ -72,13 +71,16 @@ func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.Execut
 		var state string
 		var result []byte
 		var terminalPosition *int64
-		if err := commandRows.Scan(&commandID, &state, &result, &terminalPosition); err != nil {
+		var retryPolicy, declarationFingerprint []byte
+		if err := commandRows.Scan(&commandID, &state, &result, &terminalPosition, &retryPolicy, &declarationFingerprint); err != nil {
 			t.Fatalf("scan live command: %v", err)
 		}
 		command, ok := projected.Commands[commandID]
-		if !ok || command.State != state || !bytes.Equal(command.Result, result) || !equalInt64(command.TerminalPosition, terminalPosition) {
-			t.Fatalf("replay/live command mismatch id=%s replay=%#v state=%s result=%s terminal=%v",
-				commandID, command, state, result, terminalPosition)
+		if !ok || command.State != state || !bytes.Equal(command.Result, result) ||
+			!equalInt64(command.TerminalPosition, terminalPosition) || !bytes.Equal(command.RetryPolicy, retryPolicy) ||
+			!bytes.Equal(command.DeclarationFingerprint[:], declarationFingerprint) {
+			t.Fatalf("replay/live command mismatch id=%s replay=%#v state=%s result=%s terminal=%v retry=%x fingerprint=%x",
+				commandID, command, state, result, terminalPosition, retryPolicy, declarationFingerprint)
 		}
 		seen++
 	}
@@ -88,6 +90,13 @@ func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.Execut
 	if seen != len(projected.Commands) {
 		t.Fatalf("replay/live command count = %d/%d", len(projected.Commands), seen)
 	}
+}
+
+func equalFailure(left, right *flow.Failure) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func equalInt64(left, right *int64) bool {

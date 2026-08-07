@@ -43,4 +43,7 @@ func TestRetryAfter(t *testing.T) {
 	if ValidateRetryAfter(RetryAfter(-time.Second, base)) == nil {
 		t.Fatal("negative retry delay accepted")
 	}
+	if ValidateRetryAfter(RetryAfter(time.Millisecond+time.Nanosecond, base)) == nil {
+		t.Fatal("fractional retry delay accepted")
+	}
 }

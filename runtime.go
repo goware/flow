@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/definition"
+	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/pgkit/v2"
@@ -48,6 +49,10 @@ func WithMaxCommandsPerExecution(max int) Option {
 	return runtimeOptionFunc(func(options *runtimeOptions) {
 		if max < 0 {
 			options.errs = append(options.errs, errors.New("maximum commands must not be negative"))
+			return
+		}
+		if err := durable.PostgresInteger("maximum commands", max, 0, durable.PostgresIntegerMax); err != nil {
+			options.errs = append(options.errs, err)
 			return
 		}
 		options.maxCommands = max
@@ -105,6 +110,10 @@ func withCommandLeaseForTest(lease time.Duration) Option {
 	return runtimeOptionFunc(func(options *runtimeOptions) {
 		if lease < 30*time.Millisecond {
 			options.errs = append(options.errs, errors.New("command lease must be at least 30 milliseconds"))
+			return
+		}
+		if _, err := durable.ExactMilliseconds("command lease", lease); err != nil {
+			options.errs = append(options.errs, err)
 			return
 		}
 		options.commandLease = lease

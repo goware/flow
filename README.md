@@ -84,6 +84,23 @@ func chargeWorker(ctx context.Context, work *flow.Work[chargeArgs]) (chargeResul
 
 Repeated declarations with the same key and canonical content coalesce. Conflicting declarations poison the complete decision. A `WithCommit` callback can update application tables in the same fenced transaction as Flow settlement.
 
+Choose command boundaries around independent retry, side effects, isolation,
+timeouts, queue ownership, or useful parallelism. Keep small deterministic
+transformations in the worker that owns them instead of turning every business
+logic microstep into durable work. Several small writes to the same PostgreSQL
+database can usually share one `WithCommit` callback. Keep that callback short
+and database-only: it holds the execution lock until settlement commits and is
+not an exactly-once boundary for remote calls.
+
+One execution is one serialized semantic aggregate. Keep causally related work
+together, but use separate executions for independent bulk items or shards
+instead of treating one execution as a tenant-wide work container. The default
+1,000-command ceiling is a safety limit, not a recommended execution size;
+ordinary executions are usually clearer in the tens or low hundreds. For a very
+large fan-out, have bounded batch commands declare later batches, and combine
+large input sets through hierarchical join commands rather than one enormous
+child declaration or join.
+
 ## Exact event gates and inputs
 
 A root or sub-command may wait for exact application events:
@@ -105,6 +122,12 @@ value, err := flow.GetEventValue(work, approved, "approval/42")
 
 Multiple waits are AND conditions. Matching is exact on event name and key within one execution. Events recorded before command declaration still satisfy the gate. `Within` starts at command creation and runs independently of `Delay`. At most 256 waits may be declared for one command; larger joins should use a tree of join commands or stable external references.
 
+Pass data computed by a parent directly in child arguments. Use exact events
+for sibling, cross-branch, or external facts, and stage related events and
+children in the same worker decision when they belong to one atomic change.
+Large or sensitive documents should remain in application storage; pass stable
+references through command arguments or event payloads.
+
 Flow has three event paths:
 
 | API | Use |
@@ -113,7 +136,7 @@ Flow has three event paths:
 | `event.Emit(ctx, client, id, ...)` | record an external event in a known execution |
 | `event.Deliver(ctx, client, id, ...)` | deliberately record a detached event in another known execution, including from an active worker |
 
-`Deliver` needs only the target execution ID. With `runtime.InTx(tx)`, it commits or rolls back with the caller's application writes; with a regular runtime client it commits independently. A committed delivery survives source failure and retry, so producers should use stable keys and deterministic payloads. Same-execution worker events should use staged `flow.Emit`: explicitly delivering to the current execution is detached and may survive a failed attempt. Delivery is targeted ingress, not publish/subscribe, and target workers remain at-least-once.
+`Deliver` needs only the target execution ID. With `runtime.InTx(tx)`, it commits or rolls back with the caller's application writes; with a regular runtime client it commits independently. Keep caller-owned transactions short: an execution lock remains held until the caller commits or rolls back. A committed delivery survives source failure and retry, so producers should use stable keys and deterministic payloads. Same-execution worker events should use staged `flow.Emit`: explicitly delivering to the current execution is detached and may survive a failed attempt. Delivery is targeted ingress, not publish/subscribe, and target workers remain at-least-once.
 
 Fan-out, fan-in, multi-stage joins, branches, and bounded loops are ordinary command composition. Flow intentionally has no separate coordinator/state-machine API, outcome subscriptions, OR/quorum/race gates, or automatic result dataflow.
 

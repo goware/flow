@@ -45,6 +45,48 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	if _, err := Fold([]store.JournalRow{badHash}); err == nil {
 		t.Fatal("Fold() accepted a bad body hash")
 	}
+	noncanonical := start
+	noncanonical.Body = append([]byte(" \n"), start.Body...)
+	noncanonical.BodyHash = sha256.Sum256(noncanonical.Body)
+	if _, err := Fold([]store.JournalRow{noncanonical}); err == nil {
+		t.Fatal("Fold() accepted a matching-hash noncanonical body")
+	}
+	duplicateKey := start
+	duplicateKey.Body = []byte(`{"v":1,"v":1}`)
+	duplicateKey.BodyHash = sha256.Sum256(duplicateKey.Body)
+	if _, err := Fold([]store.JournalRow{duplicateKey}); err == nil {
+		t.Fatal("Fold() accepted a matching-hash duplicate-key body")
+	}
+}
+
+func TestFoldValidatesApplicationEventBodies(t *testing.T) {
+	t.Parallel()
+
+	executionID := uuid.New()
+	start := row(t, executionID, 1, store.ExecutionStarted, nil, journalcodec.ExecutionStartedBody{
+		V: 1, ExecutionID: executionID.String(), DefinitionName: "work",
+		DefinitionVersion: 1, ExecutionKey: "key", Input: json.RawMessage(`{}`),
+		FailFast: true, DeadlineMode: "none", MaxCommands: 5, Metadata: json.RawMessage(`{}`),
+	})
+	application := row(t, executionID, 2, store.EventRecorded, nil, journalcodec.ApplicationEventBody{
+		V: 2, Payload: json.RawMessage(`{"value":"future"}`),
+	})
+	eventID := uuid.New()
+	namespace, name, key, class := "application", "event", "key", "application"
+	application.EventID = &eventID
+	application.EventNamespace = &namespace
+	application.EventName = &name
+	application.EventKey = &key
+	application.EventClass = &class
+	if _, err := Fold([]store.JournalRow{start, application}); err == nil {
+		t.Fatal("Fold() accepted an unknown application-event body version")
+	}
+
+	application.Body = []byte(`{"payload":{"duplicate":1,"duplicate":2},"v":1}`)
+	application.BodyHash = sha256.Sum256(application.Body)
+	if _, err := Fold([]store.JournalRow{start, application}); err == nil {
+		t.Fatal("Fold() accepted a matching-hash duplicate-key application payload")
+	}
 }
 
 func row(t *testing.T, executionID uuid.UUID, position int64, kind store.EntryKind, commandID *uuid.UUID, body any) store.JournalRow {

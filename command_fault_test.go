@@ -178,7 +178,7 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 		trace.Commands[0].Attempts[0].Classification != "lease_lost" ||
 		trace.Commands[0].Attempts[0].ConsumedBudget ||
 		trace.Commands[0].Attempts[1].Classification != "succeeded" ||
-		trace.Commands[0].FailureCode != "" {
+		trace.Commands[0].Failure != nil {
 		t.Fatalf("outage Trace = %#v", trace)
 	}
 	applicationEvents := 0

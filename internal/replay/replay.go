@@ -3,6 +3,7 @@
 package replay
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/canonical"
+	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/store/journalcodec"
 )
@@ -28,8 +31,7 @@ type Execution struct {
 	OpenCommands      int
 	RootCommandID     *uuid.UUID
 	LastPosition      int64
-	FailureCode       string
-	FailureMessage    string
+	Failure           *failure.Value
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	StatusAt          time.Time
@@ -42,28 +44,28 @@ type Execution struct {
 }
 
 type Command struct {
-	ID               uuid.UUID
-	Key              string
-	Name             string
-	Version          int
-	ParentCommandID  *uuid.UUID
-	Required         bool
-	State            string
-	Args             []byte
-	Queue            string
-	RetryPolicy      []byte
-	AttemptTimeoutMS *int64
-	InitialDelayMS   *int64
-	BudgetStartedAt  *time.Time
-	NextAttemptAt    *time.Time
-	Waits            []journalcodec.EventWaitBody
-	WithinMS         *int64
-	CreatedPosition  int64
-	TerminalPosition *int64
-	Result           []byte
-	FailureCode      string
-	FailureMessage   string
-	Attempts         []Attempt
+	ID                     uuid.UUID
+	Key                    string
+	Name                   string
+	Version                int
+	ParentCommandID        *uuid.UUID
+	Required               bool
+	State                  string
+	Args                   []byte
+	DeclarationFingerprint [sha256.Size]byte
+	Queue                  string
+	RetryPolicy            []byte
+	AttemptTimeoutMS       *int64
+	InitialDelayMS         *int64
+	BudgetStartedAt        *time.Time
+	NextAttemptAt          *time.Time
+	Waits                  []journalcodec.EventWaitBody
+	WithinMS               *int64
+	CreatedPosition        int64
+	TerminalPosition       *int64
+	Result                 []byte
+	Failure                *failure.Value
+	Attempts               []Attempt
 }
 
 type Attempt struct {
@@ -76,8 +78,7 @@ type Attempt struct {
 	ConsumedBudget   bool
 	ConsumedAttempts int
 	NextAttemptAt    *time.Time
-	ErrorCode        string
-	ErrorMessage     string
+	Failure          *failure.Value
 }
 
 type Event struct {
@@ -110,6 +111,13 @@ func (state *Execution) Apply(row store.JournalRow) error {
 	}
 	if sha256.Sum256(row.Body) != row.BodyHash {
 		return fmt.Errorf("journal body hash differs at position %d", row.Position)
+	}
+	canonicalBody, err := canonical.Canonicalize(row.Body, 0)
+	if err != nil {
+		return fmt.Errorf("journal body is invalid at position %d: %w", row.Position, err)
+	}
+	if !bytes.Equal(canonicalBody.Bytes, row.Body) {
+		return fmt.Errorf("journal body is noncanonical at position %d", row.Position)
 	}
 	if state.LastPosition == 0 {
 		if row.Position != 1 || row.Kind != store.ExecutionStarted {
@@ -161,10 +169,11 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		if err != nil || bodyID != *row.CommandID {
 			return errors.New("CommandCreated identity differs")
 		}
-		if _, err := hex.DecodeString(body.DeclarationFingerprint); err != nil {
+		declarationFingerprint, err := hex.DecodeString(body.DeclarationFingerprint)
+		if err != nil || len(declarationFingerprint) != sha256.Size {
 			return errors.New("CommandCreated declaration fingerprint is invalid")
 		}
-		state.Commands[bodyID] = Command{
+		command := Command{
 			ID: bodyID, Key: body.CommandKey, Name: body.Name, Version: body.Version,
 			Required: body.Required, State: body.InitialState,
 			Args: slices.Clone(body.Args), Queue: body.Queue, RetryPolicy: slices.Clone(body.RetryPolicy),
@@ -173,6 +182,8 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			BudgetStartedAt: pointerClone(body.BudgetStartedAt), NextAttemptAt: pointerClone(body.NextAttemptAt),
 			Waits: slices.Clone(body.Waits), WithinMS: pointerClone(body.WithinMS),
 		}
+		copy(command.DeclarationFingerprint[:], declarationFingerprint)
+		state.Commands[bodyID] = command
 		if body.ParentCommandID != "" {
 			parentID, err := uuid.Parse(body.ParentCommandID)
 			if err != nil {
@@ -246,8 +257,9 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			command.Attempts[index].ConsumedBudget = body.ConsumedBudget
 			command.Attempts[index].ConsumedAttempts = body.ConsumedAttempts
 			command.Attempts[index].NextAttemptAt = pointerClone(body.NextAttemptAt)
-			command.Attempts[index].ErrorCode = body.ErrorCode
-			command.Attempts[index].ErrorMessage = body.ErrorMessage
+			if body.ErrorCode != "" || body.ErrorMessage != "" {
+				command.Attempts[index].Failure = &failure.Value{Code: body.ErrorCode, Message: body.ErrorMessage}
+			}
 			found = true
 			break
 		}
@@ -284,6 +296,9 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		state.Events = append(state.Events, event)
 		switch *row.EventClass {
 		case "application":
+			if _, err := journalcodec.DecodeApplicationEvent(row.Body); err != nil {
+				return fmt.Errorf("application event body is invalid: %w", err)
+			}
 			// Exact wait readiness is projected operationally from retained rows.
 		case "command_terminal":
 			if row.CommandID == nil || row.TerminalStatus == nil {
@@ -306,11 +321,11 @@ func (state *Execution) Apply(row store.JournalRow) error {
 				if err != nil {
 					return err
 				}
-				command.FailureCode = body.Code
-				if command.FailureCode == "" {
-					command.FailureCode = *row.TerminalStatus
+				code := body.Code
+				if code == "" {
+					code = *row.TerminalStatus
 				}
-				command.FailureMessage = body.Reason
+				command.Failure = &failure.Value{Code: code, Message: body.Reason}
 			}
 			state.Commands[*row.CommandID] = command
 			state.OpenCommands--
@@ -326,11 +341,11 @@ func (state *Execution) Apply(row store.JournalRow) error {
 				if err != nil {
 					return err
 				}
-				state.FailureCode = body.Code
-				if state.FailureCode == "" {
-					state.FailureCode = *row.TerminalStatus
+				code := body.Code
+				if code == "" {
+					code = *row.TerminalStatus
 				}
-				state.FailureMessage = body.Reason
+				state.Failure = &failure.Value{Code: code, Message: body.Reason}
 			}
 		}
 	}

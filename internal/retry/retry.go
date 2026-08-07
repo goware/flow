@@ -1,6 +1,7 @@
 package retry
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/goware/flow/internal/canonical"
+	"github.com/goware/flow/internal/durable"
 )
 
 const DefaultJitter = 0.20
@@ -81,10 +83,10 @@ func DecidePublic(p PublicPolicy, input Input) (Decision, error) {
 }
 
 type DurablePolicy struct {
-	MaxAttempts *int            `json:"max_attempts,omitempty"`
-	MaxElapsed  *time.Duration  `json:"max_elapsed,omitempty"`
-	Backoff     []time.Duration `json:"backoff"`
-	Jitter      float64         `json:"jitter"`
+	MaxAttempts *int    `json:"max_attempts,omitempty"`
+	MaxElapsed  *int64  `json:"max_elapsed_ms,omitempty"`
+	Backoff     []int64 `json:"backoff_ms"`
+	Jitter      float64 `json:"jitter"`
 }
 
 func CanonicalPublic(p PublicPolicy) (canonical.Value, error) {
@@ -92,25 +94,72 @@ func CanonicalPublic(p PublicPolicy) (canonical.Value, error) {
 		return canonical.Value{}, err
 	}
 	value := ValueOf(p)
+	var maxElapsed *int64
+	if value.MaxElapsed != nil {
+		milliseconds, err := durable.ExactMilliseconds("retry elapsed bound", *value.MaxElapsed)
+		if err != nil {
+			return canonical.Value{}, err
+		}
+		maxElapsed = &milliseconds
+	}
+	backoff := make([]int64, len(value.Backoff))
+	for index, delay := range value.Backoff {
+		milliseconds, err := durable.ExactMilliseconds("retry backoff delay", delay)
+		if err != nil {
+			return canonical.Value{}, err
+		}
+		backoff[index] = milliseconds
+	}
 	return canonical.Marshal(DurablePolicy{
-		MaxAttempts: value.MaxAttempts, MaxElapsed: value.MaxElapsed,
-		Backoff: value.Backoff, Jitter: value.Jitter,
+		MaxAttempts: value.MaxAttempts, MaxElapsed: maxElapsed,
+		Backoff: backoff, Jitter: value.Jitter,
 	}, 16<<10)
 }
 
 func PublicFromCanonical(data []byte) (PublicPolicy, error) {
+	canonicalInput, err := canonical.Canonicalize(data, 16<<10)
+	if err != nil {
+		return PublicPolicy{}, err
+	}
+	if !bytes.Equal(canonicalInput.Bytes, data) {
+		return PublicPolicy{}, errors.New("retry policy encoding is not canonical")
+	}
 	var durable DurablePolicy
 	if err := canonical.Decode(data, &durable); err != nil {
 		return PublicPolicy{}, err
 	}
+	var maxElapsed *time.Duration
+	if durable.MaxElapsed != nil {
+		value, err := millisecondsDuration(*durable.MaxElapsed)
+		if err != nil {
+			return PublicPolicy{}, err
+		}
+		maxElapsed = &value
+	}
+	backoff := make([]time.Duration, len(durable.Backoff))
+	for index, milliseconds := range durable.Backoff {
+		value, err := millisecondsDuration(milliseconds)
+		if err != nil {
+			return PublicPolicy{}, err
+		}
+		backoff[index] = value
+	}
 	value := Policy{
-		MaxAttempts: durable.MaxAttempts, MaxElapsed: durable.MaxElapsed,
-		Backoff: slices.Clone(durable.Backoff), Jitter: durable.Jitter,
+		MaxAttempts: durable.MaxAttempts, MaxElapsed: maxElapsed,
+		Backoff: backoff, Jitter: durable.Jitter,
 	}
 	if err := value.Validate(); err != nil {
 		return PublicPolicy{}, err
 	}
-	return PublicPolicy{value: value}, nil
+	policy := PublicPolicy{value: value}
+	reencoded, err := CanonicalPublic(policy)
+	if err != nil {
+		return PublicPolicy{}, err
+	}
+	if !bytes.Equal(reencoded.Bytes, data) {
+		return PublicPolicy{}, errors.New("retry policy encoding does not match its canonical schema")
+	}
+	return policy, nil
 }
 
 type Policy struct {
@@ -164,8 +213,18 @@ func (p Policy) Validate() error {
 	if p.MaxAttempts != nil && *p.MaxAttempts <= 0 {
 		return errors.New("retry attempts must be positive")
 	}
+	if p.MaxAttempts != nil {
+		if err := durable.PostgresInteger("retry attempts", *p.MaxAttempts, 1, durable.PostgresIntegerMax); err != nil {
+			return err
+		}
+	}
 	if p.MaxElapsed != nil && *p.MaxElapsed <= 0 {
 		return errors.New("retry elapsed bound must be positive")
+	}
+	if p.MaxElapsed != nil {
+		if _, err := durable.ExactMilliseconds("retry elapsed bound", *p.MaxElapsed); err != nil {
+			return err
+		}
 	}
 	if len(p.Backoff) == 0 {
 		return errors.New("retry backoff must not be empty")
@@ -173,6 +232,9 @@ func (p Policy) Validate() error {
 	for _, delay := range p.Backoff {
 		if delay <= 0 {
 			return errors.New("retry backoff delays must be positive")
+		}
+		if _, err := durable.ExactMilliseconds("retry backoff delay", delay); err != nil {
+			return err
 		}
 	}
 	if math.IsNaN(p.Jitter) || math.IsInf(p.Jitter, 0) || p.Jitter < 0 || p.Jitter > 1 {
@@ -267,7 +329,10 @@ func Decide(policy Policy, input Input) (Decision, error) {
 		}, nil
 	}
 
-	consumed := input.ConsumedAttempts + 1
+	consumed, err := durable.AddPostgresInteger("consumed attempts", input.ConsumedAttempts, 1, 0, durable.PostgresIntegerMax)
+	if err != nil {
+		return Decision{}, err
+	}
 	decision := Decision{ConsumesAttempt: true, ConsumedAttempts: consumed}
 	if input.Classification == ClassPermanent {
 		decision.StopReason = "permanent"
@@ -278,7 +343,10 @@ func Decide(policy Policy, input Input) (Decision, error) {
 		return decision, nil
 	}
 
-	deadline, hasDeadline := effectiveDeadline(policy, input)
+	deadline, hasDeadline, err := effectiveDeadline(policy, input)
+	if err != nil {
+		return Decision{}, err
+	}
 	if hasDeadline && !input.DBNow.Before(deadline) {
 		decision.StopReason = "elapsed_limit"
 		return decision, nil
@@ -288,9 +356,9 @@ func Decide(policy Policy, input Input) (Decision, error) {
 	if err != nil {
 		return Decision{}, err
 	}
-	next := input.DBNow.Add(delay)
-	if next.Before(input.DBNow) {
-		return Decision{}, errors.New("retry delay overflows time")
+	next, err := durable.AddExactDuration("retry delay", input.DBNow, delay)
+	if err != nil {
+		return Decision{}, err
 	}
 	if hasDeadline && !next.Before(deadline) {
 		decision.StopReason = "deadline_before_next_attempt"
@@ -301,21 +369,28 @@ func Decide(policy Policy, input Input) (Decision, error) {
 	return decision, nil
 }
 
-func effectiveDeadline(policy Policy, input Input) (time.Time, bool) {
+func effectiveDeadline(policy Policy, input Input) (time.Time, bool, error) {
 	var deadline time.Time
 	if policy.MaxElapsed != nil {
-		deadline = input.BudgetStartedAt.Add(*policy.MaxElapsed)
+		var err error
+		deadline, err = durable.AddExactDuration("retry elapsed bound", input.BudgetStartedAt, *policy.MaxElapsed)
+		if err != nil {
+			return time.Time{}, false, err
+		}
 	}
 	if input.ExecutionDeadline != nil && (deadline.IsZero() || input.ExecutionDeadline.Before(deadline)) {
 		deadline = *input.ExecutionDeadline
 	}
-	return deadline, !deadline.IsZero()
+	return deadline, !deadline.IsZero(), nil
 }
 
 func retryDelay(policy Policy, input Input, consumed int) (time.Duration, error) {
 	if input.Classification == ClassRetryAfter {
 		if input.ExplicitDelay == nil || *input.ExplicitDelay <= 0 {
 			return 0, errors.New("retry-after conclusion requires a positive delay")
+		}
+		if _, err := durable.ExactMilliseconds("retry-after delay", *input.ExplicitDelay); err != nil {
+			return 0, err
 		}
 		return *input.ExplicitDelay, nil
 	}
@@ -330,13 +405,29 @@ func retryDelay(policy Policy, input Input, consumed int) (time.Duration, error)
 	unit := deterministicUnit(input.AttemptID, policy.Fingerprint())
 	// Full proportional jitter centered on the configured delay.
 	factor := 1 - policy.Jitter + 2*policy.Jitter*unit
-	delay := time.Duration(math.Round(float64(base) * factor))
-	if delay <= 0 {
+	baseMilliseconds := int64(base / time.Millisecond)
+	delayMilliseconds := math.Round(float64(baseMilliseconds) * factor)
+	maximumMilliseconds := float64(math.MaxInt64 / int64(time.Millisecond))
+	if delayMilliseconds > maximumMilliseconds {
+		return 0, errors.New("retry jitter delay overflows duration")
+	}
+	if delayMilliseconds < 1 {
 		// Jitter(1) has a closed lower bound of zero. Keep the durable retry
 		// schedule strictly increasing even for that valid extreme.
-		delay = time.Nanosecond
+		delayMilliseconds = 1
 	}
-	return delay, nil
+	return durable.MillisecondsDuration("retry jitter delay", int64(delayMilliseconds))
+}
+
+func millisecondsDuration(milliseconds int64) (time.Duration, error) {
+	if milliseconds <= 0 {
+		return 0, errors.New("retry duration milliseconds are out of range")
+	}
+	value, err := durable.MillisecondsDuration("retry duration", milliseconds)
+	if err != nil {
+		return 0, errors.New("retry duration milliseconds are out of range")
+	}
+	return value, nil
 }
 
 func deterministicUnit(attemptID string, policyHash [sha256.Size]byte) float64 {

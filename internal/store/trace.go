@@ -2,11 +2,11 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/jackc/pgx/v5"
@@ -22,8 +22,7 @@ type TraceCommandRow struct {
 	WaitDeadlineAt   *time.Time
 	AttemptOrdinal   int
 	ConsumedAttempts int
-	LastErrorCode    string
-	LastErrorMessage string
+	LastError        *failure.Value
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	StatusAt         time.Time
@@ -84,7 +83,7 @@ func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUI
 		if leaseOwner != nil {
 			value.LeaseOwner = *leaseOwner
 		}
-		if err := decodeTraceFailure(lastError, &value.LastErrorCode, &value.LastErrorMessage); err != nil {
+		if err := decodeTraceFailure(lastError, &value.LastError); err != nil {
 			rows.Close()
 			return TraceOperationalRows{}, err
 		}
@@ -121,17 +120,11 @@ func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUI
 	return result, nil
 }
 
-func decodeTraceFailure(value []byte, code, message *string) error {
-	if len(value) == 0 || string(value) == "null" {
-		return nil
-	}
-	var failure struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(value, &failure); err != nil {
+func decodeTraceFailure(value []byte, target **failure.Value) error {
+	decoded, err := failure.Decode(value)
+	if err != nil {
 		return fmt.Errorf("%w: invalid command error projection", flowerr.ErrInvalidState)
 	}
-	*code, *message = failure.Code, failure.Message
+	*target = decoded
 	return nil
 }

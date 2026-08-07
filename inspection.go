@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/definition"
+	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/store"
 )
 
@@ -23,7 +24,7 @@ const (
 type ExecutionFilter struct {
 	Type          string
 	KeyPrefix     string
-	Statuses      []string
+	Statuses      []ExecutionStatus
 	CreatedAfter  *time.Time
 	CreatedBefore *time.Time
 	Metadata      map[string]string
@@ -54,7 +55,7 @@ func GetExecution(ctx context.Context, c Client, id ExecutionID) (Execution, err
 	if err != nil {
 		return Execution{}, err
 	}
-	return executionFromStore(row), nil
+	return executionFromStore(row)
 }
 
 // LookupLiveExecution finds the one non-terminal execution currently holding
@@ -77,7 +78,8 @@ func LookupLiveExecution(ctx context.Context, c Client, typ, key string) (Execut
 	if err != nil || !found {
 		return Execution{}, false, err
 	}
-	return executionFromStore(row), true, nil
+	execution, err := executionFromStore(row)
+	return execution, err == nil, err
 }
 
 func ListExecutions(ctx context.Context, c Client, filter ExecutionFilter) (ExecutionPage, error) {
@@ -137,7 +139,10 @@ func ListExecutions(ctx context.Context, c Client, filter ExecutionFilter) (Exec
 	}
 	page := ExecutionPage{Executions: make([]Execution, min(len(rows), pageSize))}
 	for i := range page.Executions {
-		page.Executions[i] = executionFromStore(rows[i])
+		page.Executions[i], err = executionFromStore(rows[i])
+		if err != nil {
+			return ExecutionPage{}, err
+		}
 	}
 	if len(rows) > pageSize {
 		last := rows[pageSize-1]
@@ -183,44 +188,46 @@ func AwaitExecution(ctx context.Context, c Client, id ExecutionID) (Execution, e
 	}
 }
 
-func executionFromStore(row store.ExecutionRow) Execution {
+func executionFromStore(row store.ExecutionRow) (Execution, error) {
+	status, err := executionStatusFromString(row.Status)
+	if err != nil {
+		return Execution{}, newError(ErrInvalidState, "decode", "execution status", row.Status, "stored status is unknown")
+	}
+	if row.RootCommandID == nil {
+		return Execution{}, newError(ErrInvalidState, "decode", "root command", row.ID.String(), "stored root command is missing")
+	}
 	exec := Execution{
 		ID: ExecutionID(row.ID.String()), Type: row.DefinitionName, Version: row.DefinitionVersion,
-		Key: row.Key, Status: row.Status, FailFast: row.FailFast, MaxCommands: row.MaxCommands,
-		CommandCount: row.CommandCount, OpenCommands: row.OpenCommands,
-		DeadlineAt:  cloneTimePointer(row.DeadlineAt),
-		FailureCode: row.FailureCode, FailureMessage: row.FailureMessage,
+		Key: row.Key, Status: status, FailFast: row.FailFast, MaxCommands: row.MaxCommands,
+		RootCommandID: CommandID(row.RootCommandID.String()),
+		CommandCount:  row.CommandCount, OpenCommands: row.OpenCommands,
+		DeadlineAt: cloneTimePointer(row.DeadlineAt), Failure: failure.Clone(row.Failure),
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StatusAt: row.StatusAt,
 		FinishedAt: cloneTimePointer(row.FinishedAt), Metadata: json.RawMessage(append([]byte(nil), row.Metadata...)),
 	}
-	if row.RootCommandID != nil {
-		exec.RootCommandID = CommandID(row.RootCommandID.String())
-	}
-	return exec
+	return exec, nil
 }
 
-func validateExecutionStatuses(values []string) ([]string, error) {
-	allowed := map[string]struct{}{
-		"running": {}, "failing": {}, "succeeded": {}, "failed": {}, "cancelled": {}, "expired": {},
-	}
+func validateExecutionStatuses(values []ExecutionStatus) ([]string, error) {
 	seen := make(map[string]struct{}, len(values))
 	result := make([]string, 0, len(values))
 	for _, value := range values {
-		if _, ok := allowed[value]; !ok {
-			return nil, newError(ErrInvalid, "list", "status", value, "unknown execution status")
+		if _, err := executionStatusFromString(string(value)); err != nil {
+			return nil, newError(ErrInvalid, "list", "status", string(value), "unknown execution status")
 		}
-		if _, ok := seen[value]; ok {
+		encoded := string(value)
+		if _, ok := seen[encoded]; ok {
 			continue
 		}
-		seen[value] = struct{}{}
-		result = append(result, value)
+		seen[encoded] = struct{}{}
+		result = append(result, encoded)
 	}
 	return result, nil
 }
 
-func isTerminalExecutionStatus(status string) bool {
+func isTerminalExecutionStatus(status ExecutionStatus) bool {
 	switch status {
-	case "succeeded", "failed", "cancelled", "expired":
+	case ExecutionStatusSucceeded, ExecutionStatusFailed, ExecutionStatusCancelled, ExecutionStatusExpired:
 		return true
 	default:
 		return false

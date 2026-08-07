@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/replay"
 	"github.com/goware/flow/internal/store"
 	"github.com/jackc/pgx/v5"
@@ -18,25 +19,24 @@ import (
 // the producing Execute call created the execution; it is false for an
 // idempotent rediscovery and always false on inspection reads.
 type Execution struct {
-	ID             ExecutionID
-	Type           string
-	Version        int
-	Key            string
-	RootCommandID  CommandID
-	Status         string
-	FailFast       bool
-	MaxCommands    int
-	CommandCount   int
-	OpenCommands   int
-	DeadlineAt     *time.Time
-	FailureCode    string
-	FailureMessage string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	StatusAt       time.Time
-	FinishedAt     *time.Time
-	Metadata       json.RawMessage
-	Created        bool
+	ID            ExecutionID
+	Type          string
+	Version       int
+	Key           string
+	RootCommandID CommandID
+	Status        ExecutionStatus
+	FailFast      bool
+	MaxCommands   int
+	CommandCount  int
+	OpenCommands  int
+	DeadlineAt    *time.Time
+	Failure       *Failure
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	StatusAt      time.Time
+	FinishedAt    *time.Time
+	Metadata      json.RawMessage
+	Created       bool
 }
 
 type TraceAttempt struct {
@@ -49,8 +49,7 @@ type TraceAttempt struct {
 	ConsumedBudget   bool
 	ConsumedAttempts int
 	NextAttemptAt    *time.Time
-	ErrorCode        string
-	ErrorMessage     string
+	Failure          *Failure
 }
 
 type TraceCommand struct {
@@ -60,7 +59,7 @@ type TraceCommand struct {
 	Version          int
 	ParentCommandID  CommandID
 	Required         bool
-	State            string
+	State            CommandStatus
 	Args             json.RawMessage
 	Result           json.RawMessage
 	Queue            string
@@ -71,16 +70,14 @@ type TraceCommand struct {
 	Waits            []TraceEventWait
 	CreatedPosition  JournalPosition
 	TerminalPosition *JournalPosition
-	FailureCode      string
-	FailureMessage   string
-	LastErrorCode    string
-	LastErrorMessage string
+	Failure          *Failure
+	LastError        *Failure
 	UnsatisfiedWaits int
 	AttemptOrdinal   int
 	ConsumedAttempts int
 	WaitStartedAt    *time.Time
 	WaitDeadlineAt   *time.Time
-	DeliveryState    string
+	DeliveryState    QueueState
 	LeaseOwner       string
 	LeaseStartedAt   *time.Time
 	LeaseExpiresAt   *time.Time
@@ -104,7 +101,7 @@ type TraceEvent struct {
 	Name              string
 	Key               string
 	Class             string
-	TerminalStatus    string
+	TerminalStatus    TerminalStatus
 	CommandID         CommandID
 	RecordedAt        time.Time
 	CausationPosition *JournalPosition
@@ -182,7 +179,15 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 	if err != nil {
 		return ExecutionTrace{}, err
 	}
-	result := ExecutionTrace{Execution: executionFromStore(live), History: historyEntries(rows)}
+	execution, err := executionFromStore(live)
+	if err != nil {
+		return ExecutionTrace{}, err
+	}
+	history, err := historyEntries(rows)
+	if err != nil {
+		return ExecutionTrace{}, err
+	}
+	result := ExecutionTrace{Execution: execution, History: history}
 	operational, err := client.runtime.store.TraceOperationalInTx(ctx, client.tx, executionID)
 	if err != nil {
 		return ExecutionTrace{}, err
@@ -197,22 +202,32 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 	}
 	result.Commands = make([]TraceCommand, 0, len(state.Commands))
 	for _, command := range state.Commands {
+		status, err := commandStatusFromString(command.State)
+		if err != nil {
+			return ExecutionTrace{}, newError(ErrInvalidState, "trace", "command status", command.State, "replayed status is unknown")
+		}
 		item := TraceCommand{
 			ID: CommandID(command.ID.String()), Key: command.Key, Name: command.Name, Version: command.Version,
-			Required: command.Required, State: command.State,
+			Required: command.Required, State: status,
 			Args: json.RawMessage(append([]byte(nil), command.Args...)), Result: json.RawMessage(append([]byte(nil), command.Result...)),
 			Queue: command.Queue, CreatedPosition: JournalPosition(command.CreatedPosition),
 			BudgetStartedAt: cloneTimePointer(command.BudgetStartedAt), NextAttemptAt: cloneTimePointer(command.NextAttemptAt),
-			FailureCode: command.FailureCode, FailureMessage: command.FailureMessage,
+			Failure: cloneFailure(command.Failure),
 		}
 		if command.ParentCommandID != nil {
 			item.ParentCommandID = CommandID(command.ParentCommandID.String())
 		}
 		if command.InitialDelayMS != nil {
-			item.InitialDelay = time.Duration(*command.InitialDelayMS) * time.Millisecond
+			item.InitialDelay, err = durable.MillisecondsDuration("replayed command initial delay", *command.InitialDelayMS)
+			if err != nil {
+				return ExecutionTrace{}, newError(ErrInvalidState, "trace", "initial delay", "", "replayed duration is out of range")
+			}
 		}
 		if command.WithinMS != nil {
-			item.Within = time.Duration(*command.WithinMS) * time.Millisecond
+			item.Within, err = durable.MillisecondsDuration("replayed command within", *command.WithinMS)
+			if err != nil {
+				return ExecutionTrace{}, newError(ErrInvalidState, "trace", "within", "", "replayed duration is out of range")
+			}
 		}
 		for _, wait := range command.Waits {
 			traceWait := TraceEventWait{Name: wait.Name, Key: wait.Key}
@@ -227,14 +242,23 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 			item.TerminalPosition = &position
 		}
 		if current, ok := operationalCommands[command.ID.String()]; ok {
-			item.State = current.State
+			item.State, err = commandStatusFromString(current.State)
+			if err != nil {
+				return ExecutionTrace{}, newError(ErrInvalidState, "trace", "command status", current.State, "stored status is unknown")
+			}
 			item.BudgetStartedAt = cloneTimePointer(current.BudgetStartedAt)
 			item.NextAttemptAt = cloneTimePointer(current.NextAttemptAt)
-			item.LastErrorCode, item.LastErrorMessage = current.LastErrorCode, current.LastErrorMessage
+			item.LastError = cloneFailure(current.LastError)
 			item.UnsatisfiedWaits = current.UnsatisfiedWaits
 			item.AttemptOrdinal, item.ConsumedAttempts = current.AttemptOrdinal, current.ConsumedAttempts
 			item.WaitStartedAt, item.WaitDeadlineAt = cloneTimePointer(current.WaitStartedAt), cloneTimePointer(current.WaitDeadlineAt)
-			item.DeliveryState, item.LeaseOwner = current.DeliveryState, current.LeaseOwner
+			if current.DeliveryState != "" {
+				item.DeliveryState, err = queueStateFromString(current.DeliveryState)
+				if err != nil {
+					return ExecutionTrace{}, newError(ErrInvalidState, "trace", "queue state", current.DeliveryState, "stored state is unknown")
+				}
+			}
+			item.LeaseOwner = current.LeaseOwner
 			item.LeaseStartedAt, item.LeaseExpiresAt = cloneTimePointer(current.LeaseStartedAt), cloneTimePointer(current.LeaseExpiresAt)
 			item.CreatedAt, item.UpdatedAt, item.StatusAt = current.CreatedAt, current.UpdatedAt, current.StatusAt
 			item.FinishedAt = cloneTimePointer(current.FinishedAt)
@@ -246,7 +270,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 				FinishedAt: cloneTimePointer(attempt.FinishedAt), Worker: attempt.Worker,
 				Classification: attempt.Classification, ConsumedBudget: attempt.ConsumedBudget,
 				ConsumedAttempts: attempt.ConsumedAttempts, NextAttemptAt: cloneTimePointer(attempt.NextAttemptAt),
-				ErrorCode: attempt.ErrorCode, ErrorMessage: attempt.ErrorMessage,
+				Failure: cloneFailure(attempt.Failure),
 			}
 		}
 		result.Commands = append(result.Commands, item)
@@ -259,10 +283,17 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 	}
 	for _, event := range state.Events {
 		entry := historyByPosition[JournalPosition(event.Position)]
+		var terminalStatus TerminalStatus
+		if event.TerminalStatus != "" {
+			terminalStatus, err = terminalStatusFromString(event.TerminalStatus)
+			if err != nil {
+				return ExecutionTrace{}, newError(ErrInvalidState, "trace", "terminal status", event.TerminalStatus, "replayed status is unknown")
+			}
+		}
 		item := TraceEvent{
 			ID: EventID(event.ID.String()), Position: JournalPosition(event.Position), Namespace: event.Namespace,
 			Name: event.Name, Key: event.Key, Class: event.Class,
-			TerminalStatus: event.TerminalStatus, RecordedAt: entry.RecordedAt,
+			TerminalStatus: terminalStatus, RecordedAt: entry.RecordedAt,
 			CausationPosition: cloneJournalPosition(entry.CausationPosition),
 			Body:              json.RawMessage(append([]byte(nil), event.Body...)),
 		}

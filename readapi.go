@@ -18,13 +18,13 @@ type LiveWork struct {
 	ExecutionID      ExecutionID
 	DefinitionName   string
 	ExecutionKey     string
-	KeyScope         string
-	ExecutionStatus  string
+	KeyScope         KeyScope
+	ExecutionStatus  ExecutionStatus
 	CommandID        CommandID
 	CommandKey       string
 	CommandName      string
 	Queue            string
-	QueueState       string
+	QueueState       QueueState
 	NextRunAt        time.Time
 	LeaseOwner       string
 	LeaseExpiresAt   *time.Time
@@ -47,17 +47,29 @@ func LiveWorkByKeys(ctx context.Context, c Client, keys []string) ([]LiveWork, e
 	}
 	work := make([]LiveWork, len(rows))
 	for index, row := range rows {
+		keyScope, err := keyScopeFromString(row.KeyScope)
+		if err != nil {
+			return nil, newError(ErrInvalidState, "decode", "key scope", row.KeyScope, "stored key scope is unknown")
+		}
+		executionStatus, err := executionStatusFromString(row.ExecutionStatus)
+		if err != nil {
+			return nil, newError(ErrInvalidState, "decode", "execution status", row.ExecutionStatus, "stored status is unknown")
+		}
+		queueState, err := queueStateFromString(row.QueueState)
+		if err != nil {
+			return nil, newError(ErrInvalidState, "decode", "queue state", row.QueueState, "stored state is unknown")
+		}
 		work[index] = LiveWork{
 			ExecutionID:      ExecutionID(row.ExecutionID.String()),
 			DefinitionName:   row.DefinitionName,
 			ExecutionKey:     row.ExecutionKey,
-			KeyScope:         row.KeyScope,
-			ExecutionStatus:  row.ExecutionStatus,
+			KeyScope:         keyScope,
+			ExecutionStatus:  executionStatus,
 			CommandID:        CommandID(row.CommandID.String()),
 			CommandKey:       row.CommandKey,
 			CommandName:      row.CommandName,
 			Queue:            row.Queue,
-			QueueState:       row.QueueState,
+			QueueState:       queueState,
 			NextRunAt:        row.NextRunAt,
 			AttemptOrdinal:   row.AttemptOrdinal,
 			CommandCreatedAt: row.CommandCreatedAt,
@@ -77,7 +89,7 @@ func LiveWorkByKeys(ctx context.Context, c Client, keys []string) ([]LiveWork, e
 type KeyedHistoryEntry struct {
 	DefinitionName string
 	ExecutionKey   string
-	KeyScope       string
+	KeyScope       KeyScope
 	HistoryEntry
 }
 
@@ -96,11 +108,19 @@ func HistoryByKeys(ctx context.Context, c Client, keys []string) ([]KeyedHistory
 	}
 	entries := make([]KeyedHistoryEntry, len(rows))
 	for index, row := range rows {
+		keyScope, err := keyScopeFromString(row.KeyScope)
+		if err != nil {
+			return nil, newError(ErrInvalidState, "decode", "key scope", row.KeyScope, "stored key scope is unknown")
+		}
+		history, err := historyEntries([]store.JournalRow{row.Entry})
+		if err != nil {
+			return nil, err
+		}
 		entries[index] = KeyedHistoryEntry{
 			DefinitionName: row.DefinitionName,
 			ExecutionKey:   row.ExecutionKey,
-			KeyScope:       row.KeyScope,
-			HistoryEntry:   historyEntries([]store.JournalRow{row.Entry})[0],
+			KeyScope:       keyScope,
+			HistoryEntry:   history[0],
 		}
 	}
 	return entries, nil

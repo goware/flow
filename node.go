@@ -3,6 +3,8 @@ package flow
 import (
 	"slices"
 	"time"
+
+	"github.com/goware/flow/internal/durable"
 )
 
 // Node is an ephemeral builder for a command staged by a worker decision. It
@@ -47,6 +49,10 @@ func (node *Node) Within(duration time.Duration) *Node {
 		node.poison(newError(ErrInvalid, "execute", "within", node.key, "within must be at least one millisecond"))
 		return node
 	}
+	if _, err := durable.ExactMilliseconds("within", duration); err != nil {
+		node.poison(newError(ErrInvalid, "execute", "within", node.key, err.Error()))
+		return node
+	}
 	if command, ok := node.decisionCommand("within"); ok {
 		if command.within == duration {
 			return node
@@ -67,6 +73,10 @@ func (node *Node) Delay(duration time.Duration) *Node {
 	}
 	if duration < time.Millisecond {
 		node.poison(newError(ErrInvalid, "execute", "delay", node.key, "delay must be at least one millisecond"))
+		return node
+	}
+	if _, err := durable.ExactMilliseconds("delay", duration); err != nil {
+		node.poison(newError(ErrInvalid, "execute", "delay", node.key, err.Error()))
 		return node
 	}
 	if command, ok := node.decisionCommand("delay"); ok {

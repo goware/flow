@@ -89,13 +89,15 @@ func ParseNotificationHint(payload string) (uuid.UUID, bool) {
 }
 
 type SemanticTx struct {
-	store       *Store
-	tx          pgx.Tx
-	executionID uuid.UUID
-	dbNow       time.Time
-	closed      bool
-	applied     bool
-	failed      bool
+	store             *Store
+	tx                pgx.Tx
+	executionID       uuid.UUID
+	dbNow             time.Time
+	closed            bool
+	applied           bool
+	notificationSent  bool
+	notificationOwner *SemanticTx
+	failed            bool
 }
 
 func (s *Store) BeginSemantic(ctx context.Context, id uuid.UUID, mode LockMode) (*SemanticTx, error) {
@@ -236,28 +238,23 @@ func (tx *SemanticTx) Apply(ctx context.Context, changes PersistedChangeSet) (Ap
 	if len(changes.Journal) == 0 {
 		return ApplyResult{}, fmt.Errorf("%w: semantic change set is empty", flowerr.ErrInvalid)
 	}
-	if err := validateJournalBatch(changes.Journal); err != nil {
+	minimumFirstPosition, err := validateJournalBatch(changes.Journal)
+	if err != nil {
 		return ApplyResult{}, err
 	}
-	first, err := tx.nextJournalPosition(ctx)
+	first, err := tx.reserveJournal(ctx, len(changes.Journal), minimumFirstPosition)
 	if err != nil {
+		tx.failed = true
 		return ApplyResult{}, err
 	}
 	rows := make([]JournalRow, len(changes.Journal))
 	copyRows := make([][]any, len(changes.Journal))
 	for i, entry := range changes.Journal {
 		position := first + int64(i)
-		causation, err := resolveCausation(entry, first, i)
-		if err != nil {
-			return ApplyResult{}, err
-		}
+		causation := resolveValidatedCausation(entry, first)
 		row := rowFromEntry(tx.executionID, position, tx.dbNow, causation, entry)
 		rows[i] = row
 		copyRows[i] = row.copyValues()
-	}
-	if err := tx.reserveJournal(ctx, first, len(changes.Journal)); err != nil {
-		tx.failed = true
-		return ApplyResult{}, err
 	}
 	count, err := tx.tx.CopyFrom(ctx,
 		pgx.Identifier{tx.store.schema, "flow_journal"}, journalColumns, pgx.CopyFromRows(copyRows))
@@ -269,48 +266,71 @@ func (tx *SemanticTx) Apply(ctx context.Context, changes PersistedChangeSet) (Ap
 		tx.failed = true
 		return ApplyResult{}, fmt.Errorf("%w: journal batch inserted %d of %d rows", flowerr.ErrInvalidState, count, len(copyRows))
 	}
-	if tx.store.notifications {
-		payload := `{"v":1,"kind":"execution","key":"` + tx.executionID.String() + `"}`
-		if _, err := tx.tx.Exec(ctx, `SELECT pg_notify($1, $2)`, tx.store.notificationChannel, payload); err != nil {
-			tx.failed = true
-			return ApplyResult{}, MapError("emit notification hint", err)
-		}
-	}
 	tx.applied = true
 	return ApplyResult{Journal: cloneJournalRows(rows)}, nil
 }
 
+// NotifyRunnableCommands emits one transactional latency hint after a store
+// operation has created work that is runnable at DBNow. Polling remains the
+// correctness mechanism, and callers must not use this for journal-only or
+// future-scheduled transitions.
+func (tx *SemanticTx) NotifyRunnableCommands(ctx context.Context) error {
+	if err := tx.ensureOpen("notify runnable commands"); err != nil {
+		return err
+	}
+	if !tx.store.notifications {
+		return nil
+	}
+	notificationState := tx
+	if tx.notificationOwner != nil {
+		notificationState = tx.notificationOwner
+	}
+	if notificationState.notificationSent {
+		return nil
+	}
+	payload := `{"v":1,"kind":"execution","key":"` + tx.executionID.String() + `"}`
+	if _, err := tx.tx.Exec(ctx, `SELECT pg_notify($1, $2)`, tx.store.notificationChannel, payload); err != nil {
+		tx.failed = true
+		return MapError("notify runnable commands", err)
+	}
+	notificationState.notificationSent = true
+	return nil
+}
+
 func (tx *SemanticTx) continueBatch() *SemanticTx {
+	notificationOwner := tx
+	if tx.notificationOwner != nil {
+		notificationOwner = tx.notificationOwner
+	}
 	return &SemanticTx{
 		store: tx.store, tx: tx.tx, executionID: tx.executionID, dbNow: tx.dbNow,
+		notificationOwner: notificationOwner,
 	}
 }
 
-func (tx *SemanticTx) nextJournalPosition(ctx context.Context) (int64, error) {
-	var next int64
-	if err := tx.tx.QueryRow(ctx, `SELECT next_journal_position FROM `+
-		pgschema.Table(tx.store.schema, "flow_executions")+` WHERE execution_id=$1`, tx.executionID).Scan(&next); err != nil {
-		return 0, MapError("read journal position", err)
-	}
-	return next, nil
-}
-
-func (tx *SemanticTx) reserveJournal(ctx context.Context, expected int64, count int) error {
+func (tx *SemanticTx) reserveJournal(ctx context.Context, count int, minimumFirstPosition int64) (int64, error) {
 	if count <= 0 {
-		return fmt.Errorf("%w: journal reservation must be positive", flowerr.ErrInvalid)
+		return 0, fmt.Errorf("%w: journal reservation must be positive", flowerr.ErrInvalid)
 	}
 	var first int64
+	// The lower bound is derived from absolute causation positions during
+	// batch validation. It is not an allocator compare-and-swap: it preserves
+	// backward causation without a position pre-read and without leaving a
+	// caller-owned transaction able to commit a rejected reservation.
 	err := tx.tx.QueryRow(ctx, `UPDATE `+pgschema.Table(tx.store.schema, "flow_executions")+`
 		SET next_journal_position=next_journal_position+$2, updated_at=$3
-		WHERE execution_id=$1 AND next_journal_position=$4
-		RETURNING next_journal_position-$2`, tx.executionID, count, tx.dbNow, expected).Scan(&first)
+		WHERE execution_id=$1 AND next_journal_position >= $4
+		RETURNING next_journal_position-$2`, tx.executionID, count, tx.dbNow, minimumFirstPosition).Scan(&first)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("%w: journal allocator is missing or precedes causation", flowerr.ErrInvalidState)
+	}
 	if err != nil {
-		return MapError("reserve journal", err)
+		return 0, MapError("reserve journal", err)
 	}
-	if first != expected {
-		return fmt.Errorf("%w: journal allocator changed while execution was locked", flowerr.ErrInvalidState)
+	if first < 1 {
+		return 0, fmt.Errorf("%w: journal allocator returned a non-positive position", flowerr.ErrInvalidState)
 	}
-	return nil
+	return first, nil
 }
 
 func (tx *SemanticTx) Commit(ctx context.Context) error {
@@ -456,28 +476,41 @@ func scanJournalRow(row pgx.Row) (JournalRow, error) {
 	return result, nil
 }
 
-func validateJournalBatch(entries []JournalEntry) error {
+func validateJournalBatch(entries []JournalEntry) (int64, error) {
 	seen := make(map[uuid.UUID]struct{}, len(entries))
+	minimumFirstPosition := int64(1)
 	for index, entry := range entries {
 		if entry.EntryID == uuid.Nil {
-			return fmt.Errorf("%w: journal entry %d has nil ID", flowerr.ErrInvalid, index)
+			return 0, fmt.Errorf("%w: journal entry %d has nil ID", flowerr.ErrInvalid, index)
 		}
 		if _, ok := seen[entry.EntryID]; ok {
-			return fmt.Errorf("%w: duplicate journal entry ID", flowerr.ErrConflict)
+			return 0, fmt.Errorf("%w: duplicate journal entry ID", flowerr.ErrConflict)
 		}
 		seen[entry.EntryID] = struct{}{}
 		if !validEntryKind(entry.Kind) {
-			return fmt.Errorf("%w: invalid journal entry kind", flowerr.ErrInvalid)
+			return 0, fmt.Errorf("%w: invalid journal entry kind", flowerr.ErrInvalid)
 		}
 		canonicalBody, err := canonical.Canonicalize(entry.Body.Bytes, 0)
 		if err != nil || canonicalBody.Digest != entry.Body.Digest || !bytes.Equal(canonicalBody.Bytes, entry.Body.Bytes) {
-			return fmt.Errorf("%w: journal body is not canonical or its hash differs", flowerr.ErrInvalid)
+			return 0, fmt.Errorf("%w: journal body is not canonical or its hash differs", flowerr.ErrInvalid)
 		}
 		if entry.CausationPosition != nil && entry.CausationBatchIndex != nil {
-			return fmt.Errorf("%w: journal entry has two causation forms", flowerr.ErrInvalid)
+			return 0, fmt.Errorf("%w: journal entry has two causation forms", flowerr.ErrInvalid)
+		}
+		if entry.CausationBatchIndex != nil && (*entry.CausationBatchIndex < 0 || *entry.CausationBatchIndex >= index) {
+			return 0, fmt.Errorf("%w: batch causation must name an earlier entry", flowerr.ErrInvalid)
+		}
+		if entry.CausationPosition != nil {
+			if *entry.CausationPosition < 1 || *entry.CausationPosition == math.MaxInt64 {
+				return 0, fmt.Errorf("%w: causation position must precede its entry", flowerr.ErrInvalid)
+			}
+			requiredFirst := *entry.CausationPosition - int64(index) + 1
+			if requiredFirst > minimumFirstPosition {
+				minimumFirstPosition = requiredFirst
+			}
 		}
 	}
-	return nil
+	return minimumFirstPosition, nil
 }
 
 func validEntryKind(kind EntryKind) bool {
@@ -490,21 +523,12 @@ func validEntryKind(kind EntryKind) bool {
 	}
 }
 
-func resolveCausation(entry JournalEntry, first int64, index int) (*int64, error) {
+func resolveValidatedCausation(entry JournalEntry, first int64) *int64 {
 	if entry.CausationBatchIndex != nil {
-		if *entry.CausationBatchIndex < 0 || *entry.CausationBatchIndex >= index {
-			return nil, fmt.Errorf("%w: batch causation must name an earlier entry", flowerr.ErrInvalid)
-		}
 		position := first + int64(*entry.CausationBatchIndex)
-		return &position, nil
+		return &position
 	}
-	if entry.CausationPosition != nil {
-		position := first + int64(index)
-		if *entry.CausationPosition < 1 || *entry.CausationPosition >= position {
-			return nil, fmt.Errorf("%w: causation position must precede its entry", flowerr.ErrInvalid)
-		}
-	}
-	return clonePointer(entry.CausationPosition), nil
+	return clonePointer(entry.CausationPosition)
 }
 
 func cloneJournalRows(rows []JournalRow) []JournalRow {

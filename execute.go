@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/definition"
+	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/fault"
 	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/goware/flow/internal/store"
@@ -22,7 +23,7 @@ import (
 
 const (
 	maxCommandArgumentBytes   = 256 << 10
-	maxApplicationEventBytes  = 64 << 10
+	maxApplicationEventBytes  = journalcodec.MaxApplicationEventPayloadBytes
 	maxCommandEventWaits      = 256
 	maxExecutionMetadataBytes = 16 << 10
 	maxExecutionKeyBytes      = 1024
@@ -65,6 +66,10 @@ func WithExecutionDeadline(deadline time.Duration) ExecutionOption {
 		options.deadlineSet = true
 		if deadline <= 0 {
 			options.errs = append(options.errs, errors.New("execution deadline must be positive"))
+			return
+		}
+		if _, err := durable.ExactMilliseconds("execution deadline", deadline); err != nil {
+			options.errs = append(options.errs, err)
 			return
 		}
 		options.deadline = store.DeadlineSpec{Mode: "duration", Duration: deadline}
@@ -134,6 +139,10 @@ func WithStartDelay(delay time.Duration) ExecutionOption {
 			options.errs = append(options.errs, errors.New("start delay must be at least one millisecond"))
 			return
 		}
+		if _, err := durable.ExactMilliseconds("start delay", delay); err != nil {
+			options.errs = append(options.errs, err)
+			return
+		}
 		options.startDelay = delay
 	})
 }
@@ -158,6 +167,10 @@ func Within(duration time.Duration) ExecutionOption {
 	return executionOptionFunc(func(options *executionOptions) {
 		if duration < time.Millisecond {
 			options.errs = append(options.errs, errors.New("within must be at least one millisecond"))
+			return
+		}
+		if _, err := durable.ExactMilliseconds("within", duration); err != nil {
+			options.errs = append(options.errs, err)
 			return
 		}
 		if options.withinSet && options.within == duration {
@@ -227,7 +240,10 @@ func executeStart(ctx context.Context, client resolvedClient, request store.Star
 	if err != nil {
 		return Execution{}, err
 	}
-	exec := executionFromStore(result.Row)
+	exec, err := executionFromStore(result.Row)
+	if err != nil {
+		return Execution{}, err
+	}
 	exec.Created = result.Created
 	if client.tx == nil && result.Created {
 		client.runtime.wakeCommands()
@@ -273,7 +289,9 @@ func (event Event[T]) emitExternal(ctx context.Context, c Client, id ExecutionID
 	if err != nil {
 		return err
 	}
-	body, err := canonical.Marshal(journalcodec.ApplicationEventBody{V: 1, Payload: json.RawMessage(encoded.BytesCopy())}, 0)
+	body, err := canonical.Marshal(journalcodec.ApplicationEventBody{
+		V: journalcodec.ApplicationEventBodyVersion, Payload: json.RawMessage(encoded.BytesCopy()),
+	}, 0)
 	if err != nil {
 		return newError(ErrInvalid, "emit", "event", event.def.Name, "payload cannot be journaled")
 	}
@@ -384,6 +402,9 @@ func CancelExecution(ctx context.Context, c Client, id ExecutionID, reason strin
 }
 
 func prepareStartOptions(name string, version int, key string, input canonical.Value, supplied ...ExecutionOption) (executionOptions, canonical.Value, [32]byte, error) {
+	if err := durable.PostgresInteger("definition version", version, 1, durable.PostgresIntegerMax); err != nil {
+		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "version", "", err.Error())
+	}
 	if len(key) > maxExecutionKeyBytes || !utf8.ValidString(key) {
 		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "key", "", "execution key is invalid or too long")
 	}
@@ -419,6 +440,18 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 	}
 	// key_scope and start_delay_ms are omitted when zero so fingerprints of
 	// starts that predate these options remain rediscoverable.
+	deadlineMilliseconds, err := durable.ExactMilliseconds("execution deadline", options.deadline.Duration)
+	if err != nil {
+		return executionOptions{}, canonical.Value{}, [32]byte{}, err
+	}
+	startDelayMilliseconds, err := durable.ExactMilliseconds("start delay", options.startDelay)
+	if err != nil {
+		return executionOptions{}, canonical.Value{}, [32]byte{}, err
+	}
+	withinMilliseconds, err := durable.ExactMilliseconds("within", options.within)
+	if err != nil {
+		return executionOptions{}, canonical.Value{}, [32]byte{}, err
+	}
 	fingerprintRecord := struct {
 		V                 int                      `json:"v"`
 		DefinitionName    string                   `json:"definition_name"`
@@ -427,7 +460,7 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 		KeyScope          string                   `json:"key_scope,omitempty"`
 		Input             json.RawMessage          `json:"input"`
 		DeadlineMode      string                   `json:"deadline_mode"`
-		DeadlineDuration  int64                    `json:"deadline_duration"`
+		DeadlineDuration  int64                    `json:"deadline_duration_ms"`
 		FailFast          bool                     `json:"fail_fast"`
 		StartDelayMS      int64                    `json:"start_delay_ms,omitempty"`
 		Waits             []commandWaitFingerprint `json:"waits,omitempty"`
@@ -436,9 +469,9 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 	}{
 		V: 1, DefinitionName: name, DefinitionVersion: version,
 		ExecutionKey: key, KeyScope: options.keyScope, Input: json.RawMessage(input.BytesCopy()),
-		DeadlineMode: options.deadline.Mode, DeadlineDuration: int64(options.deadline.Duration),
-		FailFast: options.failFast, StartDelayMS: options.startDelay.Milliseconds(),
-		Waits: commandWaitFingerprints(options.waits), WithinMS: options.within.Milliseconds(),
+		DeadlineMode: options.deadline.Mode, DeadlineDuration: deadlineMilliseconds,
+		FailFast: options.failFast, StartDelayMS: startDelayMilliseconds,
+		Waits: commandWaitFingerprints(options.waits), WithinMS: withinMilliseconds,
 		Metadata: json.RawMessage(metadata.BytesCopy()),
 	}
 	fingerprint, err := canonical.Marshal(fingerprintRecord, 0)
@@ -454,6 +487,9 @@ func prepareCommand(id uuid.UUID, key string, command *definition.Command, defau
 	}
 	if err := validateStableKey(key, maxCommandKeyBytes, "command"); err != nil {
 		return store.CommandCreate{}, err
+	}
+	if err := durable.PostgresInteger("command version", command.Version, 1, durable.PostgresIntegerMax); err != nil {
+		return store.CommandCreate{}, newError(ErrInvalid, "create", "command", key, err.Error())
 	}
 	policy, err := retrypolicy.CanonicalPublic(defaults.retryPolicy)
 	if err != nil {
@@ -529,6 +565,18 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 		}
 		return waits[i].Key < waits[j].Key
 	})
+	startAfterMilliseconds, err := durable.ExactMilliseconds("initial delay", command.InitialDelay)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	attemptTimeoutMilliseconds, err := durable.ExactMilliseconds("attempt timeout", command.AttemptTimeout)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	withinMilliseconds, err := durable.ExactMilliseconds("within", command.Within)
+	if err != nil {
+		return [32]byte{}, err
+	}
 	declaration, err := canonical.Marshal(struct {
 		V            int                      `json:"v"`
 		Key          string                   `json:"key"`
@@ -537,14 +585,19 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 		Args         json.RawMessage          `json:"args"`
 		Parent       string                   `json:"parent,omitempty"`
 		Required     bool                     `json:"required"`
+		Queue        string                   `json:"queue"`
+		RetryPolicy  json.RawMessage          `json:"retry_policy"`
+		AttemptMS    int64                    `json:"attempt_timeout_ms,omitempty"`
 		StartAfterMS int64                    `json:"start_after_ms,omitempty"`
 		Waits        []commandWaitFingerprint `json:"waits,omitempty"`
 		WithinMS     int64                    `json:"within_ms,omitempty"`
 	}{
 		V: 1, Key: command.Key, Name: command.Name, Version: command.Version,
 		Args: json.RawMessage(command.Args.BytesCopy()), Parent: parent,
-		Required: command.Required, StartAfterMS: command.InitialDelay.Milliseconds(),
-		Waits: waits, WithinMS: command.Within.Milliseconds(),
+		Required: command.Required, Queue: command.Queue,
+		RetryPolicy: json.RawMessage(command.RetryPolicy.BytesCopy()), AttemptMS: attemptTimeoutMilliseconds,
+		StartAfterMS: startAfterMilliseconds,
+		Waits:        waits, WithinMS: withinMilliseconds,
 	}, 0)
 	if err != nil {
 		return [32]byte{}, newError(ErrInvalid, "create", "command", command.Key, "declaration cannot be canonicalized")

@@ -38,6 +38,8 @@ func TestPolicyValidation(t *testing.T) {
 		NewPublicAttempts(0),
 		NewPublicFor(time.Minute).Backoff(),
 		NewPublicFor(time.Minute).Backoff(-time.Second),
+		NewPublicFor(time.Minute + time.Nanosecond),
+		NewPublicFor(time.Minute).Backoff(time.Second + time.Nanosecond),
 	}
 	for i, policy := range tests {
 		if err := ValidatePublic(policy); err == nil {
@@ -208,7 +210,22 @@ func TestPublicPolicyCanonicalRoundTrip(t *testing.T) {
 	if !ValueOf(got).Equal(ValueOf(want)) {
 		t.Fatalf("round trip = %#v, want %#v", ValueOf(got), ValueOf(want))
 	}
+	if string(encoded.Bytes) != `{"backoff_ms":[1000,7000],"jitter":0.2,"max_attempts":11,"max_elapsed_ms":10800000}` {
+		t.Fatalf("canonical policy = %s", encoded.Bytes)
+	}
 	if _, err := PublicFromCanonical([]byte(`{"max_attempts":0,"backoff":[],"jitter":0}`)); err == nil {
 		t.Fatal("PublicFromCanonical() accepted invalid policy")
+	}
+	for name, value := range map[string]string{
+		"whitespace":  ` {"backoff_ms":[1000,7000],"jitter":0.2,"max_attempts":11,"max_elapsed_ms":10800000}`,
+		"field order": `{"jitter":0.2,"backoff_ms":[1000,7000],"max_attempts":11,"max_elapsed_ms":10800000}`,
+		"extra field": `{"backoff_ms":[1000,7000],"extra":true,"jitter":0.2,"max_attempts":11,"max_elapsed_ms":10800000}`,
+		"duplicate":   `{"backoff_ms":[1000,7000],"jitter":0.2,"jitter":0.2,"max_attempts":11,"max_elapsed_ms":10800000}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := PublicFromCanonical([]byte(value)); err == nil {
+				t.Fatalf("PublicFromCanonical() accepted %s encoding", name)
+			}
+		})
 	}
 }
