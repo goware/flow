@@ -152,12 +152,15 @@ func TestMigrationPrunesAndNarrowsIndexes(t *testing.T) {
 	}
 
 	var duplicateCommandKeyIndexes int
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
+	if err := database.DB.Conn.QueryRow(ctx, `WITH command_indexes AS MATERIALIZED (
+		SELECT i.indexrelid,i.indnkeyatts
 		FROM pg_catalog.pg_index i
 		JOIN pg_catalog.pg_class indexed ON indexed.oid=i.indrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid=indexed.relnamespace
 		WHERE n.nspname=$1 AND indexed.relname='flow_commands'
-		AND ARRAY(SELECT pg_get_indexdef(i.indexrelid, position, true)
+	)
+	SELECT count(*) FROM command_indexes i
+		WHERE ARRAY(SELECT pg_get_indexdef(i.indexrelid, position, true)
 			FROM generate_series(1, i.indnkeyatts) position ORDER BY position)
 			= ARRAY['execution_id','command_key']`, database.Schema).Scan(&duplicateCommandKeyIndexes); err != nil {
 		t.Fatalf("count command-key indexes: %v", err)

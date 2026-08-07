@@ -398,3 +398,109 @@ retained/shared/distinct staged/missing waits, exact journal-to-command and
 wait-to-event position mapping, final counters and queue shapes, `WithCommit`,
 fail-fast survivor child cancellation, fault rollback/ambiguous commit seams,
 caller-owned root insertion, and replay/trace equivalence.
+
+## Phase 5 claim-throughput evidence
+
+The Phase 5 working tree was measured from parent commit `23fcc85` on the same
+host, PostgreSQL 18.1 instance, durability settings, 12-connection test pool,
+and 16-worker runtime shape described above. Database credentials were supplied
+through the existing test environment and were not printed or recorded.
+
+```text
+go test -run '^$' \
+  -bench 'Benchmark(IndependentCommandLifecycle|SameExecutionFanout)$' \
+  -benchmem -benchtime=3s -count=5 .
+```
+
+Times are medians with the complete five-sample range. The post-change command
+completed successfully in 135.016 seconds.
+
+| Workload | Earlier five-sample evidence | Phase 5 median (range) |
+|---|---:|---:|
+| independent lifecycle, 1 producer | 162.2 commands/s (161.2-165.5) | 158.7 commands/s (156.5-162.6); 403.2 ms/batch (393.6-408.9) |
+| independent lifecycle, 4 producers | 176.1 commands/s (174.4-180.4) | 400.0 commands/s (387.3-409.0); 160.0 ms/batch (156.5-165.2) |
+| independent lifecycle, 16 producers | 170.2 commands/s (167.2-173.7) | 359.1 commands/s (353.4-366.7); 178.2 ms/batch (174.5-181.1) |
+| same execution, 10 commands | Phase 4: 70.81 ms; 141.2 commands/s (69.01-70.92; 141.0-144.9) | 89.54 ms; 111.7 commands/s (88.29-91.12; 109.8-113.3) |
+| same execution, 100 commands | Phase 4: 582.3 ms; 171.7 commands/s (576.1-586.8; 170.4-173.6) | 680.5 ms; 147.0 commands/s (636.4-705.0; 141.8-157.1) |
+
+Independent execution throughput now uses several claim transactions at once:
+the four- and sixteen-producer shapes materially exceed the earlier samples,
+while the deliberately serial one-producer shape remains within the earlier
+range. The internal bound is eight claim transactions and leaves two
+application-pool connections available when the pool is large enough; pools of
+one or two use one claimer. No public tuning option was added.
+
+Review also requested a contemporaneous parent comparison for all independent
+producer shapes. The parent and revised Phase 5 working tree were therefore run
+back-to-back against the same active PostgreSQL instance with five samples each:
+
+```text
+git worktree add --detach <temporary-directory> 23fcc85
+go test -run '^$' -bench '^BenchmarkIndependentCommandLifecycle$' \
+  -benchmem -benchtime=3s -count=5 .
+```
+
+The parent command completed in 74.551 seconds and the revised Phase 5 command
+completed in 82.515 seconds.
+
+| Workload | Parent `23fcc85` median (range) | Revised Phase 5 median (range) |
+|---|---:|---:|
+| independent lifecycle, 1 producer | 145.2 commands/s (144.7-150.1); 440.6 ms/batch (426.5-442.2) | 146.2 commands/s (115.9-151.9); 437.7 ms/batch (421.3-552.3) |
+| independent lifecycle, 4 producers | 160.7 commands/s (156.0-163.0); 398.3 ms/batch (392.7-410.3) | 399.7 commands/s (378.4-404.4); 160.1 ms/batch (158.2-169.1) |
+| independent lifecycle, 16 producers | 150.4 commands/s (148.3-154.5); 425.4 ms/batch (414.3-431.4) | 360.1 commands/s (355.8-360.7); 177.7 ms/batch (177.4-179.9) |
+
+The direct parent comparison confirms the concurrency gain at four and sixteen
+producers. The one-producer medians are effectively unchanged; one slower Phase
+5 sample widens that range and is retained rather than discarded.
+
+The historical Phase 4 fan-out ranges did not overlap the first Phase 5 run, so
+the parent commit was rebuilt in a detached worktree and measured immediately
+against the same active PostgreSQL instance rather than attributing the
+difference to code without evidence:
+
+```text
+git worktree add --detach <temporary-directory> 23fcc85
+go test -run '^$' -bench '^BenchmarkSameExecutionFanout$' \
+  -benchmem -benchtime=3s -count=3 .
+```
+
+| Workload | Parent `23fcc85` current-environment median (range) | Phase 5 five-sample median (range) |
+|---|---:|---:|
+| same execution, 10 commands | 90.38 ms; 110.6 commands/s (89.86-96.14; 104.0-111.3) | 89.54 ms; 111.7 commands/s (88.29-91.12; 109.8-113.3) |
+| same execution, 100 commands | 784.4 ms; 127.5 commands/s (783.1-785.4; 127.3-127.7) | 680.5 ms; 147.0 commands/s (636.4-705.0; 141.8-157.1) |
+
+That direct comparison shows no 10-command regression and a material
+100-command improvement in the current environment. The older Phase 4 timing
+difference is therefore retained transparently as machine/database variance,
+not hidden by changing the workload. The diagnostic parent run has three
+samples and is not used to claim a precise multiplier.
+
+Structural coverage proves the corresponding safety properties: independent
+execution claims overlap behind deterministic barriers; one execution remains
+one transaction; an execution-locked oldest candidate releases its reservation
+and boundedly yields past at least four older siblings to later fair candidates;
+an at-capacity named lane likewise yields past at least four older queued
+executions to a runnable command in another lane; a strict continuation cursor
+passes a stable prefix of 256 distinct locked executions without resetting to
+the same bounded exclusion window. Continuation is capped at 257 probe/claim
+rounds per scheduling turn, carries its tail cursor across turns, and alternates
+a bounded head revisit; an earlier execution becoming available is therefore
+claimed even while the fault-driven test keeps appending later locked work;
+selected slots transfer exactly to returned workers; shutdown drains claim
+goroutines before worker WaitGroup accounting can begin waiting, and a claim
+whose commit completes concurrently with shutdown is still transferred once to
+worker accounting and explicitly concluded. Prepared fence metadata survives a
+real commit-call error, and a post-commit ambiguity resolver timeout retains the
+possibly owned fence in worker accounting instead of dropping it. The
+conservative false-ambiguity case is also covered end to end: a rolled-back
+commit with an unavailable resolver transfers its prepared claim, rejects its
+phantom settlement, releases accounting, and permits the later durable attempt
+to settle exactly once. A held claim on a two-connection pool leaves maintenance
+able to expire unrelated work.
+Same-execution coverage claims 16
+siblings with one contiguous `attempt_started` batch, one queue update set, one
+command update set, and exact per-command causation positions. It also covers a
+locked sibling, mixed versions and queues, zero and 256 event-input snapshots,
+required elapsed-budget fail-fast with survivor/counter/journal-order assertions,
+malformed durable policy and malformed event-input rollback, ambiguous multi-fence
+ownership resolution, and two competing replicas without duplicate active fences.

@@ -5,12 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/testpg"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type runtimeArgs struct {
@@ -642,7 +647,7 @@ func TestRuntimeQueueConcurrencyAndFairSelection(t *testing.T) {
 	latency := DefineCommand[runtimeArgs, runtimeResult]("runtime.queue.latency", 1, WithQueue("latency"))
 	bulkRelease := make(chan struct{})
 	var bulkStarted atomic.Int32
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(3),
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
 		WithQueueConcurrency("bulk", 1), WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(time.Second))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -660,12 +665,19 @@ func TestRuntimeQueueConcurrencyAndFairSelection(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 	cancelRun, runResult := startRuntime(t, runtime)
-	bulkHandles := make([]Execution, 3)
-	for index := range bulkHandles {
-		bulkHandles[index], err = bulk.With(runtime).Execute(ctx, fmt.Sprintf("queue/bulk/%d", index), runtimeArgs{})
-		if err != nil {
-			t.Fatalf("bulk Execute(%d) error = %v", index, err)
+	bulkHandles := make([]Execution, 0, commandProbeFactor+1)
+	firstBulk, err := bulk.With(runtime).Execute(ctx, "queue/bulk/active", runtimeArgs{})
+	if err != nil {
+		t.Fatalf("bulk Execute(active) error = %v", err)
+	}
+	bulkHandles = append(bulkHandles, firstBulk)
+	waitForCount(t, &bulkStarted, 1, 3*time.Second)
+	for index := range commandProbeFactor {
+		execution, executeErr := bulk.With(runtime).Execute(ctx, fmt.Sprintf("queue/bulk/backlog/%d", index), runtimeArgs{})
+		if executeErr != nil {
+			t.Fatalf("bulk Execute(%d) error = %v", index, executeErr)
 		}
+		bulkHandles = append(bulkHandles, execution)
 	}
 	latencyHandle, err := latency.With(runtime).Execute(ctx, "queue/latency", runtimeArgs{})
 	if err != nil {
@@ -680,6 +692,840 @@ func TestRuntimeQueueConcurrencyAndFairSelection(t *testing.T) {
 		waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	}
 	stopRuntime(t, cancelRun, runResult)
+}
+
+func TestRuntimeClaimsIndependentExecutionsConcurrently(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("runtime.concurrent_claims", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(4),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	executions := make([]Execution, 4)
+	for index := range executions {
+		executions[index], err = command.With(runtime).Execute(ctx, fmt.Sprintf("concurrent-claim/%d", index), None{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered := make(chan struct{}, len(executions))
+	release := make(chan struct{})
+	runtime.faults = fault.Func(func(ctx context.Context, point fault.Point) error {
+		if point != fault.ClaimBeforeJournal {
+			return nil
+		}
+		select {
+		case entered <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	cancel, runResult := startRuntime(t, runtime)
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		stopRuntime(t, cancel, runResult)
+	}()
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("independent claim transactions did not overlap")
+		}
+	}
+	close(release)
+	for _, execution := range executions {
+		waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	}
+}
+
+func TestRuntimeClaimsOnlyAvailableSiblingSlots(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	parent := DefineCommand[None, None]("runtime.sibling_capacity_parent", 1)
+	child := DefineCommand[None, None]("runtime.sibling_capacity_child", 1)
+	release := make(chan struct{})
+	var started atomic.Int32
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(3),
+		WithMaxCommandsPerExecution(0), WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
+			for index := range 8 {
+				Execute(work, fmt.Sprintf("child/%d", index), child, None{})
+			}
+			return None{}, nil
+		}),
+		Handle(child, func(context.Context, *Work[None]) (None, error) {
+			started.Add(1)
+			<-release
+			return None{}, nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		stopRuntime(t, cancel, runResult)
+	}()
+	execution, err := parent.With(runtime).Execute(ctx, "sibling/capacity", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForCount(t, &started, 3, 3*time.Second)
+	var running, starts int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE c.state='running'),
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+` j
+		 WHERE j.execution_id=$1 AND j.entry_kind='attempt_started' AND j.command_id<>$2)
+	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
+	WHERE c.execution_id=$1 AND c.parent_command_id=$2`, execution.ID, execution.RootCommandID).
+		Scan(&running, &starts); err != nil {
+		t.Fatal(err)
+	}
+	if started.Load() != 3 || running != 3 || starts != 3 {
+		t.Fatalf("sibling capacity started=%d running=%d starts=%d, want 3", started.Load(), running, starts)
+	}
+	close(release)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+}
+
+func TestRuntimeLockedExecutionReleasesSlotForLaterCandidate(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	lockedChild := DefineCommand[None, None]("runtime.locked_claim_fairness_child", 1)
+	_, locked := stageClaimFixture(t, database, "locked_claim_fairness", commandProbeFactor, func(work *Work[None]) {
+		for index := range commandProbeFactor {
+			Execute(work, fmt.Sprintf("child/%d", index), lockedChild, None{})
+		}
+	})
+	availableCommand := DefineCommand[None, None]("runtime.locked_claim_fairness_available", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(lockedChild, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+		Handle(availableCommand, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+	); err != nil {
+		t.Fatal(err)
+	}
+	available, err := availableCommand.With(runtime).Execute(ctx, "locked-claim/available", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockTx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lockTx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := lockTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
+		WHERE execution_id=$1 FOR UPDATE`, locked.ID); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, available.ID, "succeeded", 5*time.Second)
+	stopRuntime(t, cancel, runResult)
+	var attempts int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT COALESCE(sum(attempt_ordinal),0) FROM `+
+		pgschema.Table(database.Schema, "flow_commands")+` WHERE execution_id=$1 AND parent_command_id=$2`,
+		locked.ID, locked.RootCommandID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Fatalf("locked sibling attempts=%d, want 0", attempts)
+	}
+}
+
+func TestRuntimeProbeContinuationPassesExclusionCap(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	blockedCommand := DefineCommand[None, None]("runtime.probe_continuation_blocked", 1)
+	availableCommand := DefineCommand[None, None]("runtime.probe_continuation_available", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(blockedCommand, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+		Handle(availableCommand, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+	); err != nil {
+		t.Fatal(err)
+	}
+	blockedExecutionIDs := make([]uuid.UUID, maxCommandProbe)
+	for index := range maxCommandProbe {
+		execution, executeErr := blockedCommand.With(runtime).Execute(ctx,
+			fmt.Sprintf("probe-continuation/blocked/%03d", index), None{})
+		if executeErr != nil {
+			t.Fatal(executeErr)
+		}
+		blockedExecutionIDs[index] = uuid.MustParse(string(execution.ID))
+	}
+	available, err := availableCommand.With(runtime).Execute(ctx, "probe-continuation/available", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockTx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lockTx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := lockTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
+		WHERE execution_id=ANY($1::uuid[]) FOR UPDATE`, blockedExecutionIDs); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, available.ID, "succeeded", 10*time.Second)
+	stopRuntime(t, cancel, runResult)
+	var attempts int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT COALESCE(sum(attempt_ordinal),0) FROM `+
+		pgschema.Table(database.Schema, "flow_commands")+` WHERE execution_id=ANY($1::uuid[])`, blockedExecutionIDs).
+		Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Fatalf("stable blocked prefix attempts=%d, want 0", attempts)
+	}
+}
+
+func TestRuntimeProbeContinuationRevisitsHeadBetweenBoundedTurns(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("runtime.probe_continuation_revisit", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	head, err := command.With(runtime).Execute(ctx, "probe-revisit/head", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	headID := uuid.MustParse(string(head.ID))
+	tailIDs := make([]uuid.UUID, maxCommandProbe)
+	for index := range maxCommandProbe {
+		execution, executeErr := command.With(runtime).Execute(ctx, fmt.Sprintf("probe-revisit/tail/%03d", index), None{})
+		if executeErr != nil {
+			t.Fatal(executeErr)
+		}
+		tailIDs[index] = uuid.MustParse(string(execution.ID))
+	}
+	headTx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = headTx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := headTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
+		WHERE execution_id=$1 FOR UPDATE`, headID); err != nil {
+		t.Fatal(err)
+	}
+	tailTx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tailTx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tailTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
+		WHERE execution_id=ANY($1::uuid[]) FOR UPDATE`, tailIDs); err != nil {
+		t.Fatal(err)
+	}
+	continuing := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var probes atomic.Int32
+	var keepArriving atomic.Bool
+	var arrivalSequence atomic.Int32
+	runtime.faults = fault.Func(func(hookCtx context.Context, point fault.Point) error {
+		if point != fault.ProbeReturn {
+			return nil
+		}
+		probe := probes.Add(1)
+		if probe == int32(maxCommandRoundsPerTurn) {
+			close(continuing)
+			<-releaseProbe
+		}
+		if probe > int32(maxCommandRoundsPerTurn) && keepArriving.Load() && hookCtx.Err() == nil {
+			index := arrivalSequence.Add(1)
+			execution, executeErr := command.With(runtime).Execute(hookCtx,
+				fmt.Sprintf("probe-revisit/arrival/%d", index), None{})
+			if executeErr != nil {
+				return executeErr
+			}
+			_, lockErr := tailTx.Exec(hookCtx, `SELECT execution_id FROM `+
+				pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1 FOR UPDATE`,
+				uuid.MustParse(string(execution.ID)))
+			return lockErr
+		}
+		return nil
+	})
+	cancel, runResult := startRuntime(t, runtime)
+	defer func() {
+		keepArriving.Store(false)
+		select {
+		case <-releaseProbe:
+		default:
+			close(releaseProbe)
+		}
+		stopRuntime(t, cancel, runResult)
+	}()
+	select {
+	case <-continuing:
+	case <-time.After(10 * time.Second):
+		t.Fatal("scheduler did not reach its bounded continuation turn")
+	}
+	firstArrival, err := command.With(runtime).Execute(ctx, "probe-revisit/arrival/0", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tailTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
+		WHERE execution_id=$1 FOR UPDATE`, uuid.MustParse(string(firstArrival.ID))); err != nil {
+		t.Fatal(err)
+	}
+	keepArriving.Store(true)
+	if err := headTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseProbe)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, head.ID, "succeeded", 10*time.Second)
+}
+
+func TestRuntimeShutdownDrainsInflightClaimBeforeWorkerAccounting(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("runtime.shutdown_inflight_claim", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false), WithShutdownGrace(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handlers atomic.Int32
+	if err := runtime.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		handlers.Add(1)
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := command.With(runtime).Execute(ctx, "shutdown/inflight-claim", None{}); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var once sync.Once
+	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
+		if point == fault.ClaimBeforeCommit {
+			once.Do(func() { close(entered) })
+			<-release
+			return fault.Injected(point)
+		}
+		return nil
+	})
+	cancel, runResult := startRuntime(t, runtime)
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("claim did not reach the pre-commit barrier")
+	}
+	cancel()
+	select {
+	case err := <-runResult:
+		t.Fatalf("Run returned before in-flight claim drained: %v", err)
+	default:
+	}
+	close(release)
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not finish after in-flight claim drained")
+	}
+	if handlers.Load() != 0 {
+		t.Fatalf("handlers started during shutdown=%d, want 0", handlers.Load())
+	}
+}
+
+func TestRuntimeShutdownTransfersPostCommitClaimToWorkerAccounting(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("runtime.shutdown_postcommit_claim", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false), WithShutdownGrace(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handlers atomic.Int32
+	if err := runtime.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		handlers.Add(1)
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	execution, err := command.With(runtime).Execute(ctx, "shutdown/postcommit-claim", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
+		if point == fault.ClaimCommitAmbiguous {
+			once.Do(func() { close(entered) })
+			<-release
+			return fault.Injected(point)
+		}
+		return nil
+	})
+	cancel, runResult := startRuntime(t, runtime)
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("claim did not reach the post-commit barrier")
+	}
+	cancel()
+	select {
+	case err := <-runResult:
+		t.Fatalf("Run returned before post-commit claim handoff: %v", err)
+	default:
+	}
+	close(release)
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not finish after post-commit claim handoff")
+	}
+	if handlers.Load() != 1 {
+		t.Fatalf("post-commit handlers=%d, want 1", handlers.Load())
+	}
+	var state string
+	var activeFences int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.state,
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` q
+		 WHERE q.command_id=c.command_id AND (q.active_attempt_id IS NOT NULL OR q.lease_token IS NOT NULL))
+	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c WHERE c.command_id=$1`, execution.RootCommandID).
+		Scan(&state, &activeFences); err != nil {
+		t.Fatal(err)
+	}
+	if state == "running" || activeFences != 0 {
+		t.Fatalf("post-commit command state=%s active fences=%d", state, activeFences)
+	}
+}
+
+func TestRuntimeAmbiguousClaimResolverFailureTransfersFence(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.OpenWithMaxConns(t, 2)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("runtime.ambiguous_resolver_failure", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false), withCommandLeaseForTest(400*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlerStarted := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	var handlers atomic.Int32
+	if err := runtime.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		handlers.Add(1)
+		close(handlerStarted)
+		<-handlerRelease
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	execution, err := command.With(runtime).Execute(ctx, "ambiguous/resolver-failure", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := make(chan struct{})
+	releaseClaim := make(chan struct{})
+	var once sync.Once
+	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
+		if point == fault.ClaimCommitAmbiguous {
+			once.Do(func() { close(committed) })
+			<-releaseClaim
+			return fault.Injected(point)
+		}
+		return nil
+	})
+	cancel, runResult := startRuntime(t, runtime)
+	defer func() {
+		select {
+		case <-releaseClaim:
+		default:
+			close(releaseClaim)
+		}
+		select {
+		case <-handlerRelease:
+		default:
+			close(handlerRelease)
+		}
+		stopRuntime(t, cancel, runResult)
+	}()
+	select {
+	case <-committed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("claim did not reach post-commit ambiguity barrier")
+	}
+	held := make([]*pgxpool.Conn, 0, 2)
+	defer func() {
+		for _, connection := range held {
+			connection.Release()
+		}
+	}()
+	for range 2 {
+		connection, acquireErr := database.DB.Conn.Acquire(ctx)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		held = append(held, connection)
+	}
+	close(releaseClaim)
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ambiguous committed fence was dropped after resolver timeout")
+	}
+	for _, connection := range held {
+		connection.Release()
+	}
+	held = nil
+	close(handlerRelease)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	if handlers.Load() != 1 {
+		t.Fatalf("ambiguous resolver-failure handlers=%d, want 1", handlers.Load())
+	}
+}
+
+func TestRuntimeFalseAmbiguityReleasesPhantomBeforeRealClaim(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.OpenWithMaxConns(t, 3)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("runtime.false_ambiguity", 1)
+	first, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false), withCommandLeaseForTest(400*time.Millisecond),
+		WithShutdownGrace(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	phantomStarted := make(chan struct{})
+	phantomRelease := make(chan struct{})
+	var phantomHandlers atomic.Int32
+	if err := first.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		phantomHandlers.Add(1)
+		close(phantomStarted)
+		<-phantomRelease
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	execution, err := command.With(first).Execute(ctx, "false-ambiguity/claim", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCommit := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	var once sync.Once
+	first.faults = fault.Func(func(hookCtx context.Context, point fault.Point) error {
+		if point == fault.ClaimBeforeCommit {
+			once.Do(func() { close(beforeCommit) })
+			<-releaseCommit
+			<-hookCtx.Done()
+		}
+		return nil
+	})
+	cancelFirst, firstResult := startRuntime(t, first)
+	defer func() {
+		select {
+		case <-releaseCommit:
+		default:
+			close(releaseCommit)
+		}
+		select {
+		case <-phantomRelease:
+		default:
+			close(phantomRelease)
+		}
+		cancelFirst()
+	}()
+	select {
+	case <-beforeCommit:
+	case <-time.After(3 * time.Second):
+		t.Fatal("claim did not reach the false-ambiguity commit barrier")
+	}
+	lockConnection, err := database.DB.Conn.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if lockConnection != nil {
+			lockConnection.Release()
+		}
+	}()
+	var lockPID int
+	if err := lockConnection.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&lockPID); err != nil {
+		t.Fatal(err)
+	}
+	lockTx, err := lockConnection.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lockTx.Rollback(context.Background()) }()
+	defer func() {
+		cancelFirst()
+		select {
+		case <-releaseCommit:
+		default:
+			close(releaseCommit)
+		}
+	}()
+	observerConnection, err := database.DB.Conn.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if observerConnection != nil {
+			observerConnection.Release()
+		}
+	}()
+	lockResult := make(chan error, 1)
+	go func() {
+		_, lockErr := lockTx.Exec(context.Background(), `LOCK TABLE `+
+			pgschema.Table(database.Schema, "flow_commands")+` IN ACCESS EXCLUSIVE MODE`)
+		lockResult <- lockErr
+	}()
+	waitDeadline := time.Now().Add(3 * time.Second)
+	for {
+		var waitType *string
+		if err := observerConnection.QueryRow(ctx, `SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1`, lockPID).
+			Scan(&waitType); err != nil {
+			t.Fatal(err)
+		}
+		if waitType != nil && *waitType == "Lock" {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("table-lock request did not block behind the claim transaction")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancelFirst()
+	close(releaseCommit)
+	select {
+	case lockErr := <-lockResult:
+		if lockErr != nil {
+			t.Fatal(lockErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("table lock was not granted after the false commit rolled back")
+	}
+	select {
+	case <-phantomStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("false-ambiguity metadata was dropped after ownership resolution failed")
+	}
+	if err := lockTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lockConnection.Release()
+	lockConnection = nil
+	observerConnection.Release()
+	observerConnection = nil
+	close(phantomRelease)
+	select {
+	case runErr := <-firstResult:
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first runtime did not release the conservatively transferred slot")
+	}
+	if phantomHandlers.Load() != 1 {
+		t.Fatalf("false-ambiguity phantom handlers=%d, want 1", phantomHandlers.Load())
+	}
+
+	second, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var realHandlers atomic.Int32
+	if err := second.Register(Handle(command, func(context.Context, *Work[None]) (None, error) {
+		realHandlers.Add(1)
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	cancelSecond, secondResult := startRuntime(t, second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	stopRuntime(t, cancelSecond, secondResult)
+	var attemptOrdinal, attemptStarts int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.attempt_ordinal,
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+` j
+		 WHERE j.execution_id=c.execution_id AND j.command_id=c.command_id AND j.entry_kind='attempt_started')
+	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c WHERE c.command_id=$1`, execution.RootCommandID).
+		Scan(&attemptOrdinal, &attemptStarts); err != nil {
+		t.Fatal(err)
+	}
+	if realHandlers.Load() != 1 || attemptOrdinal != 1 || attemptStarts != 1 {
+		t.Fatalf("real claim handlers=%d ordinal=%d starts=%d, want 1/1/1",
+			realHandlers.Load(), attemptOrdinal, attemptStarts)
+	}
+}
+
+func TestRuntimeTwoConnectionPoolRetainsMaintenanceHeadroomDuringClaim(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.OpenWithMaxConns(t, 2)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	claimable := DefineCommand[None, None]("runtime.small_pool_claim", 1)
+	unhandled := DefineCommand[None, None]("runtime.small_pool_deadline", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(8),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(Handle(claimable, func(context.Context, *Work[None]) (None, error) {
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	claimExecution, err := claimable.With(runtime).Execute(ctx, "small-pool/claim", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadlineExecution, err := unhandled.With(runtime).Execute(ctx, "small-pool/deadline", None{},
+		WithExecutionDeadline(25*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var once sync.Once
+	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
+		if point == fault.ClaimBeforeCommit {
+			once.Do(func() { close(entered) })
+			<-release
+		}
+		return nil
+	})
+	cancel, runResult := startRuntime(t, runtime)
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		stopRuntime(t, cancel, runResult)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("claim did not hold its bounded pool connection")
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, deadlineExecution.ID, "expired", 5*time.Second)
+	close(release)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, claimExecution.ID, "succeeded", 5*time.Second)
+}
+
+func TestClaimConcurrencyLimitLeavesMaintenanceHeadroom(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		workers int
+		pool    int
+		want    int
+	}{
+		{workers: 16, pool: 1, want: 1},
+		{workers: 16, pool: 2, want: 1},
+		{workers: 16, pool: 3, want: 1},
+		{workers: 16, pool: 4, want: 2},
+		{workers: 16, pool: 12, want: 8},
+		{workers: 2, pool: 12, want: 2},
+	}
+	for _, test := range tests {
+		if got := claimConcurrencyLimit(test.workers, test.pool); got != test.want {
+			t.Errorf("claimConcurrencyLimit(%d, %d)=%d, want %d", test.workers, test.pool, got, test.want)
+		}
+	}
 }
 
 func TestRuntimeRollingVersionLeavesUnknownWorkUnclaimed(t *testing.T) {

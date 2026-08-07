@@ -21,10 +21,13 @@ import (
 )
 
 const (
-	commandProbeFactor    = 4
-	maxCommandProbe       = 256
-	maxCommandResultBytes = 256 << 10
-	settlementAttempts    = 3
+	commandProbeFactor       = 4
+	maxCommandProbe          = 256
+	maxCommandRoundsPerTurn  = maxCommandProbe + 1
+	maxConcurrentClaims      = 8
+	claimMaintenanceHeadroom = 2
+	maxCommandResultBytes    = 256 << 10
+	settlementAttempts       = 3
 )
 
 func (r *Runtime) runCommandScheduler(ctx context.Context) {
@@ -35,6 +38,8 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 	for index, key := range keys {
 		kinds[index] = store.CommandKind{Name: key.name, Version: key.version}
 	}
+	var continuationAfter *store.CommandProbeCursor
+	revisitHead := false
 	for {
 		if ctx.Err() != nil {
 			return
@@ -45,87 +50,248 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 			r.wake.wait(ctx, seen, r.pollInterval)
 			continue
 		}
-		limit := min(maxCommandProbe, max(free, free*commandProbeFactor))
-		started := time.Now()
-		candidates, err := r.store.ProbeCommands(ctx, kinds, limit)
-		if err == nil {
-			err = r.faults.Hit(ctx, fault.ProbeReturn)
-		}
-		r.observe(ctx, Observation{
-			Kind: ObservationClaim, Operation: "probe", Outcome: outcomeForError(err),
-			Count: int64(len(candidates)), Duration: time.Since(started), Worker: r.replicaName(),
-		})
-		if err != nil {
-			r.wake.wait(ctx, seen, r.pollInterval)
-			continue
-		}
 		progress := false
-		selected := make([]store.CommandCandidate, 0, free)
-		for _, candidate := range fairQueueCandidates(candidates, &queueTurn) {
-			if slots.reserve(candidate.Queue) {
-				selected = append(selected, candidate)
+		excludedExecutions := make(map[uuid.UUID]struct{})
+		excludedQueues := make(map[string]struct{})
+		probeAfter := continuationAfter
+		headRevisit := revisitHead && continuationAfter != nil
+		resumeAfter := continuationAfter
+		if headRevisit {
+			probeAfter = nil
+			revisitHead = false
+		}
+		reachedEnd := false
+		for rounds := 0; rounds < maxCommandRoundsPerTurn && slots.free() > 0 && ctx.Err() == nil; rounds++ {
+			free = slots.free()
+			limit := min(maxCommandProbe, max(free, free*commandProbeFactor))
+			atExclusionCap := len(excludedExecutions)+len(excludedQueues) >= maxCommandProbe
+			started := time.Now()
+			candidates, err := r.store.ProbeCommandsExcluding(ctx, kinds, limit,
+				executionIDs(excludedExecutions), queueNames(excludedQueues), probeAfter)
+			if err == nil {
+				err = r.faults.Hit(ctx, fault.ProbeReturn)
 			}
-			if slots.free() == 0 {
+			r.observe(ctx, Observation{
+				Kind: ObservationClaim, Operation: "probe", Outcome: outcomeForError(err),
+				Count: int64(len(candidates)), Duration: time.Since(started), Worker: r.replicaName(),
+			})
+			if err != nil || len(candidates) == 0 {
+				if err == nil {
+					reachedEnd = true
+				}
+				break
+			}
+
+			ordered := fairQueueCandidates(candidates, &queueTurn)
+			if atExclusionCap {
+				// With the bounded exclusion set full, inspect exactly the earliest
+				// remaining database-ordered candidate. If it is blocked, advancing
+				// past that known candidate rotates beyond the stable prefix without
+				// skipping any unexamined work.
+				ordered = candidates[:1]
+			}
+			selected := make([]store.CommandCandidate, 0, free)
+			queueExclusionsBeforeSelection := len(excludedQueues)
+			for _, candidate := range ordered {
+				if slots.free() == 0 {
+					break
+				}
+				reserved, laneFull := slots.reserve(candidate.Queue)
+				if reserved {
+					selected = append(selected, candidate)
+				} else if laneFull {
+					excludedQueues[candidate.Queue] = struct{}{}
+				}
+			}
+			if len(selected) == 0 {
+				if len(excludedQueues) > queueExclusionsBeforeSelection {
+					if atExclusionCap {
+						probeAfter = commandProbeCursor(candidates[0])
+						clear(excludedExecutions)
+						clear(excludedQueues)
+					}
+					continue
+				}
+				break
+			}
+			if ctx.Err() != nil {
+				for _, candidate := range selected {
+					slots.release(candidate.Queue)
+				}
+				return
+			}
+			exclusionsBefore := len(excludedExecutions) + len(excludedQueues)
+			roundProgress := false
+			roundCommands := 0
+			groups := groupCandidatesByExecution(selected)
+			for _, claimedGroup := range r.claimExecutionGroups(ctx, groups) {
+				group, result, claimErr := claimedGroup.candidates, claimedGroup.result, claimedGroup.err
+				claimedIDs := make(map[uuid.UUID]struct{}, len(result.Commands))
+				for _, command := range result.Commands {
+					claimedIDs[command.CommandID] = struct{}{}
+				}
+				for _, candidate := range group {
+					if _, claimed := claimedIDs[candidate.CommandID]; !claimed {
+						slots.release(candidate.Queue)
+					}
+				}
+				if result.Progressed {
+					progress = true
+					if claimErr == nil {
+						roundProgress = true
+					}
+				}
+				if !result.Progressed && len(result.Commands) == 0 && len(group) > 0 {
+					excludedExecutions[group[0].ExecutionID] = struct{}{}
+				}
+				if claimErr != nil || len(result.Commands) == 0 {
+					continue
+				}
+				for _, command := range result.Commands {
+					worker, ok := r.registry.worker(command.Name, command.Version)
+					if !ok {
+						slots.release(command.Queue)
+						continue
+					}
+					progress = true
+					roundCommands++
+					r.workerGroup.Add(1)
+					go r.executeClaim(worker, command, slots)
+				}
+			}
+			if atExclusionCap {
+				if !roundProgress && roundCommands == 0 {
+					probeAfter = commandProbeCursor(candidates[0])
+					clear(excludedExecutions)
+					clear(excludedQueues)
+				}
+				continue
+			}
+			if len(excludedExecutions)+len(excludedQueues) == exclusionsBefore {
 				break
 			}
 		}
-		if ctx.Err() != nil {
-			for _, candidate := range selected {
-				slots.release(candidate.Queue)
-			}
-			return
-		}
-		for _, group := range groupCandidatesByExecution(selected) {
-			claimStarted := time.Now()
-			result, claimErr := r.store.ClaimCommands(ctx, group, r.commandLease, r.replicaName(), r.faults)
-			if claimErr != nil && len(result.Commands) > 0 {
-				confirmed := result.Commands[:0]
-				for _, command := range result.Commands {
-					ownership, resolveErr := r.store.ResolveCommandAttempt(ctx, command.CommandID, command.AttemptID, command.LeaseToken)
-					if resolveErr == nil && ownership == store.AttemptOwnershipStillOwned {
-						confirmed = append(confirmed, command)
-					}
-				}
-				result.Commands = confirmed
-				if len(confirmed) > 0 {
-					claimErr = nil
-				}
-			}
-			r.observe(ctx, Observation{
-				Kind: ObservationClaim, Operation: "claim", Outcome: outcomeForError(claimErr),
-				ExecutionID: ExecutionID(group[0].ExecutionID.String()), Count: int64(len(result.Commands)),
-				Duration: time.Since(claimStarted), Worker: r.replicaName(),
-			})
-			claimedIDs := make(map[uuid.UUID]struct{}, len(result.Commands))
-			for _, command := range result.Commands {
-				claimedIDs[command.CommandID] = struct{}{}
-			}
-			for _, candidate := range group {
-				if _, claimed := claimedIDs[candidate.CommandID]; !claimed {
-					slots.release(candidate.Queue)
-				}
-			}
-			if result.Progressed {
-				progress = true
-			}
-			if claimErr != nil || len(result.Commands) == 0 {
-				continue
-			}
-			for _, command := range result.Commands {
-				worker, ok := r.registry.worker(command.Name, command.Version)
-				if !ok {
-					slots.release(command.Queue)
-					continue
-				}
-				progress = true
-				r.workerGroup.Add(1)
-				go r.executeClaim(worker, command, slots)
-			}
+		if headRevisit {
+			// A head-revisit turn is intentionally bounded too. Resume the saved
+			// tail cursor on the next turn regardless of how far the head sweep got.
+			continuationAfter = resumeAfter
+		} else if reachedEnd {
+			continuationAfter = nil
+			revisitHead = false
+		} else {
+			continuationAfter = probeAfter
+			revisitHead = continuationAfter != nil
 		}
 		if !progress {
 			r.wake.wait(ctx, seen, r.pollInterval)
 		}
 	}
+}
+
+func commandProbeCursor(candidate store.CommandCandidate) *store.CommandProbeCursor {
+	return &store.CommandProbeCursor{
+		NextRunAt: candidate.NextRunAt,
+		Queue:     candidate.Queue,
+		CommandID: candidate.CommandID,
+	}
+}
+
+func executionIDs(executions map[uuid.UUID]struct{}) []uuid.UUID {
+	result := make([]uuid.UUID, 0, len(executions))
+	for executionID := range executions {
+		result = append(result, executionID)
+	}
+	return result
+}
+
+func queueNames(queues map[string]struct{}) []string {
+	result := make([]string, 0, len(queues))
+	for queue := range queues {
+		result = append(result, queue)
+	}
+	return result
+}
+
+type commandGroupClaim struct {
+	candidates []store.CommandCandidate
+	result     store.ClaimBatchResult
+	err        error
+}
+
+// claimExecutionGroups runs at most one transaction per execution and waits
+// for the complete selected set before the scheduler probes again. Worker
+// accounting remains scheduler-owned after this function returns, so Run
+// cannot begin waiting while a claim goroutine might still call WaitGroup.Add.
+func (r *Runtime) claimExecutionGroups(ctx context.Context, groups [][]store.CommandCandidate) []commandGroupClaim {
+	results := make([]commandGroupClaim, len(groups))
+	if len(groups) == 0 {
+		return results
+	}
+	jobs := make(chan int)
+	var group sync.WaitGroup
+	workers := min(len(groups), claimConcurrencyLimit(r.workerConcurrency, int(r.db.Conn.Config().MaxConns)))
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			for index := range jobs {
+				results[index].candidates = groups[index]
+				if ctx.Err() != nil {
+					results[index].err = ctx.Err()
+					continue
+				}
+				results[index].result, results[index].err = r.claimExecutionGroup(ctx, groups[index])
+			}
+		}()
+	}
+	for index := range groups {
+		jobs <- index
+	}
+	close(jobs)
+	group.Wait()
+	return results
+}
+
+func (r *Runtime) claimExecutionGroup(
+	ctx context.Context,
+	group []store.CommandCandidate,
+) (store.ClaimBatchResult, error) {
+	started := time.Now()
+	result, err := r.store.ClaimCommands(ctx, group, r.commandLease, r.replicaName(), r.faults)
+	if err != nil && len(result.Commands) > 0 {
+		resolveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), min(5*time.Second, max(100*time.Millisecond, r.commandLease/2)))
+		defer cancel()
+		possiblyOwned := result.Commands[:0]
+		for _, command := range result.Commands {
+			ownership, resolveErr := r.store.ResolveCommandAttempt(resolveCtx, command.CommandID, command.AttemptID, command.LeaseToken)
+			if resolveErr != nil || ownership == store.AttemptOwnershipStillOwned {
+				// A resolver failure cannot prove the commit rolled back. Retain the
+				// prepared fence and transfer it to worker accounting so a possibly
+				// committed running attempt is never silently abandoned.
+				possiblyOwned = append(possiblyOwned, command)
+			}
+		}
+		result.Commands = possiblyOwned
+		if len(possiblyOwned) > 0 {
+			err = nil
+		}
+	}
+	r.observe(ctx, Observation{
+		Kind: ObservationClaim, Operation: "claim", Outcome: outcomeForError(err),
+		ExecutionID: ExecutionID(group[0].ExecutionID.String()), Count: int64(len(result.Commands)),
+		Duration: time.Since(started), Worker: r.replicaName(),
+	})
+	return result, err
+}
+
+func claimConcurrencyLimit(workerConcurrency, poolCapacity int) int {
+	limit := min(maxConcurrentClaims, max(1, workerConcurrency))
+	if poolCapacity > claimMaintenanceHeadroom {
+		limit = min(limit, poolCapacity-claimMaintenanceHeadroom)
+	} else {
+		limit = 1
+	}
+	return max(1, limit)
 }
 
 type commandSlots struct {
@@ -143,18 +309,18 @@ func newCommandSlots(global int, limits map[string]int) *commandSlots {
 
 func (slots *commandSlots) free() int { return cap(slots.global) - len(slots.global) }
 
-func (slots *commandSlots) reserve(queue string) bool {
+func (slots *commandSlots) reserve(queue string) (reserved, laneFull bool) {
 	slots.mu.Lock()
 	defer slots.mu.Unlock()
 	if limit := slots.limits[queue]; limit > 0 && slots.active[queue] >= limit {
-		return false
+		return false, true
 	}
 	select {
 	case slots.global <- struct{}{}:
 		slots.active[queue]++
-		return true
+		return true, false
 	default:
-		return false
+		return false, false
 	}
 }
 

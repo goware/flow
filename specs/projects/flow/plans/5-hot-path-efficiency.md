@@ -1412,16 +1412,16 @@ This plan is complete when all of the following are true:
 
 ### Claims
 
-- [ ] Add bounded concurrent claiming for independent execution groups.
-- [ ] Preserve selection fairness and exact slot release.
-- [ ] Leave pool capacity for lease/deadline maintenance.
-- [ ] Add deterministic overlap, locked-group, small-pool, and shutdown tests.
-- [ ] Lock/load one same-execution claim group in a batch.
-- [ ] Load all claimed event inputs in one query.
-- [ ] Append all attempt-started entries in one journal batch.
-- [ ] Bulk-update command and queue claim projections.
-- [ ] Preserve retry-expiry and ambiguous-commit slow paths.
-- [ ] Add batch fencing, rollback, event-input grouping, and multi-replica tests.
+- [x] Add bounded concurrent claiming for independent execution groups.
+- [x] Preserve selection fairness and exact slot release.
+- [x] Leave pool capacity for lease/deadline maintenance.
+- [x] Add deterministic overlap, locked-group, small-pool, and shutdown tests.
+- [x] Lock/load one same-execution claim group in a batch.
+- [x] Load all claimed event inputs in one query.
+- [x] Append all attempt-started entries in one journal batch.
+- [x] Bulk-update command and queue claim projections.
+- [x] Preserve retry-expiry and ambiguous-commit slow paths.
+- [x] Add batch fencing, rollback, event-input grouping, and multi-replica tests.
 
 ### Event-input snapshots
 
