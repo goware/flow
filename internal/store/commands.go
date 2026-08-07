@@ -779,6 +779,24 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err := s.validateSuccessfulDecision(ctx, semantic, fence, request); err != nil {
 		return SettleResult{}, err
 	}
+	childCreates := make([]commandBatchCreate, len(request.Children))
+	for index, child := range request.Children {
+		next, addErr := durable.AddExactDuration("initial delay", semantic.DBNow(), child.InitialDelay)
+		if addErr != nil {
+			return SettleResult{}, addErr
+		}
+		childCreates[index] = commandBatchCreate{
+			command: child, budgetStartedAt: next, nextAttemptAt: next,
+		}
+	}
+	var preparedChildren preparedCommandBatch
+	if len(childCreates) > 0 {
+		preparedChildren, err = s.prepareCommandBatch(ctx, semantic.PGX(), semantic.ExecutionID(),
+			childCreates, semantic.DBNow(), fence.ExecutionDeadline, request.Events)
+		if err != nil {
+			return SettleResult{}, err
+		}
+	}
 	layout := newSuccessfulSettlementJournalLayout(len(request.Events), len(request.Children))
 
 	concluded, err := NewJournalEntry(AttemptConcluded, journalcodec.AttemptConcludedBody{
@@ -805,12 +823,12 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		entry.CausationBatchIndex = &zero
 		entries = append(entries, entry)
 	}
-	for _, child := range request.Children {
-		next, addErr := durable.AddExactDuration("initial delay", semantic.DBNow(), child.InitialDelay)
-		if addErr != nil {
-			return SettleResult{}, addErr
+	for index, child := range request.Children {
+		initialState, budgetStartedAt, nextAttemptAt, stateErr := preparedChildren.initialJournalState(index)
+		if stateErr != nil {
+			return SettleResult{}, stateErr
 		}
-		created, createErr := commandCreatedEntry(child, next, next)
+		created, createErr := commandCreatedEntry(child, initialState, budgetStartedAt, nextAttemptAt)
 		if createErr != nil {
 			return SettleResult{}, createErr
 		}
@@ -895,9 +913,28 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		return SettleResult{}, err
 	}
 	acceptedEvents := make([]acceptedEventPosition, len(request.Events))
+	acceptedEventPositions := make([]int64, len(request.Events))
 	for index, event := range request.Events {
+		row := journal.Journal[layout.applicationEventStart+index]
+		if row.EventName == nil || *row.EventName != event.Name || row.EventKey == nil || *row.EventKey != event.Key {
+			return SettleResult{}, fmt.Errorf("%w: staged application-event journal mapping differs", flowerr.ErrInvalidState)
+		}
+		acceptedEventPositions[index] = row.Position
 		acceptedEvents[index] = acceptedEventPosition{
-			name: event.Name, key: event.Key, position: layout.applicationEventPosition(journal, index),
+			name: event.Name, key: event.Key, position: acceptedEventPositions[index],
+		}
+	}
+	childCreatedPositions := make([]int64, len(request.Children))
+	for index, child := range request.Children {
+		row := journal.Journal[layout.childCreatedStart+index]
+		if row.CommandID == nil || *row.CommandID != child.ID {
+			return SettleResult{}, fmt.Errorf("%w: staged-child command-created journal mapping differs", flowerr.ErrInvalidState)
+		}
+		childCreatedPositions[index] = row.Position
+	}
+	if len(request.Children) > 0 {
+		if err := preparedChildren.assignJournalPositions(childCreatedPositions, acceptedEventPositions); err != nil {
+			return SettleResult{}, err
 		}
 	}
 	if err := hook.Hit(ctx, fault.SettleAfterAttempt); err != nil {
@@ -913,32 +950,24 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, request.Claim.CommandID); err != nil {
 		return SettleResult{}, MapError("remove successful command queue row", err)
 	}
-	immediatelyRunnable := false
-	for index, child := range request.Children {
-		next, addErr := durable.AddExactDuration("initial delay", semantic.DBNow(), child.InitialDelay)
-		if addErr != nil {
-			return SettleResult{}, addErr
-		}
-		childReady, err := s.insertCommand(ctx, semantic.PGX(), semantic.ExecutionID(), child,
-			layout.childCreatedPosition(journal, index), semantic.DBNow(), next, next)
-		if err != nil {
+	immediatelyRunnable := preparedChildren.immediatelyRunnable && !cancelStagedChildren
+	if len(request.Children) > 0 {
+		if err := s.insertPreparedCommandBatch(ctx, semantic.PGX(), semantic.ExecutionID(), semantic.DBNow(), preparedChildren); err != nil {
 			return SettleResult{}, err
 		}
-		if childReady && !cancelStagedChildren && !next.After(semantic.DBNow()) {
-			immediatelyRunnable = true
+	}
+	if cancelStagedChildren {
+		cancellationPositions := make([]int64, len(request.Children))
+		for index, child := range request.Children {
+			row := journal.Journal[childCancellationIndexes[index]]
+			if row.Kind != EventRecorded || row.EventClass == nil || *row.EventClass != "command_terminal" ||
+				row.TerminalStatus == nil || *row.TerminalStatus != "cancelled" || row.CommandID == nil || *row.CommandID != child.ID {
+				return SettleResult{}, fmt.Errorf("%w: staged-child cancellation journal mapping differs", flowerr.ErrInvalidState)
+			}
+			cancellationPositions[index] = row.Position
 		}
-		if cancelStagedChildren {
-			failure := terminalFailure{Code: "fail_fast", Message: "cancelled because the execution is failing"}
-			if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-				SET state='cancelled',terminal_failure=$2::jsonb,terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
-				WHERE command_id=$1`, child.ID, jsonString(failure),
-				journal.Journal[childCancellationIndexes[index]].Position, semantic.DBNow()); err != nil {
-				return SettleResult{}, MapError("cancel child staged while execution is failing", err)
-			}
-			if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+`
-				WHERE command_id=$1`, child.ID); err != nil {
-				return SettleResult{}, MapError("remove child staged while execution is failing", err)
-			}
+		if err := s.cancelStagedCommandBatch(ctx, semantic, preparedChildren, cancellationPositions); err != nil {
+			return SettleResult{}, err
 		}
 	}
 	if err := hook.Hit(ctx, fault.SettleAfterChildren); err != nil {
@@ -991,6 +1020,55 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		return SettleResult{}, err
 	}
 	return SettleResult{Terminal: true, Status: "succeeded"}, nil
+}
+
+func (s *Store) cancelStagedCommandBatch(
+	ctx context.Context,
+	semantic *SemanticTx,
+	batch preparedCommandBatch,
+	terminalPositions []int64,
+) error {
+	if len(batch.commands) == 0 || len(terminalPositions) != len(batch.commands) {
+		return fmt.Errorf("%w: staged-child cancellation batch differs", flowerr.ErrInvalidState)
+	}
+	commandIDs := make([]uuid.UUID, len(batch.commands))
+	for index, command := range batch.commands {
+		if terminalPositions[index] < 1 {
+			return fmt.Errorf("%w: staged-child cancellation position is invalid", flowerr.ErrInvalidState)
+		}
+		commandIDs[index] = command.command.ID
+	}
+	failure := terminalFailure{Code: "fail_fast", Message: "cancelled because the execution is failing"}
+	commandTag, err := semantic.PGX().Exec(ctx, `WITH cancelled(command_id,terminal_position) AS (
+		SELECT * FROM unnest($2::uuid[],$3::bigint[])
+	)
+	UPDATE `+pgschema.Table(s.schema, "flow_commands")+` AS c
+	SET state='cancelled',terminal_failure=$4::jsonb,terminal_position=cancelled.terminal_position,
+	    finished_at=$5,updated_at=$5,status_at=$5
+	FROM cancelled
+	WHERE c.execution_id=$1 AND c.command_id=cancelled.command_id
+	  AND c.state IN ('pending','ready')`,
+		semantic.ExecutionID(), commandIDs, terminalPositions, jsonString(failure), semantic.DBNow())
+	if err != nil {
+		return MapError("cancel staged command batch while execution is failing", err)
+	}
+	if commandTag.RowsAffected() != int64(len(commandIDs)) {
+		return fmt.Errorf("%w: staged-child cancellation batch updated %d of %d rows",
+			flowerr.ErrInvalidState, commandTag.RowsAffected(), len(commandIDs))
+	}
+	if len(batch.queues) == 0 {
+		return nil
+	}
+	queueTag, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+`
+		WHERE execution_id=$1 AND command_id=ANY($2::uuid[])`, semantic.ExecutionID(), commandIDs)
+	if err != nil {
+		return MapError("remove staged command queue batch while execution is failing", err)
+	}
+	if queueTag.RowsAffected() != int64(len(batch.queues)) {
+		return fmt.Errorf("%w: staged-child queue batch removed %d of %d rows",
+			flowerr.ErrInvalidState, queueTag.RowsAffected(), len(batch.queues))
+	}
+	return nil
 }
 
 func (s *Store) validateSuccessfulDecision(ctx context.Context, semantic *SemanticTx, fence commandFence, request CommandSuccess) error {
@@ -1469,14 +1547,31 @@ func (s *Store) expireExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		return err
 	}
 	failure := terminalFailure{Code: "execution_expired", Message: reason}
-	for _, command := range commands {
-		position := journal.Journal[terminalBatchIndex[command.ID]].Position
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-			SET state='cancelled',last_error=$2::jsonb,terminal_failure=$2::jsonb,terminal_position=$3,
-			    finished_at=$4,updated_at=$4,status_at=$4 WHERE command_id=$1`, command.ID,
-			jsonString(failure), position, semantic.DBNow()); err != nil {
-			return MapError("expire command", err)
+	commandIDs := make([]uuid.UUID, len(commands))
+	terminalPositions := make([]int64, len(commands))
+	for index, command := range commands {
+		journalIndex, exists := terminalBatchIndex[command.ID]
+		if !exists || journalIndex < 0 || journalIndex >= len(journal.Journal) {
+			return fmt.Errorf("%w: execution expiry journal mapping is invalid", flowerr.ErrInvalidState)
 		}
+		row := journal.Journal[journalIndex]
+		if row.CommandID == nil || *row.CommandID != command.ID || row.TerminalStatus == nil || *row.TerminalStatus != "cancelled" {
+			return fmt.Errorf("%w: execution expiry journal mapping differs", flowerr.ErrInvalidState)
+		}
+		commandIDs[index], terminalPositions[index] = command.ID, row.Position
+	}
+	commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+` AS c
+		SET state='cancelled',last_error=$4::jsonb,terminal_failure=$4::jsonb,
+		    terminal_position=expired.position,finished_at=$5,updated_at=$5,status_at=$5
+		FROM unnest($1::uuid[],$2::bigint[]) AS expired(command_id,position)
+		WHERE c.execution_id=$3 AND c.command_id=expired.command_id
+		  AND c.state NOT IN ('succeeded','failed','cancelled','expired')`,
+		commandIDs, terminalPositions, semantic.ExecutionID(), jsonString(failure), semantic.DBNow())
+	if err != nil {
+		return MapError("expire command batch", err)
+	}
+	if commandTag.RowsAffected() != int64(len(commandIDs)) {
+		return fmt.Errorf("%w: execution expiry set changed", flowerr.ErrInvalidState)
 	}
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE execution_id=$1`, semantic.ExecutionID()); err != nil {
 		return MapError("remove expired execution deliveries", err)

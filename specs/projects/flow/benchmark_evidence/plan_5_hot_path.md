@@ -329,3 +329,72 @@ runs the production wait-update shape under `EXPLAIN (ANALYZE, BUFFERS)`. Postgr
 verification also covered exact-deadline reconciliation, grouped multi-wait and
 multi-command release, equivalent/conflicting duplicate ingress, runnable-only
 queue insertion, fail-fast running survivors, and replay/trace equivalence.
+
+## Phase 4 batched-decision evidence
+
+The Phase 4 working tree was measured from parent commit `16f844d` on the same
+machine, PostgreSQL 18.1 instance, durability settings, 12-connection test pool,
+and 16-worker fan-out runtime as the baseline. Database credentials were
+supplied through the existing test environment and were not printed or
+recorded.
+
+```text
+go test -run '^$' \
+  -bench 'Benchmark(SameExecutionFanout|StagedDecisionBatch)$' \
+  -benchmem -benchtime=3s -count=5 .
+
+go test -run '^$' -bench '^BenchmarkExecutionIngressNotification$' \
+  -benchmem -benchtime=3s -count=5 .
+```
+
+The additional ingress run verifies that routing one-command root creation
+through the prepared batch helper did not regress the ordinary start path:
+
+| Workload | Baseline median (range) | Phase 4 median (range) |
+|---|---:|---:|
+| execution ingress, poll-only | 4.167 ms (4.060-4.341) | 3.978 ms (3.881-4.074) |
+| execution ingress, notification mode | 4.261 ms (4.083-4.320) | 4.036 ms (4.004-4.089) |
+
+### Same-execution completion
+
+| Workload | Baseline median (range) | Phase 3 median (range) | Phase 4 median (range) |
+|---|---:|---:|---:|
+| 10 commands | 78.08 ms; 128.1 commands/s (74.22-83.37 ms; 120.0-134.7 commands/s) | 76.65 ms; 130.5 commands/s (75.31-79.25 ms; 126.2-132.8 commands/s) | 70.81 ms; 141.2 commands/s (69.01-70.92 ms; 141.0-144.9 commands/s) |
+| 100 commands | 671.0 ms; 149.0 commands/s (664.7-673.1 ms; 148.6-150.4 commands/s) | 673.6 ms; 148.5 commands/s (665.9-692.7 ms; 144.4-150.2 commands/s) | 582.3 ms; 171.7 commands/s (576.1-586.8 ms; 170.4-173.6 commands/s) |
+
+### Isolated staged-decision settlement
+
+| Children | Events | Baseline median (range) | Phase 4 median (range) |
+|---:|---:|---:|---:|
+| 1 | 0 | 4.672 ms (4.450-4.719) | 4.488 ms (4.355-4.535) |
+| 1 | 10 | 5.437 ms (5.271-5.524) | 4.963 ms (4.884-5.167) |
+| 1 | 100 | 14.905 ms (14.370-15.114) | 9.289 ms (9.169-9.444) |
+| 10 | 0 | 8.966 ms (8.701-9.121) | 6.598 ms (6.516-6.796) |
+| 10 | 10 | 10.174 ms (9.682-10.502) | 7.528 ms (7.418-7.575) |
+| 10 | 100 | 21.363 ms (20.592-22.113) | 11.634 ms (11.230-11.839) |
+| 100 | 0 | 59.042 ms (56.755-60.752) | 23.107 ms (22.890-23.229) |
+| 100 | 10 | 55.329 ms (54.875-57.152) | 24.818 ms (24.533-25.031) |
+| 100 | 100 | 68.531 ms (65.941-71.072) | 29.532 ms (28.101-30.144) |
+
+The improvement grows with decision size: the 100-child shapes settle in
+approximately 23-30 ms instead of 55-69 ms. End-to-end 100-command completion
+also improved by about 13% in these samples. These remain development-machine
+measurements rather than timing contracts.
+
+The structural query shape is now bounded by store operation rather than item
+count:
+
+- all normalized staged-event identities are compared with one `unnest` query;
+- all deduplicated child-wait identities use one retained-event position query;
+- child command, wait, and initially ready queue projections use one `CopyFrom`
+  operation per table, with exact affected-row checks;
+- fail-fast survivor children use one position-aware command update and one
+  queue delete; and
+- whole-execution cancellation and expiry projection updates are likewise
+  position-aware sets rather than one update per command.
+
+PostgreSQL tests cover 100 no-wait children, a 100-child mixed batch with
+retained/shared/distinct staged/missing waits, exact journal-to-command and
+wait-to-event position mapping, final counters and queue shapes, `WithCommit`,
+fail-fast survivor child cancellation, fault rollback/ambiguous commit seams,
+caller-owned root insertion, and replay/trace equivalence.

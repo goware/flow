@@ -170,7 +170,7 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 		return StartResult{}, false, err
 	}
 	rootReady, err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position,
-		dbNow, dbNow, nextAttemptAt)
+		dbNow, dbNow, nextAttemptAt, deadlineAt)
 	if err != nil {
 		return StartResult{}, false, err
 	}
@@ -269,7 +269,15 @@ func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time
 	if err != nil {
 		return nil, err
 	}
-	created, err := commandCreatedEntry(*request.Root, dbNow, nextAttemptAt)
+	initialState := "ready"
+	var budgetStartedAt, recordedNextAttemptAt *time.Time
+	if len(request.Root.Waits) > 0 {
+		initialState = "pending"
+	} else {
+		budgetStartedAt = clonePointer(&dbNow)
+		recordedNextAttemptAt = clonePointer(&nextAttemptAt)
+	}
+	created, err := commandCreatedEntry(*request.Root, initialState, budgetStartedAt, recordedNextAttemptAt)
 	if err != nil {
 		return nil, err
 	}
@@ -279,9 +287,21 @@ func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time
 	return entries, nil
 }
 
-func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt time.Time) (JournalEntry, error) {
+func commandCreatedEntry(
+	command CommandCreate,
+	initialState string,
+	budgetStartedAt *time.Time,
+	nextAttemptAt *time.Time,
+) (JournalEntry, error) {
 	if err := validateCommandCreate(command); err != nil {
 		return JournalEntry{}, err
+	}
+	if initialState != "pending" && initialState != "ready" {
+		return JournalEntry{}, fmt.Errorf("%w: invalid initial command state", flowerr.ErrInvalid)
+	}
+	if initialState == "pending" && (budgetStartedAt != nil || nextAttemptAt != nil) ||
+		initialState == "ready" && (budgetStartedAt == nil || nextAttemptAt == nil) {
+		return JournalEntry{}, fmt.Errorf("%w: invalid initial command timing", flowerr.ErrInvalid)
 	}
 	var timeoutMS *int64
 	if command.AttemptTimeout > 0 {
@@ -299,20 +319,13 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 		}
 		initialDelayMS = &value
 	}
-	initialState := "ready"
-	var recordedBudget, recordedNext *time.Time
-	if len(command.Waits) > 0 {
-		initialState = "pending"
-	} else {
-		recordedBudget, recordedNext = &budgetStartedAt, &nextAttemptAt
-	}
 	body := journalcodec.CommandCreatedBody{
 		V: 1, CommandID: command.ID.String(), CommandKey: command.Key, Name: command.Name,
 		Version: command.Version, Args: json.RawMessage(command.Args.BytesCopy()),
 		Required: command.Required, InitialState: initialState,
 		Queue: command.Queue, AttemptTimeoutMS: timeoutMS,
 		RetryPolicy:    json.RawMessage(command.RetryPolicy.BytesCopy()),
-		InitialDelayMS: initialDelayMS, BudgetStartedAt: recordedBudget, NextAttemptAt: recordedNext,
+		InitialDelayMS: initialDelayMS, BudgetStartedAt: clonePointer(budgetStartedAt), NextAttemptAt: clonePointer(nextAttemptAt),
 		DeclarationFingerprint: hex.EncodeToString(command.DeclarationFingerprint[:]),
 	}
 	for _, wait := range command.Waits {
@@ -336,6 +349,86 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 	return entry, nil
 }
 
+type commandBatchCreate struct {
+	command         CommandCreate
+	createdPosition int64
+	budgetStartedAt time.Time
+	nextAttemptAt   time.Time
+}
+
+type applicationEventIdentity struct {
+	name string
+	key  string
+}
+
+type preparedCommandInsert struct {
+	command          CommandCreate
+	createdPosition  int64
+	state            string
+	unsatisfiedWaits int
+	attemptTimeoutMS *int64
+	initialDelayMS   *int64
+	budgetStartedAt  *time.Time
+	nextAttemptAt    *time.Time
+	waitStartedAt    *time.Time
+	waitDeadlineAt   *time.Time
+	waitTimeoutMS    *int64
+}
+
+type preparedWaitInsert struct {
+	commandID        uuid.UUID
+	name             string
+	key              string
+	satisfied        *int64
+	stagedEventIndex int
+}
+
+type preparedQueueInsert struct {
+	commandID uuid.UUID
+	queue     string
+	name      string
+	version   int
+	nextRunAt time.Time
+}
+
+type preparedCommandBatch struct {
+	commands            []preparedCommandInsert
+	waits               []preparedWaitInsert
+	queues              []preparedQueueInsert
+	immediatelyRunnable bool
+}
+
+func (batch *preparedCommandBatch) assignJournalPositions(created, stagedEvents []int64) error {
+	if batch == nil || len(created) != len(batch.commands) {
+		return fmt.Errorf("%w: command-created journal position count differs", flowerr.ErrInvalidState)
+	}
+	for index, position := range created {
+		if position < 1 {
+			return fmt.Errorf("%w: command-created journal position is invalid", flowerr.ErrInvalidState)
+		}
+		batch.commands[index].createdPosition = position
+	}
+	for index := range batch.waits {
+		wait := &batch.waits[index]
+		if wait.stagedEventIndex < 0 {
+			continue
+		}
+		if wait.stagedEventIndex >= len(stagedEvents) || stagedEvents[wait.stagedEventIndex] < 1 {
+			return fmt.Errorf("%w: staged-event wait journal position differs", flowerr.ErrInvalidState)
+		}
+		wait.satisfied = clonePointer(&stagedEvents[wait.stagedEventIndex])
+	}
+	return nil
+}
+
+func (batch preparedCommandBatch) initialJournalState(index int) (string, *time.Time, *time.Time, error) {
+	if index < 0 || index >= len(batch.commands) {
+		return "", nil, nil, fmt.Errorf("%w: prepared command index is invalid", flowerr.ErrInvalidState)
+	}
+	command := batch.commands[index]
+	return command.state, clonePointer(command.budgetStartedAt), clonePointer(command.nextAttemptAt), nil
+}
+
 func (s *Store) insertCommand(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -345,115 +438,275 @@ func (s *Store) insertCommand(
 	createdAt time.Time,
 	budgetStartedAt time.Time,
 	nextAttemptAt time.Time,
+	executionDeadline *time.Time,
 ) (bool, error) {
-	if err := validateCommandCreate(command); err != nil {
+	batch, err := s.prepareCommandBatch(ctx, tx, executionID, []commandBatchCreate{{
+		command: command, createdPosition: createdPosition,
+		budgetStartedAt: budgetStartedAt, nextAttemptAt: nextAttemptAt,
+	}}, createdAt, executionDeadline, nil)
+	if err != nil {
 		return false, err
 	}
-	var timeoutMS *int64
-	if command.AttemptTimeout > 0 {
-		value, err := durable.ExactMilliseconds("attempt timeout", command.AttemptTimeout)
-		if err != nil {
-			return false, err
+	if err := s.insertPreparedCommandBatch(ctx, tx, executionID, createdAt, batch); err != nil {
+		return false, err
+	}
+	return batch.commands[0].state == "ready", nil
+}
+
+func (s *Store) prepareCommandBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	executionID uuid.UUID,
+	creates []commandBatchCreate,
+	createdAt time.Time,
+	executionDeadline *time.Time,
+	stagedEvents []ApplicationEvent,
+) (preparedCommandBatch, error) {
+	if tx == nil || executionID == uuid.Nil || createdAt.IsZero() {
+		return preparedCommandBatch{}, fmt.Errorf("%w: invalid command batch context", flowerr.ErrInvalid)
+	}
+	if err := durable.PostgresInteger("command batch count", len(creates), 1, durable.PostgresIntegerMax); err != nil {
+		return preparedCommandBatch{}, err
+	}
+
+	staged := make(map[applicationEventIdentity]int, len(stagedEvents))
+	for index, event := range stagedEvents {
+		identity := applicationEventIdentity{name: event.Name, key: event.Key}
+		if event.Name == "" || event.Key == "" {
+			return preparedCommandBatch{}, fmt.Errorf("%w: incomplete staged application event", flowerr.ErrInvalid)
 		}
-		timeoutMS = &value
-	}
-	var initialDelayMS *int64
-	if command.InitialDelay > 0 {
-		value, err := durable.ExactMilliseconds("initial delay", command.InitialDelay)
-		if err != nil {
-			return false, err
+		if _, exists := staged[identity]; exists {
+			return preparedCommandBatch{}, fmt.Errorf("%w: duplicate normalized staged application event", flowerr.ErrInvalidState)
 		}
-		initialDelayMS = &value
+		staged[identity] = index
 	}
-	state := "ready"
-	unsatisfiedWaits := 0
-	waitPositions := make(map[int]int64, len(command.Waits))
-	for index, wait := range command.Waits {
-		var position int64
-		err := tx.QueryRow(ctx, `SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
-			WHERE execution_id=$1 AND entry_kind='event_recorded' AND event_class='application'
-			AND event_namespace='application' AND event_name=$2 AND event_key=$3
-			ORDER BY position LIMIT 1`, executionID, wait.Name, wait.Key).Scan(&position)
-		if errors.Is(err, pgx.ErrNoRows) {
-			unsatisfiedWaits++
-			continue
+
+	wanted := make([]applicationEventIdentity, 0)
+	wantedSet := make(map[applicationEventIdentity]struct{})
+	commandIDs := make(map[uuid.UUID]struct{}, len(creates))
+	commandKeys := make(map[string]struct{}, len(creates))
+	for _, create := range creates {
+		if err := validateCommandCreate(create.command); err != nil {
+			return preparedCommandBatch{}, err
 		}
-		if err != nil {
-			return false, MapError("find retained event for command wait", err)
+		if create.budgetStartedAt.IsZero() || create.nextAttemptAt.IsZero() {
+			return preparedCommandBatch{}, fmt.Errorf("%w: command batch timing is empty", flowerr.ErrInvalid)
 		}
-		waitPositions[index] = position
-	}
-	if unsatisfiedWaits > 0 {
-		state = "pending"
-	}
-	var acceptedBudget, acceptedNext *time.Time
-	if state == "ready" {
-		acceptedBudget, acceptedNext = &budgetStartedAt, &nextAttemptAt
-	}
-	var withinMS *int64
-	if command.Within > 0 {
-		value, err := durable.ExactMilliseconds("wait timeout", command.Within)
-		if err != nil {
-			return false, err
+		if create.createdPosition < 0 {
+			return preparedCommandBatch{}, fmt.Errorf("%w: command-created position is invalid", flowerr.ErrInvalid)
 		}
-		withinMS = &value
-	}
-	var waitStartedAt, waitDeadlineAt *time.Time
-	if state == "pending" {
-		waitStartedAt = clonePointer(&createdAt)
-		if command.Within > 0 {
-			value, addErr := durable.AddExactDuration("wait timeout", createdAt, command.Within)
-			if addErr != nil {
-				return false, addErr
+		if _, exists := commandIDs[create.command.ID]; exists {
+			return preparedCommandBatch{}, fmt.Errorf("%w: duplicate command ID in batch", flowerr.ErrConflict)
+		}
+		if _, exists := commandKeys[create.command.Key]; exists {
+			return preparedCommandBatch{}, fmt.Errorf("%w: duplicate command key in batch", flowerr.ErrConflict)
+		}
+		commandIDs[create.command.ID] = struct{}{}
+		commandKeys[create.command.Key] = struct{}{}
+		for _, wait := range create.command.Waits {
+			identity := applicationEventIdentity{name: wait.Name, key: wait.Key}
+			if _, exists := wantedSet[identity]; exists {
+				continue
 			}
-			var executionDeadline *time.Time
-			if err := tx.QueryRow(ctx, `SELECT deadline_at FROM `+pgschema.Table(s.schema, "flow_executions")+`
-				WHERE execution_id=$1`, executionID).Scan(&executionDeadline); err != nil {
-				return false, MapError("load execution deadline for initial wait", err)
-			}
-			if executionDeadline != nil && executionDeadline.Before(value) {
-				value = *executionDeadline
-			}
-			waitDeadlineAt = &value
+			wantedSet[identity] = struct{}{}
+			wanted = append(wanted, identity)
 		}
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_commands")+` (
-		command_id,execution_id,command_key,name,version,parent_command_id,required,
-		args,declaration_fingerprint,state,unsatisfied_waits,
-		queue,attempt_timeout_ms,retry_policy,initial_delay_ms,
-		budget_started_at,next_attempt_at,wait_started_at,wait_deadline_at,wait_timeout_ms,
-		created_position,created_at,updated_at,status_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$22,$22)`,
-		command.ID, executionID, command.Key, command.Name, command.Version,
-		command.ParentCommandID, command.Required, command.Args.Bytes,
-		command.DeclarationFingerprint[:], state, unsatisfiedWaits, command.Queue, timeoutMS,
-		command.RetryPolicy.Bytes, initialDelayMS,
-		acceptedBudget, acceptedNext, waitStartedAt, waitDeadlineAt, withinMS, createdPosition, createdAt,
-	)
+
+	retained, err := s.lookupRetainedEventPositions(ctx, tx, executionID, wanted)
 	if err != nil {
-		return false, MapError("insert command", err)
+		return preparedCommandBatch{}, err
 	}
-	if state == "ready" {
-		_, err = tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_queue")+`
-			(command_id,execution_id,queue,name,version,state,next_run_at)
-			VALUES ($1,$2,$3,$4,$5,'ready',$6)`,
-			command.ID, executionID, command.Queue, command.Name, command.Version, nextAttemptAt)
+	result := preparedCommandBatch{
+		commands: make([]preparedCommandInsert, 0, len(creates)),
+	}
+	for _, create := range creates {
+		command := create.command
+		prepared := preparedCommandInsert{command: command, createdPosition: create.createdPosition, state: "ready"}
+		if command.AttemptTimeout > 0 {
+			value, err := durable.ExactMilliseconds("attempt timeout", command.AttemptTimeout)
+			if err != nil {
+				return preparedCommandBatch{}, err
+			}
+			prepared.attemptTimeoutMS = &value
+		}
+		if command.InitialDelay > 0 {
+			value, err := durable.ExactMilliseconds("initial delay", command.InitialDelay)
+			if err != nil {
+				return preparedCommandBatch{}, err
+			}
+			prepared.initialDelayMS = &value
+		}
+		if command.Within > 0 {
+			value, err := durable.ExactMilliseconds("wait timeout", command.Within)
+			if err != nil {
+				return preparedCommandBatch{}, err
+			}
+			prepared.waitTimeoutMS = &value
+		}
+
+		for _, wait := range command.Waits {
+			identity := applicationEventIdentity{name: wait.Name, key: wait.Key}
+			preparedWait := preparedWaitInsert{
+				commandID: command.ID, name: wait.Name, key: wait.Key, stagedEventIndex: -1,
+			}
+			if position, ok := retained[identity]; ok {
+				preparedWait.satisfied = clonePointer(&position)
+			} else if eventIndex, ok := staged[identity]; ok {
+				preparedWait.stagedEventIndex = eventIndex
+			} else {
+				prepared.unsatisfiedWaits++
+			}
+			result.waits = append(result.waits, preparedWait)
+		}
+
+		if prepared.unsatisfiedWaits > 0 {
+			prepared.state = "pending"
+			prepared.waitStartedAt = clonePointer(&createdAt)
+			if command.Within > 0 {
+				deadline, err := durable.AddExactDuration("wait timeout", createdAt, command.Within)
+				if err != nil {
+					return preparedCommandBatch{}, err
+				}
+				if executionDeadline != nil && executionDeadline.Before(deadline) {
+					deadline = *executionDeadline
+				}
+				prepared.waitDeadlineAt = &deadline
+			}
+		} else {
+			prepared.budgetStartedAt = clonePointer(&create.budgetStartedAt)
+			prepared.nextAttemptAt = clonePointer(&create.nextAttemptAt)
+			result.queues = append(result.queues, preparedQueueInsert{
+				commandID: command.ID, queue: command.Queue, name: command.Name,
+				version: command.Version, nextRunAt: create.nextAttemptAt,
+			})
+			if !create.nextAttemptAt.After(createdAt) {
+				result.immediatelyRunnable = true
+			}
+		}
+		result.commands = append(result.commands, prepared)
+	}
+	return result, nil
+}
+
+func (s *Store) lookupRetainedEventPositions(
+	ctx context.Context,
+	tx pgx.Tx,
+	executionID uuid.UUID,
+	identities []applicationEventIdentity,
+) (map[applicationEventIdentity]int64, error) {
+	result := make(map[applicationEventIdentity]int64, len(identities))
+	if len(identities) == 0 {
+		return result, nil
+	}
+	names := make([]string, len(identities))
+	keys := make([]string, len(identities))
+	for index, identity := range identities {
+		names[index], keys[index] = identity.name, identity.key
+	}
+	rows, err := tx.Query(ctx, `WITH wanted(event_name,event_key) AS (
+		SELECT * FROM unnest($2::text[],$3::text[])
+	)
+	SELECT j.event_name,j.event_key,j.position
+	FROM wanted
+	JOIN `+pgschema.Table(s.schema, "flow_journal")+` AS j
+	  ON j.execution_id=$1 AND j.entry_kind='event_recorded'
+	 AND j.event_class='application' AND j.event_namespace='application'
+	 AND j.event_name=wanted.event_name AND j.event_key=wanted.event_key`, executionID, names, keys)
+	if err != nil {
+		return nil, MapError("load retained events for command batch", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var identity applicationEventIdentity
+		var position int64
+		if err := rows.Scan(&identity.name, &identity.key, &position); err != nil {
+			return nil, MapError("scan retained event for command batch", err)
+		}
+		if position < 1 {
+			return nil, fmt.Errorf("%w: retained application-event position is invalid", flowerr.ErrInvalidState)
+		}
+		if _, exists := result[identity]; exists {
+			return nil, fmt.Errorf("%w: retained application-event identity is not unique", flowerr.ErrInvalidState)
+		}
+		result[identity] = position
+	}
+	if err := rows.Err(); err != nil {
+		return nil, MapError("read retained events for command batch", err)
+	}
+	return result, nil
+}
+
+func (s *Store) insertPreparedCommandBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	executionID uuid.UUID,
+	createdAt time.Time,
+	batch preparedCommandBatch,
+) error {
+	commandRows := make([][]any, len(batch.commands))
+	for index, prepared := range batch.commands {
+		if prepared.createdPosition < 1 {
+			return fmt.Errorf("%w: command-created journal position is missing", flowerr.ErrInvalidState)
+		}
+		command := prepared.command
+		commandRows[index] = []any{
+			command.ID, executionID, command.Key, command.Name, command.Version,
+			command.ParentCommandID, command.Required, command.Args.Bytes,
+			command.DeclarationFingerprint[:], prepared.state, prepared.unsatisfiedWaits,
+			command.Queue, prepared.attemptTimeoutMS, command.RetryPolicy.Bytes, prepared.initialDelayMS,
+			prepared.budgetStartedAt, prepared.nextAttemptAt, prepared.waitStartedAt,
+			prepared.waitDeadlineAt, prepared.waitTimeoutMS, prepared.createdPosition,
+			createdAt, createdAt, createdAt,
+		}
+	}
+	count, err := tx.CopyFrom(ctx, pgx.Identifier{s.schema, "flow_commands"}, []string{
+		"command_id", "execution_id", "command_key", "name", "version", "parent_command_id", "required",
+		"args", "declaration_fingerprint", "state", "unsatisfied_waits", "queue", "attempt_timeout_ms",
+		"retry_policy", "initial_delay_ms", "budget_started_at", "next_attempt_at", "wait_started_at",
+		"wait_deadline_at", "wait_timeout_ms", "created_position", "created_at", "updated_at", "status_at",
+	}, pgx.CopyFromRows(commandRows))
+	if err != nil {
+		return MapError("insert command batch", err)
+	}
+	if count != int64(len(commandRows)) {
+		return fmt.Errorf("%w: command batch inserted %d of %d rows", flowerr.ErrInvalidState, count, len(commandRows))
+	}
+
+	if len(batch.waits) > 0 {
+		waitRows := make([][]any, len(batch.waits))
+		for index, wait := range batch.waits {
+			waitRows[index] = []any{wait.commandID, executionID, wait.name, wait.key, wait.satisfied}
+		}
+		count, err = tx.CopyFrom(ctx, pgx.Identifier{s.schema, "flow_command_event_waits"}, []string{
+			"command_id", "execution_id", "event_name", "event_key", "satisfied_position",
+		}, pgx.CopyFromRows(waitRows))
 		if err != nil {
-			return false, MapError("enqueue command", err)
+			return MapError("insert command event wait batch", err)
+		}
+		if count != int64(len(waitRows)) {
+			return fmt.Errorf("%w: command event wait batch inserted %d of %d rows", flowerr.ErrInvalidState, count, len(waitRows))
 		}
 	}
-	for index, wait := range command.Waits {
-		var satisfied *int64
-		if position, ok := waitPositions[index]; ok {
-			satisfied = &position
+
+	if len(batch.queues) > 0 {
+		queueRows := make([][]any, len(batch.queues))
+		for index, queue := range batch.queues {
+			queueRows[index] = []any{
+				queue.commandID, executionID, queue.queue, queue.name, queue.version, "ready", queue.nextRunAt,
+			}
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_event_waits")+`
-			(command_id,execution_id,event_name,event_key,satisfied_position)
-			VALUES ($1,$2,$3,$4,$5)`, command.ID, executionID, wait.Name, wait.Key, satisfied); err != nil {
-			return false, MapError("insert command event wait", err)
+		count, err = tx.CopyFrom(ctx, pgx.Identifier{s.schema, "flow_command_queue"}, []string{
+			"command_id", "execution_id", "queue", "name", "version", "state", "next_run_at",
+		}, pgx.CopyFromRows(queueRows))
+		if err != nil {
+			return MapError("insert command queue batch", err)
+		}
+		if count != int64(len(queueRows)) {
+			return fmt.Errorf("%w: command queue batch inserted %d of %d rows", flowerr.ErrInvalidState, count, len(queueRows))
 		}
 	}
-	return state == "ready", nil
+	return nil
 }
 
 type ExecutionHead struct {
@@ -497,13 +750,13 @@ func (s *Store) coalesceApplicationEvents(ctx context.Context, semantic *Semanti
 		}
 		return ordered[i].Key < ordered[j].Key
 	})
-	result := make([]ApplicationEvent, 0, len(ordered))
-	seen := make(map[string]ApplicationEvent, len(ordered))
+	unique := make([]ApplicationEvent, 0, len(ordered))
+	seen := make(map[applicationEventIdentity]ApplicationEvent, len(ordered))
 	for _, event := range ordered {
 		if event.ID == uuid.Nil || event.Name == "" || event.Key == "" || len(event.Body.Bytes) == 0 {
 			return nil, fmt.Errorf("%w: incomplete staged application event", flowerr.ErrInvalid)
 		}
-		identity := event.Name + "\x00" + event.Key
+		identity := applicationEventIdentity{name: event.Name, key: event.Key}
 		if prior, exists := seen[identity]; exists {
 			if bytes.Equal(prior.Body.Bytes, event.Body.Bytes) {
 				continue
@@ -511,17 +764,57 @@ func (s *Store) coalesceApplicationEvents(ctx context.Context, semantic *Semanti
 			return nil, fmt.Errorf("%w: staged application event identity differs", flowerr.ErrConflict)
 		}
 		seen[identity] = event
-		existing, err := s.LookupApplicationEvent(ctx, semantic.PGX(), semantic.ExecutionID(), event.Name, event.Key)
-		if err != nil {
-			return nil, err
+		unique = append(unique, event)
+	}
+
+	names := make([]string, len(unique))
+	keys := make([]string, len(unique))
+	for index, event := range unique {
+		names[index], keys[index] = event.Name, event.Key
+	}
+	rows, err := semantic.PGX().Query(ctx, `WITH staged(event_name,event_key) AS (
+		SELECT * FROM unnest($2::text[],$3::text[])
+	)
+	SELECT j.event_name,j.event_key,j.body
+	FROM staged
+	JOIN `+pgschema.Table(s.schema, "flow_journal")+` AS j
+	  ON j.execution_id=$1 AND j.entry_kind='event_recorded'
+	 AND j.event_class='application' AND j.event_namespace='application'
+	 AND j.event_name=staged.event_name AND j.event_key=staged.event_key`,
+		semantic.ExecutionID(), names, keys)
+	if err != nil {
+		return nil, MapError("load staged application event identities", err)
+	}
+	existing := make(map[applicationEventIdentity][]byte, len(unique))
+	for rows.Next() {
+		var identity applicationEventIdentity
+		var body []byte
+		if err := rows.Scan(&identity.name, &identity.key, &body); err != nil {
+			rows.Close()
+			return nil, MapError("scan staged application event identity", err)
 		}
-		if existing.Found {
-			if bytes.Equal(existing.Body, event.Body.Bytes) {
-				continue
-			}
+		if _, exists := existing[identity]; exists {
+			rows.Close()
+			return nil, fmt.Errorf("%w: application event identity is not unique", flowerr.ErrInvalidState)
+		}
+		existing[identity] = body
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, MapError("read staged application event identities", err)
+	}
+	rows.Close()
+
+	result := make([]ApplicationEvent, 0, len(unique))
+	for _, event := range unique {
+		body, found := existing[applicationEventIdentity{name: event.Name, key: event.Key}]
+		if !found {
+			result = append(result, event)
+			continue
+		}
+		if !bytes.Equal(body, event.Body.Bytes) {
 			return nil, fmt.Errorf("%w: application event identity differs", flowerr.ErrConflict)
 		}
-		result = append(result, event)
 	}
 	return result, nil
 }
@@ -911,12 +1204,31 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		return CancelResult{}, err
 	}
 	failure := jsonString(terminalFailure{Code: "cancelled", Message: reason})
-	for _, command := range commands {
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-			SET state='cancelled',terminal_failure=$2::jsonb,terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
-			WHERE command_id=$1`, command.id, failure, journal.Journal[terminalBatchIndex[command.id]].Position, semantic.DBNow()); err != nil {
-			return CancelResult{}, MapError("cancel execution command", err)
+	commandIDs := make([]uuid.UUID, len(commands))
+	terminalPositions := make([]int64, len(commands))
+	for index, command := range commands {
+		journalIndex, exists := terminalBatchIndex[command.id]
+		if !exists || journalIndex < 0 || journalIndex >= len(journal.Journal) {
+			return CancelResult{}, fmt.Errorf("%w: execution cancellation journal mapping is invalid", flowerr.ErrInvalidState)
 		}
+		row := journal.Journal[journalIndex]
+		if row.CommandID == nil || *row.CommandID != command.id || row.TerminalStatus == nil || *row.TerminalStatus != "cancelled" {
+			return CancelResult{}, fmt.Errorf("%w: execution cancellation journal mapping differs", flowerr.ErrInvalidState)
+		}
+		commandIDs[index], terminalPositions[index] = command.id, row.Position
+	}
+	commandTag, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+` AS c
+		SET state='cancelled',terminal_failure=$4::jsonb,terminal_position=cancelled.position,
+		    finished_at=$5,updated_at=$5,status_at=$5
+		FROM unnest($1::uuid[],$2::bigint[]) AS cancelled(command_id,position)
+		WHERE c.execution_id=$3 AND c.command_id=cancelled.command_id
+		  AND c.state NOT IN ('succeeded','failed','cancelled','expired')`,
+		commandIDs, terminalPositions, head.ID, failure, semantic.DBNow())
+	if err != nil {
+		return CancelResult{}, MapError("cancel execution command batch", err)
+	}
+	if commandTag.RowsAffected() != int64(len(commandIDs)) {
+		return CancelResult{}, fmt.Errorf("%w: execution cancellation set changed", flowerr.ErrInvalidState)
 	}
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE execution_id=$1`, head.ID); err != nil {
 		return CancelResult{}, MapError("remove execution deliveries", err)
@@ -1045,6 +1357,20 @@ func validateCommandCreate(command CommandCreate) error {
 	}
 	if err := durable.PostgresInteger("unsatisfied waits", len(command.Waits), 0, durable.PostgresIntegerMax); err != nil {
 		return err
+	}
+	if len(command.Waits) > MaxCommandEventWaits {
+		return fmt.Errorf("%w: command exceeds event-wait limit", flowerr.ErrInvalid)
+	}
+	waits := make(map[applicationEventIdentity]struct{}, len(command.Waits))
+	for _, wait := range command.Waits {
+		identity := applicationEventIdentity{name: wait.Name, key: wait.Key}
+		if wait.Name == "" || wait.Key == "" {
+			return fmt.Errorf("%w: incomplete command event wait", flowerr.ErrInvalid)
+		}
+		if _, exists := waits[identity]; exists {
+			return fmt.Errorf("%w: duplicate command event wait", flowerr.ErrConflict)
+		}
+		waits[identity] = struct{}{}
 	}
 	for field, value := range map[string]time.Duration{
 		"attempt timeout": command.AttemptTimeout,

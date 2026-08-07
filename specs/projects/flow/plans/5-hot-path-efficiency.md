@@ -1400,15 +1400,15 @@ This plan is complete when all of the following are true:
 
 ### Batched decisions
 
-- [ ] Load all existing staged-event identities in one query.
-- [ ] Load retained events for all child waits in one query.
-- [ ] Compute final child/wait/queue shapes before persistence.
-- [ ] Bulk-insert command rows.
-- [ ] Bulk-insert wait rows.
-- [ ] Bulk-insert ready queue rows.
-- [ ] Batch cancellation of children staged by a fail-fast survivor.
-- [ ] Preserve fault hooks and `WithCommit` ordering.
-- [ ] Add 100-child, shared-wait, mixed event/child, conflict rollback, ceiling, and replay tests.
+- [x] Load all existing staged-event identities in one query.
+- [x] Load retained events for all child waits in one query.
+- [x] Compute final child/wait/queue shapes before persistence.
+- [x] Bulk-insert command rows.
+- [x] Bulk-insert wait rows.
+- [x] Bulk-insert ready queue rows.
+- [x] Batch cancellation of children staged by a fail-fast survivor.
+- [x] Preserve fault hooks and `WithCommit` ordering.
+- [x] Add 100-child, shared-wait, mixed event/child, conflict rollback, ceiling, and replay tests.
 
 ### Claims
 

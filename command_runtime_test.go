@@ -364,6 +364,7 @@ func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
 
 func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testing.T) {
 	t.Parallel()
+	const stagedChildren = 10
 	for _, test := range []struct {
 		name       string
 		failFast   bool
@@ -371,7 +372,7 @@ func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testi
 		childCalls int32
 	}{
 		{name: "enabled", failFast: true, childState: StatusCancelled},
-		{name: "disabled", failFast: false, childState: StatusSucceeded, childCalls: 1},
+		{name: "disabled", failFast: false, childState: StatusSucceeded, childCalls: stagedChildren},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			database := testpg.Open(t)
@@ -412,7 +413,9 @@ func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testi
 					if err := Emit(work, fact, "committed", None{}); err != nil {
 						return None{}, err
 					}
-					Execute(work, "late-child", late, None{})
+					for index := range stagedChildren {
+						Execute(work, fmt.Sprintf("late-child/%02d", index), late, None{})
+					}
 					return None{}, nil
 				}),
 				Handle(late, func(context.Context, *Work[None]) (None, error) {
@@ -435,14 +438,17 @@ func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testi
 			if err != nil {
 				t.Fatal(err)
 			}
-			var lateState CommandStatus
+			var lateChildren int
 			for _, command := range trace.Commands {
-				if command.Key == "late-child" {
-					lateState = command.State
+				if strings.HasPrefix(command.Key, "late-child/") {
+					lateChildren++
+					if command.State != test.childState {
+						t.Fatalf("late child %q state=%s, want %s", command.Key, command.State, test.childState)
+					}
 				}
 			}
-			if lateState != test.childState || lateCalls.Load() != test.childCalls {
-				t.Fatalf("late child state/calls=%s/%d want %s/%d", lateState, lateCalls.Load(), test.childState, test.childCalls)
+			if lateChildren != stagedChildren || lateCalls.Load() != test.childCalls {
+				t.Fatalf("late children/calls=%d/%d want %d/%d", lateChildren, lateCalls.Load(), stagedChildren, test.childCalls)
 			}
 			var events int
 			if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
