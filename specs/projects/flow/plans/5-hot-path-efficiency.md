@@ -1387,16 +1387,16 @@ This plan is complete when all of the following are true:
 
 ### Incremental readiness
 
-- [ ] Implement set-oriented matching wait satisfaction.
-- [ ] Group new wait satisfactions by command.
-- [ ] Atomically decrement `unsatisfied_waits` only for newly satisfied rows.
-- [ ] Transition and queue only commands reaching zero.
-- [ ] Remove execution-wide ordinary readiness scans.
-- [ ] Remove the redundant pending/wait-start sweep after creation paths are final-shape inserts.
-- [ ] Separate fail-fast open-command resolution from event readiness.
-- [ ] Batch fail-fast command updates and queue deletes.
-- [ ] Add exact-deadline, duplicate, multi-wait, multi-command, same-decision, and replay tests.
-- [ ] Add an indexed scale/query-plan gate for sparse matching waits.
+- [x] Implement set-oriented matching wait satisfaction.
+- [x] Group new wait satisfactions by command.
+- [x] Atomically decrement `unsatisfied_waits` only for newly satisfied rows.
+- [x] Transition and queue only commands reaching zero.
+- [x] Remove execution-wide ordinary readiness scans.
+- [x] Remove the redundant pending/wait-start sweep after creation paths are final-shape inserts.
+- [x] Separate fail-fast open-command resolution from event readiness.
+- [x] Batch fail-fast command updates and queue deletes.
+- [x] Add exact-deadline, duplicate, multi-wait, multi-command, same-decision, and replay tests.
+- [x] Add an indexed scale/query-plan gate for sparse matching waits.
 
 ### Batched decisions
 

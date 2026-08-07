@@ -169,7 +169,8 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	if err != nil {
 		return StartResult{}, false, err
 	}
-	rootReady, err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position, dbNow, nextAttemptAt)
+	rootReady, err := s.insertCommand(ctx, tx, request.ID, *request.Root, journal.Journal[1].Position,
+		dbNow, dbNow, nextAttemptAt)
 	if err != nil {
 		return StartResult{}, false, err
 	}
@@ -335,7 +336,16 @@ func commandCreatedEntry(command CommandCreate, budgetStartedAt, nextAttemptAt t
 	return entry, nil
 }
 
-func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.UUID, command CommandCreate, createdPosition int64, budgetStartedAt, nextAttemptAt time.Time) (bool, error) {
+func (s *Store) insertCommand(
+	ctx context.Context,
+	tx pgx.Tx,
+	executionID uuid.UUID,
+	command CommandCreate,
+	createdPosition int64,
+	createdAt time.Time,
+	budgetStartedAt time.Time,
+	nextAttemptAt time.Time,
+) (bool, error) {
 	if err := validateCommandCreate(command); err != nil {
 		return false, err
 	}
@@ -388,25 +398,11 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 		}
 		withinMS = &value
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_commands")+` (
-		command_id,execution_id,command_key,name,version,parent_command_id,required,
-		args,declaration_fingerprint,state,unsatisfied_waits,
-		queue,attempt_timeout_ms,retry_policy,initial_delay_ms,
-		budget_started_at,next_attempt_at,wait_timeout_ms,created_position,created_at,updated_at,status_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$20,$20)`,
-		command.ID, executionID, command.Key, command.Name, command.Version,
-		command.ParentCommandID, command.Required, command.Args.Bytes,
-		command.DeclarationFingerprint[:], state, unsatisfiedWaits, command.Queue, timeoutMS,
-		command.RetryPolicy.Bytes, initialDelayMS,
-		acceptedBudget, acceptedNext, withinMS, createdPosition, budgetStartedAt,
-	)
-	if err != nil {
-		return false, MapError("insert command", err)
-	}
-	if state == "pending" && unsatisfiedWaits > 0 {
-		var deadline *time.Time
+	var waitStartedAt, waitDeadlineAt *time.Time
+	if state == "pending" {
+		waitStartedAt = clonePointer(&createdAt)
 		if command.Within > 0 {
-			value, addErr := durable.AddExactDuration("wait timeout", budgetStartedAt, command.Within)
+			value, addErr := durable.AddExactDuration("wait timeout", createdAt, command.Within)
 			if addErr != nil {
 				return false, addErr
 			}
@@ -418,12 +414,24 @@ func (s *Store) insertCommand(ctx context.Context, tx pgx.Tx, executionID uuid.U
 			if executionDeadline != nil && executionDeadline.Before(value) {
 				value = *executionDeadline
 			}
-			deadline = &value
+			waitDeadlineAt = &value
 		}
-		if _, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
-			SET wait_started_at=$2,wait_deadline_at=$3 WHERE command_id=$1`, command.ID, budgetStartedAt, deadline); err != nil {
-			return false, MapError("start initial command wait", err)
-		}
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_commands")+` (
+		command_id,execution_id,command_key,name,version,parent_command_id,required,
+		args,declaration_fingerprint,state,unsatisfied_waits,
+		queue,attempt_timeout_ms,retry_policy,initial_delay_ms,
+		budget_started_at,next_attempt_at,wait_started_at,wait_deadline_at,wait_timeout_ms,
+		created_position,created_at,updated_at,status_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$22,$22)`,
+		command.ID, executionID, command.Key, command.Name, command.Version,
+		command.ParentCommandID, command.Required, command.Args.Bytes,
+		command.DeclarationFingerprint[:], state, unsatisfiedWaits, command.Queue, timeoutMS,
+		command.RetryPolicy.Bytes, initialDelayMS,
+		acceptedBudget, acceptedNext, waitStartedAt, waitDeadlineAt, withinMS, createdPosition, createdAt,
+	)
+	if err != nil {
+		return false, MapError("insert command", err)
 	}
 	if state == "ready" {
 		_, err = tx.Exec(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_command_queue")+`
@@ -573,15 +581,9 @@ func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event Appl
 	if err != nil {
 		return false, err
 	}
-	waits, err := s.matchingWaitsLocked(ctx, semantic, event.Name, event.Key, journal.Journal[0].Position)
-	if err != nil {
-		return false, err
-	}
-	resolution, err := s.resolveReadinessLocked(ctx, semantic, nil, waits)
-	if err != nil {
-		return false, err
-	}
-	immediatelyRunnable, err := s.applyReadinessResolution(ctx, semantic, resolution)
+	immediatelyRunnable, err := s.resolveEventReadinessLocked(ctx, semantic, []acceptedEventPosition{{
+		name: event.Name, key: event.Key, position: journal.Journal[0].Position,
+	}})
 	if err != nil {
 		return false, err
 	}
@@ -711,13 +713,9 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	}
 	terminalIndex := len(entries)
 	entries = append(entries, commandEvent)
-	resolution := readinessResolution{}
 	failureEffects := failureResolution{}
 	if required {
 		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, commandID, "cancelled", head.FailFast)
-		resolution = failureEffects.readinessResolution
-	} else {
-		resolution, err = s.resolveReadinessLocked(ctx, semantic, map[uuid.UUID]string{commandID: "cancelled"}, nil)
 	}
 	if err != nil {
 		return CancelResult{}, err
@@ -782,12 +780,10 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		return CancelResult{}, MapError("remove cancelled command delivery", err)
 	}
 	if required {
-		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, 0, cancelledOffset,
+		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
 			"cancelled by fail-fast after required command cancellation"); err != nil {
 			return CancelResult{}, err
 		}
-	} else if _, err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
-		return CancelResult{}, err
 	}
 
 	if terminalExecution {

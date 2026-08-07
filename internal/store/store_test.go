@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"math"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
 	"github.com/goware/pgkit/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -355,6 +358,105 @@ func TestSchemaConstraints(t *testing.T) {
 	assertConstraint(t, err, "flow_journal_event_shape_ck")
 	if validID == uuid.Nil {
 		t.Fatal("seed execution returned nil")
+	}
+}
+
+func TestSparseEventWaitUpdateUsesProductionReverseIndexQuery(t *testing.T) {
+	db, schema, repository := setupStore(t)
+	executionID := seedExecution(t, db, schema, "sparse-waits")
+	ctx := context.Background()
+
+	semantic, err := repository.BeginSemantic(ctx, executionID, store.LockBlocking)
+	if err != nil {
+		t.Fatalf("BeginSemantic() error = %v", err)
+	}
+	eventName, eventKey := "store.sparse_target", "target"
+	eventID := uuid.New()
+	eventNamespace, eventClass := "application", "application"
+	event, err := store.NewJournalEntry(store.EventRecorded, map[string]any{"v": 1, "payload": map[string]any{}})
+	if err != nil {
+		t.Fatalf("NewJournalEntry() error = %v", err)
+	}
+	event.EventID = &eventID
+	event.EventNamespace = &eventNamespace
+	event.EventName = &eventName
+	event.EventKey = &eventKey
+	event.EventClass = &eventClass
+	applied, err := semantic.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{event}})
+	if err != nil {
+		t.Fatalf("Apply(event) error = %v", err)
+	}
+	if err := semantic.Commit(ctx); err != nil {
+		t.Fatalf("Commit(event) error = %v", err)
+	}
+	position := applied.Journal[0].Position
+
+	commands := pgschema.Table(schema, "flow_commands")
+	waits := pgschema.Table(schema, "flow_command_event_waits")
+	var rootID uuid.UUID
+	if err := db.Conn.QueryRow(ctx, `SELECT root_command_id FROM `+pgschema.Table(schema, "flow_executions")+`
+		WHERE execution_id=$1`, executionID).Scan(&rootID); err != nil {
+		t.Fatalf("load root command: %v", err)
+	}
+	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+commands+` (
+		command_id,execution_id,command_key,name,version,parent_command_id,required,args,declaration_fingerprint,
+		state,unsatisfied_waits,queue,retry_policy,wait_started_at,wait_timeout_ms,
+		created_position,created_at,updated_at,status_at)
+		SELECT md5($1::text||':'||g::text)::uuid,$1::uuid,'scale/'||g::text,'store.sparse.synthetic',1,$2::uuid,true,
+		       convert_to('{}','UTF8'),decode(repeat('00',32),'hex'),'pending',1,'default',convert_to('{}','UTF8'),
+		       clock_timestamp(),3600000,1,clock_timestamp(),clock_timestamp(),clock_timestamp()
+		FROM generate_series(0,10000) AS g`, executionID, rootID); err != nil {
+		t.Fatalf("seed sparse commands: %v", err)
+	}
+	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+waits+` (command_id,execution_id,event_name,event_key)
+		SELECT command_id,execution_id,
+		       CASE WHEN command_key='scale/0' THEN $2 ELSE 'store.sparse_unrelated' END,
+		       CASE WHEN command_key='scale/0' THEN $3 ELSE command_key END
+		FROM `+commands+` WHERE execution_id=$1 AND command_key LIKE 'scale/%'`,
+		executionID, eventName, eventKey); err != nil {
+		t.Fatalf("seed sparse waits: %v", err)
+	}
+	if _, err := db.Conn.Exec(ctx, `ANALYZE `+waits); err != nil {
+		t.Fatalf("analyze sparse waits: %v", err)
+	}
+
+	tx, err := db.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin sparse explain: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `EXPLAIN (ANALYZE,BUFFERS,FORMAT TEXT) `+
+		store.EventWaitUpdateQueryForTest(repository),
+		executionID, []string{eventName}, []string{eventKey}, []int64{position})
+	if err != nil {
+		t.Fatalf("explain production event wait update: %v", err)
+	}
+	planLines, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("collect production event wait update plan: %v", err)
+	}
+	var updated int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+waits+`
+		WHERE execution_id=$1 AND satisfied_position=$2`, executionID, position).Scan(&updated); err != nil {
+		t.Fatalf("count sparse updated waits: %v", err)
+	}
+	if updated != 1 {
+		t.Fatalf("production sparse wait update changed %d rows, want 1", updated)
+	}
+	var updateNode, reverseIndexNode string
+	for _, line := range planLines {
+		switch {
+		case strings.Contains(line, "Update on flow_command_event_waits"):
+			updateNode = line
+		case strings.Contains(line, "Index Scan using flow_command_event_waits_reverse_idx"):
+			reverseIndexNode = line
+		}
+	}
+	oneRow := regexp.MustCompile(`actual .* rows=1(?:\.0+)? loops=1`)
+	if updateNode == "" || !oneRow.MatchString(updateNode) ||
+		reverseIndexNode == "" || !oneRow.MatchString(reverseIndexNode) {
+		t.Fatalf("production sparse wait update plan did not update/index-scan exactly one row:\n%s",
+			strings.Join(planLines, "\n"))
 	}
 }
 

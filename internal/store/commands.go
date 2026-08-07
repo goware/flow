@@ -426,13 +426,9 @@ func (s *Store) failBeforeClaimLocked(
 	if err != nil {
 		return err
 	}
-	resolution := readinessResolution{}
 	failureEffects := failureResolution{}
 	if required {
 		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, commandID, "failed", head.FailFast)
-		resolution = failureEffects.readinessResolution
-	} else {
-		resolution, err = s.resolveReadinessLocked(ctx, semantic, map[uuid.UUID]string{commandID: "failed"}, nil)
 	}
 	if err != nil {
 		return err
@@ -505,12 +501,10 @@ func (s *Store) failBeforeClaimLocked(
 		return MapError("remove failed command queue row", err)
 	}
 	if required {
-		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, 0, cancelledOffset,
+		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
 			"cancelled by fail-fast after required command failure"); err != nil {
 			return err
 		}
-	} else if _, err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
-		return err
 	}
 	status := head.Status
 	if required {
@@ -900,19 +894,11 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err := layout.validateAccepted(journal); err != nil {
 		return SettleResult{}, err
 	}
-	var waitUpdates []waitUpdate
+	acceptedEvents := make([]acceptedEventPosition, len(request.Events))
 	for index, event := range request.Events {
-		waits, matchErr := s.matchingWaitsLocked(ctx, semantic, event.Name, event.Key,
-			layout.applicationEventPosition(journal, index))
-		if matchErr != nil {
-			return SettleResult{}, matchErr
+		acceptedEvents[index] = acceptedEventPosition{
+			name: event.Name, key: event.Key, position: layout.applicationEventPosition(journal, index),
 		}
-		waitUpdates = append(waitUpdates, waits...)
-	}
-	resolution, err := s.resolveReadinessLocked(ctx, semantic,
-		map[uuid.UUID]string{request.Claim.CommandID: "succeeded"}, waitUpdates)
-	if err != nil {
-		return SettleResult{}, err
 	}
 	if err := hook.Hit(ctx, fault.SettleAfterAttempt); err != nil {
 		return SettleResult{}, err
@@ -934,7 +920,7 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 			return SettleResult{}, addErr
 		}
 		childReady, err := s.insertCommand(ctx, semantic.PGX(), semantic.ExecutionID(), child,
-			layout.childCreatedPosition(journal, index), next, next)
+			layout.childCreatedPosition(journal, index), semantic.DBNow(), next, next)
 		if err != nil {
 			return SettleResult{}, err
 		}
@@ -958,7 +944,7 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err := hook.Hit(ctx, fault.SettleAfterChildren); err != nil {
 		return SettleResult{}, err
 	}
-	releasedRunnable, err := s.applyReadinessResolution(ctx, semantic, resolution)
+	releasedRunnable, err := s.resolveEventReadinessLocked(ctx, semantic, acceptedEvents)
 	if err != nil {
 		return SettleResult{}, err
 	}
@@ -1121,7 +1107,6 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 	concluded.AttemptID = clonePointer(&request.Claim.AttemptID)
 	concluded.CausationPosition = clonePointer(&fence.AttemptStartedPosition)
 	entries := []JournalEntry{concluded}
-	resolution := readinessResolution{}
 	failureEffects := failureResolution{}
 	cancelledOffset := 0
 	terminalExecution := false
@@ -1130,9 +1115,6 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 	if !decision.Retry {
 		if fence.Required {
 			failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, request.Claim.CommandID, "failed", fence.Head.FailFast)
-			resolution = failureEffects.readinessResolution
-		} else {
-			resolution, err = s.resolveReadinessLocked(ctx, semantic, map[uuid.UUID]string{request.Claim.CommandID: "failed"}, nil)
 		}
 		if err != nil {
 			return SettleResult{}, err
@@ -1223,12 +1205,10 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 			return SettleResult{}, MapError("remove failed command queue row", err)
 		}
 		if fence.Required {
-			if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, 0, cancelledOffset,
+			if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
 				"cancelled by fail-fast after required command failure"); err != nil {
 				return SettleResult{}, err
 			}
-		} else if _, err := s.applyReadinessResolution(ctx, semantic, resolution); err != nil {
-			return SettleResult{}, err
 		}
 		status := fence.Head.Status
 		if fence.Required {

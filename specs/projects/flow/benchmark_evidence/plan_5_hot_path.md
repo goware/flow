@@ -290,3 +290,42 @@ Source scans and PostgreSQL tests establish the structural result:
 - commit/rollback, remote root and event wake, unrelated-event no-op, claim,
   terminal settlement, immediate retry, lease recovery, gap-free rollback, and
   same-decision staged-event/new-child position tests pass against PostgreSQL.
+
+## Phase 3 incremental-readiness evidence
+
+The Phase 3 working tree was measured from parent commit `1f4677c` on the same
+machine, PostgreSQL 18.1 instance, durability settings, 12-connection test pool,
+and 16-worker fan-out runtime as the baseline. The database password was
+supplied through the existing test environment and was not printed or recorded.
+
+```text
+go test -run '^$' \
+  -bench 'Benchmark(SameExecutionFanout|ExternalEventIngress)$' \
+  -benchmem -benchtime=3s -count=5 .
+```
+
+| Workload | Baseline median (range) | Phase 3 median (range) |
+|---|---:|---:|
+| same execution, 10 commands | 78.08 ms; 128.1 commands/s (74.22-83.37 ms; 120.0-134.7 commands/s) | 76.65 ms; 130.5 commands/s (75.31-79.25 ms; 126.2-132.8 commands/s) |
+| same execution, 100 commands | 671.0 ms; 149.0 commands/s (664.7-673.1 ms; 148.6-150.4 commands/s) | 673.6 ms; 148.5 commands/s (665.9-692.7 ms; 144.4-150.2 commands/s) |
+| distinct small live executions, no wait | 3.650 ms/event (3.460-3.825) | 3.695 ms/event (3.508-3.834) |
+| one small hot execution, no wait | 3.465 ms/event (3.389-3.476) | 3.569 ms/event (3.547-3.772) |
+| 100 retained commands, no wait | 3.823 ms/event (3.793-3.968) | 3.656 ms/event (3.480-3.710) |
+| 100 retained commands, one match per event | 4.302 ms/event; 232.4 events/s (4.127-4.363 ms; 229.2-242.3 events/s) | 4.025 ms/event; 248.4 events/s (3.933-4.095 ms; 244.2-254.3 events/s) |
+| 100 retained commands, nine matches per event | 6.885 ms/event; 145.2 events/s (6.492-7.026 ms; 142.3-154.0 events/s) | 4.395 ms/event; 227.6 events/s (4.354-4.559 ms; 219.4-229.7 events/s) |
+
+The no-match and same-execution ranges overlap ordinary machine variance. The
+nine-command match shape improved materially because one accepted event now
+updates only matching reverse-wait rows, groups decrements by affected command,
+and inserts released queue rows in sets instead of scanning every command and
+issuing per-wait projection writes. The one-match shape also improved in this
+sample, while the 100-command lifecycle result stayed within overlapping
+variance.
+
+`TestSparseEventWaitUpdateUsesProductionReverseIndexQuery` adds 10,000 unrelated
+unresolved wait rows plus one matching selector, analyzes the wait table, and
+runs the production wait-update shape under `EXPLAIN (ANALYZE, BUFFERS)`. PostgreSQL used
+`flow_command_event_waits_reverse_idx`; the index scan returned one row. Phase 3
+verification also covered exact-deadline reconciliation, grouped multi-wait and
+multi-command release, equivalent/conflicting duplicate ingress, runnable-only
+queue insertion, fail-fast running survivors, and replay/trace equivalence.
