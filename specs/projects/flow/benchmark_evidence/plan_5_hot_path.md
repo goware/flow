@@ -541,3 +541,22 @@ private attempt snapshot. Flow's journal append still canonicalizes and verifies
 every body at the accepted write boundary, while replay deliberately reconstructs
 canonical history for stronger corruption diagnostics. No payload table or
 column was added.
+
+## Phase 7 documentation synchronization
+
+The active README, package documentation, overview, functional specification,
+architecture, and schema/engine component designs now describe the implemented
+composition and hot-path boundaries. They distinguish command lifecycle
+boundaries from deterministic worker logic, one serialized execution from
+independent shard executions, bounded fan-out chunks and hierarchical joins,
+direct child data and stable external payload references, and short
+`WithCommit`/caller-owned transactions.
+
+The design descriptions also match the structural evidence above: delta
+readiness uses reverse waits and `unsatisfied_waits`; notifications are limited
+to newly immediate runnable work; normalized decisions and same-execution
+claims persist in bounded sets; independent execution groups may claim within a
+pool-aware bound; and journal integrity is divided across accepted write, hot
+claim, and full replay diagnostics. These are implementation and usage
+descriptions, not new hard limits, service-level objectives, or throughput
+promises. Final release-gate and full before/after evidence remain separate.

@@ -19,6 +19,19 @@
 // idempotency keys for external effects because invocation remains at-least-once
 // even though durable PostgreSQL progression commits exactly once.
 //
+// A command should mark an independent retry, side-effect, isolation, queue, or
+// parallelism boundary, rather than each deterministic business-logic step.
+// Keep causally related commands in one execution, but use separate executions
+// for independent bulk items because one execution is a serialized semantic
+// aggregate. Large fan-outs should be chunked into bounded command batches and
+// large all-of inputs reduced through hierarchical joins. Parent-produced data
+// belongs directly in child arguments; large or sensitive values should stay in
+// application storage behind stable references.
+//
+// WithCommit is intended for short same-database writes and must not contain
+// remote calls. Caller-owned transactions should also be kept short because an
+// execution lock remains held until the caller commits or rolls back.
+//
 // External callers record execution-scoped events with Event.Emit. Event.Deliver
 // provides deliberately detached ingress to a known execution, including from
 // an active worker; passing Runtime.InTx joins it to caller-owned application

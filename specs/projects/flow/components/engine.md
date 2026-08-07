@@ -17,6 +17,12 @@ Commands retain name/version, argument/result codecs, retry policy, attempt time
 
 Durable arguments, results, event payloads, metadata, retry settings, and journal bodies use bounded canonical JSON and hashes. A command fingerprint covers definition, key, arguments, parent, required flag, exact waits, delay, wait budget, queue, timeout, and retry policy.
 
+A useful command boundary introduces independent retry, side effects,
+isolation, timeout, queue ownership, or parallelism. Small deterministic
+transformations remain in one worker. Parent-produced data goes directly into
+child arguments; exact events carry sibling, cross-branch, or external facts;
+large or sensitive values use stable application-storage references.
+
 ## Node grammar and event inputs
 
 `Node` is a non-generic ephemeral staging builder:
@@ -34,6 +40,13 @@ Before a worker runs, the runtime supplies immutable canonical snapshots for eve
 ## Normalization and failure
 
 Before settlement the engine returns the first defect, encodes the result, sorts events by name/key, sorts commands by key, validates modifiers, computes fingerprints, and enforces the execution command ceiling. No partially valid decision is accepted.
+
+This complete normalized decision lets the store compare staged identities and
+persist commands, waits, and queue rows in bounded sets while preserving stable
+journal mapping. Related events and children should be staged together when
+they form one atomic change. Very large fan-outs should be chunked through
+bounded batch commands, and large all-of inputs reduced through hierarchical
+joins.
 
 Required command failure may enter reduced fail-fast. Optional failure is observable but does not determine success. Running attempts remain fenced and settleable; sub-commands staged after failure begins are recorded cancelled.
 

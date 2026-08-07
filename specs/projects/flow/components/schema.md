@@ -34,9 +34,16 @@ Retry policy is opaque canonical `bytea`; no SQL path parses, filters, or reseri
 
 Command states are `pending`, `ready`, `running`, `retry_wait`, `succeeded`, `failed`, `cancelled`, and `expired`. Queue rows exist only for claimable/retrying/running commands and contain the minimum claim and fence dimensions.
 
-Wait rows are keyed by `(command_id,event_name,event_key)` and optionally reference `satisfied_position`. On creation the store checks retained events; on ingress it resolves matching unresolved rows. Claim materialization joins all wait rows to their exact application-event journal bodies in one query and validates a maximum of 256.
+Wait rows are keyed by `(command_id,event_name,event_key)` and optionally reference `satisfied_position`. On creation the store checks retained events. Later ingress uses the partial reverse index to update only matching unresolved rows, groups newly satisfied rows by command, decrements `unsatisfied_waits`, and queues only commands whose counter reaches zero. Claim materialization joins all waits for a same-execution claim batch to their exact application-event journal bodies in one query and validates a maximum of 256 per command.
 
 Journal kinds are `execution_started`, `execution_failing`, `command_created`, `attempt_started`, `attempt_concluded`, and `event_recorded`. Event classes are application, command terminal, and execution terminal. Application events are immutable journal facts; no separate event-payload table exists. All stored position references are positive, and causation must precede the current journal position.
+
+Integrity responsibilities are split deliberately. Journal append
+re-canonicalizes and hash-checks every accepted body. Event-input claim
+materialization verifies the retained hash, decodes the typed versioned body
+once, and validates the nested canonical payload without creating another
+canonical copy. Full replay verifies the hash and reconstructs canonical bodies
+again for stronger diagnostics.
 
 Indexes are kept deliberately narrow. Primary and unique indexes enforce public execution, command, application-event, lifecycle, and same-execution ownership invariants; random journal entry/event UUIDs are retained data but are not separately indexed because no lookup, foreign key, or idempotency contract consumes them. One partial `(attempt_id, entry_kind)` guard permits one start and one conclusion per attempt. Exact application-event reads state the identity-index predicate, and maintenance, queue, and wait indexes cover only their bounded hot probes. The metadata GIN index remains because containment filtering is a documented indexed inspection feature.
 
@@ -57,9 +64,13 @@ The shared failure encoding does not merge `last_error`, `terminal_failure`, or 
 
 ## Transactions and maintenance
 
-Start creates one execution and root command. Success settlement accepts the application commit callback, result, staged events/sub-commands, attempt conclusion, wait resolution, and completion progression atomically. Failure settlement applies retry classification or terminal/fail-fast transitions.
+Start creates one execution and root command. Success settlement accepts the application commit callback, result, staged events/sub-commands, attempt conclusion, wait resolution, and completion progression atomically. Normalized event identity reads, retained-event reads, command/wait/queue insertion, and ordinary same-execution claims use bounded operation-specific sets rather than one SQL round trip per item. Failure settlement applies retry classification or terminal/fail-fast transitions.
 
-External event ingress through `Event.Emit` or `Event.Deliver` enforces exact target-local identity, appends the event, records satisfying positions, and recalculates readiness. Equivalent repeats are idempotent; conflicting repeats fail; terminal executions cannot be reopened. Delivery adds no source identity or storage shape and uses a caller transaction unchanged when supplied.
+External event ingress through `Event.Emit` or `Event.Deliver` enforces exact target-local identity, appends the event, records satisfying positions, and applies delta readiness. Equivalent repeats are idempotent; conflicting repeats fail; terminal executions cannot be reopened. Delivery adds no source identity or storage shape and uses a caller transaction unchanged when supplied.
+
+The generic journal append emits no scheduler notification. A semantic
+operation may emit at most one transactional hint after it creates work that is
+immediately runnable at database time; polling remains the correctness path.
 
 Bounded indexed maintenance recovers command leases, expires unresolved waits, and enforces execution deadlines. Inspection uses indexed lookup/keyset pagination. Trace folds the journal under repeatable read and overlays bounded operational command data.
 

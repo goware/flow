@@ -1434,12 +1434,12 @@ This plan is complete when all of the following are true:
 
 ### Documentation and release
 
-- [ ] Document command granularity around retry/effect/isolation/parallelism boundaries.
-- [ ] Document execution granularity as a bounded serialized aggregate.
-- [ ] Document fan-out chunking, hierarchical joins, and stable external payload references.
-- [ ] Document short `WithCommit` and caller-owned transaction guidance.
-- [ ] Synchronize architecture, functional, schema, engine, overview, README, and package docs.
-- [ ] Link completed Plan 5 outcomes from the active implementation plan.
+- [x] Document command granularity around retry/effect/isolation/parallelism boundaries.
+- [x] Document execution granularity as a bounded serialized aggregate.
+- [x] Document fan-out chunking, hierarchical joins, and stable external payload references.
+- [x] Document short `WithCommit` and caller-owned transaction guidance.
+- [x] Synchronize architecture, functional, schema, engine, overview, README, and package docs.
+- [x] Link completed Plan 5 outcomes from the active implementation plan.
 - [ ] Run formatting, diff, build, vet, ordinary, PostgreSQL, and race gates.
 - [ ] Run supported PostgreSQL-version coverage.
 - [ ] Record final before/after benchmark evidence.

@@ -152,6 +152,30 @@ Sibling/external data may be supplied through:
 
 `ResultOf(trace, key, command)` is an inspection helper that decodes a successful command result from an `ExecutionTrace`. It fails permanently for a missing command, mismatched definition, non-successful command, or undecodable result. It is not worker-time dataflow.
 
+### 5.3 Composition granularity
+
+A command should represent an independent retry, side-effect, isolation,
+timeout, queue-ownership, or useful parallelism boundary. Small deterministic
+transformations should stay inside the worker that owns them. Several small
+writes to the same PostgreSQL database may share one `WithCommit` callback;
+creating a durable command for each microstep adds a lifecycle without adding a
+meaningful boundary.
+
+One execution is one serialized semantic aggregate. Causally related work
+belongs in one execution; independent bulk items or shards should use separate
+executions instead of a tenant-wide or global execution. The default
+1,000-command ceiling is a safety limit rather than a normal target. Executions
+in the tens or low hundreds are the ordinary shape; this guidance does not add
+a hard limit beyond the configured ceiling.
+
+Very large fan-outs should be chunked into bounded batch commands when one
+enormous atomic child declaration is unnecessary. Large all-of inputs should
+use hierarchical join commands. Parent-produced data should be passed directly
+in child arguments, exact events should carry sibling/cross-branch/external
+facts, and related events and children should be staged together when they form
+one atomic decision. Large or sensitive documents should remain in application
+storage behind stable references.
+
 ## 6. Application events and exact inputs
 
 Application-event identity is `(execution ID, event name, event key)`. The event key must be non-empty, stable, valid UTF-8 without surrounding whitespace, and at most 1024 bytes.
@@ -189,6 +213,11 @@ All waits are exact AND gates. A command is claimable only when:
 
 At most 256 exact waits may be declared on one command. The store records each satisfying journal position. Claim materialization loads every selector and its canonical event body in one bounded query before releasing the connection.
 
+Accepted event ingress updates only matching unresolved reverse-wait rows,
+decrements the affected commands' `unsatisfied_waits` counters, and queues only
+commands whose final wait was satisfied. Unrelated retained commands are not
+part of ordinary event readiness resolution.
+
 `GetEventValue(work, event, key)`:
 
 - does not block;
@@ -218,6 +247,12 @@ Only the still-current attempt ID and lease token may settle. A lost or already 
 `WithCommit` runs inside this transaction after durable changes have been prepared but before commit. It receives typed arguments/result, `CommandInfo`, and a restricted SQL transaction interface. It may write application tables in the same PostgreSQL database.
 
 If the callback returns an error, the entire success transaction rolls back. `Permanent` and `RetryAfter` retain their normal classifications; invalid/conflict/state/payload Flow errors are permanent invalid decisions; other errors are retryable. The callback may run again on a later attempt, so it must not perform non-transactional effects as though they were exactly once.
+
+The callback should contain only short same-database work. It must not perform
+remote calls, and unnecessarily long SQL holds the execution lock and delays
+other semantic mutations for that execution. Normalized staged events,
+children, waits, and initially ready queue rows are prepared completely and
+persisted with bounded set-oriented operations inside the same settlement.
 
 ## 8. Retry, timeout, and fencing
 
@@ -313,6 +348,10 @@ Cancellation through `runtime.InTx(tx)` remains uncommitted until the caller com
 
 All Flow operations in one transaction must reuse the same transaction client. Semantic operations touching existing executions must request execution locks in ascending `ExecutionID` order. Callers must perform Flow operations before application-table writes so all participating code follows the global execution-first lock discipline.
 
+The caller should commit or roll back promptly after the Flow operations and
+associated application writes. Every acquired execution lock remains held for
+the lifetime of the caller-owned transaction.
+
 Starts create their execution row and therefore do not enter the existing-execution order until later operations address that execution. Multi-execution workflows are not settled atomically by Flow itself; explicit caller transactions are the only cross-execution/application-write boundary.
 
 ## 12. Runtime and deployment
@@ -351,6 +390,18 @@ Public options are:
 
 Polling is the correctness path. Notifications are transactional latency hints; malformed/lost hints, listener disconnects, transaction-pooling proxies, and disabled notifications do not lose work.
 
+Flow emits a wake hint only when a committed transition creates work that is
+immediately runnable. Journal-only transitions, claims, terminal settlements
+without follow-up work, unmatched events, and work scheduled for the future do
+not require a hint.
+
+The scheduler may claim selected groups from independent executions
+concurrently using an internal bound derived from worker capacity and the
+database pool while retaining capacity for maintenance. Candidates from one
+execution remain in one serialized claim transaction, where eligible attempts,
+event inputs, journal entries, and command/queue projection changes are handled
+as bounded sets. This policy adds no public concurrency setting.
+
 Global and named-queue concurrency limits are process-local. PostgreSQL claims and fences coordinate all replicas. The named-queue limit shares the runtime's global capacity.
 
 `Stop(ctx)` initiates shutdown and waits for `Run` to finish or for the supplied context to end. Run-context cancellation does the same. The scheduler stops claiming first, waits through the grace period, then interrupts remaining handlers. Shutdown interruption does not consume retry budget. The caller-owned database pool is never closed.
@@ -369,6 +420,12 @@ Flow owns exactly six `flow_` tables in one validated PostgreSQL schema:
 6. `flow_schema_migrations`.
 
 Applications must not use these tables as a write API. Semantic journal entries and current projections must remain transactionally consistent.
+
+Every accepted journal write is canonicalized and its hash verified before
+persistence. Claim materialization verifies the retained body hash, decodes the
+bounded application-event body once, and validates the canonical payload before
+giving it to a worker. Full replay independently verifies hashes and
+re-canonicalizes retained bodies for stronger history diagnostics.
 
 Database constraints require a non-null root command and enforce same-execution ownership for roots, parents, delivery rows, event waits, and journal command references. Durable position references are positive, and journal causation must point to an earlier position.
 

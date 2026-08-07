@@ -7,7 +7,19 @@ completed_at: 2026-08-04
 
 ## Controlling amendments
 
-[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. This remains a pre-release API; removed APIs and durable formats have no compatibility aliases or data migration.
+[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. [`plans/5-hot-path-efficiency.md`](plans/5-hot-path-efficiency.md) reduces hot-path work without changing the public command/event model or six-table durability boundary. This remains a pre-release API; removed APIs and durable formats have no compatibility aliases or data migration.
+
+## Implemented Plan 5 outcomes (final gate pending)
+
+- [x] Narrow the command-key index and reserve journal positions in one operation.
+- [x] Resolve readiness through matching reverse waits and notify only for immediate runnable work.
+- [x] Persist normalized child/event decisions and same-execution claims in bounded sets.
+- [x] Claim independent execution groups concurrently within a pool-aware internal bound.
+- [x] Reduce event-input materialization while retaining write, claim, and replay integrity checks.
+- [x] Document efficient command, execution, event, payload, join, and transaction granularity.
+
+Plan 5's full release verification, final before/after evidence, and completion
+status remain pending in the linked detailed plan.
 
 ## Completed delivery
 

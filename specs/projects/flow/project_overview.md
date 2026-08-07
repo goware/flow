@@ -64,6 +64,25 @@ Stable command keys make worker retries deterministic. Repeating an equivalent d
 
 Multiple waits on one command are exact AND conditions. Flow deliberately does not infer dependencies from results or observe arbitrary command outcomes. Parent-computed data is passed directly in child arguments. Sibling or external data moves through declared event payloads, stable application references, or application tables.
 
+Command boundaries should correspond to independent retry, side-effect,
+isolation, timeout, queue-ownership, or useful parallelism boundaries. Small
+deterministic transformations remain inside the worker that owns them, and
+several small same-database writes may share one `WithCommit` callback. A
+microstep whose durable lifecycle costs more than its work is not a useful
+command boundary.
+
+An execution is one serialized semantic aggregate. Causally related work
+belongs together, while independent bulk items or shards should use separate
+executions rather than one tenant-wide or global container. The default
+1,000-command ceiling is a safety limit, not a target or a new recommended hard
+maximum. Ordinary executions should normally remain in the tens or low
+hundreds. Very large fan-outs can be chunked behind bounded batch commands, and
+large all-of inputs can be combined through hierarchical join commands.
+
+Related events and children should be staged in one decision when they form one
+atomic change. Large or sensitive documents remain in application storage and
+move through Flow as stable references in arguments or event payloads.
+
 ## Event model
 
 Application events are immutable facts local to one execution. Their identity is:
@@ -102,10 +121,23 @@ Every semantic mutation is scoped to one execution and locks its execution row f
 2. allocates consecutive journal positions;
 3. appends immutable semantic entries;
 4. updates current-state, readiness, and delivery projections;
-5. emits an optional transactional notification hint; and
+5. emits an optional transactional notification hint only when the mutation
+   creates immediately runnable work; and
 6. commits all changes together.
 
 The journal is gap-free and commit-ordered within each execution. It records execution start/failing, command creation, attempt start/conclusion, application events, and command/execution terminal events. Current projections make claims and inspection efficient; replay verifies that retained semantic history reconstructs the same outcome.
+
+Event readiness is delta-based: accepted events use the reverse-wait index to
+update matching unresolved waits and decrement only their commands'
+`unsatisfied_waits` counters. Normalized child/event decisions and
+same-execution claims are persisted in bounded sets. A runtime may claim groups
+from independent executions concurrently within its worker and database-pool
+capacity, but mutations within one execution remain serialized.
+
+Journal integrity has three deliberate boundaries. Accepted writes canonicalize
+and hash every body. The claim hot path verifies the retained hash and decodes
+the bounded application-event envelope without redundant reconstruction. Full
+replay re-canonicalizes history for stronger conformance diagnostics.
 
 Claims install an attempt ID, lease token, owner, and expiry. Only the currently fenced attempt may settle. A stale worker may finish locally after lease loss, but its result, events, children, and commit callback cannot become durable.
 
@@ -124,6 +156,10 @@ A required command that exhausts retry or is cancelled/expired makes the executi
 `WithCommit` is the completion-side transaction boundary. It receives the worker arguments, result, command information, and Flow's fenced PostgreSQL transaction. It is suitable for application-table writes that must commit exactly with command success. If it returns an error, the success settlement rolls back and the error follows normal permanent/retryable classification.
 
 Neither mechanism makes remote calls or other non-transactional effects exactly once.
+
+Both transaction forms should be short. `WithCommit` is for bounded
+same-database writes, not remote calls, and a caller-owned transaction retains
+each acquired execution lock until the caller commits or rolls back.
 
 ## Storage and operations
 

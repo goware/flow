@@ -25,6 +25,12 @@ Earlier designs used plans, graphs, and coordinators in addition to commands. Th
 
 The current design uses one command tree for ownership/provenance and exact application events for synchronization. A worker may create later commands only as part of its successful decision. This keeps every executable action on the same queue, lease, retry, cancellation, and inspection path.
 
+A command is therefore a retry, side-effect, isolation, timeout, queue, or
+parallelism boundary—not a wrapper around every deterministic line of business
+logic. Small transformations stay within one worker. Independent bulk items use
+separate executions, while very large fan-outs use bounded batch commands and
+hierarchical joins rather than one oversized aggregate.
+
 The accepted tradeoff is deliberate. The engine cannot react to arbitrary unsuccessful predecessor outcomes, choose the first of several events, compute quorum/race gates, or mutate open-ended workflow state. Those behaviors would require another durable state machine rather than a small extension to command gating.
 
 ### 2.2 Events synchronize; they do not execute code
@@ -89,6 +95,13 @@ flow/
 ## 4. Execution aggregate and invariants
 
 One execution is the transaction and locking aggregate for all of its commands and events.
+
+Semantic mutations within an execution are intentionally serialized. This
+makes causation, gap-free journal allocation, and fenced settlement auditable,
+but it also means an execution is not a tenant-wide or global work container.
+Independent items or shards scale through separate executions. The default
+1,000-command ceiling remains a safety limit rather than a target; guidance to
+keep ordinary executions in the tens or low hundreds is not a new hard bound.
 
 Core invariants are:
 
@@ -166,7 +179,8 @@ Standalone Flow writes use `READ COMMITTED`. A semantic mutation follows this pr
 7. append the immutable batch;
 8. update projections, counters, readiness, and queue state;
 9. execute an optional fenced application commit callback;
-10. issue an optional transactional notification hint; and
+10. issue an optional transactional notification hint only if the transition
+    created immediately runnable work; and
 11. commit or roll back the whole unit.
 
 Database time is captured after lock acquisition so transitions serialized on one execution also have a consistent decision time. Journal reservation and append occur in the same transaction, so rollback creates no visible gaps.
@@ -207,7 +221,21 @@ poll or notification wake
 
 The scheduler never claims work it cannot handle. Queue probes are bounded and may be repeated safely. `SKIP LOCKED` allows replicas to make progress independently when another execution is busy.
 
-Claim materialization validates that all waits are satisfied, joins their recorded positions to the exact application-event journal bodies, and enforces the 256-input bound. The connection is released before codec decoding/application work proceeds.
+Selected candidates are grouped by execution. A pool-aware internal bound lets
+independent execution groups claim concurrently while leaving database capacity
+for lease and deadline maintenance. Candidates from one execution remain in
+one transaction: the store locks the eligible set, loads all of its event inputs
+in one query, appends one stable `attempt_started` batch, and updates queue and
+command projections in sets. The scheduler gathers the selected claims before
+probing again, preserving centralized capacity and fairness accounting.
+
+Claim materialization validates that all waits are satisfied, joins their recorded positions to the exact application-event journal bodies, and enforces the 256-input bound. The connection is released before application argument/event codec decoding and worker invocation proceed.
+
+The claim hot path hashes each retained event body directly, compares its
+stored digest, performs one typed envelope decode, and validates the nested
+canonical payload. It relies on the accepted write boundary having already
+canonicalized the complete body; replay retains stronger independent
+reconstruction for diagnostics.
 
 The attempt context combines the configured attempt timeout, retry elapsed limit, execution deadline, runtime shutdown, and lease-fence cancellation. Panics are recovered at the invocation boundary.
 
@@ -224,6 +252,12 @@ Before settlement the runtime:
 5. converts it to store-level event/command declarations with fingerprints.
 
 Successful settlement reacquires the execution lock and verifies command ID, attempt ID, lease token, and current state. It then prepares journal/projection changes. `WithCommit` runs on this same transaction after the Flow changes are prepared and before commit.
+
+Normalization produces one bounded deterministic change set. Existing staged
+event identities and retained event positions for new waits are loaded in sets;
+command, wait, and initially ready queue projections are inserted in batches.
+This keeps round trips bounded by store operation rather than by child or wait
+count while retaining the original atomic fault boundaries.
 
 If `WithCommit` fails, PostgreSQL rolls back all proposed success changes. The runtime then concludes the still-owned attempt through the ordinary retry/failure path. This gives application-table writes atomicity with accepted command success without claiming exactly-once execution of the callback body.
 
@@ -249,6 +283,12 @@ canonical target event
 Cross-execution delivery is target-local. It adds no source ID, cross-journal causation edge, outbox row, acknowledgement, or multi-execution settlement. When producer atomicity matters, application code uses `runtime.InTx(tx)` to commit its own write and target event together.
 
 On command creation, retained events can satisfy waits immediately. On later ingress, the reverse wait index finds only unresolved matching selectors. On expiry, the store checks for any event committed at or before the deadline before terminally expiring the command, so maintenance delay cannot overturn a timely fact.
+
+Later ingress is delta-based. Newly satisfied reverse-wait rows are grouped by
+command, `unsatisfied_waits` is decremented exactly by those rows, and only
+commands reaching zero are transitioned and queued. The operation reports
+whether any released command is runnable at database time so notification is
+limited to useful immediate wakes.
 
 ## 11. Retry and failure transitions
 
@@ -286,6 +326,11 @@ Lease renewals run in bounded batches for locally active attempts. Failure to re
 
 Notifications use one separately established session-capable PostgreSQL connection because pool/transaction connections cannot reliably own `LISTEN`. The listener reconnects with bounded backoff and performs a broad wake after every connection to close commit-before-LISTEN gaps. Every scheduler continues polling regardless.
 
+The store emits at most one transactional wake for an operation that creates
+immediately runnable work. Claims, journal-only transitions, unmatched events,
+terminal settlement without follow-up work, and future-scheduled work do not
+notify.
+
 ## 14. Runtime lifecycle and deployment
 
 `New` validates schema/configuration and allocates no background services. This permits API-only clients and makes startup ordering explicit.
@@ -319,6 +364,11 @@ This division is intentional:
 
 Replay is a conformance and diagnostics mechanism, not an automatic projection-rebuild or disaster-recovery API in the current release.
 
+Integrity work is deliberately split by boundary: accepted writes canonicalize
+complete journal bodies and verify their hashes; claims perform direct hash and
+bounded typed event decoding without redundant full reconstruction; replay
+verifies hashes and re-canonicalizes every retained body before folding it.
+
 ## 16. Migrations and compatibility
 
 Embedded migrations are rendered for one validated schema while table names retain the `flow_` prefix. `Migrate` takes an advisory transaction lock scoped to database/schema, verifies all known checksums, and applies each pending unit transactionally. `MigrationFS` provides equivalent SQL plus ledger inserts for an external runner.
@@ -336,6 +386,11 @@ Embedded migrations are rendered for one validated schema while table names reta
 ## 17. Data safety, retention, and operational limits
 
 Canonical command arguments/results, event payloads, metadata, retry settings, and journal bodies are stored in PostgreSQL. Retained start/declaration fingerprints and journal body hashes support identity comparison and invariant checking; redundant write-only projection hashes are not stored. These values are not encryption. Applications must avoid putting secrets in keys, metadata, errors, or observer dimensions and should prefer stable references for sensitive/large values.
+
+Parent-produced values should travel directly in child arguments, while exact
+events carry sibling, cross-branch, or external facts. Related events and
+children belong in one decision when they must commit together. Large or
+sensitive documents stay in application storage behind stable references.
 
 Structured Flow errors map database/constraint failures into safe sentinel categories without including raw SQL or driver details. Observers intentionally exclude payloads, results, SQL, connections, and lease tokens; delivery is bounded and non-blocking so monitoring cannot stall correctness.
 
