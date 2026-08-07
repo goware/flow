@@ -181,6 +181,137 @@ func benchmarkSameExecutionFanout(b *testing.B, commandCount int) {
 	reportBenchmarkRate(b, float64(b.N*commandCount), "commands")
 }
 
+// BenchmarkSameExecutionClaimBatch measures one ordinary multi-command claim
+// transaction for ready siblings in the same execution. Fixture creation,
+// candidate probing, and projection reset are excluded from the timed region.
+func BenchmarkSameExecutionClaimBatch(b *testing.B) {
+	const commandCount = 16
+
+	database := testpg.Open(b)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		b.Fatal(err)
+	}
+	parent := DefineCommand[None, None]("benchmark.claim_batch.parent", 1)
+	child := DefineCommand[None, None]("benchmark.claim_batch.child", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+		WithMaxCommandsPerExecution(0), WithWorkerConcurrency(1), WithPollInterval(benchmarkPollInterval))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := runtime.Register(Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
+		for index := range commandCount {
+			Execute(work, fmt.Sprintf("child/%02d", index), child, None{})
+		}
+		return None{}, nil
+	})); err != nil {
+		b.Fatal(err)
+	}
+	stop := startBenchmarkRuntime(b, runtime)
+	execution, err := parent.With(runtime).Execute(ctx, "claim-batch", None{}, WithoutExecutionDeadline())
+	if err != nil {
+		stop()
+		b.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var persistedCommands int
+		var parentState string
+		if err := database.DB.Conn.QueryRow(ctx, `SELECT e.command_count,c.state
+			FROM `+pgschema.Table(database.Schema, "flow_executions")+` e
+			JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c
+			  ON c.execution_id=e.execution_id AND c.command_id=e.root_command_id
+			WHERE e.execution_id=$1`, execution.ID).Scan(&persistedCommands, &parentState); err != nil {
+			stop()
+			b.Fatal(err)
+		}
+		if persistedCommands == commandCount+1 && parentState == "succeeded" {
+			break
+		}
+		if time.Now().After(deadline) {
+			stop()
+			b.Fatalf("claim fixture commands=%d parent=%s", persistedCommands, parentState)
+		}
+		time.Sleep(benchmarkPollInterval)
+	}
+	stop()
+	candidates, err := runtime.store.ProbeCommands(ctx,
+		[]store.CommandKind{{Name: child.Name(), Version: child.Version()}}, commandCount)
+	if err != nil || len(candidates) != commandCount {
+		b.Fatalf("ProbeCommands() candidates=%d, err=%v", len(candidates), err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.StopTimer()
+	for range b.N {
+		b.StartTimer()
+		result, claimErr := runtime.store.ClaimCommands(ctx, candidates, time.Minute, "benchmark", nil)
+		b.StopTimer()
+		if claimErr != nil || !result.Progressed || len(result.Commands) != commandCount {
+			b.Fatalf("ClaimCommands() progressed=%t commands=%d, err=%v",
+				result.Progressed, len(result.Commands), claimErr)
+		}
+		resetBenchmarkClaimBatch(b, ctx, runtime, result.Commands)
+	}
+	b.ReportMetric(commandCount, "commands/op")
+	reportBenchmarkRate(b, float64(b.N*commandCount), "commands")
+}
+
+func resetBenchmarkClaimBatch(b *testing.B, ctx context.Context, runtime *Runtime, claims []store.ClaimedCommand) {
+	b.Helper()
+	commandIDs := make([]uuid.UUID, len(claims))
+	attemptIDs := make([]uuid.UUID, len(claims))
+	firstPosition := claims[0].AttemptStartedPosition
+	executionID := claims[0].ExecutionID
+	for index, claim := range claims {
+		if claim.ExecutionID != executionID || claim.AttemptStartedPosition != firstPosition+int64(index) {
+			b.Fatalf("claim[%d] execution=%s position=%d, want %s/%d", index,
+				claim.ExecutionID, claim.AttemptStartedPosition, executionID, firstPosition+int64(index))
+		}
+		commandIDs[index], attemptIDs[index] = claim.CommandID, claim.AttemptID
+	}
+	tx, err := runtime.db.Conn.Begin(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	removed, err := tx.Exec(ctx, `DELETE FROM `+pgschema.Table(runtime.schema, "flow_journal")+`
+		WHERE execution_id=$1 AND attempt_id=ANY($2::uuid[]) AND entry_kind='attempt_started'`,
+		executionID, attemptIDs)
+	if err != nil || removed.RowsAffected() != int64(len(claims)) {
+		b.Fatalf("reset claim journal rows=%d, err=%v", removed.RowsAffected(), err)
+	}
+	resetQueue, err := tx.Exec(ctx, `WITH reset(command_id,attempt_id) AS (
+		SELECT * FROM unnest($1::uuid[],$2::uuid[])
+	)
+	UPDATE `+pgschema.Table(runtime.schema, "flow_command_queue")+` q
+	SET state='ready',active_attempt_id=NULL,lease_token=NULL,lease_owner=NULL,
+	    lease_started_at=NULL,lease_expires_at=NULL
+	FROM reset
+	WHERE q.command_id=reset.command_id AND q.execution_id=$3 AND q.active_attempt_id=reset.attempt_id`,
+		commandIDs, attemptIDs, executionID)
+	if err != nil || resetQueue.RowsAffected() != int64(len(claims)) {
+		b.Fatalf("reset claim queue rows=%d, err=%v", resetQueue.RowsAffected(), err)
+	}
+	resetCommand, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_commands")+`
+		SET state='ready',attempt_ordinal=attempt_ordinal-1
+		WHERE execution_id=$1 AND command_id=ANY($2::uuid[]) AND state='running' AND attempt_ordinal>0`,
+		executionID, commandIDs)
+	if err != nil || resetCommand.RowsAffected() != int64(len(claims)) {
+		b.Fatalf("reset claim command rows=%d, err=%v", resetCommand.RowsAffected(), err)
+	}
+	resetExecution, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_executions")+`
+		SET next_journal_position=$2
+		WHERE execution_id=$1 AND next_journal_position=$2::bigint+$3::bigint`, executionID, firstPosition, len(claims))
+	if err != nil || resetExecution.RowsAffected() != 1 {
+		b.Fatalf("reset claim execution rows=%d, err=%v", resetExecution.RowsAffected(), err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		b.Fatal(err)
+	}
+}
+
 // BenchmarkStagedDecisionBatch isolates the successful settlement transaction
 // from execution ingress, claiming, handler work, and later child execution.
 // Child shapes rotate through no waits, one wait, and three waits.

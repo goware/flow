@@ -9,7 +9,7 @@ completed_at: 2026-08-04
 
 [`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. [`plans/5-hot-path-efficiency.md`](plans/5-hot-path-efficiency.md) reduces hot-path work without changing the public command/event model or six-table durability boundary. This remains a pre-release API; removed APIs and durable formats have no compatibility aliases or data migration.
 
-## Implemented Plan 5 outcomes (final gate pending)
+## Completed Plan 5 outcomes
 
 - [x] Narrow the command-key index and reserve journal positions in one operation.
 - [x] Resolve readiness through matching reverse waits and notify only for immediate runnable work.
@@ -17,9 +17,13 @@ completed_at: 2026-08-04
 - [x] Claim independent execution groups concurrently within a pool-aware internal bound.
 - [x] Reduce event-input materialization while retaining write, claim, and replay integrity checks.
 - [x] Document efficient command, execution, event, payload, join, and transaction granularity.
+- [x] Verify all 18 acceptance criteria with full PostgreSQL 17/18 ordinary and race gates.
 
-Plan 5's full release verification, final before/after evidence, and completion
-status remain pending in the linked detailed plan.
+Plan 5 is complete. Its final same-environment claim comparison, complete
+before/after workload matrix, retained-journal cost, architecture/schema scans,
+manual persistence-loop audit, version coverage, bounded variance, and
+criterion-by-criterion release evidence are recorded in the
+[Plan 5 benchmark evidence](benchmark_evidence/plan_5_hot_path.md#final-release-verification).
 
 ## Completed delivery
 

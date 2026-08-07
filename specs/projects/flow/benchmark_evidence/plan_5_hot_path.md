@@ -560,3 +560,314 @@ pool-aware bound; and journal integrity is divided across accepted write, hot
 claim, and full replay diagnostics. These are implementation and usage
 descriptions, not new hard limits, service-level objectives, or throughput
 promises. Final release-gate and full before/after evidence remain separate.
+
+## Final release verification
+
+The final verification ran on 2026-08-07 from the working tree based on
+`2ed40d18bb4dbeec650365f00272ef86c35edb2e`. The final documentation and
+focused claim-benchmark changes were not committed by the verification agent.
+Historical phase plans and their evidence were not edited.
+
+The host remained the same Intel Core Ultra 7 255H Linux/amd64 machine with 16
+logical CPUs and the same 12-connection benchmark pool and 16-worker runtime
+shapes. The final host kernel was Linux 6.18.42 and Go was 1.26.5. The final
+benchmark server was PostgreSQL 18.4 in the locally supplied Alpine container,
+with `fsync=on`, `synchronous_commit=on`, `full_page_writes=on`, and
+`max_connections=100`. The Phase 0 baseline used PostgreSQL 18.1 on the same
+host. This patch-level/container difference is recorded rather than presenting
+the final samples as a laboratory-identical PostgreSQL environment.
+
+The repository does not declare an older PostgreSQL-major support floor or a
+CI version matrix. To avoid inventing a broader compatibility promise, final
+coverage used the locally supplied adjacent release matrix: PostgreSQL 17.10
+as the oldest exercised major and PostgreSQL 18.4 as the newest. Both reported
+all three durability settings above as enabled.
+
+### Final commands and functional gates
+
+Database URLs were supplied without embedding a password in any command or
+evidence. The PostgreSQL containers used local trust authentication only for
+these isolated release-verification databases.
+
+```text
+gofmt -w <all Go files changed since d2713d8>
+git diff --check
+make build
+go vet ./...
+FLOW_TEST_DATABASE_URL=<local PostgreSQL URL without credentials> go test -count=1 ./...
+make test
+
+FLOW_TEST_DATABASE_URL=<local PostgreSQL 17 URL without credentials> go test -count=1 ./...
+FLOW_TEST_DATABASE_URL=<local PostgreSQL 17 URL without credentials> make test
+
+FLOW_TEST_DATABASE_URL=<local PostgreSQL 18 URL without credentials> go test -count=1 ./...
+FLOW_TEST_DATABASE_URL=<local PostgreSQL 18 URL without credentials> make test
+```
+
+The ordinary and complete race suites passed on PostgreSQL 17.10 and 18.4.
+`make test` expanded to `go test -race -count=1 -p 1 -parallel 4 ./...`.
+A JSON event audit of the ordinary PostgreSQL 18 suite counted 293 named test
+runs and zero named test skips. Go also emitted five package-level skip events
+for packages with no test files; those were not test skips.
+
+The exact final benchmark and retained-journal commands were:
+
+```text
+go test -count=1 -run '^TestJournalGrowthMeasurement100Commands$' -v .
+
+GOMAXPROCS=16 go test -run '^$' \
+  -bench 'Benchmark(IndependentCommandLifecycle|SameExecutionFanout|StagedDecisionBatch|ExternalEventIngress|ExecutionIngressNotification|EventSnapshotMaterialization)' \
+  -benchmem -benchtime=3s -count=5 .
+
+GOMAXPROCS=16 go test -run '^$' \
+  -bench '^BenchmarkSameExecutionClaimBatch$' \
+  -benchmem -benchtime=3s -count=5 .
+```
+
+The complete multi-workload command passed in 899.474 seconds. The final
+reproducibility-review claim command passed in 36.647 seconds. Every named
+shape ran; the opt-in 1,000-command stress benchmark was not selected by these
+commands and its historical one-shot result remains recorded above.
+
+`BenchmarkSameExecutionClaimBatch` creates 16 no-wait, default-queue,
+default-retry siblings under one execution. Parent execution, fixture
+settlement, candidate probing, and reset of attempt journal rows,
+queue/command eligibility projections, and the execution allocator to a
+repeatable claim state are outside the timer. The timed region is exactly one
+`ClaimCommands` call and verifies that all 16 attempts are returned with
+contiguous positions.
+
+The exact baseline source is retained as
+[`plan_5_claim_baseline.go.txt`](plan_5_claim_baseline.go.txt), SHA-256
+`431f81cde702eda366c456ce0064e220d87127059ca63f6a0ca3bf5e29f08883`.
+It is stored with a `.go.txt` suffix so ordinary current-tree package discovery
+does not compile a historical-only helper. From a clean repository root, the
+following commands create the detached baseline, verify the applied bytes, run
+five samples, and remove the temporary source/worktree. The database URL shown
+contains no credential; the verification server used local trust
+authentication.
+
+```text
+flow_plan5_repo="$(pwd)"
+test ! -e /tmp/flow-plan5-claim-repro
+git worktree add --detach /tmp/flow-plan5-claim-repro d2713d8
+cp "$flow_plan5_repo/specs/projects/flow/benchmark_evidence/plan_5_claim_baseline.go.txt" \
+  /tmp/flow-plan5-claim-repro/plan5_claim_benchmark_test.go
+sha256sum /tmp/flow-plan5-claim-repro/plan5_claim_benchmark_test.go
+
+cd /tmp/flow-plan5-claim-repro
+FLOW_TEST_DATABASE_URL='postgres://postgres@127.0.0.1:55418/flow_test?sslmode=disable' \
+  GOMAXPROCS=16 go test -run '^$' \
+  -bench '^BenchmarkPlan5BaselineSameExecutionClaimBatch$' \
+  -benchmem -benchtime=3s -count=5 .
+
+cd "$flow_plan5_repo"
+FLOW_TEST_DATABASE_URL='postgres://postgres@127.0.0.1:55418/flow_test?sslmode=disable' \
+  GOMAXPROCS=16 go test -run '^$' \
+  -bench '^BenchmarkSameExecutionClaimBatch$' \
+  -benchmem -benchtime=3s -count=5 .
+
+rm /tmp/flow-plan5-claim-repro/plan5_claim_benchmark_test.go
+git worktree remove /tmp/flow-plan5-claim-repro
+```
+
+The reproducibility review executed these steps against a fresh `d2713d8`
+worktree. The copied file checksum matched the versioned artifact, the baseline
+command passed in 34.638 seconds, and a back-to-back current command passed in
+36.647 seconds on the same PostgreSQL 18.4 server with `fsync=on`,
+`synchronous_commit=on`, and `full_page_writes=on`.
+
+The artifact and current benchmark use the same parent/child definitions,
+16 default-queue/default-retry no-wait siblings, notifications disabled,
+unlimited command ceiling, one fixture worker, 5 ms poll, and one-minute claim
+lease. Both wait for the succeeded parent and 17 persisted commands, stop the
+runtime, and probe the same 16 child candidates before timing. The timed region
+in both contains only `ClaimCommands`; both require 16 contiguous attempts and
+run the same verified journal/queue/command/allocator batch reset while the
+timer is stopped. The resets deliberately leave command `updated_at`/`status_at`
+and execution `updated_at` advanced; those timestamps are not claim-eligibility
+inputs, and every timed claim overwrites them. Only the benchmark/helper names
+differ so the baseline source can compile independently at `d2713d8`.
+
+### Final before/after results
+
+Medians and complete five-sample ranges follow. The before column is the
+Phase 0 `d2713d8` evidence unless the row explicitly identifies the detached
+same-environment claim comparison.
+
+| Workload | Before median (range) | Final median (range) |
+|---|---:|---:|
+| execution ingress, poll-only | 4.167 ms (4.060-4.341) | 4.410 ms (4.248-4.506) |
+| execution ingress, notification mode | 4.261 ms (4.083-4.320) | 4.367 ms (4.103-4.448) |
+| independent lifecycle, 1 producer | 162.2 commands/s (161.2-165.5) | 172.4 commands/s (170.1-173.1); 371.2 ms/batch (369.7-376.1) |
+| independent lifecycle, 4 producers | 176.1 commands/s (174.4-180.4) | 463.4 commands/s (457.1-465.6); 138.1 ms/batch (137.5-140.0) |
+| independent lifecycle, 16 producers | 170.2 commands/s (167.2-173.7) | 417.6 commands/s (400.9-421.5); 153.2 ms/batch (151.8-159.6) |
+| same execution, 10 commands | 78.08 ms; 128.1 commands/s (74.22-83.37; 120.0-134.7) | 69.63 ms; 143.6 commands/s (68.98-71.14; 140.6-145.0) |
+| same execution, 100 commands | 671.0 ms; 149.0 commands/s (664.7-673.1; 148.6-150.4) | 571.5 ms; 175.0 commands/s (564.8-576.1; 173.6-177.1) |
+
+The final execution-ingress medians are modestly higher than the original
+PostgreSQL 18.1 baseline. Notification ranges overlap, and the poll-only range
+overlaps the previously recorded Phase 2 range of 4.057-4.468 ms. Root ingress
+received no later production change after the Phase 4 same-environment samples
+showed 3.978/4.036 ms medians. The final difference is therefore recorded as
+bounded host/PostgreSQL-container variance, not hidden and not claimed as an
+ingress improvement. The targeted concurrent and same-execution workloads
+improve materially.
+
+#### Staged-decision settlement
+
+| Children | Events | Before median (range) | Final median (range) |
+|---:|---:|---:|---:|
+| 1 | 0 | 4.672 ms (4.450-4.719) | 4.710 ms (4.689-4.899) |
+| 1 | 10 | 5.437 ms (5.271-5.524) | 5.523 ms (5.357-5.772) |
+| 1 | 100 | 14.905 ms (14.370-15.114) | 10.708 ms (10.454-10.740) |
+| 10 | 0 | 8.966 ms (8.701-9.121) | 7.720 ms (7.303-7.946) |
+| 10 | 10 | 10.174 ms (9.682-10.502) | 8.918 ms (8.669-9.179) |
+| 10 | 100 | 21.363 ms (20.592-22.113) | 14.240 ms (13.871-14.805) |
+| 100 | 0 | 59.042 ms (56.755-60.752) | 28.548 ms (28.384-29.910) |
+| 100 | 10 | 55.329 ms (54.875-57.152) | 31.667 ms (31.261-31.855) |
+| 100 | 100 | 68.531 ms (65.941-71.072) | 35.713 ms (34.904-36.057) |
+
+The two smallest shapes remain within ordinary repeated-sample variance. The
+gain grows with the batch: 100 children and 100 events settle in about 35.7 ms
+instead of 68.5 ms without changing the payload or timed boundary.
+
+#### External event ingress
+
+| Target and match shape | Before median (range) | Final median (range) |
+|---|---:|---:|
+| distinct small live executions, no match | 3.650 ms/event (3.460-3.825) | 3.684 ms/event (3.657-3.924) |
+| one small hot execution, no match | 3.465 ms/event (3.389-3.476) | 3.577 ms/event (3.476-3.670) |
+| 100 retained commands, no match | 3.823 ms/event (3.793-3.968) | 3.696 ms/event (3.495-3.769) |
+| 100 retained commands, one match/event | 4.302 ms/event; 232.4 events/s (4.127-4.363; 229.2-242.3) | 4.126 ms/event; 242.4 events/s (4.054-4.346; 230.1-246.7) |
+| 100 retained commands, nine matches/event | 6.885 ms/event; 145.2 events/s (6.492-7.026; 142.3-154.0) | 4.750 ms/event; 210.5 events/s (4.692-4.936; 202.6-213.1) |
+
+No-match costs remain bounded independently of the retained 100-command shape.
+The several-match case retains the delta-readiness gain. The small-hot median is
+higher than the old narrow range but effectively matches the same-environment
+Phase 3 median of 3.569 ms. The final retained/matching directions and
+structural index gate remain positive.
+
+#### Same-execution claim batch
+
+| Metric | `d2713d8` on final environment | Final working tree |
+|---|---:|---:|
+| latency for 16-command claim | 18.103 ms (17.198-18.213) | 6.368 ms (6.263-6.942) |
+| claimed commands per second | 883.8 (878.5-930.3) | 2,513 (2,305-2,554) |
+| allocated bytes/op | 704,864 (700,732-711,755) | 592,551 (589,810-596,642) |
+| allocations/op | 16,458 (16,454-16,463) | 13,872 (13,870-13,879) |
+
+The reproducible same-environment comparison shows about 65% lower claim
+latency and roughly 2.8 times the command rate. It directly measures the set-oriented
+attempt journal and projection update rather than relabeling end-to-end fan-out.
+
+#### Event-input claim materialization
+
+| Inputs and canonical payload | Before median | Final median | Final range |
+|---|---:|---:|---:|
+| 1 x 1 KiB | 4.108 ms; 66,947 B/op; 1,208 allocs/op | 4.162 ms; 55,882 B/op; 1,188 allocs/op | 4.117-4.401 ms; 55,655-56,975 B/op; 1,186-1,189 allocs/op |
+| 32 x 1 KiB | 5.457 ms; 687,873 B/op; 4,074 allocs/op | 4.732 ms; 234,475 B/op; 2,374 allocs/op | 4.623-5.151 ms; 232,746-236,966 B/op; 2,373-2,374 allocs/op |
+| 256 x 1 KiB | 13.820 ms; 4,989,091 B/op; 24,708 allocs/op | 7.867 ms; 1,511,259 B/op; 10,910 allocs/op | 7.682-7.990 ms; 1,510,610-1,512,730 B/op; 10,909-10,910 allocs/op |
+| 256 x 64 KiB | 380.581 ms; 389,806,639 B/op; 31,161 allocs/op | 90.111 ms; 103,030,008 B/op; 12,534 allocs/op | 89.391-96.715 ms; 103,021,746-103,045,065 B/op; 12,531-12,537 allocs/op |
+
+The maximum final runtime is above the Phase 6 median of 84.854 ms, but its
+allocated bytes and allocation count are effectively identical to Phase 6.
+Only `doc.go` changed between the snapshot implementation commit and the final
+tree, while PostgreSQL moved from the local 18.1 installation to an 18.4
+container and the host kernel changed. The timing difference is therefore
+documented as environment variance. Relative to the planned-at baseline, the
+adversarial claim still uses about 74% fewer allocated bytes and 76% less time,
+with no durability or integrity relaxation.
+
+#### Retained journal cost
+
+| Metric | Before | Final |
+|---|---:|---:|
+| journal rows | 402 | 402 |
+| journal tuple bytes | 199,620-199,639 | 199,613 |
+| journal body bytes | 124,068-124,087 | 124,061 |
+| journal tuple bytes per command | 1,996.2-1,996.4 | 1,996.1 |
+
+The semantic journal shape and retained storage cost are unchanged within the
+documented timestamp-encoding byte variance.
+
+### Architecture, schema, and loop audit
+
+The final required scans produced no matches for global readiness resolution,
+the position pre-read, or a mutable command-key `INCLUDE` payload. The sole
+production `pg_notify` occurrence is the statement inside
+`SemanticTx.NotifyRunnableCommands`:
+
+```text
+rg -n 'resolveReadinessLocked|loadReadinessCommands' internal/store
+rg -n 'nextJournalPosition' internal/store
+rg -n 'INCLUDE .*state|unsatisfied_waits.*terminal_position' migrations
+rg -n 'pg_notify' internal/store
+```
+
+`SemanticTx.Apply` validates first, reserves the complete batch with one
+`UPDATE ... RETURNING`, and performs one journal `CopyFrom`; it contains no
+notification. `NotifyRunnableCommands` shares one `notificationSent` owner
+across continued semantic batches, so one store operation emits at most one
+transactional hint. Source inspection classified all `Apply` call sites: starts,
+event release, immediate child release, immediate retry, and immediate lease
+recovery notify only when runnable at `DBNow`; claims, conclusions without
+follow-up work, cancellation, expiry, unrelated events, and future scheduling
+do not.
+
+The migrations contain exactly the six planned `CREATE TABLE` statements, and
+`TestMigrateAndCheckSchema` independently counted six catalog tables and 28
+indexes on clean PostgreSQL 17 and 18 schemas. Catalog and adversarial tests
+prove the narrow unique `(execution_id, command_key)` index, the separate
+`(execution_id, command_id)` ownership key, root/parent/queue/wait/journal
+same-execution foreign keys, command/event identity guards, unique creation,
+terminal, execution-failing, and attempt-kind lifecycle entries, and positive
+journal positions.
+
+Every remaining loop in `internal/store/{ingress,commands,graph}.go` was
+inspected. Staged identity and retained-event lookup execute once per batch;
+command, wait, and queue insertion use one `CopyFrom` per table; matching wait
+satisfaction, command counter updates, released queue insertion, fail-fast
+cancellation, whole-execution command cancellation, and queue deletion are set
+operations. Loops prepare, validate, encode, map journal positions, or scan a
+single result set. The two deliberate exceptional full-aggregate paths still
+lock active-attempt details per running command during explicit whole-execution
+cancellation or expiry; they perform no per-item projection write and are not
+ordinary event/child/wait persistence. No prohibited per-item retained-event
+lookup, wait/child insert, wait update, cancellation update, or queue delete
+remains.
+
+The production diff contains no durability-setting statement or unlogged
+table. The only changed public-package implementation declaration after
+`d2713d8` substitutes internal journal-codec constants in `execute.go`; `doc.go`
+adds guidance. No exported public declaration was added, removed, or changed.
+Active-code and compile-contract scans show no coordinator, plan runtime,
+state-machine, outcome subscription, or compatibility alias; active docs mention
+those names only to state that they are unsupported or superseded.
+
+### Acceptance-criterion audit
+
+| # | Final evidence | Result |
+|---:|---|:---:|
+| 1 | The retained benchmark file covers independent lifecycles, 10/100/opt-in-1,000 fan-out, the complete staged matrix, five external-ingress shapes, the focused 16-command claim batch, and four snapshot shapes; the exact historical claim fixture is retained as a checksummed source artifact. | PASS |
+| 2 | This file records commits, host/server/settings, pool/workers, exact apply/run/revert commands, artifact checksum, timer boundaries, payloads, five samples, limitations, and before/after results. | PASS |
+| 3 | Migration source plus `TestMigrationPrunesAndNarrowsIndexes` prove exactly two key columns, uniqueness, no `INCLUDE`, and no duplicate. | PASS |
+| 4 | `reserveJournal` is one allocator `UPDATE ... RETURNING`; source scan finds no `nextJournalPosition`; semantic rollback/gap tests pass. | PASS |
+| 5 | `SemanticTx.Apply` has no notification and the sole `pg_notify` is in the explicit helper. | PASS |
+| 6 | The shared notification owner caps one hint per operation; runnable/no-op/claim/terminal/retry/recovery/commit/rollback/reconnect tests pass. | PASS |
+| 7 | Global resolver symbols are absent; no-event success bypasses readiness and event ingress calls the delta resolver only with accepted positions. | PASS |
+| 8 | The reverse-index update filters unresolved exact matches and returns each newly satisfied command; duplicate/conflict/deadline tests pass. | PASS |
+| 9 | Grouped counter update and one released-queue insert handle only affected commands; multi-wait/multi-command and sparse 10,000-wait index tests pass. | PASS |
+| 10 | Fail-fast alone loads affected open commands; cancellation command/queue writes are batched with exact journal positions; survivor/disabled tests pass. | PASS |
+| 11 | Staged identity lookup, retained child-wait lookup, and command/wait/queue writes are one bounded operation each; the manual loop audit found no prohibited per-item persistence. | PASS |
+| 12 | Large mixed decision, conflict, ceiling, fault, caller-transaction, `WithCommit`, counter, replay, and trace tests pass atomically. | PASS |
+| 13 | Bounded pool-aware independent claims and barrier-based overlap, fairness, small-pool, shutdown, ambiguity, and multi-replica tests pass under race. | PASS |
+| 14 | Sixteen siblings use one journal batch and one queue/command update set; structural tests and the dedicated repeated benchmark prove the batch path. | PASS |
+| 15 | Claims hash the stored body, decode once, validate/copy the canonical payload once, and retain corrupt/version/size/selector/retry/takeover/replay coverage. | PASS |
+| 16 | Permanent/live identity, event identity, deadline, retry, fencing, fail-fast, cancellation, caller transaction, history, trace, replay, notification, and migration tests all pass in the full ordinary/race suites. | PASS |
+| 17 | README, package docs, overview, functional spec, architecture, and schema/engine docs describe efficient command, execution, event, payload, join, and transaction granularity. | PASS |
+| 18 | Clean migration inventory is exactly six tables; the public API diff is compatible; PostgreSQL 17/18 ordinary and race suites plus format/diff/build/vet pass with durability enabled. | PASS |
+
+All 18 criteria are verified. The directional gains are evidence rather than
+SLOs, and the bounded timing variance above is retained explicitly rather than
+weakened into a timing assertion.

@@ -1,8 +1,13 @@
 # Plan 5: Reduce hot-path work while preserving Flow's command/event model
 
-Status: Planned
+Status: Complete
 
 Planned at: `d2713d8` on 2026-08-06
+
+Completed on 2026-08-07 from verification base `2ed40d1`. The complete
+PostgreSQL 17/18 release gates, final before/after measurements, architecture
+scans, loop audit, and all 18 acceptance-criterion results are recorded in
+[`benchmark_evidence/plan_5_hot_path.md`](../benchmark_evidence/plan_5_hot_path.md#final-release-verification).
 
 > **Executor instructions:** Read this complete plan before changing code. Follow
 > the phases in order, run every phase-specific verification gate, and keep each
@@ -1440,10 +1445,10 @@ This plan is complete when all of the following are true:
 - [x] Document short `WithCommit` and caller-owned transaction guidance.
 - [x] Synchronize architecture, functional, schema, engine, overview, README, and package docs.
 - [x] Link completed Plan 5 outcomes from the active implementation plan.
-- [ ] Run formatting, diff, build, vet, ordinary, PostgreSQL, and race gates.
-- [ ] Run supported PostgreSQL-version coverage.
-- [ ] Record final before/after benchmark evidence.
-- [ ] Mark this plan complete only after every acceptance criterion is verified.
+- [x] Run formatting, diff, build, vet, ordinary, PostgreSQL, and race gates.
+- [x] Run supported PostgreSQL-version coverage.
+- [x] Record final before/after benchmark evidence.
+- [x] Mark this plan complete only after every acceptance criterion is verified.
 
 ## 17. STOP conditions
 
