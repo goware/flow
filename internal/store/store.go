@@ -12,11 +12,11 @@ import (
 	"slices"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store/journalcodec"
+	"github.com/goware/flow/internal/uuid"
 	"github.com/goware/pgkit/v2"
 	"github.com/jackc/pgx/v5"
 )

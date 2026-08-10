@@ -7,11 +7,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/goware/flow/internal/definition"
 	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/fault"
 	"github.com/goware/flow/internal/store"
+	"github.com/goware/flow/internal/uuid"
 	"github.com/goware/pgkit/v2"
 	"github.com/jackc/pgx/v5"
 )

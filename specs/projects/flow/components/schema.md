@@ -30,6 +30,14 @@ Go versions and counters remain `int`; public construction and store persistence
 
 Retry policy is opaque canonical `bytea`; no SQL path parses, filters, or reserializes it. Execution status, command status, delivery state, key scope, and terminal status remain PostgreSQL `text` with named `CHECK` constraints synchronized with typed public constants and exhaustive decoders.
 
+Every Flow-generated identifier — execution, command, attempt, lease token,
+journal entry, and event — is a UUIDv7 produced by `internal/uuid`.
+Time-ordered identifiers keep hot primary-key indexes append-mostly and make
+identifier byte order correlate with creation order; generation is strictly
+monotonic within one process. Identifiers therefore encode their creation
+time and are not secrets. The storage type is the ordinary 16-byte `uuid`, so
+rows created before this policy coexist unchanged.
+
 ## Commands, waits, and journal
 
 Command states are `pending`, `ready`, `running`, `retry_wait`, `succeeded`, `failed`, `cancelled`, and `expired`. Queue rows exist only for claimable/retrying/running commands and contain the minimum claim and fence dimensions.
@@ -45,7 +53,7 @@ once, and validates the nested canonical payload without creating another
 canonical copy. Full replay verifies the hash and reconstructs canonical bodies
 again for stronger diagnostics.
 
-Indexes are kept deliberately narrow. Primary and unique indexes enforce public execution, command, application-event, lifecycle, and same-execution ownership invariants; random journal entry/event UUIDs are retained data but are not separately indexed because no lookup, foreign key, or idempotency contract consumes them. One partial `(attempt_id, entry_kind)` guard permits one start and one conclusion per attempt. Exact application-event reads state the identity-index predicate, and maintenance, queue, and wait indexes cover only their bounded hot probes. The metadata GIN index remains because containment filtering is a documented indexed inspection feature.
+Indexes are kept deliberately narrow. Primary and unique indexes enforce public execution, command, application-event, lifecycle, and same-execution ownership invariants; journal entry/event UUIDs are retained data but are not separately indexed because no lookup, foreign key, or idempotency contract consumes them. One partial `(attempt_id, entry_kind)` guard permits one start and one conclusion per attempt. Exact application-event reads state the identity-index predicate, and maintenance, queue, and wait indexes cover only their bounded hot probes. The metadata GIN index remains because containment filtering is a documented indexed inspection feature.
 
 ## Retained semantic projections
 
