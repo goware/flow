@@ -24,6 +24,13 @@ const (
 var errRuntimeShutdown = errors.New("flow runtime is stopping")
 var errAttemptTimeout = errors.New("flow command attempt timed out")
 
+const (
+	maintenanceExecutionPage = 64
+	maintenanceWaitPage      = 128
+	maintenanceLeasePage     = 128
+	maintenanceDrainPasses   = 8
+)
+
 type wakeHub struct {
 	mu         sync.Mutex
 	generation uint64
@@ -72,6 +79,7 @@ type activeCommand struct {
 	token       uuid.UUID
 	localExpiry time.Time
 	cancel      context.CancelCauseFunc
+	cancelled   bool
 }
 
 type activeCommands struct {
@@ -103,50 +111,64 @@ func (active *activeCommands) snapshot() []activeCommand {
 	defer active.mu.Unlock()
 	result := make([]activeCommand, 0, len(active.values))
 	for _, command := range active.values {
+		if command.cancelled {
+			continue
+		}
 		result = append(result, command)
 	}
 	return result
 }
 
-func (active *activeCommands) renewed(commandID, attemptID uuid.UUID, expiresAt time.Time) {
+func (active *activeCommands) renewed(commandID, attemptID uuid.UUID, expiresAt time.Time) bool {
 	active.mu.Lock()
+	defer active.mu.Unlock()
 	command, exists := active.values[commandID]
-	if exists && command.attemptID == attemptID {
+	if exists && command.attemptID == attemptID && !command.cancelled {
 		command.localExpiry = expiresAt
 		active.values[commandID] = command
+		return true
 	}
-	active.mu.Unlock()
+	return false
 }
 
-func (active *activeCommands) cancelExpired() {
+func (active *activeCommands) cancelExpired() int {
 	now := time.Now()
 	active.mu.Lock()
 	defer active.mu.Unlock()
-	for _, command := range active.values {
-		if !now.Before(command.localExpiry) {
+	cancelled := 0
+	for id, command := range active.values {
+		if !command.cancelled && !now.Before(command.localExpiry) {
+			command.cancelled = true
+			active.values[id] = command
 			command.cancel(ErrLeaseLost)
+			cancelled++
 		}
 	}
+	return cancelled
 }
 
-func (active *activeCommands) cancelUnrenewed(attempted map[uuid.UUID]uuid.UUID, renewed map[uuid.UUID]struct{}) {
+func (active *activeCommands) cancelLost(commandID, attemptID uuid.UUID) bool {
 	active.mu.Lock()
 	defer active.mu.Unlock()
-	for id, command := range active.values {
-		attemptID, wasAttempted := attempted[id]
-		if !wasAttempted || command.attemptID != attemptID {
-			continue
-		}
-		if _, ok := renewed[id]; !ok {
-			command.cancel(ErrLeaseLost)
-		}
+	command, exists := active.values[commandID]
+	if !exists || command.attemptID != attemptID || command.cancelled {
+		return false
 	}
+	command.cancelled = true
+	active.values[commandID] = command
+	command.cancel(ErrLeaseLost)
+	return true
 }
 
 func (active *activeCommands) cancelAll(cause error) {
 	active.mu.Lock()
 	defer active.mu.Unlock()
-	for _, command := range active.values {
+	for id, command := range active.values {
+		if command.cancelled {
+			continue
+		}
+		command.cancelled = true
+		active.values[id] = command
 		command.cancel(cause)
 	}
 }
@@ -193,7 +215,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	serviceCtx, stopServices := context.WithCancel(context.Background())
 	var services sync.WaitGroup
-	serviceCount := 2
+	serviceCount := 3
 	if r.notifications {
 		serviceCount++
 	}
@@ -205,6 +227,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 	go func() {
 		defer services.Done()
 		r.runMaintenance(serviceCtx)
+	}()
+	go func() {
+		defer services.Done()
+		r.runLeaseWatchdog(serviceCtx)
 	}()
 	if r.notifications {
 		go func() {
@@ -376,84 +402,261 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 			continue
 		}
 		renewals := make([]store.LeaseRenewal, len(current))
-		attemptedCommands := make(map[uuid.UUID]uuid.UUID, len(current))
 		for index, command := range current {
 			renewals[index] = store.LeaseRenewal{CommandID: command.commandID, AttemptID: command.attemptID, Token: command.token}
-			attemptedCommands[command.commandID] = command.attemptID
 		}
-		if err := r.faults.Hit(ctx, fault.RenewBeforeResult); err != nil {
-			r.active.cancelExpired()
+		started := time.Now()
+		renewCtx, cancel := context.WithTimeout(ctx, commandRenewalTimeout(r.commandLease))
+		err := r.faults.Hit(renewCtx, fault.RenewBeforeResult)
+		var results []store.LeaseRenewalResult
+		if err == nil {
+			results, err = r.store.RenewCommandLeases(renewCtx, renewals, r.commandLease)
+		}
+		cancel()
+		duration := time.Since(started)
+		if err != nil {
+			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: "error",
+				Count: int64(len(current)), Duration: duration, Worker: r.replicaName()})
 			continue
 		}
-		renewed, err := r.store.RenewCommandLeases(ctx, renewals, r.commandLease)
-		if err != nil {
-			r.active.cancelExpired()
-			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: "error", Count: int64(len(current))})
-		} else {
-			renewedSet := make(map[uuid.UUID]struct{}, len(renewed))
-			for _, lease := range renewed {
-				renewedSet[lease.CommandID] = struct{}{}
-				r.active.renewed(lease.CommandID, attemptedCommands[lease.CommandID], time.Now().Add(r.commandLease))
-			}
-			r.active.cancelUnrenewed(attemptedCommands, renewedSet)
+		counts := map[store.LeaseRenewalOutcome]int64{
+			store.LeaseRenewed: 0, store.LeaseLost: 0, store.LeaseUncertain: 0,
 		}
-		r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: "ok", Count: int64(len(renewed))})
+		localLost := int64(0)
+		for _, result := range results {
+			counts[result.Outcome]++
+			switch result.Outcome {
+			case store.LeaseRenewed:
+				if result.LeaseExpiresAt == nil {
+					continue
+				}
+				r.active.renewed(result.CommandID, result.AttemptID, started.Add(r.commandLease))
+			case store.LeaseLost:
+				if r.active.cancelLost(result.CommandID, result.AttemptID) {
+					localLost++
+				}
+			case store.LeaseUncertain:
+			}
+		}
+		outcome := "ok"
+		if counts[store.LeaseLost]+counts[store.LeaseUncertain] > 0 {
+			outcome = "partial"
+		}
+		r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: outcome,
+			Count: int64(len(current)), Duration: duration, Worker: r.replicaName()})
+		for _, resultOutcome := range []store.LeaseRenewalOutcome{store.LeaseRenewed, store.LeaseLost, store.LeaseUncertain} {
+			if counts[resultOutcome] == 0 {
+				continue
+			}
+			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew_result", Outcome: string(resultOutcome),
+				Count: counts[resultOutcome], Worker: r.replicaName()})
+		}
+		if localLost > 0 {
+			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "local_cancel", Outcome: "lost",
+				Count: localLost, Worker: r.replicaName()})
+		}
 	}
 }
 
-func (r *Runtime) runMaintenance(ctx context.Context) {
-	ticker := time.NewTicker(r.pollInterval)
+func commandRenewalTimeout(lease time.Duration) time.Duration {
+	return max(10*time.Millisecond, min(5*time.Second, lease/6))
+}
+
+func leaseWatchdogInterval(lease time.Duration) time.Duration {
+	return max(10*time.Millisecond, min(time.Second, lease/6))
+}
+
+func (r *Runtime) runLeaseWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(leaseWatchdogInterval(r.commandLease))
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-		}
-		progress := false
-		if ids, err := r.store.ProbeExpiredExecutions(ctx, 64); err == nil {
-			if len(ids) > 0 {
-				if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
-					continue
-				}
+			if cancelled := r.active.cancelExpired(); cancelled > 0 {
+				r.observe(ctx, Observation{Kind: ObservationLease, Operation: "local_cancel", Outcome: "expired",
+					Count: int64(cancelled), Worker: r.replicaName()})
 			}
-			for _, id := range ids {
-				changed, expireErr := r.store.ExpireExecution(ctx, id, "execution deadline reached")
-				if expireErr == nil && changed {
-					progress = true
-				}
-			}
-		}
-		if waits, err := r.store.ProbeExpiredCommandWaits(ctx, 128); err == nil {
-			if len(waits) > 0 {
-				if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
-					continue
-				}
-			}
-			for _, candidate := range waits {
-				changed, expireErr := r.store.ExpireCommandWait(ctx, candidate)
-				if expireErr == nil && changed {
-					progress = true
-				}
-			}
-		}
-		if leases, err := r.store.ProbeExpiredCommandLeases(ctx, 128); err == nil {
-			if len(leases) > 0 {
-				if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
-					continue
-				}
-			}
-			for _, candidate := range leases {
-				changed, recoverErr := r.store.RecoverExpiredCommandLease(ctx, candidate)
-				if recoverErr == nil && changed {
-					progress = true
-				}
-			}
-		}
-		if progress {
-			r.wake.signal()
 		}
 	}
+}
+
+func (r *Runtime) runMaintenance(ctx context.Context) {
+	timer := time.NewTimer(r.pollInterval)
+	defer timer.Stop()
+	consecutiveDrainPasses := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		result := r.runMaintenancePass(ctx)
+		if result.progressed {
+			r.wake.signal()
+		}
+		delay, nextDrainPasses := nextMaintenanceDelay(r.pollInterval, result, consecutiveDrainPasses)
+		consecutiveDrainPasses = nextDrainPasses
+		timer.Reset(delay)
+	}
+}
+
+type maintenancePassResult struct {
+	progressed bool
+	saturated  bool
+}
+
+func nextMaintenanceDelay(pollInterval time.Duration, result maintenancePassResult, consecutiveDrainPasses int) (time.Duration, int) {
+	if !result.progressed || !result.saturated {
+		return pollInterval, 0
+	}
+	consecutiveDrainPasses++
+	if consecutiveDrainPasses >= maintenanceDrainPasses {
+		return min(pollInterval, 25*time.Millisecond), 0
+	}
+	return min(pollInterval, time.Millisecond), consecutiveDrainPasses
+}
+
+func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult {
+	var result maintenancePassResult
+
+	started := time.Now()
+	executions, err := r.store.ProbeExpiredExecutions(ctx, maintenanceExecutionPage)
+	r.observeMaintenanceProbe(ctx, "deadline_probe", len(executions), err, started)
+	if err == nil {
+		result.saturated = len(executions) == maintenanceExecutionPage
+		changed, transitionErr := r.runExecutionDeadlinePage(ctx, executions)
+		result.progressed = result.progressed || changed > 0
+		if len(executions) > 0 {
+			r.observeMaintenanceTransition(ctx, "deadline", len(executions), changed, transitionErr, started)
+		}
+	}
+
+	started = time.Now()
+	waits, err := r.store.ProbeExpiredCommandWaits(ctx, maintenanceWaitPage)
+	r.observeMaintenanceProbe(ctx, "wait_expiry_probe", len(waits), err, started)
+	if err == nil {
+		result.saturated = result.saturated || len(waits) == maintenanceWaitPage
+		changed, transitionErr := r.runWaitExpiryPage(ctx, waits)
+		result.progressed = result.progressed || changed > 0
+		if len(waits) > 0 {
+			r.observeMaintenanceTransition(ctx, "wait_expiry", len(waits), changed, transitionErr, started)
+		}
+	}
+
+	started = time.Now()
+	leases, err := r.store.ProbeExpiredCommandLeases(ctx, maintenanceLeasePage)
+	r.observeMaintenanceProbe(ctx, "lease_recovery_probe", len(leases), err, started)
+	if err == nil {
+		result.saturated = result.saturated || len(leases) == maintenanceLeasePage
+		changed, transitionErr := r.runLeaseRecoveryPage(ctx, leases)
+		result.progressed = result.progressed || changed > 0
+		if len(leases) > 0 {
+			r.observeMaintenanceTransition(ctx, "lease_recovery", len(leases), changed, transitionErr, started)
+		}
+	}
+	if result.saturated {
+		outcome := "blocked"
+		if result.progressed {
+			outcome = "drain"
+		}
+		r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "maintenance_pass", Outcome: outcome,
+			Count: 1, Worker: r.replicaName()})
+	}
+
+	return result
+}
+
+func (r *Runtime) runExecutionDeadlinePage(ctx context.Context, candidates []uuid.UUID) (int, error) {
+	if len(candidates) > 0 {
+		if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
+			return 0, err
+		}
+	}
+	changed := 0
+	var firstErr error
+	for _, id := range candidates {
+		progressed, err := r.store.ExpireExecution(ctx, id, "execution deadline reached")
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if progressed {
+			changed++
+		}
+	}
+	return changed, firstErr
+}
+
+func (r *Runtime) runWaitExpiryPage(ctx context.Context, candidates []store.ExpiredWaitCandidate) (int, error) {
+	if len(candidates) > 0 {
+		if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
+			return 0, err
+		}
+	}
+	changed := 0
+	var firstErr error
+	for _, candidate := range candidates {
+		progressed, err := r.store.ExpireCommandWait(ctx, candidate)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if progressed {
+			changed++
+		}
+	}
+	return changed, firstErr
+}
+
+func (r *Runtime) runLeaseRecoveryPage(ctx context.Context, candidates []store.ExpiredLeaseCandidate) (int, error) {
+	if len(candidates) > 0 {
+		if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
+			return 0, err
+		}
+	}
+	changed := 0
+	var firstErr error
+	for _, candidate := range candidates {
+		progressed, err := r.store.RecoverExpiredCommandLease(ctx, candidate)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if progressed {
+			changed++
+		}
+	}
+	return changed, firstErr
+}
+
+func (r *Runtime) observeMaintenanceProbe(ctx context.Context, operation string, count int, err error, started time.Time) {
+	if err == nil && count == 0 {
+		return
+	}
+	r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: operation, Outcome: outcomeForError(err),
+		Count: int64(count), Duration: time.Since(started), Worker: r.replicaName()})
+}
+
+func (r *Runtime) observeMaintenanceTransition(
+	ctx context.Context,
+	operation string,
+	attempted int,
+	changed int,
+	err error,
+	started time.Time,
+) {
+	outcome := "ok"
+	count := changed
+	if err != nil {
+		outcome = "error"
+		if changed > 0 {
+			outcome = "partial"
+		}
+	} else if attempted > 0 && changed == 0 {
+		outcome = "noop"
+		count = attempted
+	}
+	r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: operation, Outcome: outcome,
+		Count: int64(count), Duration: time.Since(started), Worker: r.replicaName()})
 }
 
 func (r *Runtime) replicaName() string {

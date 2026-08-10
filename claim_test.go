@@ -175,6 +175,177 @@ func TestClaimBatchSkipsOneLockedSibling(t *testing.T) {
 	}
 }
 
+func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	child := DefineCommand[None, None]("claim.renew_classification_child", 1)
+	runtime, execution := stageClaimFixture(t, database, "renew_classification", 2, func(work *Work[None]) {
+		Execute(work, "child/0", child, None{})
+		Execute(work, "child/1", child, None{})
+	})
+	candidates := probeClaimCandidates(t, runtime,
+		[]store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 2)
+	claimed, err := runtime.store.ClaimCommands(ctx, candidates, time.Minute, "renew-test", fault.None{})
+	if err != nil || len(claimed.Commands) != 2 {
+		t.Fatalf("ClaimCommands() commands=%d, err=%v", len(claimed.Commands), err)
+	}
+	renewals := make([]store.LeaseRenewal, len(claimed.Commands))
+	for index, command := range claimed.Commands {
+		renewals[index] = store.LeaseRenewal{
+			CommandID: command.CommandID, AttemptID: command.AttemptID, Token: command.LeaseToken,
+		}
+	}
+	incomplete := renewals[0]
+	incomplete.Token = uuid.Nil
+	if _, err := runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{incomplete}, time.Minute); err == nil {
+		t.Fatal("RenewCommandLeases() accepted an incomplete fence")
+	}
+	if _, err := runtime.store.RenewCommandLeases(ctx,
+		[]store.LeaseRenewal{renewals[0], renewals[0]}, time.Minute); err == nil {
+		t.Fatal("RenewCommandLeases() accepted a duplicate command ID")
+	}
+
+	lockTx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTx.Exec(ctx, `SELECT command_id FROM `+
+		pgschema.Table(database.Schema, "flow_command_queue")+` WHERE command_id=$1 FOR UPDATE`,
+		claimed.Commands[0].CommandID); err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	started := time.Now()
+	results, err := runtime.store.RenewCommandLeases(ctx, renewals, time.Minute)
+	if err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		_ = lockTx.Rollback(ctx)
+		t.Fatalf("skip-locked renewal took %s", elapsed)
+	}
+	if len(results) != 2 || results[0].Outcome != store.LeaseUncertain ||
+		results[1].Outcome != store.LeaseRenewed || results[1].LeaseExpiresAt == nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatalf("locked renewal results = %#v", results)
+	}
+	if err := lockTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	missing := store.LeaseRenewal{CommandID: uuid.New(), AttemptID: uuid.New(), Token: uuid.New()}
+	results, err = runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{missing}, time.Minute)
+	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
+		t.Fatalf("missing renewal results = %#v, %v", results, err)
+	}
+	mismatched := renewals[0]
+	mismatched.Token = uuid.New()
+	results, err = runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{mismatched}, time.Minute)
+	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
+		t.Fatalf("mismatched renewal results = %#v, %v", results, err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+
+		pgschema.Table(database.Schema, "flow_command_queue")+`
+		SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`,
+		renewals[0].CommandID); err != nil {
+		t.Fatal(err)
+	}
+	results, err = runtime.store.RenewCommandLeases(ctx, renewals[:1], time.Minute)
+	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
+		t.Fatalf("expired renewal results = %#v, %v", results, err)
+	}
+
+	reader, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CancelExecution(ctx, reader, execution.ID, "renewal classification complete"); err != nil {
+		t.Fatal(err)
+	}
+	results, err = runtime.store.RenewCommandLeases(ctx, renewals, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, result := range results {
+		if result.Outcome != store.LeaseLost || result.LeaseExpiresAt != nil {
+			t.Fatalf("lost renewal[%d] = %#v", index, result)
+		}
+	}
+}
+
+func TestClaimLocalLeaseDeadlineAnchorsAtClaimStart(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	child := DefineCommand[None, None]("claim.local_lease_anchor_child", 1)
+	runtime, execution := stageClaimFixture(t, database, "local_lease_anchor", 1, func(work *Work[None]) {
+		Execute(work, "child", child, None{})
+	})
+	runtime.commandLease = 300 * time.Millisecond
+	candidates := probeClaimCandidates(t, runtime,
+		[]store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 1)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	runtime.faults = fault.Func(func(ctx context.Context, point fault.Point) error {
+		switch point {
+		case fault.ClaimBeforeJournal:
+			close(entered)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		case fault.ClaimCommitAmbiguous:
+			return fault.Injected(point)
+		default:
+			return nil
+		}
+	})
+	type claimResult struct {
+		result store.ClaimBatchResult
+		err    error
+	}
+	resultChannel := make(chan claimResult, 1)
+	go func() {
+		result, err := runtime.claimExecutionGroup(ctx, candidates)
+		resultChannel <- claimResult{result: result, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("claim did not reach the pre-journal barrier")
+	}
+	time.Sleep(150 * time.Millisecond)
+	releasedAt := time.Now()
+	close(release)
+	claimed := <-resultChannel
+	if claimed.err != nil || len(claimed.result.Commands) != 1 {
+		t.Fatalf("claim commands=%d, err=%v", len(claimed.result.Commands), claimed.err)
+	}
+	deadline := claimed.result.Commands[0].LocalLeaseExpiresAt
+	remaining := deadline.Sub(releasedAt)
+	if deadline.IsZero() || remaining >= 250*time.Millisecond {
+		t.Fatalf("ambiguous claim-local lease remaining at release=%s; want a deadline anchored before the delayed claim", remaining)
+	}
+	reader, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CancelExecution(ctx, reader, execution.ID, "claim-local deadline test complete"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClaimBatchGroupsEventInputsByCommand(t *testing.T) {
 	t.Parallel()
 

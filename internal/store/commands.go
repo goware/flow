@@ -155,6 +155,7 @@ type ClaimedCommand struct {
 	LeaseToken             uuid.UUID
 	DBNow                  time.Time
 	LeaseExpiresAt         time.Time
+	LocalLeaseExpiresAt    time.Time
 	AttemptStartedPosition int64
 }
 
@@ -713,12 +714,22 @@ type LeaseRenewal struct {
 	Token     uuid.UUID
 }
 
-type RenewedLease struct {
+type LeaseRenewalOutcome string
+
+const (
+	LeaseRenewed   LeaseRenewalOutcome = "renewed"
+	LeaseLost      LeaseRenewalOutcome = "lost"
+	LeaseUncertain LeaseRenewalOutcome = "uncertain"
+)
+
+type LeaseRenewalResult struct {
 	CommandID      uuid.UUID
-	LeaseExpiresAt time.Time
+	AttemptID      uuid.UUID
+	Outcome        LeaseRenewalOutcome
+	LeaseExpiresAt *time.Time
 }
 
-func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, duration time.Duration) ([]RenewedLease, error) {
+func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, duration time.Duration) ([]LeaseRenewalResult, error) {
 	if len(leases) == 0 {
 		return nil, nil
 	}
@@ -732,34 +743,83 @@ func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, d
 	commandIDs := make([]uuid.UUID, len(leases))
 	attemptIDs := make([]uuid.UUID, len(leases))
 	tokens := make([]uuid.UUID, len(leases))
+	seen := make(map[uuid.UUID]struct{}, len(leases))
 	for index, lease := range leases {
+		if lease.CommandID == uuid.Nil || lease.AttemptID == uuid.Nil || lease.Token == uuid.Nil {
+			return nil, fmt.Errorf("%w: incomplete command lease renewal", flowerr.ErrInvalid)
+		}
+		if _, duplicate := seen[lease.CommandID]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate command lease renewal", flowerr.ErrInvalid)
+		}
+		seen[lease.CommandID] = struct{}{}
 		commandIDs[index], attemptIDs[index], tokens[index] = lease.CommandID, lease.AttemptID, lease.Token
 	}
-	rows, err := s.db.Conn.Query(ctx, `WITH now_value AS (SELECT clock_timestamp() AS now), requested(command_id,attempt_id,token) AS (
-		SELECT * FROM unnest($1::uuid[],$2::uuid[],$3::uuid[])
+	rows, err := s.db.Conn.Query(ctx, `WITH now_value AS (SELECT clock_timestamp() AS now), requested(command_id,attempt_id,token,ordinal) AS (
+		SELECT command_id,attempt_id,token,ordinality
+		FROM unnest($1::uuid[],$2::uuid[],$3::uuid[]) WITH ORDINALITY AS input(command_id,attempt_id,token,ordinality)
+	), observed AS MATERIALIZED (
+		SELECT r.command_id AS requested_command_id,r.attempt_id AS requested_attempt_id,r.token AS requested_token,r.ordinal,
+		       q.command_id,q.state,q.active_attempt_id,q.lease_token,q.lease_expires_at
+		FROM requested r
+		LEFT JOIN `+pgschema.Table(s.schema, "flow_command_queue")+` q ON q.command_id=r.command_id
+	), lockable AS (
+		SELECT q.command_id
+		FROM `+pgschema.Table(s.schema, "flow_command_queue")+` q
+		JOIN requested r ON r.command_id=q.command_id
+		CROSS JOIN now_value n
+		WHERE q.active_attempt_id=r.attempt_id AND q.lease_token=r.token
+		  AND q.state='running' AND q.lease_expires_at>n.now
+		FOR UPDATE OF q SKIP LOCKED
 	), renewed AS (
 		UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+` q
 		SET lease_expires_at=n.now+($4 * interval '1 millisecond')
-		FROM requested r,now_value n
-		WHERE q.command_id=r.command_id AND q.active_attempt_id=r.attempt_id AND q.lease_token=r.token
-		  AND q.state='running' AND q.lease_expires_at>n.now
+		FROM lockable l,now_value n
+		WHERE q.command_id=l.command_id
 		RETURNING q.command_id,q.lease_expires_at
 	)
-	SELECT command_id,lease_expires_at FROM renewed`, commandIDs, attemptIDs, tokens, durationMilliseconds)
+	SELECT o.requested_command_id,o.requested_attempt_id,
+	       CASE
+	         WHEN x.command_id IS NOT NULL THEN 'renewed'
+	         WHEN o.command_id IS NULL
+	           OR o.state IS DISTINCT FROM 'running'
+	           OR o.active_attempt_id IS DISTINCT FROM o.requested_attempt_id
+	           OR o.lease_token IS DISTINCT FROM o.requested_token
+	           OR o.lease_expires_at IS NULL
+	           OR o.lease_expires_at<=n.now THEN 'lost'
+	         ELSE 'uncertain'
+	       END AS outcome,
+	       x.lease_expires_at
+	FROM observed o
+	CROSS JOIN now_value n
+	LEFT JOIN renewed x ON x.command_id=o.requested_command_id
+	ORDER BY o.ordinal`, commandIDs, attemptIDs, tokens, durationMilliseconds)
 	if err != nil {
 		return nil, MapError("renew command leases", err)
 	}
 	defer rows.Close()
-	result := make([]RenewedLease, 0, len(leases))
+	result := make([]LeaseRenewalResult, 0, len(leases))
 	for rows.Next() {
-		var renewed RenewedLease
-		if err := rows.Scan(&renewed.CommandID, &renewed.LeaseExpiresAt); err != nil {
+		var renewed LeaseRenewalResult
+		if err := rows.Scan(&renewed.CommandID, &renewed.AttemptID, &renewed.Outcome, &renewed.LeaseExpiresAt); err != nil {
 			return nil, MapError("scan renewed command lease", err)
+		}
+		if renewed.CommandID == uuid.Nil || renewed.AttemptID == uuid.Nil ||
+			(renewed.Outcome != LeaseRenewed && renewed.Outcome != LeaseLost && renewed.Outcome != LeaseUncertain) ||
+			(renewed.Outcome == LeaseRenewed) != (renewed.LeaseExpiresAt != nil) {
+			return nil, fmt.Errorf("%w: command lease renewal result is invalid", flowerr.ErrInvalidState)
 		}
 		result = append(result, renewed)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, MapError("read renewed command leases", err)
+	}
+	if len(result) != len(leases) {
+		return nil, fmt.Errorf("%w: command lease renewal result count differs", flowerr.ErrInvalidState)
+	}
+	for index := range result {
+		if result[index].CommandID != leases[index].CommandID || result[index].AttemptID != leases[index].AttemptID {
+			return nil, fmt.Errorf("%w: command lease renewal result identity differs", flowerr.ErrInvalidState)
+		}
 	}
 	return result, nil
 }

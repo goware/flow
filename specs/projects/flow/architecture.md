@@ -310,7 +310,7 @@ Command cancellation locks the command, concludes an active attempt if present, 
 
 Execution cancellation locks all open commands in stable order, concludes active attempts, records command cancellations followed by one execution-cancelled event, deletes delivery rows, and terminally updates the aggregate in one transaction.
 
-Maintenance probes bounded indexes for expired execution deadlines, expired wait budgets, and expired attempt leases. Probes do not decide state. Each candidate is revalidated under its execution lock, so duplicate maintenance across replicas is harmless.
+Maintenance probes bounded indexes for expired execution deadlines, expired wait budgets, and expired attempt leases. Probes do not decide state. Each candidate is revalidated under its execution lock, so duplicate maintenance across replicas is harmless. A full page that commits progress requests a bounded prompt follow-up; every pass visits all categories, and a locked/no-progress page falls back to the ordinary poll interval instead of spinning.
 
 ## 13. Runtime concurrency and scaling
 
@@ -322,7 +322,7 @@ Each runtime has one scheduler and process-local capacity accounting:
 
 There is no global worker-count table. PostgreSQL row locks, queue state, and fences coordinate replicas. Adding replicas increases competing claimers; each successful claim still belongs to exactly one active fence.
 
-Lease renewals run in bounded batches for locally active attempts. Failure to renew does not immediately prove loss, but once local expiry passes—or a renewal result omits the fence—the runtime cancels that worker context. Maintenance later recovers the durable queue row.
+Lease renewals run as one bounded set-oriented statement for locally active attempts. Exact running fences are selected `FOR UPDATE SKIP LOCKED`, so one row held by settlement cannot block unrelated renewals. Each request is classified as renewed, definitely lost, or uncertain. Definitely lost fences cancel the matching local context immediately; an uncertain locked row is neither extended nor immediately cancelled and retains its prior conservative local deadline. A separate runtime watchdog continues checking those deadlines even while renewal SQL or pool acquisition is blocked. Maintenance later recovers expired durable queue rows.
 
 Notifications use one separately established session-capable PostgreSQL connection because pool/transaction connections cannot reliably own `LISTEN`. The listener reconnects with bounded backoff and performs a broad wake after every connection to close commit-before-LISTEN gaps. Every scheduler continues polling regardless.
 
