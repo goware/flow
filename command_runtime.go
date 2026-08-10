@@ -9,13 +9,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/fault"
 	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/store/journalcodec"
+	"github.com/goware/flow/internal/uuid"
 	"github.com/jackc/pgx/v5"
 )
 

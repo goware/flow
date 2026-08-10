@@ -10,7 +10,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/definition"
 	"github.com/goware/flow/internal/durable"
@@ -18,6 +17,7 @@ import (
 	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/store/journalcodec"
+	"github.com/goware/flow/internal/uuid"
 	"github.com/jackc/pgx/v5"
 )
 

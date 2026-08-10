@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/failure"
@@ -20,6 +19,7 @@ import (
 	"github.com/goware/flow/internal/pgschema"
 	retrypolicy "github.com/goware/flow/internal/retry"
 	"github.com/goware/flow/internal/store/journalcodec"
+	"github.com/goware/flow/internal/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
