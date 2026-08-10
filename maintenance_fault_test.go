@@ -287,6 +287,33 @@ func TestMaintenanceLoopStopsWithContext(t *testing.T) {
 	}
 }
 
+func TestMaintenancePromptDrainDelayIsBounded(t *testing.T) {
+	const pollInterval = time.Second
+	for _, result := range []maintenancePassResult{
+		{progressed: false, saturated: true},
+		{progressed: true, saturated: false},
+	} {
+		delay, passes := nextMaintenanceDelay(pollInterval, result, 4)
+		if delay != pollInterval || passes != 0 {
+			t.Fatalf("non-draining maintenance delay=%s passes=%d", delay, passes)
+		}
+	}
+	passes := 0
+	for turn := 1; turn < maintenanceDrainPasses; turn++ {
+		delay, next := nextMaintenanceDelay(pollInterval,
+			maintenancePassResult{progressed: true, saturated: true}, passes)
+		if delay != time.Millisecond || next != turn {
+			t.Fatalf("prompt maintenance turn %d delay=%s passes=%d", turn, delay, next)
+		}
+		passes = next
+	}
+	delay, passes := nextMaintenanceDelay(pollInterval,
+		maintenancePassResult{progressed: true, saturated: true}, passes)
+	if delay != 25*time.Millisecond || passes != 0 {
+		t.Fatalf("yielding maintenance delay=%s passes=%d", delay, passes)
+	}
+}
+
 func mustReader(t *testing.T, database testpg.Database) *Runtime {
 	t.Helper()
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))

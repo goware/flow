@@ -238,6 +238,27 @@ func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
 	if err := lockTx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
+	missing := store.LeaseRenewal{CommandID: uuid.New(), AttemptID: uuid.New(), Token: uuid.New()}
+	results, err = runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{missing}, time.Minute)
+	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
+		t.Fatalf("missing renewal results = %#v, %v", results, err)
+	}
+	mismatched := renewals[0]
+	mismatched.Token = uuid.New()
+	results, err = runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{mismatched}, time.Minute)
+	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
+		t.Fatalf("mismatched renewal results = %#v, %v", results, err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+
+		pgschema.Table(database.Schema, "flow_command_queue")+`
+		SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`,
+		renewals[0].CommandID); err != nil {
+		t.Fatal(err)
+	}
+	results, err = runtime.store.RenewCommandLeases(ctx, renewals[:1], time.Minute)
+	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
+		t.Fatalf("expired renewal results = %#v, %v", results, err)
+	}
 
 	reader, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
 	if err != nil {
@@ -275,15 +296,19 @@ func TestClaimLocalLeaseDeadlineAnchorsAtClaimStart(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	runtime.faults = fault.Func(func(ctx context.Context, point fault.Point) error {
-		if point != fault.ClaimBeforeJournal {
+		switch point {
+		case fault.ClaimBeforeJournal:
+			close(entered)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		case fault.ClaimCommitAmbiguous:
+			return fault.Injected(point)
+		default:
 			return nil
-		}
-		close(entered)
-		select {
-		case <-release:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
 		}
 	})
 	type claimResult struct {
@@ -301,14 +326,16 @@ func TestClaimLocalLeaseDeadlineAnchorsAtClaimStart(t *testing.T) {
 		t.Fatal("claim did not reach the pre-journal barrier")
 	}
 	time.Sleep(150 * time.Millisecond)
+	releasedAt := time.Now()
 	close(release)
 	claimed := <-resultChannel
 	if claimed.err != nil || len(claimed.result.Commands) != 1 {
 		t.Fatalf("claim commands=%d, err=%v", len(claimed.result.Commands), claimed.err)
 	}
-	remaining := time.Until(claimed.result.Commands[0].LocalLeaseExpiresAt)
-	if remaining <= 0 || remaining >= 250*time.Millisecond {
-		t.Fatalf("claim-local lease remaining=%s; want a positive duration anchored before the delayed claim", remaining)
+	deadline := claimed.result.Commands[0].LocalLeaseExpiresAt
+	remaining := deadline.Sub(releasedAt)
+	if deadline.IsZero() || remaining >= 250*time.Millisecond {
+		t.Fatalf("ambiguous claim-local lease remaining at release=%s; want a deadline anchored before the delayed claim", remaining)
 	}
 	reader, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
 	if err != nil {

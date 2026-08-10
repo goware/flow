@@ -4,7 +4,7 @@ Status: Complete
 
 Planned at: `411ec71` on 2026-08-07
 
-Completed on: 2026-08-07 in the `fixes` worktree based on `411ec71`
+Completed on: 2026-08-10 in the `fixes` worktree based on `411ec71`
 
 - **Branch:** `fixes`
 - **Priority:** P1 for lease correctness; P2 for maintenance recovery latency

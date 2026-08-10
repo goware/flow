@@ -496,17 +496,8 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 		if result.progressed {
 			r.wake.signal()
 		}
-		delay := r.pollInterval
-		if result.progressed && result.saturated {
-			consecutiveDrainPasses++
-			delay = min(r.pollInterval, time.Millisecond)
-			if consecutiveDrainPasses >= maintenanceDrainPasses {
-				consecutiveDrainPasses = 0
-				delay = min(r.pollInterval, 25*time.Millisecond)
-			}
-		} else {
-			consecutiveDrainPasses = 0
-		}
+		delay, nextDrainPasses := nextMaintenanceDelay(r.pollInterval, result, consecutiveDrainPasses)
+		consecutiveDrainPasses = nextDrainPasses
 		timer.Reset(delay)
 	}
 }
@@ -514,6 +505,17 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 type maintenancePassResult struct {
 	progressed bool
 	saturated  bool
+}
+
+func nextMaintenanceDelay(pollInterval time.Duration, result maintenancePassResult, consecutiveDrainPasses int) (time.Duration, int) {
+	if !result.progressed || !result.saturated {
+		return pollInterval, 0
+	}
+	consecutiveDrainPasses++
+	if consecutiveDrainPasses >= maintenanceDrainPasses {
+		return min(pollInterval, 25*time.Millisecond), 0
+	}
+	return min(pollInterval, time.Millisecond), consecutiveDrainPasses
 }
 
 func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult {

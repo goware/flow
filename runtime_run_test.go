@@ -89,7 +89,7 @@ func TestActiveCommandUncertainRenewalKeepsOldDeadline(t *testing.T) {
 	active := newActiveCommands()
 	commandID, attemptID := uuid.New(), uuid.New()
 	cancelled := make(chan struct{}, 1)
-	oldDeadline := time.Now().Add(30 * time.Millisecond)
+	oldDeadline := time.Now().Add(time.Minute)
 	active.register(activeCommand{
 		commandID: commandID, attemptID: attemptID, token: uuid.New(), localExpiry: oldDeadline,
 		cancel: func(error) { cancelled <- struct{}{} },
@@ -107,7 +107,9 @@ func TestActiveCommandUncertainRenewalKeepsOldDeadline(t *testing.T) {
 		t.Fatal("uncertain attempt cancelled before its prior deadline")
 	default:
 	}
-	time.Sleep(time.Until(oldDeadline) + 5*time.Millisecond)
+	expired := values[0]
+	expired.localExpiry = time.Now().Add(-time.Millisecond)
+	active.register(expired)
 	if got := active.cancelExpired(); got != 1 {
 		t.Fatalf("cancelExpired() at deadline = %d, want 1", got)
 	}
