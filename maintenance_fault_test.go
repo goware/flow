@@ -336,6 +336,7 @@ func TestMaintenancePromptDrainDelayIsBounded(t *testing.T) {
 	for _, result := range []maintenancePassResult{
 		{progressed: false, saturated: true},
 		{progressed: true, saturated: false},
+		{progressed: true, saturated: true, drainable: false},
 	} {
 		delay, passes := nextMaintenanceDelay(pollInterval, result, 4)
 		if delay != pollInterval || passes != 0 {
@@ -345,16 +346,34 @@ func TestMaintenancePromptDrainDelayIsBounded(t *testing.T) {
 	passes := 0
 	for turn := 1; turn < maintenanceDrainPasses; turn++ {
 		delay, next := nextMaintenanceDelay(pollInterval,
-			maintenancePassResult{progressed: true, saturated: true}, passes)
+			maintenancePassResult{progressed: true, saturated: true, drainable: true}, passes)
 		if delay != time.Millisecond || next != turn {
 			t.Fatalf("prompt maintenance turn %d delay=%s passes=%d", turn, delay, next)
 		}
 		passes = next
 	}
 	delay, passes := nextMaintenanceDelay(pollInterval,
-		maintenancePassResult{progressed: true, saturated: true}, passes)
+		maintenancePassResult{progressed: true, saturated: true, drainable: true}, passes)
 	if delay != 25*time.Millisecond || passes != 0 {
 		t.Fatalf("yielding maintenance delay=%s passes=%d", delay, passes)
+	}
+}
+
+func TestMaintenanceContinuationRequiresProgressInFullCategory(t *testing.T) {
+	var result maintenancePassResult
+	result.recordCategory(maintenanceExecutionPage, maintenanceExecutionPage, 0)
+	result.recordCategory(1, maintenanceWaitPage, 1)
+	if !result.saturated || !result.progressed || result.drainable {
+		t.Fatalf("cross-category maintenance result = %+v", result)
+	}
+	delay, passes := nextMaintenanceDelay(time.Second, result, 4)
+	if delay != time.Second || passes != 0 {
+		t.Fatalf("cross-category maintenance delay=%s passes=%d", delay, passes)
+	}
+
+	result.recordCategory(maintenanceLeasePage, maintenanceLeasePage, 1)
+	if !result.drainable {
+		t.Fatalf("progressing full category did not request continuation: %+v", result)
 	}
 }
 

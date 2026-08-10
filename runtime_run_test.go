@@ -121,6 +121,30 @@ func TestActiveCommandUncertainRenewalKeepsOldDeadline(t *testing.T) {
 	}
 }
 
+func TestActiveCommandShutdownCancellationExcludesRenewal(t *testing.T) {
+	active := newActiveCommands()
+	commandID, attemptID := uuid.New(), uuid.New()
+	cancelled := make(chan error, 1)
+	active.register(activeCommand{
+		commandID: commandID, attemptID: attemptID, token: uuid.New(), localExpiry: time.Now().Add(time.Minute),
+		cancel: func(cause error) { cancelled <- cause },
+	})
+	if !active.cancelAttempt(commandID, attemptID, errRuntimeShutdown) {
+		t.Fatal("shutdown did not cancel the registered attempt")
+	}
+	if len(active.snapshot()) != 0 {
+		t.Fatal("shutdown-cancelled attempt remained eligible for renewal")
+	}
+	select {
+	case cause := <-cancelled:
+		if cause != errRuntimeShutdown {
+			t.Fatalf("shutdown cancellation cause = %v", cause)
+		}
+	default:
+		t.Fatal("shutdown cancellation did not reach the attempt context")
+	}
+}
+
 func TestLeaseServiceIntervalsStayInsideLeaseWindow(t *testing.T) {
 	for _, lease := range []time.Duration{30 * time.Millisecond, 120 * time.Millisecond, 60 * time.Second} {
 		if timeout := commandRenewalTimeout(lease); timeout <= 0 || timeout >= lease {
@@ -199,21 +223,24 @@ func TestLockedSettlementIsUncertainWhileUnrelatedLeaseRenews(t *testing.T) {
 	settling := DefineCommand[None, None]("runtime.locked_renewal_settling", 1)
 	unrelated := DefineCommand[None, None]("runtime.locked_renewal_unrelated", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
-		WithWorkerConcurrency(2), WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond),
+		WithWorkerConcurrency(2), WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(3*time.Second),
 		WithObserver(observer))
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitStarted := make(chan struct{})
+	commitStarted := make(chan struct{}, 1)
 	releaseCommit := make(chan struct{})
 	commitCancelled := make(chan struct{}, 1)
-	unrelatedStarted := make(chan struct{})
+	unrelatedStarted := make(chan struct{}, 1)
 	releaseUnrelated := make(chan struct{})
 	if err := runtime.Register(
 		Handle(settling, func(context.Context, *Work[None]) (None, error) {
 			return None{}, nil
 		}, WithCommit(func(ctx context.Context, _ Tx, _ Commit[None, None]) error {
-			close(commitStarted)
+			select {
+			case commitStarted <- struct{}{}:
+			default:
+			}
 			select {
 			case <-releaseCommit:
 				return nil
@@ -223,7 +250,10 @@ func TestLockedSettlementIsUncertainWhileUnrelatedLeaseRenews(t *testing.T) {
 			}
 		})),
 		Handle(unrelated, func(context.Context, *Work[None]) (None, error) {
-			close(unrelatedStarted)
+			select {
+			case unrelatedStarted <- struct{}{}:
+			default:
+			}
 			<-releaseUnrelated
 			return None{}, nil
 		}),

@@ -410,7 +410,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	stopping := r.lifecycle == runtimeStopping || r.lifecycle == runtimeStopped
 	r.mu.RUnlock()
 	if stopping {
-		cancelCause(errRuntimeShutdown)
+		r.active.cancelAttempt(claim.CommandID, claim.AttemptID, errRuntimeShutdown)
 	}
 	defer func() {
 		cancelDeadline()

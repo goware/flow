@@ -1384,11 +1384,20 @@ func TestRuntimeShutdownTransfersPostCommitClaimToWorkerAccounting(t *testing.T)
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
+	var renewableDuringShutdown atomic.Bool
+	commandID := uuid.MustParse(string(execution.RootCommandID))
 	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
-		if point == fault.ClaimCommitAmbiguous {
+		switch point {
+		case fault.ClaimCommitAmbiguous:
 			once.Do(func() { close(entered) })
 			<-release
 			return fault.Injected(point)
+		case fault.HandlerStart:
+			for _, active := range runtime.active.snapshot() {
+				if active.commandID == commandID {
+					renewableDuringShutdown.Store(true)
+				}
+			}
 		}
 		return nil
 	})
@@ -1416,6 +1425,9 @@ func TestRuntimeShutdownTransfersPostCommitClaimToWorkerAccounting(t *testing.T)
 	}
 	if handlers.Load() != 1 {
 		t.Fatalf("post-commit handlers=%d, want 1", handlers.Load())
+	}
+	if renewableDuringShutdown.Load() {
+		t.Fatal("shutdown-cancelled post-commit attempt remained eligible for renewal")
 	}
 	var state string
 	var activeFences int
@@ -2053,6 +2065,14 @@ func startRuntime(t *testing.T, runtime *Runtime) (context.CancelFunc, <-chan er
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- runtime.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		stopCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if err := runtime.Stop(stopCtx); err != nil {
+			t.Errorf("cleanup Runtime.Stop() error = %v", err)
+		}
+	})
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		runtime.mu.RLock()
