@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -201,4 +202,44 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 	if childCount != 0 {
 		t.Fatalf("lost lease exposed %d staged children", childCount)
 	}
+}
+
+func TestExhaustedSettlementLoopsAreObserved(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	succeeds := DefineCommand[None, None]("fault.exhausted_success_settlement", 1)
+	fails := DefineCommand[None, None]("fault.exhausted_conclusion", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+		WithWorkerConcurrency(2), WithPollInterval(5*time.Millisecond), WithObserver(observer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(succeeds, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+		Handle(fails, func(context.Context, *Work[None]) (None, error) { return None{}, errors.New("expected failure") }),
+	); err != nil {
+		t.Fatal(err)
+	}
+	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
+		if point == fault.SettleAfterFence {
+			return fault.Injected(point)
+		}
+		return nil
+	})
+	cancel, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, runResult)
+	if _, err := succeeds.With(runtime).Execute(ctx, "settle/error", None{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fails.With(runtime).Execute(ctx, "conclude/error", None{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForObservation(t, observer, "settle", "error", 1, 2*time.Second)
+	waitForObservation(t, observer, "conclude", "error", 1, 2*time.Second)
 }

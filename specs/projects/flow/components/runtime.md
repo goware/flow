@@ -35,6 +35,6 @@ Notification hints reduce wake latency. Polling remains sufficient through trans
 
 Cancellation stops claims/listening/maintenance, waits through shutdown grace, then cancels remaining worker contexts. The caller-owned database pool is never closed.
 
-Observers receive bounded command, execution, event-ingress, renewal classification/local cancellation, maintenance probe/transition, notification, and shutdown facts. Delivery remains best-effort and secret-free. Fault hooks cover journal, projection, queue, fence, commit, notification, and ambiguous-commit boundaries.
+Observers receive bounded command, execution, event-ingress, renewal classification/local cancellation, maintenance probe/transition, notification, and shutdown facts. Delivery and shutdown drain remain best-effort and secret-free. Observers must return promptly and should honor context cancellation; a blocked callback cannot block runtime shutdown. Fault hooks cover journal, projection, queue, fence, commit, notification, and ambiguous-commit boundaries.
 
 Deployments may combine all workers, run selected command pools, or use API-only publishers. PostgreSQL remains the sole coordination authority.

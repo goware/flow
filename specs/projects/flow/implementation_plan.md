@@ -7,7 +7,7 @@ completed_at: 2026-08-04
 
 ## Controlling amendments
 
-[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. [`plans/5-hot-path-efficiency.md`](plans/5-hot-path-efficiency.md) reduces hot-path work without changing the public command/event model or six-table durability boundary. This remains a pre-release API; removed APIs and durable formats have no compatibility aliases or data migration.
+[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. [`plans/5-hot-path-efficiency.md`](plans/5-hot-path-efficiency.md) reduces hot-path work without changing the public command/event model or six-table durability boundary. Plan 6 was a discarded `hardening-2` planning draft and was never committed; [`plans/7-lease-and-maintenance-bug-fixes.md`](plans/7-lease-and-maintenance-bug-fixes.md) retained only its necessary bug-fix subset. [`plans/8-v0.1.0-release-hardening.md`](plans/8-v0.1.0-release-hardening.md) is the controlling v0.1 release-hardening amendment. The Go API may still change intentionally during v0.x with release notes, while published migrations become immutable and forward-only at v0.1.0.
 
 ## Completed Plan 5 outcomes
 

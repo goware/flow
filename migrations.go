@@ -23,7 +23,7 @@ import (
 
 const (
 	defaultSchema         = "public"
-	currentSchemaVersion  = 2
+	currentSchemaVersion  = 3
 	currentReaderVersion  = 1
 	currentWriterVersion  = 1
 	migrationToken        = "{{schema}}"
@@ -82,6 +82,7 @@ var migrationFiles = []struct {
 }{
 	{version: 1, name: "initial", path: "migrations/001_initial.sql", minReader: 1, minWriter: 1},
 	{version: 2, name: "live_keys", path: "migrations/002_live_keys.sql", minReader: 1, minWriter: 1},
+	{version: 3, name: "release_read_paths", path: "migrations/003_release_read_paths.sql", minReader: 1, minWriter: 1},
 }
 
 // Migrate applies every unapplied embedded Flow migration in its own
@@ -297,7 +298,8 @@ func quoteIdentifier(identifier string) string {
 
 func migrationLedgerExists(ctx context.Context, db queryer, schema string) (bool, error) {
 	var relation *string
-	if err := db.QueryRow(ctx, `SELECT to_regclass($1)`, schema+`.flow_schema_migrations`).Scan(&relation); err != nil {
+	qualifiedLedger := quoteIdentifier(schema) + `.` + quoteIdentifier("flow_schema_migrations")
+	if err := db.QueryRow(ctx, `SELECT to_regclass($1)`, qualifiedLedger).Scan(&relation); err != nil {
 		return false, store.MapError("lookup migration schema", err)
 	}
 	return relation != nil, nil
@@ -343,6 +345,11 @@ func verifyAppliedMigrations(applied map[int]appliedMigration, units []migration
 		if row.name != unit.name || row.checksum != unit.checksum ||
 			row.minReader != unit.minReader || row.minWriter != unit.minWriter {
 			return newError(ErrSchema, "check", "migration", fmt.Sprint(version), "name, checksum, or compatibility differs from embedded migration")
+		}
+	}
+	for version := 1; version <= len(applied); version++ {
+		if _, ok := applied[version]; !ok {
+			return newError(ErrSchema, "check", "migration", fmt.Sprint(version), "database migration ledger is not contiguous")
 		}
 	}
 	return nil

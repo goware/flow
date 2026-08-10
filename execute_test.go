@@ -291,6 +291,7 @@ func TestTransactionExecutionOrdering(t *testing.T) {
 	second, _ := command.With(runtime).Execute(ctx, "two", ingressArgs{})
 	ids := []ExecutionID{first.ID, second.ID}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	keyByID := map[ExecutionID]string{first.ID: "one", second.ID: "two"}
 	fact := DefineEvent[ingressArgs]("order.fact")
 
 	tx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
@@ -300,6 +301,9 @@ func TestTransactionExecutionOrdering(t *testing.T) {
 	client := runtime.InTx(tx)
 	if err := fact.Emit(ctx, client, ids[1], "high", ingressArgs{}); err != nil {
 		t.Fatalf("Emit(high) error = %v", err)
+	}
+	if _, err := command.With(client).Execute(ctx, keyByID[ids[0]], ingressArgs{}); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("Execute(rediscover reverse order) error = %v", err)
 	}
 	if err := fact.Emit(ctx, client, ids[0], "low", ingressArgs{}); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("Emit(reverse order) error = %v", err)
@@ -316,11 +320,50 @@ func TestTransactionExecutionOrdering(t *testing.T) {
 	if err := fact.Emit(ctx, client, ids[0], "low", ingressArgs{}); err != nil {
 		t.Fatalf("Emit(low) error = %v", err)
 	}
+	rediscovered, err := command.With(client).Execute(ctx, keyByID[ids[1]], ingressArgs{})
+	if err != nil || rediscovered.ID != ids[1] || rediscovered.Created {
+		t.Fatalf("Execute(rediscover ordered) = %#v, %v", rediscovered, err)
+	}
 	if err := fact.Emit(ctx, client, ids[1], "high", ingressArgs{}); err != nil {
 		t.Fatalf("Emit(high ordered) error = %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("Commit() error = %v", err)
+	}
+}
+
+func TestTransactionStartRejectsApplicationPhaseBeforeSQL(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[ingressArgs, ingressResult]("order.application_phase", 1)
+	tx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	client := runtime.InTx(tx).(*transactionClient)
+	if err := client.order.BeginApplicationPhase(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := command.With(client).Execute(ctx, "must-not-start", ingressArgs{}); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("Execute(application phase) error = %v", err)
+	}
+	var executions int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_executions")+`
+		WHERE definition_name=$1 AND execution_key=$2`, command.Name(), "must-not-start").Scan(&executions); err != nil {
+		t.Fatal(err)
+	}
+	if executions != 0 {
+		t.Fatalf("application-phase start wrote %d executions", executions)
 	}
 }
 

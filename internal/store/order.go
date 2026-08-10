@@ -17,12 +17,22 @@ type LockOrder struct {
 	applicationPhase bool
 }
 
+// BeforeFlowOperation rejects a Flow operation after application-owned writes
+// have begun without registering an execution lock that the operation has not
+// resolved yet.
+func (o *LockOrder) BeforeFlowOperation() error {
+	if o.applicationPhase {
+		return fmt.Errorf("%w: Flow operation follows application-write phase", flowerr.ErrInvalidState)
+	}
+	return nil
+}
+
 func (o *LockOrder) BeforeExecution(id uuid.UUID) error {
 	if id == uuid.Nil {
 		return fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
 	}
-	if o.applicationPhase {
-		return fmt.Errorf("%w: Flow operation follows application-write phase", flowerr.ErrInvalidState)
+	if err := o.BeforeFlowOperation(); err != nil {
+		return err
 	}
 	if o.hasLast && bytesCompare(id, o.last) < 0 {
 		return fmt.Errorf("%w: execution locks must be requested in ascending order", flowerr.ErrInvalidState)

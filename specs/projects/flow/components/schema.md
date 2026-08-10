@@ -76,4 +76,9 @@ Bounded indexed maintenance recovers command leases, expires unresolved waits, a
 
 ## Migration policy
 
-This pre-release refactor rewrites baseline migrations. Existing development schemas from the removed architecture must be recreated. Once this baseline is released, the same changes require forward migrations rather than editing applied SQL. `CheckSchema` verifies migration checksums and the exact six-table inventory.
+Migrations 001 and 002 are the immutable historical baseline, and release
+hardening is added through forward migration 003. Publishing v0.1.0 freezes
+001–003 permanently; every later schema change must add another forward
+migration. Applications run migrations before a newer runtime and should back
+up durable data before upgrading. `CheckSchema` verifies migration checksums,
+their contiguous order, compatibility, and the exact six-table inventory.

@@ -39,7 +39,8 @@ Completed on: 2026-08-10 in the `fixes` worktree based on `411ec71`
 
 ## 1. Purpose
 
-This is the deliberately small bug-fix subset of Plan 6. It fixes confirmed
+This is the deliberately small bug-fix subset retained from the discarded,
+uncommitted Plan 6 draft on `hardening-2`. It fixes confirmed
 failure- and contention-path defects in lease handling and bounded maintenance:
 
 1. one locked queue row or a starved connection pool can block the complete

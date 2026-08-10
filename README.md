@@ -18,6 +18,11 @@ go get github.com/goware/flow
 
 Flow uses the application's existing PostgreSQL database. Its six tables use a `flow_` prefix and default to the `public` schema. `flow.WithSchema` selects another schema.
 
+The v0.1 release line supports Go 1.26 and PostgreSQL 17 and 18. During v0.x,
+intentional Go API changes may be made with release notes. Published migration
+files are immutable: upgrades add forward migrations, and applications must run
+`Migrate` before starting a newer runtime. Back up durable data before upgrades.
+
 Run migrations explicitly during deployment:
 
 ```go
@@ -165,6 +170,15 @@ FLOW_EXAMPLE_DATABASE_URL='postgres://postgres@localhost/postgres?sslmode=disabl
 - Required command failure enters reduced fail-fast by default. `flow.WithFailFast(false)` lets remaining work continue.
 - Execution deadlines, retries, queues, concurrency limits, graceful shutdown, polling, notification hints, observers, history, trace, cancellation, and caller-owned transactions are supported.
 - Publishers may use a `Runtime` without calling `Run` or registering workers. Worker pools may be deployed independently.
+- Observer delivery and shutdown drain are best-effort. Observers must return promptly and should honor context cancellation; observation loss never changes durable correctness.
+- Flow has no pruning or archival API. Journal, payload, and terminal execution data remain retained until an operator deliberately archives or removes them outside Flow's supported API.
+
+For bounded domain-row decoration, `ListLiveWork` and `ListHistoryByKeys`
+accept at most 200 exact execution keys and return cursor pages of 100 rows by
+default (maximum 1,000). Ordinary pages are not a cross-page snapshot; use a
+Repeatable Read or Serializable caller transaction when one coherent snapshot
+is required. The same rule applies to caller-owned `Trace`; Flow-owned `Trace`
+uses Repeatable Read automatically.
 
 ## Tests
 

@@ -123,6 +123,10 @@ type traceOptions struct{ errs []error }
 
 const maxTraceEntries = 100_000
 
+// Trace reconstructs one execution and overlays its current operational
+// projections. A Runtime client gets one Flow-owned Repeatable Read snapshot.
+// A transaction-scoped client inherits the caller's isolation; callers needing
+// a coherent multi-statement snapshot must use Repeatable Read or Serializable.
 func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (ExecutionTrace, error) {
 	executionID, err := parseExecutionID(id)
 	if err != nil {

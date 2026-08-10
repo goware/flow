@@ -221,6 +221,50 @@ func TestMaintenanceCategoryErrorDoesNotStarveOtherCategories(t *testing.T) {
 	}
 }
 
+func TestWaitExpiryScanErrorIsReported(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithObserver(observer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.observations.run()
+	defer runtime.observations.close()
+	command := DefineCommand[None, None]("maintenance.wait_scan_error", 1)
+	event := DefineEvent[None]("maintenance.wait_scan_error_event")
+	execution, err := command.With(runtime).Execute(ctx, "maintenance/wait-scan-error", None{},
+		WaitFor(event, "missing"), Within(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := pgschema.Table(database.Schema, "flow_commands")
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+schema+`
+		SET wait_deadline_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, execution.RootCommandID); err != nil {
+		t.Fatal(err)
+	}
+	// The expiry probe does not read required, while ExpireCommandWait scans it
+	// into a bool. This isolated schema corruption forces the transition query's
+	// scan error without adding a production fault hook.
+	if _, err := database.DB.Conn.Exec(ctx, `ALTER TABLE `+schema+`
+		ALTER COLUMN required TYPE text USING required::text`); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.runMaintenancePass(ctx)
+	waitForObservation(t, observer, "wait_expiry", "error", 1, time.Second)
+	for _, observation := range observer.snapshot() {
+		if observation.Operation == "wait_expiry" && observation.Outcome == "noop" {
+			t.Fatalf("wait expiry scan error was reported as noop: %#v", observer.snapshot())
+		}
+	}
+}
+
 func TestMaintenanceReplicasApplyEachDeadlineOnce(t *testing.T) {
 	t.Parallel()
 

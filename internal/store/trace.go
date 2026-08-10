@@ -95,9 +95,7 @@ func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUI
 	}
 	rows.Close()
 
-	query = `SELECT command_id,event_name,event_key,satisfied_position
-		FROM ` + pgschema.Table(s.schema, "flow_command_event_waits") + `
-		WHERE execution_id=$1 ORDER BY command_id,event_name,event_key`
+	query = s.traceWaitsQuery()
 	if tx != nil {
 		rows, err = tx.Query(ctx, query, id)
 	} else {
@@ -118,6 +116,14 @@ func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUI
 		return TraceOperationalRows{}, MapError("read trace event wait rows", err)
 	}
 	return result, nil
+}
+
+func (s *Store) traceWaitsQuery() string {
+	return `SELECT w.command_id,w.event_name,w.event_key,w.satisfied_position
+		FROM ` + pgschema.Table(s.schema, "flow_commands") + ` c
+		JOIN ` + pgschema.Table(s.schema, "flow_command_event_waits") + ` w
+			ON w.execution_id=c.execution_id AND w.command_id=c.command_id
+		WHERE c.execution_id=$1 ORDER BY w.command_id,w.event_name,w.event_key`
 }
 
 func decodeTraceFailure(value []byte, target **failure.Value) error {

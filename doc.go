@@ -36,6 +36,15 @@
 // WithCommit is intended for short same-database writes and must not contain
 // remote calls. Caller-owned transactions should also be kept short because an
 // execution lock remains held until the caller commits or rolls back.
+
+// The v0.1 release line supports Go 1.26 and PostgreSQL 17 and 18. Published
+// migrations are immutable and upgrades are forward-only. During v0.x,
+// intentional Go API changes may be described in release notes. Flow retains
+// journal, payload, and terminal data indefinitely and exposes no pruning API.
+
+// Observer delivery is bounded and best-effort. Observers must return promptly
+// and should honor context cancellation; a blocked or failed observer never
+// changes durable execution correctness or prevents runtime shutdown.
 //
 // External callers record execution-scoped events with Event.Emit. Event.Deliver
 // provides deliberately detached ingress to a known execution, including from

@@ -86,6 +86,11 @@ func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter Execut
 	if (filter.CursorCreated == nil) != (filter.CursorID == nil) {
 		return nil, fmt.Errorf("%w: execution list cursor is incomplete", flowerr.ErrInvalid)
 	}
+	query, args := s.listExecutionsQuery(filter)
+	return s.queryExecutions(ctx, tx, query, args...)
+}
+
+func (s *Store) listExecutionsQuery(filter ExecutionListFilter) (string, []any) {
 	clauses := make([]string, 0, 7)
 	args := make([]any, 0, 8)
 	add := func(sql string, value any) {
@@ -121,7 +126,7 @@ func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter Execut
 		query += ` WHERE ` + strings.Join(clauses, ` AND `)
 	}
 	query += fmt.Sprintf(` ORDER BY created_at DESC,execution_id DESC LIMIT $%d`, len(args))
-	return s.queryExecutions(ctx, tx, query, args...)
+	return query, args
 }
 
 const executionSelectColumns = `SELECT execution_id,definition_name,definition_version,execution_key,status,
@@ -196,13 +201,7 @@ func (s *Store) QueueDepthInTx(ctx context.Context, tx pgx.Tx, queue string) (Qu
 	if queue == "" {
 		return QueueDepthRow{}, fmt.Errorf("%w: queue name is required", flowerr.ErrInvalid)
 	}
-	query := `SELECT
-		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= clock_timestamp()),
-		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at > clock_timestamp()),
-		COUNT(*) FILTER (WHERE state = 'running'),
-		COALESCE(EXTRACT(EPOCH FROM clock_timestamp() - MIN(next_run_at)
-			FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= clock_timestamp())), 0)
-	FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` WHERE queue = $1`
+	query := s.queueDepthQuery()
 	var row QueueDepthRow
 	var oldestSeconds float64
 	var scan pgx.Row
@@ -216,4 +215,15 @@ func (s *Store) QueueDepthInTx(ctx context.Context, tx pgx.Tx, queue string) (Qu
 	}
 	row.OldestReadyFor = time.Duration(oldestSeconds * float64(time.Second))
 	return row, nil
+}
+
+func (s *Store) queueDepthQuery() string {
+	return `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now)
+	SELECT
+		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= observed.now),
+		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at > observed.now),
+		COUNT(*) FILTER (WHERE state = 'running'),
+		COALESCE(EXTRACT(EPOCH FROM MAX(observed.now) - MIN(next_run_at)
+			FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= observed.now)), 0)
+	FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` CROSS JOIN observed WHERE queue = $1`
 }

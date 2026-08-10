@@ -5,3 +5,19 @@ package store
 func EventWaitUpdateQueryForTest(s *Store) string {
 	return s.satisfyMatchingEventWaitsSQL()
 }
+
+func LiveWorkListQueryForTest(s *Store, filter LiveWorkListFilter) (string, []any) {
+	return s.listLiveWorkQuery(filter)
+}
+
+func KeyedHistoryListQueryForTest(s *Store, filter KeyedHistoryListFilter) (string, []any) {
+	return s.listJournalByKeysQuery(filter)
+}
+
+func ExecutionListQueryForTest(s *Store, filter ExecutionListFilter) (string, []any) {
+	return s.listExecutionsQuery(filter)
+}
+
+func QueueDepthQueryForTest(s *Store) string { return s.queueDepthQuery() }
+
+func TraceWaitsQueryForTest(s *Store) string { return s.traceWaitsQuery() }

@@ -152,6 +152,9 @@ type DirectResult[R any] struct {
 // decisions. Resolver supplies registrations for staged sub-command name/version.
 func RunDirect[A, R any](ctx context.Context, root flow.Registration, args A, maxCommands int,
 	resolver func(name string, version int) (flow.Registration, bool)) (DirectResult[R], error) {
+	if maxCommands < 0 {
+		return DirectResult[R]{}, errors.New("flowtest: command ceiling must not be negative")
+	}
 	if maxCommands == 0 {
 		maxCommands = 1000
 	}

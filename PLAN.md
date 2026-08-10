@@ -13,7 +13,11 @@ This is the authoritative staged plan for pruning Flow's pre-release PostgreSQL 
 
 ## Scope and migration policy
 
-Flow is still using a pre-release baseline. Until a schema version is released, pruning and hardening may rewrite `migrations/001_initial.sql` and all matching SQL call sites. Once users can have the affected schema in durable environments, stop rewriting an applied migration: add a forward migration, bump compatibility metadata where required, and test upgrade as well as clean install.
+This plan originally operated on a pre-release baseline and therefore rewrote
+`migrations/001_initial.sql`. Release hardening now preserves migrations 001
+and 002 byte-for-byte and adds migration 003. Publishing v0.1.0 freezes all
+three; every subsequent schema change must be a forward migration with clean
+install and upgrade coverage.
 
 The semantic journal and mutable projections have different jobs. A projection hash is not retained merely because canonicalization computes one in memory. A hash stays only when a read path, identity contract, corruption check, or replay invariant consumes it.
 
@@ -134,7 +138,14 @@ Decision record (2026-08-05): all candidates are intentionally retained in the p
 
 Keep indexes that implement public identity, same-execution ownership, hot queue/maintenance probes, exact unresolved-wait matching, history order, and indexed inspection. Remove indexes that duplicate an identical key, index a random UUID with no lookup or foreign-key consumer, or support no current predicate/order path.
 
-Merge the command execution covering index into the `(execution_id, command_key)` unique constraint with `INCLUDE`. Consolidate the two attempt-kind uniqueness indexes into one `(attempt_id, entry_kind)` partial unique index. Application-event reads must state the complete application-event predicate so the identity index serves both idempotency and retained-event lookup; the broader journal event lookup index can then be removed.
+Retain the narrow `(execution_id, command_key)` unique constraint without an
+`INCLUDE` payload; the separate `(execution_id, command_id)` ownership key
+serves execution scans and composite foreign keys without widening every
+command-key uniqueness write. Consolidate the two attempt-kind uniqueness
+indexes into one `(attempt_id, entry_kind)` partial unique index.
+Application-event reads must state the complete application-event predicate so
+the identity index serves both idempotency and retained-event lookup; the
+broader journal event lookup index can then be removed.
 
 Narrow supporting indexes when suffix columns cannot contribute to the current predicate or ordering. Retain the metadata GIN index because metadata containment is an active indexed inspection contract; production usage statistics may inform a later released-schema migration, but the baseline should not silently make that API scan-bound.
 
