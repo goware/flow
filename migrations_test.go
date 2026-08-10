@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goware/flow/internal/testpg"
 	"github.com/jackc/pgx/v5"
@@ -51,8 +53,8 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	).Scan(&indexes); err != nil {
 		t.Fatalf("count indexes: %v", err)
 	}
-	if indexes != 28 {
-		t.Fatalf("Flow index count = %d, want 28", indexes)
+	if indexes != 31 {
+		t.Fatalf("Flow index count = %d, want 31", indexes)
 	}
 	if err := database.DB.Conn.QueryRow(ctx,
 		`SELECT count(*) FROM `+quoteIdentifier(database.Schema)+`.flow_schema_migrations`,
@@ -73,6 +75,233 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	}
 	if bytes.Contains(rendered, []byte(migrationToken)) || !bytes.Contains(rendered, []byte(quoteIdentifier(database.Schema)+`.flow_executions`)) {
 		t.Fatal("MigrationFS did not safely render the configured schema")
+	}
+}
+
+func TestMigrationReleaseReadPaths(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	type indexShape struct {
+		name      string
+		columns   []string
+		unique    bool
+		predicate bool
+		collation *string
+		opclass   *string
+		contains  string
+	}
+	want := []indexShape{
+		{name: "flow_executions_key_lookup_idx", columns: []string{"execution_key", "definition_name", "created_at", "execution_id"}, collation: ptr("C"), opclass: ptr("text_ops")},
+		{name: "flow_executions_created_idx", columns: []string{"created_at", "execution_id"}, contains: "(created_at DESC, execution_id DESC)"},
+		{name: "flow_command_queue_depth_idx", columns: []string{"queue", "state", "next_run_at"}},
+	}
+	for _, expected := range want {
+		var columns []string
+		var unique, predicate bool
+		var collation, opclass *string
+		var definition string
+		err := database.DB.Conn.QueryRow(ctx, `WITH target AS MATERIALIZED (
+			SELECT i.indexrelid,i.indnkeyatts,i.indisunique,i.indpred,i.indcollation[0] AS first_collation,
+				i.indclass[0] AS first_opclass
+			FROM pg_catalog.pg_index i
+			JOIN pg_catalog.pg_class indexed ON indexed.oid=i.indrelid
+			JOIN pg_catalog.pg_class index_relation ON index_relation.oid=i.indexrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid=indexed.relnamespace
+			WHERE n.nspname=$1 AND index_relation.relname=$2
+		)
+		SELECT ARRAY(SELECT pg_get_indexdef(target.indexrelid, position, true)
+				FROM generate_series(1, target.indnkeyatts) position ORDER BY position),
+			target.indisunique, target.indpred IS NOT NULL, col.collname, opc.opcname,
+			pg_get_indexdef(target.indexrelid)
+		FROM target
+		LEFT JOIN pg_catalog.pg_collation col ON col.oid=target.first_collation
+		LEFT JOIN pg_catalog.pg_opclass opc ON opc.oid=target.first_opclass`, database.Schema, expected.name).
+			Scan(&columns, &unique, &predicate, &collation, &opclass, &definition)
+		if err != nil {
+			t.Fatalf("inspect index %s: %v", expected.name, err)
+		}
+		if !slices.Equal(columns, expected.columns) || unique != expected.unique || predicate != expected.predicate {
+			t.Fatalf("index %s = columns %v unique=%v predicate=%v, want %#v", expected.name, columns, unique, predicate, expected)
+		}
+		if expected.collation != nil && (collation == nil || *collation != *expected.collation) {
+			t.Fatalf("index %s collation = %v, want %q", expected.name, collation, *expected.collation)
+		}
+		if expected.opclass != nil && (opclass == nil || *opclass != *expected.opclass) {
+			t.Fatalf("index %s operator class = %v, want %q", expected.name, opclass, *expected.opclass)
+		}
+		if expected.contains != "" && !strings.Contains(definition, expected.contains) {
+			t.Fatalf("index %s definition = %s, want substring %q", expected.name, definition, expected.contains)
+		}
+	}
+
+	var prefixDefinition string
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT indexdef FROM pg_catalog.pg_indexes
+		WHERE schemaname=$1 AND indexname='flow_executions_key_prefix_idx'`, database.Schema).Scan(&prefixDefinition); err != nil {
+		t.Fatalf("inspect retained prefix index: %v", err)
+	}
+	if !strings.Contains(prefixDefinition, "(definition_name, execution_key text_pattern_ops)") {
+		t.Fatalf("retained prefix index = %s", prefixDefinition)
+	}
+
+	var checkDefinition string
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT pg_get_constraintdef(oid)
+		FROM pg_catalog.pg_constraint
+		WHERE connamespace=$1::regnamespace AND conname='flow_executions_open_commands_ck'`, database.Schema).
+		Scan(&checkDefinition); err != nil {
+		t.Fatalf("inspect open-command check: %v", err)
+	}
+	if !strings.Contains(checkDefinition, "open_commands <= command_count") {
+		t.Fatalf("open-command check = %s", checkDefinition)
+	}
+}
+
+func ptr[T any](value T) *T { return &value }
+
+func TestMigrationVersionTwoUpgradePreservesLedger(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	option := WithSchema(database.Schema)
+	_, units, err := prepareMigrations(option)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range units[:2] {
+		if _, err := database.DB.Conn.Exec(ctx, string(externalMigration(database.Schema, unit))); err != nil {
+			t.Fatalf("apply historical migration %d: %v", unit.version, err)
+		}
+	}
+	before := make(map[int][]byte, 2)
+	rows, err := database.DB.Conn.Query(ctx, `SELECT version,checksum FROM `+quoteIdentifier(database.Schema)+`.flow_schema_migrations ORDER BY version`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var version int
+		var checksum []byte
+		if err := rows.Scan(&version, &checksum); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		before[version] = bytes.Clone(checksum)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+
+	if err := Migrate(ctx, database.DB, option); err != nil {
+		t.Fatalf("upgrade Migrate() error = %v", err)
+	}
+	for version, checksum := range before {
+		var after []byte
+		if err := database.DB.Conn.QueryRow(ctx, `SELECT checksum FROM `+quoteIdentifier(database.Schema)+`.flow_schema_migrations WHERE version=$1`, version).Scan(&after); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(after, checksum) {
+			t.Fatalf("historical checksum %d changed", version)
+		}
+	}
+	status, err := CheckSchema(ctx, database.DB, option)
+	if err != nil || status.CurrentVersion != 3 {
+		t.Fatalf("CheckSchema() = %#v, %v", status, err)
+	}
+}
+
+func TestMigrationMixedCaseSchemaIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	schema := "FlowReleaseMixedCase"
+	t.Cleanup(func() {
+		_, _ = database.DB.Conn.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+quoteIdentifier(schema)+` CASCADE`)
+	})
+	option := WithSchema(schema)
+	if err := Migrate(ctx, database.DB, option); err != nil {
+		t.Fatalf("first Migrate() error = %v", err)
+	}
+	if err := Migrate(ctx, database.DB, option); err != nil {
+		t.Fatalf("second Migrate() error = %v", err)
+	}
+	if _, err := CheckSchema(ctx, database.DB, option); err != nil {
+		t.Fatalf("CheckSchema() error = %v", err)
+	}
+}
+
+func TestMigrationRejectsLedgerGapBeforeApplyingPending(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	option := WithSchema(database.Schema)
+	_, units, err := prepareMigrations(option)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, string(externalMigration(database.Schema, units[0]))); err != nil {
+		t.Fatalf("apply initial migration: %v", err)
+	}
+	unit := units[2]
+	if _, err := database.DB.Conn.Exec(ctx, `INSERT INTO `+quoteIdentifier(database.Schema)+`.flow_schema_migrations
+		(version,name,checksum,library_version,min_reader_version,min_writer_version,applied_at)
+		VALUES ($1,$2,$3,'test',$4,$5,clock_timestamp())`, unit.version, unit.name, unit.checksum[:], unit.minReader, unit.minWriter); err != nil {
+		t.Fatalf("create migration gap: %v", err)
+	}
+	if err := Migrate(ctx, database.DB, option); !errors.Is(err, ErrSchema) {
+		t.Fatalf("Migrate(gap) error = %v, want ErrSchema", err)
+	}
+	var keyScopeColumns int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='flow_executions' AND column_name='key_scope'`, database.Schema).Scan(&keyScopeColumns); err != nil {
+		t.Fatal(err)
+	}
+	if keyScopeColumns != 0 {
+		t.Fatal("pending migration 2 was applied despite a non-contiguous ledger")
+	}
+}
+
+func TestVerifyAppliedMigrationsRequiresKnownPrefix(t *testing.T) {
+	_, units, err := prepareMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := func(unit migrationUnit) appliedMigration {
+		return appliedMigration{
+			version: unit.version, name: unit.name, checksum: unit.checksum,
+			minReader: unit.minReader, minWriter: unit.minWriter, appliedAt: time.Now(),
+		}
+	}
+	tests := []struct {
+		name    string
+		applied map[int]appliedMigration
+		wantErr bool
+	}{
+		{name: "empty", applied: map[int]appliedMigration{}},
+		{name: "first", applied: map[int]appliedMigration{1: row(units[0])}},
+		{name: "complete", applied: map[int]appliedMigration{1: row(units[0]), 2: row(units[1]), 3: row(units[2])}},
+		{name: "missing first", applied: map[int]appliedMigration{2: row(units[1])}, wantErr: true},
+		{name: "missing middle", applied: map[int]appliedMigration{1: row(units[0]), 3: row(units[2])}, wantErr: true},
+		{name: "unknown future", applied: map[int]appliedMigration{1: row(units[0]), 4: {version: 4}}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyAppliedMigrations(test.applied, units)
+			if test.wantErr && !errors.Is(err, ErrSchema) {
+				t.Fatalf("verifyAppliedMigrations() error = %v, want ErrSchema", err)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("verifyAppliedMigrations() error = %v", err)
+			}
+		})
 	}
 }
 

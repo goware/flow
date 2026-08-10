@@ -221,6 +221,50 @@ func TestMaintenanceCategoryErrorDoesNotStarveOtherCategories(t *testing.T) {
 	}
 }
 
+func TestWaitExpiryScanErrorIsReported(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithObserver(observer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.observations.run()
+	defer runtime.observations.close()
+	command := DefineCommand[None, None]("maintenance.wait_scan_error", 1)
+	event := DefineEvent[None]("maintenance.wait_scan_error_event")
+	execution, err := command.With(runtime).Execute(ctx, "maintenance/wait-scan-error", None{},
+		WaitFor(event, "missing"), Within(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := pgschema.Table(database.Schema, "flow_commands")
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+schema+`
+		SET wait_deadline_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, execution.RootCommandID); err != nil {
+		t.Fatal(err)
+	}
+	// The expiry probe does not read required, while ExpireCommandWait scans it
+	// into a bool. This isolated schema corruption forces the transition query's
+	// scan error without adding a production fault hook.
+	if _, err := database.DB.Conn.Exec(ctx, `ALTER TABLE `+schema+`
+		ALTER COLUMN required TYPE text USING required::text`); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.runMaintenancePass(ctx)
+	waitForObservation(t, observer, "wait_expiry", "error", 1, time.Second)
+	for _, observation := range observer.snapshot() {
+		if observation.Operation == "wait_expiry" && observation.Outcome == "noop" {
+			t.Fatalf("wait expiry scan error was reported as noop: %#v", observer.snapshot())
+		}
+	}
+}
+
 func TestMaintenanceReplicasApplyEachDeadlineOnce(t *testing.T) {
 	t.Parallel()
 
@@ -292,6 +336,7 @@ func TestMaintenancePromptDrainDelayIsBounded(t *testing.T) {
 	for _, result := range []maintenancePassResult{
 		{progressed: false, saturated: true},
 		{progressed: true, saturated: false},
+		{progressed: true, saturated: true, drainable: false},
 	} {
 		delay, passes := nextMaintenanceDelay(pollInterval, result, 4)
 		if delay != pollInterval || passes != 0 {
@@ -301,16 +346,34 @@ func TestMaintenancePromptDrainDelayIsBounded(t *testing.T) {
 	passes := 0
 	for turn := 1; turn < maintenanceDrainPasses; turn++ {
 		delay, next := nextMaintenanceDelay(pollInterval,
-			maintenancePassResult{progressed: true, saturated: true}, passes)
+			maintenancePassResult{progressed: true, saturated: true, drainable: true}, passes)
 		if delay != time.Millisecond || next != turn {
 			t.Fatalf("prompt maintenance turn %d delay=%s passes=%d", turn, delay, next)
 		}
 		passes = next
 	}
 	delay, passes := nextMaintenanceDelay(pollInterval,
-		maintenancePassResult{progressed: true, saturated: true}, passes)
+		maintenancePassResult{progressed: true, saturated: true, drainable: true}, passes)
 	if delay != 25*time.Millisecond || passes != 0 {
 		t.Fatalf("yielding maintenance delay=%s passes=%d", delay, passes)
+	}
+}
+
+func TestMaintenanceContinuationRequiresProgressInFullCategory(t *testing.T) {
+	var result maintenancePassResult
+	result.recordCategory(maintenanceExecutionPage, maintenanceExecutionPage, 0)
+	result.recordCategory(1, maintenanceWaitPage, 1)
+	if !result.saturated || !result.progressed || result.drainable {
+		t.Fatalf("cross-category maintenance result = %+v", result)
+	}
+	delay, passes := nextMaintenanceDelay(time.Second, result, 4)
+	if delay != time.Second || passes != 0 {
+		t.Fatalf("cross-category maintenance delay=%s passes=%d", delay, passes)
+	}
+
+	result.recordCategory(maintenanceLeasePage, maintenanceLeasePage, 1)
+	if !result.drainable {
+		t.Fatalf("progressing full category did not request continuation: %+v", result)
 	}
 }
 

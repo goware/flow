@@ -40,6 +40,9 @@ type Observation struct {
 }
 
 type Observer interface {
+	// Observe receives best-effort operational metadata. Implementations must
+	// return promptly and should stop work when ctx is cancelled. Flow never
+	// waits indefinitely for an observer during runtime shutdown.
 	Observe(context.Context, Observation)
 }
 
@@ -51,6 +54,8 @@ const observerQueueSize = 1024
 
 type observerAdapter struct {
 	observer Observer
+	ctx      context.Context
+	cancel   context.CancelFunc
 	queue    chan Observation
 	done     chan struct{}
 	mu       sync.RWMutex
@@ -61,7 +66,11 @@ type observerAdapter struct {
 }
 
 func newObserverAdapter(observer Observer) *observerAdapter {
-	return &observerAdapter{observer: observer, queue: make(chan Observation, observerQueueSize), done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &observerAdapter{
+		observer: observer, ctx: ctx, cancel: cancel,
+		queue: make(chan Observation, observerQueueSize), done: make(chan struct{}),
+	}
 }
 
 func (adapter *observerAdapter) run() {
@@ -105,14 +114,14 @@ func (adapter *observerAdapter) close() {
 	adapter.stop.Do(func() {
 		adapter.mu.Lock()
 		adapter.closed = true
+		adapter.cancel()
 		close(adapter.queue)
 		adapter.mu.Unlock()
 	})
 	adapter.run()
-	<-adapter.done
 }
 
 func (adapter *observerAdapter) deliver(observation Observation) {
 	defer func() { _ = recover() }()
-	adapter.observer.Observe(context.Background(), observation)
+	adapter.observer.Observe(adapter.ctx, observation)
 }

@@ -216,6 +216,239 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 	}
 }
 
+func TestRuntimeRecoversCommitPanicAndRollsBackItsWrites(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, `CREATE TABLE `+pgschema.Table(database.Schema, "commit_panic_writes")+`
+		(command_id text PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	panicking := DefineCommand[None, None]("runtime.commit_panic", 1, WithRetry(Attempts(1)))
+	sibling := DefineCommand[None, None]("runtime.commit_panic_sibling", 1, WithRetry(Attempts(1)))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+		WithWorkerConcurrency(2), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(panicking, func(context.Context, *Work[None]) (None, error) {
+			return None{}, nil
+		}, WithCommit(func(ctx context.Context, tx Tx, commit Commit[None, None]) error {
+			if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "commit_panic_writes")+`
+				(command_id) VALUES ($1)`, commit.Info.CommandID); err != nil {
+				return err
+			}
+			panic("secret commit panic value")
+		})),
+		Handle(sibling, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancel, result := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, result)
+	failed, err := panicking.With(runtime).Execute(ctx, "commit-panic", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	succeeded, err := sibling.With(runtime).Execute(ctx, "commit-panic-sibling", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, failed.ID, "failed", 5*time.Second)
+	waitForExecutionStatus(t, database.Schema, database.DB.Conn, succeeded.ID, "succeeded", 5*time.Second)
+
+	var writes int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "commit_panic_writes")).Scan(&writes); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 0 {
+		t.Fatalf("panicking commit retained %d application writes", writes)
+	}
+	trace, err := Trace(ctx, runtime, failed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Commands) != 1 || len(trace.Commands[0].Attempts) != 1 ||
+		trace.Commands[0].Attempts[0].Classification != "panic" || trace.Commands[0].Failure == nil ||
+		trace.Commands[0].Failure.Code != "panic" || strings.Contains(trace.Commands[0].Failure.Message, "secret") {
+		t.Fatalf("commit-panic trace = %#v", trace)
+	}
+}
+
+func TestDeterministicEarlyFailuresUseDetachedConclusionContext(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	malformed := DefineCommand[None, None]("runtime.detached_argument_failure", 1, WithRetry(Attempts(1)))
+	duplicate := DefineCommand[None, None]("runtime.detached_event_failure", 1, WithRetry(Attempts(1)))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithWorkerConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(malformed, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+		Handle(duplicate, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
+	); err != nil {
+		t.Fatal(err)
+	}
+	malformedExecution, err := malformed.With(runtime).Execute(ctx, "detached/argument", None{}, WithoutExecutionDeadline())
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateExecution, err := duplicate.With(runtime).Execute(ctx, "detached/event", None{}, WithoutExecutionDeadline())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_commands")+`
+		SET args=convert_to('not-json','UTF8') WHERE command_id=$1`, malformedExecution.RootCommandID); err != nil {
+		t.Fatal(err)
+	}
+
+	claims := make(map[ExecutionID]store.ClaimedCommand, 2)
+	for _, definition := range []struct {
+		name    string
+		version int
+	}{
+		{name: malformed.Name(), version: malformed.Version()},
+		{name: duplicate.Name(), version: duplicate.Version()},
+	} {
+		candidates, err := runtime.store.ProbeCommands(ctx, []store.CommandKind{{Name: definition.name, Version: definition.version}}, 1)
+		if err != nil || len(candidates) != 1 {
+			t.Fatalf("ProbeCommands(%s) candidates=%d error=%v", definition.name, len(candidates), err)
+		}
+		claimed, err := runtime.store.ClaimCommands(ctx, candidates, time.Minute, "detached-test", fault.None{})
+		if err != nil || len(claimed.Commands) != 1 {
+			t.Fatalf("ClaimCommands(%s) commands=%d error=%v", definition.name, len(claimed.Commands), err)
+		}
+		claim := claimed.Commands[0]
+		past := time.Now().Add(-time.Second)
+		claim.ExecutionDeadline = &past
+		claims[ExecutionID(claim.ExecutionID.String())] = claim
+	}
+	duplicateClaim := claims[duplicateExecution.ID]
+	duplicateClaim.EventInputs = []store.ClaimedEventInput{
+		{Name: "duplicate", Key: "same", Position: 1, Payload: []byte(`{}`)},
+		{Name: "duplicate", Key: "same", Position: 1, Payload: []byte(`{}`)},
+	}
+	claims[duplicateExecution.ID] = duplicateClaim
+
+	for _, test := range []struct {
+		execution Execution
+		command   Command[None, None]
+		code      string
+	}{
+		{execution: malformedExecution, command: malformed, code: "argument_decode"},
+		{execution: duplicateExecution, command: duplicate, code: "event_input_decode"},
+	} {
+		worker, ok := runtime.registry.worker(test.command.Name(), test.command.Version())
+		if !ok {
+			t.Fatalf("worker %s missing", test.command.Name())
+		}
+		claim := claims[test.execution.ID]
+		slots := newCommandSlots(1, nil)
+		if reserved, _ := slots.reserve(claim.Queue); !reserved {
+			t.Fatal("failed to reserve direct test slot")
+		}
+		runtime.workerGroup.Add(1)
+		runtime.executeClaim(worker, claim, slots)
+		trace, err := Trace(ctx, runtime, test.execution.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if trace.Execution.Status != ExecutionStatusFailed || len(trace.Commands) != 1 || trace.Commands[0].Failure == nil ||
+			trace.Commands[0].Failure.Code != test.code {
+			t.Fatalf("detached %s trace = %#v", test.code, trace)
+		}
+	}
+}
+
+func TestDeadlineDiscardedDecisionEmitsOnlyExpiredSettlement(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	event := DefineEvent[None]("runtime.deadline_discard_event")
+	command := DefineCommand[None, None]("runtime.deadline_discard", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithObserver(observer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.observations.run()
+	defer runtime.observations.close()
+	if err := runtime.Register(Handle(command, func(_ context.Context, work *Work[None]) (None, error) {
+		if err := Emit(work, event, "discarded", None{}); err != nil {
+			return None{}, err
+		}
+		return None{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	execution, err := command.With(runtime).Execute(ctx, "deadline/discard", None{}, WithoutExecutionDeadline())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := runtime.store.ProbeCommands(ctx,
+		[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("ProbeCommands() candidates=%d error=%v", len(candidates), err)
+	}
+	claimed, err := runtime.store.ClaimCommands(ctx, candidates, time.Minute, "deadline-discard-test", fault.None{})
+	if err != nil || len(claimed.Commands) != 1 {
+		t.Fatalf("ClaimCommands() commands=%d error=%v", len(claimed.Commands), err)
+	}
+	claim := claimed.Commands[0]
+	claim.ExecutionDeadline = nil
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_executions")+`
+		SET deadline_at=clock_timestamp()-interval '1 second' WHERE execution_id=$1`, execution.ID); err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := runtime.registry.worker(command.Name(), command.Version())
+	if !ok {
+		t.Fatal("registered worker missing")
+	}
+	slots := newCommandSlots(1, nil)
+	if reserved, _ := slots.reserve(claim.Queue); !reserved {
+		t.Fatal("failed to reserve direct test slot")
+	}
+	runtime.workerGroup.Add(1)
+	runtime.executeClaim(worker, claim, slots)
+	waitForObservation(t, observer, "settle", "expired", 1, time.Second)
+	for _, observation := range observer.snapshot() {
+		if observation.ExecutionID != execution.ID {
+			continue
+		}
+		if (observation.Kind == ObservationEvent && observation.Operation == "settle" && observation.Outcome == "accepted") ||
+			(observation.Kind == ObservationAttempt && observation.Operation == "settle" && observation.Outcome == "succeeded") {
+			t.Fatalf("discarded decision emitted success observation: %#v", observation)
+		}
+	}
+	var status string
+	var applicationEvents int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT status,
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
+		 WHERE execution_id=e.execution_id AND event_class='application')
+		FROM `+pgschema.Table(database.Schema, "flow_executions")+` e WHERE execution_id=$1`, execution.ID).
+		Scan(&status, &applicationEvents); err != nil {
+		t.Fatal(err)
+	}
+	if status != "expired" || applicationEvents != 0 {
+		t.Fatalf("discarded decision status=%s application_events=%d", status, applicationEvents)
+	}
+}
+
 func TestRuntimeStagesDelayedChildrenAtomically(t *testing.T) {
 	t.Parallel()
 	database := testpg.Open(t)
@@ -1151,11 +1384,20 @@ func TestRuntimeShutdownTransfersPostCommitClaimToWorkerAccounting(t *testing.T)
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
+	var renewableDuringShutdown atomic.Bool
+	commandID := uuid.MustParse(string(execution.RootCommandID))
 	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
-		if point == fault.ClaimCommitAmbiguous {
+		switch point {
+		case fault.ClaimCommitAmbiguous:
 			once.Do(func() { close(entered) })
 			<-release
 			return fault.Injected(point)
+		case fault.HandlerStart:
+			for _, active := range runtime.active.snapshot() {
+				if active.commandID == commandID {
+					renewableDuringShutdown.Store(true)
+				}
+			}
 		}
 		return nil
 	})
@@ -1183,6 +1425,9 @@ func TestRuntimeShutdownTransfersPostCommitClaimToWorkerAccounting(t *testing.T)
 	}
 	if handlers.Load() != 1 {
 		t.Fatalf("post-commit handlers=%d, want 1", handlers.Load())
+	}
+	if renewableDuringShutdown.Load() {
+		t.Fatal("shutdown-cancelled post-commit attempt remained eligible for renewal")
 	}
 	var state string
 	var activeFences int
@@ -1820,6 +2065,14 @@ func startRuntime(t *testing.T, runtime *Runtime) (context.CancelFunc, <-chan er
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- runtime.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		stopCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if err := runtime.Stop(stopCtx); err != nil {
+			t.Errorf("cleanup Runtime.Stop() error = %v", err)
+		}
+	})
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		runtime.mu.RLock()

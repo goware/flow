@@ -119,16 +119,14 @@ func (active *activeCommands) snapshot() []activeCommand {
 	return result
 }
 
-func (active *activeCommands) renewed(commandID, attemptID uuid.UUID, expiresAt time.Time) bool {
+func (active *activeCommands) renewed(commandID, attemptID uuid.UUID, expiresAt time.Time) {
 	active.mu.Lock()
 	defer active.mu.Unlock()
 	command, exists := active.values[commandID]
 	if exists && command.attemptID == attemptID && !command.cancelled {
 		command.localExpiry = expiresAt
 		active.values[commandID] = command
-		return true
 	}
-	return false
 }
 
 func (active *activeCommands) cancelExpired() int {
@@ -147,7 +145,7 @@ func (active *activeCommands) cancelExpired() int {
 	return cancelled
 }
 
-func (active *activeCommands) cancelLost(commandID, attemptID uuid.UUID) bool {
+func (active *activeCommands) cancelAttempt(commandID, attemptID uuid.UUID, cause error) bool {
 	active.mu.Lock()
 	defer active.mu.Unlock()
 	command, exists := active.values[commandID]
@@ -156,8 +154,12 @@ func (active *activeCommands) cancelLost(commandID, attemptID uuid.UUID) bool {
 	}
 	command.cancelled = true
 	active.values[commandID] = command
-	command.cancel(ErrLeaseLost)
+	command.cancel(cause)
 	return true
+}
+
+func (active *activeCommands) cancelLost(commandID, attemptID uuid.UUID) bool {
+	return active.cancelAttempt(commandID, attemptID, ErrLeaseLost)
 }
 
 func (active *activeCommands) cancelAll(cause error) {
@@ -215,24 +217,23 @@ func (r *Runtime) Run(ctx context.Context) error {
 
 	serviceCtx, stopServices := context.WithCancel(context.Background())
 	var services sync.WaitGroup
-	serviceCount := 3
-	if r.notifications {
-		serviceCount++
-	}
-	services.Add(serviceCount)
+	services.Add(1)
 	go func() {
 		defer services.Done()
 		r.runLeaseManager(serviceCtx)
 	}()
+	services.Add(1)
 	go func() {
 		defer services.Done()
 		r.runMaintenance(serviceCtx)
 	}()
+	services.Add(1)
 	go func() {
 		defer services.Done()
 		r.runLeaseWatchdog(serviceCtx)
 	}()
 	if r.notifications {
+		services.Add(1)
 		go func() {
 			defer services.Done()
 			r.runNotificationListener(serviceCtx)
@@ -427,9 +428,6 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 			counts[result.Outcome]++
 			switch result.Outcome {
 			case store.LeaseRenewed:
-				if result.LeaseExpiresAt == nil {
-					continue
-				}
 				r.active.renewed(result.CommandID, result.AttemptID, started.Add(r.commandLease))
 			case store.LeaseLost:
 				if r.active.cancelLost(result.CommandID, result.AttemptID) {
@@ -505,10 +503,11 @@ func (r *Runtime) runMaintenance(ctx context.Context) {
 type maintenancePassResult struct {
 	progressed bool
 	saturated  bool
+	drainable  bool
 }
 
 func nextMaintenanceDelay(pollInterval time.Duration, result maintenancePassResult, consecutiveDrainPasses int) (time.Duration, int) {
-	if !result.progressed || !result.saturated {
+	if !result.drainable {
 		return pollInterval, 0
 	}
 	consecutiveDrainPasses++
@@ -518,6 +517,14 @@ func nextMaintenanceDelay(pollInterval time.Duration, result maintenancePassResu
 	return min(pollInterval, time.Millisecond), consecutiveDrainPasses
 }
 
+func (result *maintenancePassResult) recordCategory(returned, pageSize, changed int) {
+	saturated := returned == pageSize
+	progressed := changed > 0
+	result.saturated = result.saturated || saturated
+	result.progressed = result.progressed || progressed
+	result.drainable = result.drainable || saturated && progressed
+}
+
 func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult {
 	var result maintenancePassResult
 
@@ -525,11 +532,11 @@ func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult 
 	executions, err := r.store.ProbeExpiredExecutions(ctx, maintenanceExecutionPage)
 	r.observeMaintenanceProbe(ctx, "deadline_probe", len(executions), err, started)
 	if err == nil {
-		result.saturated = len(executions) == maintenanceExecutionPage
+		transitionStarted := time.Now()
 		changed, transitionErr := r.runExecutionDeadlinePage(ctx, executions)
-		result.progressed = result.progressed || changed > 0
+		result.recordCategory(len(executions), maintenanceExecutionPage, changed)
 		if len(executions) > 0 {
-			r.observeMaintenanceTransition(ctx, "deadline", len(executions), changed, transitionErr, started)
+			r.observeMaintenanceTransition(ctx, "deadline", len(executions), changed, transitionErr, transitionStarted)
 		}
 	}
 
@@ -537,11 +544,11 @@ func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult 
 	waits, err := r.store.ProbeExpiredCommandWaits(ctx, maintenanceWaitPage)
 	r.observeMaintenanceProbe(ctx, "wait_expiry_probe", len(waits), err, started)
 	if err == nil {
-		result.saturated = result.saturated || len(waits) == maintenanceWaitPage
+		transitionStarted := time.Now()
 		changed, transitionErr := r.runWaitExpiryPage(ctx, waits)
-		result.progressed = result.progressed || changed > 0
+		result.recordCategory(len(waits), maintenanceWaitPage, changed)
 		if len(waits) > 0 {
-			r.observeMaintenanceTransition(ctx, "wait_expiry", len(waits), changed, transitionErr, started)
+			r.observeMaintenanceTransition(ctx, "wait_expiry", len(waits), changed, transitionErr, transitionStarted)
 		}
 	}
 
@@ -549,16 +556,16 @@ func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult 
 	leases, err := r.store.ProbeExpiredCommandLeases(ctx, maintenanceLeasePage)
 	r.observeMaintenanceProbe(ctx, "lease_recovery_probe", len(leases), err, started)
 	if err == nil {
-		result.saturated = result.saturated || len(leases) == maintenanceLeasePage
+		transitionStarted := time.Now()
 		changed, transitionErr := r.runLeaseRecoveryPage(ctx, leases)
-		result.progressed = result.progressed || changed > 0
+		result.recordCategory(len(leases), maintenanceLeasePage, changed)
 		if len(leases) > 0 {
-			r.observeMaintenanceTransition(ctx, "lease_recovery", len(leases), changed, transitionErr, started)
+			r.observeMaintenanceTransition(ctx, "lease_recovery", len(leases), changed, transitionErr, transitionStarted)
 		}
 	}
 	if result.saturated {
 		outcome := "blocked"
-		if result.progressed {
+		if result.drainable {
 			outcome = "drain"
 		}
 		r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "maintenance_pass", Outcome: outcome,

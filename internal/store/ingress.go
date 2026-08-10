@@ -84,12 +84,17 @@ type StartResult struct {
 
 // StartInTx creates or idempotently rediscovers an execution inside tx. It
 // never commits or rolls back tx.
-func (s *Store) StartInTx(ctx context.Context, tx pgx.Tx, request StartRequest) (StartResult, error) {
+func (s *Store) StartInTx(ctx context.Context, tx pgx.Tx, request StartRequest, order *LockOrder) (StartResult, error) {
 	if tx == nil {
 		return StartResult{}, fmt.Errorf("%w: transaction is nil", flowerr.ErrInvalid)
 	}
 	if err := validateStartRequest(request); err != nil {
 		return StartResult{}, err
+	}
+	if order != nil {
+		if err := order.BeforeFlowOperation(); err != nil {
+			return StartResult{}, err
+		}
 	}
 	if request.KeyScope == "" {
 		request.KeyScope = KeyScopePermanent
@@ -102,14 +107,14 @@ func (s *Store) StartInTx(ctx context.Context, tx pgx.Tx, request StartRequest) 
 		attempts = 2
 	}
 	for attempt := 0; ; attempt++ {
-		result, retry, err := s.startAttempt(ctx, tx, request)
+		result, retry, err := s.startAttempt(ctx, tx, request, order)
 		if err == nil || !retry || attempt+1 >= attempts {
 			return result, err
 		}
 	}
 }
 
-func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartRequest) (StartResult, bool, error) {
+func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartRequest, order *LockOrder) (StartResult, bool, error) {
 	var dbNow time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
 		return StartResult{}, false, MapError("capture start time", err)
@@ -142,11 +147,16 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 		return StartResult{}, false, MapError("insert execution", err)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		result, retry, loadErr := s.loadEquivalentStart(ctx, tx, request)
+		result, retry, loadErr := s.loadEquivalentStart(ctx, tx, request, order)
 		return result, retry, loadErr
 	}
 	if inserted != request.ID {
 		return StartResult{}, false, fmt.Errorf("%w: inserted execution identity differs", flowerr.ErrInvalidState)
+	}
+	if order != nil {
+		if err := order.BeforeExecution(request.ID); err != nil {
+			return StartResult{}, false, err
+		}
 	}
 
 	semantic, err := s.AdoptSemantic(tx, request.ID, dbNow)
@@ -196,7 +206,12 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 // asked to ensure a live execution exists, not to describe a specific one.
 // retry=true means the conflicting live holder settled before the lookup;
 // the caller may attempt the insert again.
-func (s *Store) loadEquivalentStart(ctx context.Context, tx pgx.Tx, request StartRequest) (StartResult, bool, error) {
+func (s *Store) loadEquivalentStart(
+	ctx context.Context,
+	tx pgx.Tx,
+	request StartRequest,
+	order *LockOrder,
+) (StartResult, bool, error) {
 	if request.Key == "" {
 		return StartResult{}, false, fmt.Errorf("%w: unkeyed start unexpectedly conflicted", flowerr.ErrInvalidState)
 	}
@@ -205,14 +220,34 @@ func (s *Store) loadEquivalentStart(ctx context.Context, tx pgx.Tx, request Star
 		err := tx.QueryRow(ctx, `SELECT execution_id
 			FROM `+pgschema.Table(s.schema, "flow_executions")+`
 			WHERE definition_name=$1 AND execution_key=$2
-			  AND key_scope=$3 AND status IN ('running','failing') FOR UPDATE`,
+			  AND key_scope=$3 AND status IN ('running','failing')`,
 			request.DefinitionName, request.Key, KeyScopeLive,
 		).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StartResult{}, true, fmt.Errorf("%w: live key holder settled during start", flowerr.ErrConflict)
 		}
 		if err != nil {
-			return StartResult{}, false, MapError("load live execution", err)
+			return StartResult{}, false, MapError("resolve live execution", err)
+		}
+		if order != nil {
+			if err := order.BeforeExecution(id); err != nil {
+				return StartResult{}, false, err
+			}
+		}
+		var definitionName, executionKey, keyScope, status string
+		err = tx.QueryRow(ctx, `SELECT definition_name,execution_key,key_scope,status
+			FROM `+pgschema.Table(s.schema, "flow_executions")+`
+			WHERE execution_id=$1 FOR UPDATE`, id).
+			Scan(&definitionName, &executionKey, &keyScope, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return StartResult{}, true, fmt.Errorf("%w: live key holder changed during start", flowerr.ErrConflict)
+		}
+		if err != nil {
+			return StartResult{}, false, MapError("lock live execution", err)
+		}
+		if definitionName != request.DefinitionName || executionKey != request.Key || keyScope != KeyScopeLive ||
+			status != "running" && status != "failing" {
+			return StartResult{}, true, fmt.Errorf("%w: live key holder changed during start", flowerr.ErrConflict)
 		}
 		row, err := s.GetExecutionInTx(ctx, tx, id)
 		if err != nil {
@@ -221,15 +256,32 @@ func (s *Store) loadEquivalentStart(ctx context.Context, tx pgx.Tx, request Star
 		return StartResult{Row: row, Created: false}, false, nil
 	}
 	var id uuid.UUID
+	err := tx.QueryRow(ctx, `SELECT execution_id
+		FROM `+pgschema.Table(s.schema, "flow_executions")+`
+		WHERE definition_name=$1 AND execution_key=$2 AND key_scope=$3`,
+		request.DefinitionName, request.Key, KeyScopePermanent,
+	).Scan(&id)
+	if err != nil {
+		return StartResult{}, false, MapError("resolve existing execution", err)
+	}
+	if order != nil {
+		if err := order.BeforeExecution(id); err != nil {
+			return StartResult{}, false, err
+		}
+	}
+	var definitionName, executionKey, keyScope string
 	var version int
 	var fingerprint, input, metadata []byte
-	err := tx.QueryRow(ctx, `SELECT execution_id,definition_version,start_fingerprint,input,metadata_canonical
+	err = tx.QueryRow(ctx, `SELECT definition_name,execution_key,key_scope,definition_version,
+		start_fingerprint,input,metadata_canonical
 		FROM `+pgschema.Table(s.schema, "flow_executions")+`
-		WHERE definition_name=$1 AND execution_key=$2 AND key_scope=$3 FOR UPDATE`,
-		request.DefinitionName, request.Key, KeyScopePermanent,
-	).Scan(&id, &version, &fingerprint, &input, &metadata)
+		WHERE execution_id=$1 FOR UPDATE`, id).
+		Scan(&definitionName, &executionKey, &keyScope, &version, &fingerprint, &input, &metadata)
 	if err != nil {
-		return StartResult{}, false, MapError("load existing execution", err)
+		return StartResult{}, false, MapError("lock existing execution", err)
+	}
+	if definitionName != request.DefinitionName || executionKey != request.Key || keyScope != KeyScopePermanent {
+		return StartResult{}, false, fmt.Errorf("%w: execution key owner changed during start", flowerr.ErrConflict)
 	}
 	if version != request.DefinitionVersion || !bytes.Equal(fingerprint, request.StartFingerprint[:]) ||
 		!bytes.Equal(input, request.Input.Bytes) || !bytes.Equal(metadata, request.Metadata.Bytes) {

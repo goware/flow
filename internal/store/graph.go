@@ -136,11 +136,14 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		FROM `+pgschema.Table(s.schema, "flow_commands")+`
 		WHERE command_id=$1 AND execution_id=$2 FOR UPDATE`, candidate.CommandID, candidate.ExecutionID).
 		Scan(&key, &state, &required, &deadline, &createdPosition)
-	if errors.Is(err, pgx.ErrNoRows) || state != "pending" || semantic.DBNow().Before(deadline) {
-		return false, nil
-	}
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
 		return false, MapError("lock expired command wait", err)
+	}
+	if state != "pending" || semantic.DBNow().Before(deadline) {
+		return false, nil
 	}
 
 	// A fact committed on or before the persisted deadline wins, even when

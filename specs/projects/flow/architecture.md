@@ -69,6 +69,7 @@ flow/
 ├── runtime_run.go          scheduler services, leases, notifications, shutdown
 ├── command_runtime.go      claim invocation, normalization, settlement routing
 ├── inspection.go           execution/list/await/queue queries
+├── readapi.go              bounded key-addressed live-work/history pages
 ├── history.go / trace.go   journal access and reconstructed diagnostics
 ├── migrations.go           embedded migration and compatibility API
 ├── flowtest/               database-free decision/retry/replay test helpers
@@ -343,7 +344,7 @@ Shutdown occurs in phases:
 2. allow active workers to finish through the configured grace period;
 3. cancel remaining worker contexts as budget-neutral interruption;
 4. stop lease, maintenance, and notification services;
-5. close observer delivery; and
+5. cancel and close observer delivery without waiting indefinitely for user code; and
 6. mark the runtime closed.
 
 The application's `pgkit.DB` and pool remain caller-owned and are never closed by Flow.
@@ -354,7 +355,7 @@ Supported deployment shapes include one all-worker binary, independently scaled 
 
 Point/list/queue queries read indexed projections. History reads journal positions directly. Await polls the execution projection without reserving a connection between polls.
 
-Trace uses a repeatable-read transaction when it owns the read. It loads bounded history, folds it through the pure replay reducer, loads the live execution projection and operational command/wait data in the same snapshot, and overlays those operational fields onto reconstructed semantic commands.
+Trace uses a repeatable-read transaction when it owns the read. It loads bounded history, folds it through the pure replay reducer, loads the live execution projection and operational command/wait data in the same snapshot, and overlays those operational fields onto reconstructed semantic commands. A caller-owned Trace inherits the supplied transaction's isolation; callers that require the same coherent cross-statement view must use Repeatable Read or Serializable.
 
 This division is intentional:
 
@@ -392,7 +393,7 @@ events carry sibling, cross-branch, or external facts. Related events and
 children belong in one decision when they must commit together. Large or
 sensitive documents stay in application storage behind stable references.
 
-Structured Flow errors map database/constraint failures into safe sentinel categories without including raw SQL or driver details. Observers intentionally exclude payloads, results, SQL, connections, and lease tokens; delivery is bounded and non-blocking so monitoring cannot stall correctness.
+Structured Flow errors map database/constraint failures into safe sentinel categories without including raw SQL or driver details. Observers intentionally exclude payloads, results, SQL, connections, and lease tokens; delivery and shutdown drain are bounded and best-effort. Observers should honor cancellation, and monitoring cannot stall durable correctness or runtime shutdown.
 
 The current schema retains journal and payload data and exposes no pruning API. Operators own PostgreSQL backup, access control, encryption, capacity planning, and any future application-approved archival process. Direct deletion or mutation of Flow-owned rows is outside the supported contract because it can break replay, idempotency, waits, and projection invariants.
 

@@ -352,7 +352,11 @@ The caller should commit or roll back promptly after the Flow operations and
 associated application writes. Every acquired execution lock remains held for
 the lifetime of the caller-owned transaction.
 
-Starts create their execution row and therefore do not enter the existing-execution order until later operations address that execution. Multi-execution workflows are not settled atomically by Flow itself; explicit caller transactions are the only cross-execution/application-write boundary.
+Caller-owned starts participate in the same ascending execution-lock order.
+Created starts register their accepted execution identity; keyed rediscovery
+resolves and registers the actual owner before locking it. Multi-execution
+workflows are not settled atomically by Flow itself; explicit caller
+transactions are the only cross-execution/application-write boundary.
 
 ## 12. Runtime and deployment
 
@@ -443,15 +447,30 @@ The current release has no journal pruning or archival API. Arguments, results, 
 
 `ListExecutions` provides indexed keyset pagination with optional command type, key prefix, statuses, creation-time range, and metadata containment. `CreatedAfter` is inclusive, `CreatedBefore` exclusive. Page size defaults to 50 and may be 1 through 200.
 
+`ListLiveWork` returns queued or leased commands for at most 200 exact execution
+keys. `ListHistoryByKeys` returns retained journal entries for the same bounded
+key set. Both use opaque, versioned, query-specific keyset cursors bound to the
+normalized keys; pages default to 100 rows and may be 1 through 1000. Keys must
+be non-empty valid UTF-8 no larger than 1024 bytes. Ordinary calls do not
+promise a cross-page snapshot; transaction-scoped clients observe the caller's
+transaction and its uncommitted writes.
+
 `AwaitExecution` polls without holding a worker, lease, or database connection between reads until the execution is terminal or the context ends.
 
 `GetQueueDepth(queue)` returns a point-in-time count of ready, delayed, and running delivery rows plus how long the oldest ready item has waited. It is operational state, not semantic history.
 
 `History` returns immutable entries ordered by journal position. `HistoryAfter` is exclusive; `HistoryLimit` defaults to 100 and may be 1 through 1000.
 
-`Trace` reads a repeatable-read snapshot, folds retained journal facts, and overlays current operational command/wait/lease data. It exposes execution state, command provenance, attempts, results/failures, waits and satisfying positions, events, and raw ordered history. The current implementation rejects an initial trace at 100,000 or more retained history entries rather than returning an unbounded snapshot.
+`Trace` folds retained journal facts and overlays current operational
+command/wait/lease data. A Flow-owned call uses Repeatable Read. A
+transaction-scoped call inherits its caller's isolation; a caller requiring one
+coherent cross-statement snapshot must supply Repeatable Read or Serializable.
+Trace exposes execution state, command provenance, attempts, results/failures,
+waits and satisfying positions, events, and raw ordered history. The current
+implementation rejects an initial trace at 100,000 or more retained history
+entries rather than returning an unbounded snapshot.
 
-While `Run` is active, observers receive bounded operational metadata asynchronously. Delivery is best-effort: a full observer queue drops observations and later reports a drop count, and observer panics do not affect execution. Observations contain no arguments, results, event payloads, SQL, connection objects, or lease tokens.
+While `Run` is active, observers receive bounded operational metadata asynchronously. Delivery and shutdown drain are best-effort: a full observer queue drops observations and later reports a drop count, and observer panics do not affect execution. Observers must return promptly and should honor callback-context cancellation. A blocked observer may strand its one delivery goroutine, but cannot block runtime shutdown or durable work. Observations contain no arguments, results, event payloads, SQL, connection objects, or lease tokens.
 
 ## 15. Errors and data handling
 
@@ -490,6 +509,9 @@ Flow canonicalizes durable typed values as JSON and stores them in PostgreSQL; i
 | commands per execution | runtime-configurable, default 1000; zero disables |
 | execution listing page | default 50, maximum 200 |
 | history page | default 100, maximum 1000 |
+| by-key read batch | maximum 200 non-empty UTF-8 keys, each at most 1024 bytes |
+| live-work/keyed-history page | default 100, maximum 1000 |
+| opaque by-key cursor | maximum 4096 encoded bytes |
 | initial trace history | fewer than 100,000 entries |
 
 Bounds apply to canonical encoded values, not merely the apparent size of Go fields. A command using 256 maximum-size event inputs may materialize about 16 MiB of encoded event data before decoding overhead; larger joins should use a command tree or stable external references.

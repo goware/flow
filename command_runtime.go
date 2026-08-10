@@ -29,6 +29,8 @@ const (
 	settlementAttempts       = 3
 )
 
+var errCommitPanicked = errors.New("command commit function panicked")
+
 func (r *Runtime) runCommandScheduler(ctx context.Context) {
 	slots := newCommandSlots(r.workerConcurrency, r.queueConcurrency)
 	queueTurn := 0
@@ -408,7 +410,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	stopping := r.lifecycle == runtimeStopping || r.lifecycle == runtimeStopped
 	r.mu.RUnlock()
 	if stopping {
-		cancelCause(errRuntimeShutdown)
+		r.active.cancelAttempt(claim.CommandID, claim.AttemptID, errRuntimeShutdown)
 	}
 	defer func() {
 		cancelDeadline()
@@ -420,7 +422,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 
 	args, err := worker.command.Args.Decode(claim.Args)
 	if err != nil {
-		r.concludeClaim(workerCtx, claim, classifiedConclusion{
+		r.concludeClaim(context.Background(), claim, classifiedConclusion{
 			class: retrypolicy.ClassPermanent, code: "argument_decode", message: "stored command arguments do not match the registered definition",
 		})
 		return
@@ -436,7 +438,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		var duplicate bool
 		scope.state.eventInputs, duplicate = claimedEventInputSnapshots(claim.EventInputs)
 		if duplicate {
-			r.concludeClaim(workerCtx, claim, classifiedConclusion{
+			r.concludeClaim(context.Background(), claim, classifiedConclusion{
 				class: retrypolicy.ClassPermanent, code: "event_input_decode", message: "claimed command contains duplicate event inputs",
 			})
 			return
@@ -484,7 +486,12 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 	commit := func(tx pgx.Tx) error { return nil }
 	if worker.commit != nil {
-		commit = func(tx pgx.Tx) error {
+		commit = func(tx pgx.Tx) (resultErr error) {
+			defer func() {
+				if recover() != nil {
+					resultErr = errCommitPanicked
+				}
+			}()
 			commitErr := worker.commit(workerCtx, tx, args, result, info)
 			if scope.state.firstError != nil {
 				return scope.state.firstError
@@ -495,26 +502,42 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		commit = nil
 	}
 	for attempt := 0; attempt < settlementAttempts; attempt++ {
-		_, settleErr := r.store.SettleCommandSuccess(context.Background(), store.CommandSuccess{
+		settleResult, settleErr := r.store.SettleCommandSuccess(context.Background(), store.CommandSuccess{
 			Claim: claim, Result: encoded, Events: events, Children: children, Commit: commit,
 		}, r.faults)
 		if settleErr == nil {
-			for _, event := range events {
+			switch settleResult.Status {
+			case "succeeded":
+				for _, event := range events {
+					r.observe(context.Background(), Observation{
+						Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
+						ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+						Name: event.Name, Worker: r.replicaName(),
+					})
+				}
 				r.observe(context.Background(), Observation{
-					Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
+					Kind: ObservationAttempt, Operation: "settle", Outcome: "succeeded",
 					ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-					Name: event.Name, Worker: r.replicaName(),
+					Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
 				})
+				return
+			case "expired":
+				r.observe(context.Background(), Observation{
+					Kind: ObservationAttempt, Operation: "settle", Outcome: "expired",
+					ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+					Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
+				})
+				return
+			default:
+				settleErr = newError(ErrInvalidState, "settle", "status", settleResult.Status, "successful settlement returned an unknown status")
 			}
-			r.observe(context.Background(), Observation{
-				Kind: ObservationAttempt, Operation: "settle", Outcome: "succeeded",
-				ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-				Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
-			})
-			return
 		}
 		var commitErr *store.CommitFunctionError
 		if errors.As(settleErr, &commitErr) {
+			if errors.Is(commitErr.Err, errCommitPanicked) {
+				r.concludeClaim(context.Background(), claim, classifyWorkerError(commitErr.Err, true))
+				return
+			}
 			if errors.Is(commitErr.Err, ErrConflict) || errors.Is(commitErr.Err, ErrInvalid) ||
 				errors.Is(commitErr.Err, ErrInvalidState) || errors.Is(commitErr.Err, ErrPayloadTooLarge) {
 				r.concludeClaim(context.Background(), claim, classifiedConclusion{
@@ -543,6 +566,11 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 			time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 		}
 	}
+	r.observe(context.Background(), Observation{
+		Kind: ObservationAttempt, Operation: "settle", Outcome: "error",
+		ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+		Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
+	})
 }
 
 func claimedEventInputSnapshots(inputs []store.ClaimedEventInput) (map[string]eventInputSnapshot, bool) {
@@ -679,6 +707,11 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 			time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 		}
 	}
+	r.observe(context.Background(), Observation{
+		Kind: ObservationAttempt, Operation: "conclude", Outcome: "error",
+		ExecutionID: ExecutionID(claim.ExecutionID.String()), CommandID: CommandID(claim.CommandID.String()),
+		CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
+	})
 }
 
 func commandAttemptRemaining(claim store.ClaimedCommand) (time.Duration, bool) {

@@ -234,7 +234,7 @@ func executeStart(ctx context.Context, client resolvedClient, request store.Star
 			return err
 		}
 		var err error
-		result, err = client.runtime.store.StartInTx(ctx, tx, request)
+		result, err = client.runtime.store.StartInTx(ctx, tx, request, client.order)
 		return err
 	})
 	if err != nil {

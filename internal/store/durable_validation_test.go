@@ -66,7 +66,7 @@ func TestStartInTxRejectsDurableBoundsBeforeSQL(t *testing.T) {
 			root := *base.Root
 			request.Root = &root
 			mutate(&request)
-			if _, err := repository.StartInTx(context.Background(), noSQLTx{}, request); !errors.Is(err, flowerr.ErrInvalid) {
+			if _, err := repository.StartInTx(context.Background(), noSQLTx{}, request, nil); !errors.Is(err, flowerr.ErrInvalid) {
 				t.Fatalf("StartInTx() error = %v, want ErrInvalid", err)
 			}
 		})

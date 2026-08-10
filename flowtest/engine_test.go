@@ -215,6 +215,28 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	}
 }
 
+func TestRunDirectRejectsNegativeCommandCeilingBeforeApplicationCode(t *testing.T) {
+	root := flow.DefineCommand[testArgs, testResult]("flowtest.negative_ceiling_root", 1)
+	child := flow.DefineCommand[testArgs, testResult]("flowtest.negative_ceiling_child", 1)
+	for _, withChild := range []bool{false, true} {
+		calls := 0
+		registration := flow.Handle(root, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+			calls++
+			if withChild {
+				flow.Execute(work, "child", child, testArgs{})
+			}
+			return testResult{}, nil
+		})
+		if _, err := flowtest.RunDirect[testArgs, testResult](context.Background(), registration, testArgs{}, -1,
+			func(string, int) (flow.Registration, bool) { return registration, true }); err == nil {
+			t.Fatalf("RunDirect(withChild=%v) accepted a negative ceiling", withChild)
+		}
+		if calls != 0 {
+			t.Fatalf("RunDirect(withChild=%v) invoked application code %d times", withChild, calls)
+		}
+	}
+}
+
 type recordingTx struct{ args []any }
 
 func (tx *recordingTx) Exec(_ context.Context, _ string, args ...any) (pgconn.CommandTag, error) {
