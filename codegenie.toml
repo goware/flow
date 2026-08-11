@@ -1,0 +1,18 @@
+# codegenie AI code review config. See https://github.com/0xPolygon/codegenie
+#
+# Only repo-safe keys take effect here; provider credentials and model
+# selection live in ~/.codegenie/ locally and in the workflow in CI.
+
+[git]
+baseBranch = "master"
+
+[review]
+depth = "normal"
+
+# Published migrations are immutable once released (see README); sequential
+# numbering collides across PRs and these run once against durable data.
+[[classification.pathRules]]
+pattern = "migrations/**"
+reviewPriority = "critical"
+labels = ["migrations"]
+reason = "immutable once published; applied once against durable data at deploy"
