@@ -1,6 +1,6 @@
 # Plan 10: Make run ownership and transactional use explicit
 
-Status: Implemented (combined v0.3 candidate; final review pending)
+Status: Implemented (combined v0.3 candidate; awaiting human approval)
 
 Planned at: `788c9b5` on 2026-08-11
 
@@ -748,8 +748,9 @@ Stop and report evidence rather than improvising if:
 
 - [x] Run formatting, diff, build, vet, module, vulnerability, ordinary, race,
   and supported-PostgreSQL gates with no unintended skips.
-- [ ] Review every changed hunk against all acceptance criteria and STOP
+- [x] Review every changed hunk against all acceptance criteria and STOP
   conditions.
-- [ ] Repeat the Trails proof against the exact candidate commit.
+- [x] Repeat the Trails proof against the exact candidate implementation
+  commit.
 - [ ] Obtain human approval and tag the combined Plans 9–10 v0.3.0 candidate;
   do not combine Plan 11.

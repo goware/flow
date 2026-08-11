@@ -1,6 +1,6 @@
 # Plan 9: Simplify Flow's developer experience without weakening its model
 
-Status: Implemented (combined v0.3 candidate; final review pending)
+Status: Implemented (combined v0.3 candidate; awaiting human approval)
 
 Planned at: `788c9b5` on 2026-08-11; implementation baseline remains the
 tagged `v0.2.0` source at `3d2b29b`
@@ -1170,7 +1170,7 @@ discovered constraint.
 ### Baseline and decisions
 
 - [x] Reconcile any accepted change-set rename and start from a clean reviewed base.
-- [ ] Record the final implementation commit; Go/PostgreSQL versions, schema
+- [x] Record the final implementation commit; Go/PostgreSQL versions, schema
   version, and the exported API inventory are recorded in candidate evidence.
 - [x] Inventory all exported/internal `Execution*`/`Lookup*` names and fields, every execution-named live catalog/SQL identifier, plus all Flow and Trails uses of bound/direct command starts, `Event.Deliver`, method `Event.Emit`, duration normalization, and command-key suffix input detection; identify the enduring independent-monitor paths retained after Trails Plan 004.
 - [x] Confirm the Plan 9 v0.3 signatures with compile-only examples before
@@ -1246,6 +1246,7 @@ discovered constraint.
 - [x] Run every named ordinary and race test with zero unintended PostgreSQL skips.
 - [x] Run the supported PostgreSQL-major matrix with durability settings enabled.
 - [x] Run retained performance shapes and record a non-regression conclusion.
-- [ ] Review every changed hunk against this plan and all 23 acceptance criteria.
-- [ ] Obtain review of the exact Plan 9 completion SHA and record it for Plan
-  10's drift check without creating an intermediate release tag.
+- [x] Review every changed hunk against this plan and all 23 acceptance criteria.
+- [x] Review the exact combined implementation SHA as Plan 9's logical
+  checkpoint and record it for Plan 10 without creating an intermediate
+  release tag.
