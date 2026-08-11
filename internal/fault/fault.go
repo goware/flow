@@ -12,7 +12,7 @@ type Point string
 
 const (
 	ProbeReturn                Point = "probe_return"
-	ClaimExecutionLock         Point = "claim_execution_lock"
+	ClaimRunLock               Point = "claim_run_lock"
 	ClaimBeforeJournal         Point = "claim_before_journal"
 	ClaimBeforeCommit          Point = "claim_before_commit"
 	HandlerStart               Point = "handler_start"

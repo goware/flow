@@ -38,8 +38,8 @@ func TestPolicyValidation(t *testing.T) {
 		NewPublicAttempts(0),
 		NewPublicFor(time.Minute).Backoff(),
 		NewPublicFor(time.Minute).Backoff(-time.Second),
-		NewPublicFor(time.Minute + time.Nanosecond),
-		NewPublicFor(time.Minute).Backoff(time.Second + time.Nanosecond),
+		NewPublicFor(time.Duration(1<<63 - 1)),
+		NewPublicFor(time.Minute).Backoff(time.Duration(1<<63 - 1)),
 	}
 	for i, policy := range tests {
 		if err := ValidatePublic(policy); err == nil {
@@ -48,6 +48,12 @@ func TestPolicyValidation(t *testing.T) {
 	}
 	if err := ValidatePublic(DefaultPublic()); err != nil {
 		t.Fatalf("default policy invalid: %v", err)
+	}
+	normalized := NewPublicFor(time.Nanosecond).Backoff(time.Nanosecond, time.Millisecond+time.Nanosecond)
+	value := ValueOf(normalized)
+	if err := ValidatePublic(normalized); err != nil || value.MaxElapsed == nil || *value.MaxElapsed != time.Millisecond ||
+		len(value.Backoff) != 2 || value.Backoff[0] != time.Millisecond || value.Backoff[1] != 2*time.Millisecond {
+		t.Fatalf("normalized policy = %#v, %v", value, err)
 	}
 }
 
@@ -143,7 +149,7 @@ func TestDecideElapsedDeadlineAndJitter(t *testing.T) {
 	}
 
 	deadline := now.Add(5 * time.Second)
-	input.ExecutionDeadline = &deadline
+	input.RunDeadline = &deadline
 	stopped, err := DecidePublic(public, input)
 	if err != nil {
 		t.Fatalf("DecidePublic(deadline) error = %v", err)
@@ -152,7 +158,7 @@ func TestDecideElapsedDeadlineAndJitter(t *testing.T) {
 		t.Fatalf("deadline decision = %#v", stopped)
 	}
 
-	input.ExecutionDeadline = nil
+	input.RunDeadline = nil
 	input.DBNow = input.BudgetStartedAt.Add(time.Minute)
 	stopped, err = DecidePublic(public, input)
 	if err != nil {

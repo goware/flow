@@ -35,7 +35,7 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 		!strings.Contains(output.String(), "running tool archive") {
 		t.Fatalf("output=%q", output.String())
 	}
-	if trace.Execution.Status != "succeeded" || len(trace.Commands) != 4 {
+	if trace.Run.Status != "succeeded" || len(trace.Commands) != 4 {
 		t.Fatalf("trace=%+v", trace)
 	}
 	statuses := map[string]flow.CommandStatus{}
@@ -56,10 +56,10 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 	}
 	var outcomes, applicationEvents, queueRows int
 	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FILTER (WHERE event_class='command_terminal'),
-		count(*) FILTER (WHERE event_class='application') FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, exec.ID).Scan(&outcomes, &applicationEvents); err != nil {
+		count(*) FILTER (WHERE event_class='application') FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1`, exec.ID).Scan(&outcomes, &applicationEvents); err != nil {
 		t.Fatal(err)
 	}
-	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` WHERE execution_id=$1`, exec.ID).Scan(&queueRows); err != nil {
+	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` WHERE run_id=$1`, exec.ID).Scan(&queueRows); err != nil {
 		t.Fatal(err)
 	}
 	if outcomes != 4 || applicationEvents != 4 || queueRows != 0 {

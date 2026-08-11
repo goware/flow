@@ -246,7 +246,7 @@ func RunDirect[A, R any](ctx context.Context, root flow.Registration, args A, ma
 }
 
 func bridgeInfo(info flow.CommandInfo) testengine.Info {
-	return testengine.Info{ExecutionID: string(info.ExecutionID), CommandID: string(info.CommandID), CommandKey: info.CommandKey,
+	return testengine.Info{RunID: string(info.RunID), RunKey: info.RunKey, CommandID: string(info.CommandID), CommandKey: info.CommandKey,
 		Name: info.Name, Version: info.Version, CreatedAt: info.CreatedAt, BudgetStartedAt: info.BudgetStartedAt,
 		Attempt: info.Attempt, AttemptStartedAt: info.AttemptStartedAt}
 }

@@ -44,10 +44,10 @@ func TestNotificationHintsCommitButDoNotRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin(commit) error = %v", err)
 	}
-	exec, err := command.With(runtime.InTx(tx)).Execute(ctx, "notify/commit", runtimeArgs{})
+	exec, err := command.Enqueue(ctx, runtime.InTx(tx), "notify/commit", runtimeArgs{})
 	if err != nil {
 		_ = tx.Rollback(ctx)
-		t.Fatalf("Execute(commit) error = %v", err)
+		t.Fatalf("Enqueue(commit) error = %v", err)
 	}
 	assertNoNotification(t, listener, 150*time.Millisecond)
 	if err := tx.Commit(ctx); err != nil {
@@ -71,12 +71,57 @@ func TestNotificationHintsCommitButDoNotRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin() error = %v", err)
 	}
-	if _, err := command.With(runtime.InTx(tx)).Execute(ctx, "notify/rollback", runtimeArgs{}); err != nil {
+	if _, err := command.Enqueue(ctx, runtime.InTx(tx), "notify/rollback", runtimeArgs{}); err != nil {
 		_ = tx.Rollback(ctx)
-		t.Fatalf("Execute(rollback) error = %v", err)
+		t.Fatalf("Enqueue(rollback) error = %v", err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatalf("Rollback() error = %v", err)
+	}
+	assertNoNotification(t, listener, 150*time.Millisecond)
+}
+
+func TestReplaceCurrentRunNotifiesOnlyForCommittedRunnableSuccessor(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("notify.replace", 1)
+	listener := openNotificationListener(t, database, runtime)
+	original, err := command.Enqueue(ctx, runtime, "notify/replace", None{}, WithLiveKey(), WithStartDelay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoNotification(t, listener, 150*time.Millisecond)
+	replaced, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "notify/replace", None{}, "runnable replacement", WithLiveKey())
+	if err != nil || !replaced.Replaced {
+		t.Fatalf("replacement = %#v, %v", replaced, err)
+	}
+	waitForNotificationHint(t, listener, replaced.Run.ID, 2*time.Second)
+
+	rolledBackOriginal, err := command.Enqueue(ctx, runtime, "notify/replace-rollback", None{}, WithLiveKey(), WithStartDelay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoNotification(t, listener, 150*time.Millisecond)
+	tx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := command.ReplaceCurrentRun(ctx, runtime.InTx(tx), rolledBackOriginal.ID,
+		"notify/replace-rollback", None{}, "rolled back replacement", WithLiveKey()); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	assertNoNotification(t, listener, 150*time.Millisecond)
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
 	}
 	assertNoNotification(t, listener, 150*time.Millisecond)
 }
@@ -109,22 +154,22 @@ func TestNotificationHintsOnlyForRunnableTransitions(t *testing.T) {
 	cancelRun, runResult := startRuntime(t, worker)
 	defer stopRuntime(t, cancelRun, runResult)
 
-	exec, err := command.With(api).Execute(ctx, "notify/gated", None{}, WaitFor(event, "ready"), Within(time.Second))
+	exec, err := command.Enqueue(ctx, api, "notify/gated", None{}, WaitFor(event, "ready"), Within(time.Second))
 	if err != nil {
-		t.Fatalf("Execute(gated) error = %v", err)
+		t.Fatalf("Enqueue(gated) error = %v", err)
 	}
 	assertNoNotification(t, listener, 150*time.Millisecond)
-	if err := event.Emit(ctx, api, exec.ID, "unrelated", None{}); err != nil {
+	if err := event.Deliver(ctx, api, exec.ID, "unrelated", None{}); err != nil {
 		t.Fatalf("Emit(unrelated) error = %v", err)
 	}
 	assertNoNotification(t, listener, 150*time.Millisecond)
 
 	started := time.Now()
-	if err := event.Emit(ctx, api, exec.ID, "ready", None{}); err != nil {
+	if err := event.Deliver(ctx, api, exec.ID, "ready", None{}); err != nil {
 		t.Fatalf("Emit(ready) error = %v", err)
 	}
 	waitForNotificationHint(t, listener, exec.ID, 2*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 2*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 2*time.Second)
 	if elapsed := time.Since(started); elapsed >= 2*time.Second {
 		t.Fatalf("event-release notification wake took %s with five-second polling", elapsed)
 	}
@@ -144,9 +189,9 @@ func TestClaimAndTerminalSettlementDoNotNotify(t *testing.T) {
 	}
 	command := DefineCommand[None, None]("notify.journal_only", 1)
 	listener := openNotificationListener(t, database, runtime)
-	exec, err := command.With(runtime).Execute(ctx, "notify/journal-only", None{})
+	exec, err := command.Enqueue(ctx, runtime, "notify/journal-only", None{})
 	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatalf("Enqueue() error = %v", err)
 	}
 	waitForNotificationHint(t, listener, exec.ID, 2*time.Second)
 
@@ -190,7 +235,7 @@ func TestImmediateRetryAndLeaseRecoveryNotify(t *testing.T) {
 	}, fault.None{}); err != nil {
 		t.Fatalf("SettleCommandConclusion(interrupted) error = %v", err)
 	}
-	waitForNotificationHint(t, listener, ExecutionID(claim.ExecutionID.String()), 2*time.Second)
+	waitForNotificationHint(t, listener, RunID(claim.RunID.String()), 2*time.Second)
 	candidates, err := runtime.store.ProbeCommands(ctx,
 		[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 10)
 	if err != nil {
@@ -198,7 +243,7 @@ func TestImmediateRetryAndLeaseRecoveryNotify(t *testing.T) {
 	}
 	var retryCandidate *store.CommandCandidate
 	for index := range candidates {
-		if candidates[index].ExecutionID == claim.ExecutionID {
+		if candidates[index].RunID == claim.RunID {
 			retryCandidate = &candidates[index]
 			break
 		}
@@ -225,12 +270,12 @@ func TestImmediateRetryAndLeaseRecoveryNotify(t *testing.T) {
 		t.Fatalf("expire lease: %v", err)
 	}
 	changed, err := runtime.store.RecoverExpiredCommandLease(ctx, store.ExpiredLeaseCandidate{
-		CommandID: recoveryClaim.CommandID, ExecutionID: recoveryClaim.ExecutionID,
+		CommandID: recoveryClaim.CommandID, RunID: recoveryClaim.RunID,
 	})
 	if err != nil || !changed {
 		t.Fatalf("RecoverExpiredCommandLease() = %t, %v", changed, err)
 	}
-	waitForNotificationHint(t, listener, ExecutionID(recoveryClaim.ExecutionID.String()), 2*time.Second)
+	waitForNotificationHint(t, listener, RunID(recoveryClaim.RunID.String()), 2*time.Second)
 }
 
 func openNotificationListener(t *testing.T, database testpg.Database, runtime *Runtime) *pgx.Conn {
@@ -248,7 +293,7 @@ func openNotificationListener(t *testing.T, database testpg.Database, runtime *R
 	return listener
 }
 
-func waitForNotificationHint(t *testing.T, listener *pgx.Conn, executionID ExecutionID, timeout time.Duration) {
+func waitForNotificationHint(t *testing.T, listener *pgx.Conn, runID RunID, timeout time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -257,8 +302,8 @@ func waitForNotificationHint(t *testing.T, listener *pgx.Conn, executionID Execu
 		t.Fatalf("WaitForNotification() error = %v", err)
 	}
 	id, valid := store.ParseNotificationHint(notification.Payload)
-	if !valid || id.String() != string(executionID) {
-		t.Fatalf("notification = %#v, parsed=%s/%t, want execution %s", notification, id, valid, executionID)
+	if !valid || id.String() != string(runID) {
+		t.Fatalf("notification = %#v, parsed=%s/%t, want run %s", notification, id, valid, runID)
 	}
 }
 
@@ -281,9 +326,9 @@ func startAndClaimForNotification(
 	key string,
 ) store.ClaimedCommand {
 	t.Helper()
-	exec, err := command.With(runtime).Execute(ctx, key, None{})
+	exec, err := command.Enqueue(ctx, runtime, key, None{})
 	if err != nil {
-		t.Fatalf("Execute(%s) error = %v", key, err)
+		t.Fatalf("Enqueue(%s) error = %v", key, err)
 	}
 	waitForNotificationHint(t, listener, exec.ID, 2*time.Second)
 	candidates, err := runtime.store.ProbeCommands(ctx,
@@ -292,7 +337,7 @@ func startAndClaimForNotification(
 		t.Fatalf("ProbeCommands(%s) error = %v", key, err)
 	}
 	for _, candidate := range candidates {
-		if candidate.ExecutionID.String() != string(exec.ID) {
+		if candidate.RunID.String() != string(exec.ID) {
 			continue
 		}
 		claimed, err := runtime.store.ClaimCommand(ctx, candidate, time.Minute, "notification-test", fault.None{})
@@ -334,11 +379,11 @@ func TestDistributedNotificationAndReconnectCatchUp(t *testing.T) {
 	waitForObservation(t, observer, "notify_listener", "listening", 1, 2*time.Second)
 
 	started := time.Now()
-	first, err := command.With(api).Execute(ctx, "notify/remote", runtimeArgs{})
+	first, err := command.Enqueue(ctx, api, "notify/remote", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("Execute(remote) error = %v", err)
+		t.Fatalf("Enqueue(remote) error = %v", err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, first.ID, "succeeded", 2*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, first.ID, "succeeded", 2*time.Second)
 	if elapsed := time.Since(started); elapsed >= 2*time.Second {
 		t.Fatalf("notification wake took %s with five-second polling", elapsed)
 	}
@@ -361,11 +406,11 @@ func TestDistributedNotificationAndReconnectCatchUp(t *testing.T) {
 	// This commit races the disconnected window. Either a reconnected listener
 	// receives its hint or the mandatory post-LISTEN catch-up generation finds
 	// it; the five-second correctness poll is intentionally too slow to help.
-	second, err := command.With(api).Execute(ctx, "notify/reconnect", runtimeArgs{})
+	second, err := command.Enqueue(ctx, api, "notify/reconnect", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("Execute(reconnect) error = %v", err)
+		t.Fatalf("Enqueue(reconnect) error = %v", err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, second.ID, "succeeded", 2*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, second.ID, "succeeded", 2*time.Second)
 	waitForObservation(t, observer, "notify_listener", "listening", 2, 2*time.Second)
 	stopRuntime(t, cancelRun, runResult)
 }

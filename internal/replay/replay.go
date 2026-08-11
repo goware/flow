@@ -18,12 +18,12 @@ import (
 	"github.com/goware/flow/internal/store/journalcodec"
 )
 
-type Execution struct {
+type Run struct {
 	Initialized       bool
 	ID                uuid.UUID
 	DefinitionName    string
 	DefinitionVersion int
-	ExecutionKey      string
+	RunKey            string
 	Status            string
 	FailFast          bool
 	MaxCommands       int
@@ -93,19 +93,19 @@ type Event struct {
 	Body           []byte
 }
 
-func New() Execution { return Execution{Commands: make(map[uuid.UUID]Command)} }
+func New() Run { return Run{Commands: make(map[uuid.UUID]Command)} }
 
-func Fold(rows []store.JournalRow) (Execution, error) {
+func Fold(rows []store.JournalRow) (Run, error) {
 	state := New()
 	for _, row := range rows {
 		if err := state.Apply(row); err != nil {
-			return Execution{}, err
+			return Run{}, err
 		}
 	}
 	return state, nil
 }
 
-func (state *Execution) Apply(row store.JournalRow) error {
+func (state *Run) Apply(row store.JournalRow) error {
 	if state == nil {
 		return errors.New("replay state is nil")
 	}
@@ -120,31 +120,31 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		return fmt.Errorf("journal body is noncanonical at position %d", row.Position)
 	}
 	if state.LastPosition == 0 {
-		if row.Position != 1 || row.Kind != store.ExecutionStarted {
-			return fmt.Errorf("history does not begin with ExecutionStarted")
+		if row.Position != 1 || row.Kind != store.RunStarted {
+			return fmt.Errorf("history does not begin with RunStarted")
 		}
-	} else if row.Position != state.LastPosition+1 || row.ExecutionID != state.ID {
-		return fmt.Errorf("journal position or execution changed at %d", row.Position)
+	} else if row.Position != state.LastPosition+1 || row.RunID != state.ID {
+		return fmt.Errorf("journal position or run changed at %d", row.Position)
 	}
 
 	switch row.Kind {
-	case store.ExecutionStarted:
+	case store.RunStarted:
 		if state.Initialized {
-			return errors.New("execution started more than once")
+			return errors.New("run started more than once")
 		}
-		body, err := journalcodec.Decode[journalcodec.ExecutionStartedBody](row.Body)
+		body, err := journalcodec.Decode[journalcodec.RunStartedBody](row.Body)
 		if err != nil {
 			return err
 		}
-		id, err := uuid.Parse(body.ExecutionID)
-		if err != nil || id != row.ExecutionID {
-			return errors.New("ExecutionStarted identity differs")
+		id, err := uuid.Parse(body.RunID)
+		if err != nil || id != row.RunID {
+			return errors.New("RunStarted identity differs")
 		}
 		state.Initialized = true
 		state.ID = id
 		state.DefinitionName = body.DefinitionName
 		state.DefinitionVersion = body.DefinitionVersion
-		state.ExecutionKey = body.ExecutionKey
+		state.RunKey = body.RunKey
 		state.Status = "running"
 		state.CreatedAt = row.RecordedAt
 		state.StatusAt = row.RecordedAt
@@ -156,7 +156,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 
 	case store.CommandCreated:
 		if !state.Initialized || row.CommandID == nil {
-			return errors.New("CommandCreated has no initialized execution or command")
+			return errors.New("CommandCreated has no initialized run or command")
 		}
 		if _, exists := state.Commands[*row.CommandID]; exists {
 			return errors.New("command created more than once")
@@ -194,7 +194,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			state.Commands[bodyID] = command
 		} else {
 			if state.RootCommandID != nil {
-				return errors.New("execution has more than one root command")
+				return errors.New("run has more than one root command")
 			}
 			state.RootCommandID = pointer(bodyID)
 		}
@@ -271,7 +271,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 		}
 		state.Commands[*row.CommandID] = command
 
-	case store.ExecutionFailing:
+	case store.RunFailing:
 		state.Status = "failing"
 		state.StatusAt = row.RecordedAt
 
@@ -331,7 +331,7 @@ func (state *Execution) Apply(row store.JournalRow) error {
 			state.OpenCommands--
 		case "execution_terminal":
 			if row.TerminalStatus == nil {
-				return errors.New("execution terminal event has no status")
+				return errors.New("run terminal event has no status")
 			}
 			state.Status = *row.TerminalStatus
 			state.StatusAt = row.RecordedAt

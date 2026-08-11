@@ -69,7 +69,7 @@ func MapError(operation string, err error) error {
 
 func categoryForPostgres(pgError *pgconn.PgError) error {
 	switch pgError.ConstraintName {
-	case "flow_executions_idempotency_uq", "flow_commands_execution_key_uq",
+	case "flow_runs_idempotency_uq", "flow_commands_run_key_uq",
 		"flow_journal_application_event_key_uq":
 		return flowerr.ErrConflict
 	}

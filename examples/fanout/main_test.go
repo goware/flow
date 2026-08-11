@@ -38,17 +38,17 @@ func TestFanOutExampleEndToEnd(t *testing.T) {
 	if err != nil || final.Total != 6 {
 		t.Fatalf("final report = %#v, %v", final, err)
 	}
-	if trace.Execution.Status != "succeeded" || len(trace.Commands) != 10 {
+	if trace.Run.Status != "succeeded" || len(trace.Commands) != 10 {
 		t.Fatalf("example trace = %#v", trace)
 	}
 	var queueRows, createdRows, terminalRows int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE execution_id=$1`, exec.ID).Scan(&queueRows); err != nil {
+		WHERE run_id=$1`, exec.ID).Scan(&queueRows); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FILTER (WHERE entry_kind='command_created'),
 		count(*) FILTER (WHERE entry_kind='event_recorded' AND event_class='command_terminal')
-		FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, exec.ID).
+		FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1`, exec.ID).
 		Scan(&createdRows, &terminalRows); err != nil {
 		t.Fatal(err)
 	}

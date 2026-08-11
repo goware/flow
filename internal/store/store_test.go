@@ -21,19 +21,19 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func TestBeginSemanticExecutionFirst(t *testing.T) {
+func TestBeginSemanticRunFirst(t *testing.T) {
 	t.Parallel()
 
 	db, schema, repository := setupStore(t)
-	id := seedExecution(t, db, schema, "lock")
+	id := seedRun(t, db, schema, "lock")
 	ctx := context.Background()
 	first, err := repository.BeginSemantic(ctx, id, store.LockBlocking)
 	if err != nil {
 		t.Fatalf("BeginSemantic(first) error = %v", err)
 	}
 	defer first.Rollback(ctx)
-	if first.DBNow().IsZero() || first.ExecutionID() != id {
-		t.Fatalf("first semantic metadata = %s/%s", first.ExecutionID(), first.DBNow())
+	if first.DBNow().IsZero() || first.RunID() != id {
+		t.Fatalf("first semantic metadata = %s/%s", first.RunID(), first.DBNow())
 	}
 
 	started := time.Now()
@@ -41,7 +41,7 @@ func TestBeginSemanticExecutionFirst(t *testing.T) {
 		t.Fatalf("BeginSemantic(skip locked) error = %v", err)
 	}
 	if time.Since(started) > time.Second {
-		t.Fatal("skip-locked execution acquisition waited")
+		t.Fatal("skip-locked run acquisition waited")
 	}
 
 	type response struct {
@@ -84,13 +84,13 @@ func TestJournalAllocationGapFreeAndHistory(t *testing.T) {
 	t.Parallel()
 
 	db, schema, repository := setupStore(t)
-	id := seedExecution(t, db, schema, "journal")
+	id := seedRun(t, db, schema, "journal")
 	ctx := context.Background()
-	firstEntry, err := store.NewJournalEntry(store.ExecutionStarted, map[string]any{"v": 1, "kind": "first"})
+	firstEntry, err := store.NewJournalEntry(store.RunStarted, map[string]any{"v": 1, "kind": "first"})
 	if err != nil {
 		t.Fatalf("NewJournalEntry(first) error = %v", err)
 	}
-	secondEntry, err := store.NewJournalEntry(store.ExecutionFailing, map[string]any{"v": 1, "kind": "second"})
+	secondEntry, err := store.NewJournalEntry(store.RunFailing, map[string]any{"v": 1, "kind": "second"})
 	if err != nil {
 		t.Fatalf("NewJournalEntry(second) error = %v", err)
 	}
@@ -154,7 +154,7 @@ func TestJournalAllocationGapFreeAndHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("History(first page) error = %v", err)
 	}
-	if len(history) != 1 || history[0].Position != 1 || history[0].Kind != store.ExecutionStarted {
+	if len(history) != 1 || history[0].Position != 1 || history[0].Kind != store.RunStarted {
 		t.Fatalf("History(first page) = %#v", history)
 	}
 	history[0].Body[0] = '['
@@ -175,7 +175,7 @@ func TestJournalAllocationGapFreeAndHistory(t *testing.T) {
 		t.Fatalf("History immutability/hash = %#v", again)
 	}
 	var nextPosition int64
-	if err := db.Conn.QueryRow(ctx, `SELECT next_journal_position FROM `+pgschema.Table(schema, "flow_executions")+` WHERE execution_id=$1`, id).Scan(&nextPosition); err != nil {
+	if err := db.Conn.QueryRow(ctx, `SELECT next_journal_position FROM `+pgschema.Table(schema, "flow_runs")+` WHERE run_id=$1`, id).Scan(&nextPosition); err != nil {
 		t.Fatalf("read allocator: %v", err)
 	}
 	if nextPosition != 4 {
@@ -187,7 +187,7 @@ func TestStoreValidation(t *testing.T) {
 	t.Parallel()
 
 	db, schema, repository := setupStore(t)
-	id := seedExecution(t, db, schema, "validation")
+	id := seedRun(t, db, schema, "validation")
 	ctx := context.Background()
 	if _, err := store.New(nil, schema, false); !errors.Is(err, flow.ErrInvalid) {
 		t.Fatalf("New(nil) error = %v", err)
@@ -223,12 +223,12 @@ func TestStoreValidation(t *testing.T) {
 	if _, err := tx.Apply(ctx, store.PersistedChangeSet{}); !errors.Is(err, flow.ErrInvalid) {
 		t.Fatalf("Apply(empty) error = %v", err)
 	}
-	entry, _ := store.NewJournalEntry(store.ExecutionStarted, map[string]int{"v": 1})
+	entry, _ := store.NewJournalEntry(store.RunStarted, map[string]int{"v": 1})
 	entry.EntryID = uuid.Nil
 	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{entry}}); !errors.Is(err, flow.ErrInvalid) {
 		t.Fatalf("Apply(nil entry ID) error = %v", err)
 	}
-	validEntry, _ := store.NewJournalEntry(store.ExecutionStarted, map[string]int{"v": 1})
+	validEntry, _ := store.NewJournalEntry(store.RunStarted, map[string]int{"v": 1})
 	duplicate := validEntry
 	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{validEntry, duplicate}}); !errors.Is(err, flow.ErrConflict) {
 		t.Fatalf("Apply(duplicate entry) error = %v", err)
@@ -261,7 +261,7 @@ func TestStoreValidation(t *testing.T) {
 	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{badCausation}}); !errors.Is(err, flow.ErrInvalid) {
 		t.Fatalf("Apply(two causation forms) error = %v", err)
 	}
-	if _, err := store.NewJournalEntry(store.ExecutionStarted, map[string]string{"missing": "version"}); err == nil {
+	if _, err := store.NewJournalEntry(store.RunStarted, map[string]string{"missing": "version"}); err == nil {
 		t.Fatal("NewJournalEntry() accepted an unversioned body")
 	}
 	if err := tx.Rollback(ctx); err != nil {
@@ -273,7 +273,7 @@ func TestStoreValidation(t *testing.T) {
 		t.Fatalf("BeginSemantic(causation validation) error = %v", err)
 	}
 	futureCausation := int64(100)
-	futureEntry, _ := store.NewJournalEntry(store.ExecutionStarted, map[string]int{"v": 1})
+	futureEntry, _ := store.NewJournalEntry(store.RunStarted, map[string]int{"v": 1})
 	futureEntry.CausationPosition = &futureCausation
 	if _, err := tx.Apply(ctx, store.PersistedChangeSet{Journal: []store.JournalEntry{futureEntry}}); !errors.Is(err, flow.ErrInvalidState) {
 		t.Fatalf("Apply(future causation) error = %v, want invalid state", err)
@@ -283,7 +283,7 @@ func TestStoreValidation(t *testing.T) {
 	}
 	var allocatorAfterCausation int64
 	if err := db.Conn.QueryRow(ctx, `SELECT next_journal_position FROM `+
-		pgschema.Table(schema, "flow_executions")+` WHERE execution_id=$1`, id).Scan(&allocatorAfterCausation); err != nil {
+		pgschema.Table(schema, "flow_runs")+` WHERE run_id=$1`, id).Scan(&allocatorAfterCausation); err != nil {
 		t.Fatalf("read allocator after causation rejection: %v", err)
 	}
 	if allocatorAfterCausation != 1 {
@@ -305,7 +305,7 @@ func TestStoreValidation(t *testing.T) {
 		t.Fatalf("Commit(poisoned transaction) error = %v", err)
 	}
 	var position int64
-	if err := db.Conn.QueryRow(ctx, `SELECT next_journal_position FROM `+pgschema.Table(schema, "flow_executions")+` WHERE execution_id=$1`, id).Scan(&position); err != nil {
+	if err := db.Conn.QueryRow(ctx, `SELECT next_journal_position FROM `+pgschema.Table(schema, "flow_runs")+` WHERE run_id=$1`, id).Scan(&position); err != nil {
 		t.Fatalf("read allocator after failed apply: %v", err)
 	}
 	if position != 1 {
@@ -321,11 +321,11 @@ func TestNotificationChannelAndPayload(t *testing.T) {
 		t.Fatalf("notification channels lower=%q upper=%q", lower, upper)
 	}
 	id := uuid.New()
-	parsed, ok := store.ParseNotificationHint(`{"v":1,"kind":"execution","key":"` + id.String() + `"}`)
+	parsed, ok := store.ParseNotificationHint(`{"v":1,"kind":"run","key":"` + id.String() + `"}`)
 	if !ok || parsed != id {
 		t.Fatalf("parsed notification=%s/%t want %s", parsed, ok, id)
 	}
-	for _, invalid := range []string{"", `{}`, `{"v":2,"kind":"execution","key":"` + id.String() + `"}`,
+	for _, invalid := range []string{"", `{}`, `{"v":2,"kind":"run","key":"` + id.String() + `"}`,
 		`{"v":1,"kind":"work","key":"` + id.String() + `"}`} {
 		if _, ok := store.ParseNotificationHint(invalid); ok {
 			t.Fatalf("accepted invalid notification %q", invalid)
@@ -338,13 +338,13 @@ func TestSchemaConstraints(t *testing.T) {
 
 	db, schema, _ := setupStore(t)
 	ctx := context.Background()
-	validID := seedExecution(t, db, schema, "duplicate")
-	_, err := db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "test", 1, "duplicate", "running", nil, uuid.New())
-	assertConstraint(t, err, "flow_executions_idempotency_uq")
-	_, err = db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "test", 1, "invalid-status", "unknown", nil, uuid.New())
-	assertConstraint(t, err, "flow_executions_status_ck")
-	_, err = db.Conn.Exec(ctx, executionInsertSQL(schema), uuid.New(), "test", 1, "bad-terminal", "succeeded", nil, uuid.New())
-	assertConstraint(t, err, "flow_executions_terminal_shape_ck")
+	validID := seedRun(t, db, schema, "duplicate")
+	_, err := db.Conn.Exec(ctx, runInsertSQL(schema), uuid.New(), "test", 1, "duplicate", "running", nil, uuid.New())
+	assertConstraint(t, err, "flow_runs_idempotency_uq")
+	_, err = db.Conn.Exec(ctx, runInsertSQL(schema), uuid.New(), "test", 1, "invalid-status", "unknown", nil, uuid.New())
+	assertConstraint(t, err, "flow_runs_status_ck")
+	_, err = db.Conn.Exec(ctx, runInsertSQL(schema), uuid.New(), "test", 1, "bad-terminal", "succeeded", nil, uuid.New())
+	assertConstraint(t, err, "flow_runs_terminal_shape_ck")
 
 	commandID := seedCommand(t, db, schema, validID, "command")
 	_, err = db.Conn.Exec(ctx, `UPDATE `+pgschema.Table(schema, "flow_commands")+` SET consumed_attempts=2, attempt_ordinal=1 WHERE command_id=$1`, commandID)
@@ -354,30 +354,30 @@ func TestSchemaConstraints(t *testing.T) {
 	_, err = db.Conn.Exec(ctx, `UPDATE `+pgschema.Table(schema, "flow_commands")+` SET state='succeeded' WHERE command_id=$1`, commandID)
 	assertConstraint(t, err, "flow_commands_result_shape_ck")
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_command_queue")+`
-		(command_id,execution_id,queue,name,version,state,next_run_at,lease_token)
+		(command_id,run_id,queue,name,version,state,next_run_at,lease_token)
 		VALUES ($1,$2,'default','work',1,'ready',clock_timestamp(),$3)`, commandID, validID, uuid.New())
 	assertConstraint(t, err, "flow_command_queue_lease_shape_ck")
 
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_command_event_waits")+`
-		(command_id,execution_id,event_name,event_key,satisfied_position) VALUES ($1,$2,'event','key',0)`, commandID, validID)
+		(command_id,run_id,event_name,event_key,satisfied_position) VALUES ($1,$2,'event','key',0)`, commandID, validID)
 	assertConstraint(t, err, "flow_command_event_waits_position_ck")
 
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_journal")+`
-		(execution_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,event_key,event_class,body,body_hash)
+		(run_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,event_key,event_class,body,body_hash)
 		VALUES ($1,1,$2,'execution_started',clock_timestamp(),$3,'application','event','key','application','{}'::text::bytea,decode(repeat('00',32),'hex'))`,
 		validID, uuid.New(), uuid.New())
 	assertConstraint(t, err, "flow_journal_event_shape_ck")
 	if validID == uuid.Nil {
-		t.Fatal("seed execution returned nil")
+		t.Fatal("seed run returned nil")
 	}
 }
 
 func TestSparseEventWaitUpdateUsesProductionReverseIndexQuery(t *testing.T) {
 	db, schema, repository := setupStore(t)
-	executionID := seedExecution(t, db, schema, "sparse-waits")
+	runID := seedRun(t, db, schema, "sparse-waits")
 	ctx := context.Background()
 
-	semantic, err := repository.BeginSemantic(ctx, executionID, store.LockBlocking)
+	semantic, err := repository.BeginSemantic(ctx, runID, store.LockBlocking)
 	if err != nil {
 		t.Fatalf("BeginSemantic() error = %v", err)
 	}
@@ -405,26 +405,26 @@ func TestSparseEventWaitUpdateUsesProductionReverseIndexQuery(t *testing.T) {
 	commands := pgschema.Table(schema, "flow_commands")
 	waits := pgschema.Table(schema, "flow_command_event_waits")
 	var rootID uuid.UUID
-	if err := db.Conn.QueryRow(ctx, `SELECT root_command_id FROM `+pgschema.Table(schema, "flow_executions")+`
-		WHERE execution_id=$1`, executionID).Scan(&rootID); err != nil {
+	if err := db.Conn.QueryRow(ctx, `SELECT root_command_id FROM `+pgschema.Table(schema, "flow_runs")+`
+		WHERE run_id=$1`, runID).Scan(&rootID); err != nil {
 		t.Fatalf("load root command: %v", err)
 	}
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+commands+` (
-		command_id,execution_id,command_key,name,version,parent_command_id,required,args,declaration_fingerprint,
+		command_id,run_id,command_key,name,version,parent_command_id,required,args,declaration_fingerprint,
 		state,unsatisfied_waits,queue,retry_policy,wait_started_at,wait_timeout_ms,
 		created_position,created_at,updated_at,status_at)
 		SELECT md5($1::text||':'||g::text)::uuid,$1::uuid,'scale/'||g::text,'store.sparse.synthetic',1,$2::uuid,true,
 		       convert_to('{}','UTF8'),decode(repeat('00',32),'hex'),'pending',1,'default',convert_to('{}','UTF8'),
 		       clock_timestamp(),3600000,1,clock_timestamp(),clock_timestamp(),clock_timestamp()
-		FROM generate_series(0,10000) AS g`, executionID, rootID); err != nil {
+		FROM generate_series(0,10000) AS g`, runID, rootID); err != nil {
 		t.Fatalf("seed sparse commands: %v", err)
 	}
-	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+waits+` (command_id,execution_id,event_name,event_key)
-		SELECT command_id,execution_id,
+	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+waits+` (command_id,run_id,event_name,event_key)
+		SELECT command_id,run_id,
 		       CASE WHEN command_key='scale/0' THEN $2 ELSE 'store.sparse_unrelated' END,
 		       CASE WHEN command_key='scale/0' THEN $3 ELSE command_key END
-		FROM `+commands+` WHERE execution_id=$1 AND command_key LIKE 'scale/%'`,
-		executionID, eventName, eventKey); err != nil {
+		FROM `+commands+` WHERE run_id=$1 AND command_key LIKE 'scale/%'`,
+		runID, eventName, eventKey); err != nil {
 		t.Fatalf("seed sparse waits: %v", err)
 	}
 	if _, err := db.Conn.Exec(ctx, `ANALYZE `+waits); err != nil {
@@ -438,7 +438,7 @@ func TestSparseEventWaitUpdateUsesProductionReverseIndexQuery(t *testing.T) {
 	defer tx.Rollback(ctx)
 	rows, err := tx.Query(ctx, `EXPLAIN (ANALYZE,BUFFERS,FORMAT TEXT) `+
 		store.EventWaitUpdateQueryForTest(repository),
-		executionID, []string{eventName}, []string{eventKey}, []int64{position})
+		runID, []string{eventName}, []string{eventKey}, []int64{position})
 	if err != nil {
 		t.Fatalf("explain production event wait update: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestSparseEventWaitUpdateUsesProductionReverseIndexQuery(t *testing.T) {
 	}
 	var updated int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+waits+`
-		WHERE execution_id=$1 AND satisfied_position=$2`, executionID, position).Scan(&updated); err != nil {
+		WHERE run_id=$1 AND satisfied_position=$2`, runID, position).Scan(&updated); err != nil {
 		t.Fatalf("count sparse updated waits: %v", err)
 	}
 	if updated != 1 {
@@ -471,16 +471,16 @@ func TestSparseEventWaitUpdateUsesProductionReverseIndexQuery(t *testing.T) {
 	}
 }
 
-func seedCommand(t *testing.T, db *pgkit.DB, schema string, executionID uuid.UUID, key string) uuid.UUID {
+func seedCommand(t *testing.T, db *pgkit.DB, schema string, runID uuid.UUID, key string) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
 	_, err := db.Conn.Exec(context.Background(), `INSERT INTO `+pgschema.Table(schema, "flow_commands")+` (
-		command_id,execution_id,command_key,name,version,args,declaration_fingerprint,
+		command_id,run_id,command_key,name,version,args,declaration_fingerprint,
 		state,queue,retry_policy,budget_started_at,next_attempt_at,
 		created_position,created_at,updated_at,status_at
 	) VALUES ($1,$2,$3,'work',1,'{}'::text::bytea,decode(repeat('00',32),'hex'),
 		'ready','default','{}'::text::bytea,clock_timestamp(),clock_timestamp(),
-		1,clock_timestamp(),clock_timestamp(),clock_timestamp())`, id, executionID, key)
+		1,clock_timestamp(),clock_timestamp(),clock_timestamp())`, id, runID, key)
 	if err != nil {
 		t.Fatalf("seed command: %v", err)
 	}
@@ -500,20 +500,20 @@ func setupStore(t *testing.T) (*pgkit.DB, string, *store.Store) {
 	return database.DB, database.Schema, repository
 }
 
-func seedExecution(t *testing.T, db *pgkit.DB, schema, key string) uuid.UUID {
+func seedRun(t *testing.T, db *pgkit.DB, schema, key string) uuid.UUID {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := db.Conn.Begin(ctx)
 	if err != nil {
-		t.Fatalf("begin seed execution: %v", err)
+		t.Fatalf("begin seed run: %v", err)
 	}
 	defer tx.Rollback(ctx)
 	id, rootID := uuid.New(), uuid.New()
-	if _, err := tx.Exec(ctx, executionInsertSQL(schema), id, "test", 1, key, "running", nil, rootID); err != nil {
-		t.Fatalf("seed execution: %v", err)
+	if _, err := tx.Exec(ctx, runInsertSQL(schema), id, "test", 1, key, "running", nil, rootID); err != nil {
+		t.Fatalf("seed run: %v", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_commands")+` (
-		command_id,execution_id,command_key,name,version,args,declaration_fingerprint,
+		command_id,run_id,command_key,name,version,args,declaration_fingerprint,
 		state,queue,retry_policy,budget_started_at,next_attempt_at,
 		created_position,created_at,updated_at,status_at
 	) VALUES ($1,$2,'root','work',1,'{}'::text::bytea,decode(repeat('00',32),'hex'),
@@ -522,14 +522,14 @@ func seedExecution(t *testing.T, db *pgkit.DB, schema, key string) uuid.UUID {
 		t.Fatalf("seed root command: %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit seed execution: %v", err)
+		t.Fatalf("commit seed run: %v", err)
 	}
 	return id
 }
 
-func executionInsertSQL(schema string) string {
-	return `INSERT INTO ` + pgschema.Table(schema, "flow_executions") + ` (
-		execution_id, definition_name, definition_version, execution_key, status,
+func runInsertSQL(schema string) string {
+	return `INSERT INTO ` + pgschema.Table(schema, "flow_runs") + ` (
+		run_id, definition_name, definition_version, run_key, status,
 		start_fingerprint, input, metadata, metadata_canonical,
 		max_commands, command_count, open_commands, root_command_id,
 		created_at, updated_at, status_at, finished_at

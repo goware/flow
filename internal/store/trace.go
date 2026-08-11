@@ -47,14 +47,14 @@ type TraceOperationalRows struct {
 
 func (s *Store) TraceOperationalInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (TraceOperationalRows, error) {
 	if id == uuid.Nil {
-		return TraceOperationalRows{}, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
+		return TraceOperationalRows{}, fmt.Errorf("%w: run ID is nil", flowerr.ErrInvalid)
 	}
 	query := `SELECT c.command_id,c.state,c.unsatisfied_waits,c.budget_started_at,c.next_attempt_at,
 		c.wait_started_at,c.wait_deadline_at,c.attempt_ordinal,c.consumed_attempts,c.last_error,
 		c.created_at,c.updated_at,c.status_at,c.finished_at,q.state,q.lease_owner,q.lease_started_at,q.lease_expires_at
 		FROM ` + pgschema.Table(s.schema, "flow_commands") + ` c
 		LEFT JOIN ` + pgschema.Table(s.schema, "flow_command_queue") + ` q USING(command_id)
-		WHERE c.execution_id=$1 ORDER BY c.command_key`
+		WHERE c.run_id=$1 ORDER BY c.command_key`
 	var rows pgx.Rows
 	var err error
 	if tx != nil {
@@ -122,8 +122,8 @@ func (s *Store) traceWaitsQuery() string {
 	return `SELECT w.command_id,w.event_name,w.event_key,w.satisfied_position
 		FROM ` + pgschema.Table(s.schema, "flow_commands") + ` c
 		JOIN ` + pgschema.Table(s.schema, "flow_command_event_waits") + ` w
-			ON w.execution_id=c.execution_id AND w.command_id=c.command_id
-		WHERE c.execution_id=$1 ORDER BY w.command_id,w.event_name,w.event_key`
+			ON w.run_id=c.run_id AND w.command_id=c.command_id
+		WHERE c.run_id=$1 ORDER BY w.command_id,w.event_name,w.event_key`
 }
 
 func decodeTraceFailure(value []byte, target **failure.Value) error {

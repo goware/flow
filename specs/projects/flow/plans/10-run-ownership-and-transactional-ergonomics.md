@@ -1,17 +1,17 @@
 # Plan 10: Make run ownership and transactional use explicit
 
-Status: Planned
+Status: Implemented (combined v0.3 candidate; final review pending)
 
 Planned at: `788c9b5` on 2026-08-11
 
-- **Target release:** v0.4.0 candidate, released independently after Plan 9's
-  v0.3.0 tag
+- **Target release:** combined v0.3.0 candidate after the untagged Plan 9
+  checkpoint; Plan 11 remains separate
 - **Priority:** P1 for correctness and Trails integration simplicity
 - **Effort:** M-L
 - **Risk:** MEDIUM-HIGH; no durable format or schema change is intended, but
   atomic replacement and caller-owned transaction ordering are concurrency-
   sensitive
-- **Depends on:** Plan 9 implemented, reviewed, and released as v0.3.0
+- **Depends on:** Plan 9 implemented and reviewed as an untagged checkpoint
 - **Schema impact:** none; the Flow table count remains six and migration 004
   remains the current schema version
 - **Durable format impact:** none; replacement uses the existing run,
@@ -21,7 +21,7 @@ Planned at: `788c9b5` on 2026-08-11
   return type to a named transaction-scoped client; no `flow.Call`
 
 > **Executor instructions:** Read this plan completely before editing. Start
-> from the exact reviewed Plan 9 release, perform the Phase 0 decision proof,
+> from the exact reviewed Plan 9 checkpoint, perform the Phase 0 decision proof,
 > then implement in phase order. Keep each phase independently reviewable and
 > run its focused ordinary and race tests before continuing. This plan removes
 > application workarounds by giving Flow the smallest missing ownership APIs;
@@ -40,13 +40,13 @@ Planned at: `788c9b5` on 2026-08-11
 > git status --short --branch
 > git log -1 --decorate --oneline
 > git describe --tags --always
-> git diff --stat v0.3.0..HEAD -- \
+> git diff --stat <plan-9-checkpoint>..HEAD -- \
 >   runtime.go client.go types.go command_runtime.go execute.go \
 >   internal/store internal/replay testing_bridge.go flowtest \
 >   compile_contract_test.go README.md flow.go specs/projects/flow
 > ```
 >
-> Replace `v0.3.0` with the exact approved Plan 9 tag if necessary. Reconcile
+> Replace `<plan-9-checkpoint>` with the exact reviewed Plan 9 SHA. Reconcile
 > every accepted change before implementation. Unexplained API, schema,
 > journal, transaction-order, or Trails integration drift is a STOP condition.
 
@@ -60,7 +60,7 @@ unsafe transaction choreography:
    run's key. `CommandInfo` should carry `RunKey` so a handler does not call
    `GetRun` merely to recover its root entity key.
 2. Replacing the current live-key run is one semantic operation. Flow should
-   atomically cancel the expected current run and enqueue its equivalent
+   atomically cancel the expected current run and enqueue the requested
    replacement, rather than forcing an application to commit cancellation and
    start the replacement afterward.
 3. A caller-owned PostgreSQL transaction has one Flow lock-order history.
@@ -190,9 +190,9 @@ weaken the following semantics:
 
 | State at the serialized live-key decision | Outcome |
 |---|---|
-| current live run is declaration-equivalent to the requested replacement | return that run with `Replaced=false`; no cancellation or new journal entries |
-| current live run ID equals `expected` and requested replacement differs | cancel the expected run and create the replacement in one transaction; return `Replaced=true` |
-| current live run ID differs from `expected` and is not equivalent | `ErrConflict`; no mutation |
+| current live run ID equals `expected`, whether or not its declaration is equivalent to the request | cancel the expected run and create the requested replacement in one transaction; return the distinct new run with `Replaced=true` |
+| current live run ID differs from `expected` and is declaration-equivalent to the requested replacement | return that already-committed run with `Replaced=false`; no cancellation or new journal entries |
+| current live run ID differs from `expected` and is not declaration-equivalent | `ErrConflict`; no mutation |
 | no current live run exists | `ErrConflict`; ordinary `Enqueue` remains the explicit create-if-absent operation |
 | expected run or its graph is corrupt/impossible | fail closed with `ErrInvalidState`; no partial mutation |
 | cancellation or replacement validation fails | roll back both sides |
@@ -200,9 +200,14 @@ weaken the following semantics:
 
 “Declaration-equivalent” must reuse the same command definition version,
 canonical input, normalized options, key scope, and start fingerprint used by
-ordinary `Enqueue`. Treating an equivalent current run as success gives
-ambiguous-commit retries the same desired-state rediscovery behavior as live-
-key enqueue. It does not authorize retargeting a different declaration.
+ordinary `Enqueue`. The expected-current comparison has precedence over
+equivalence: when the current ID still equals `expected`, the caller is
+explicitly asking to replace that generation, so even a byte-for-byte
+equivalent declaration must create a distinct replacement. Equivalence is
+consulted only after the current ID differs from `expected`; that ordering lets
+a retry after a concurrent winner or ambiguous commit rediscover the already-
+committed requested replacement without replacing it again. It does not
+authorize retargeting a different declaration.
 
 Additional rules:
 
@@ -349,7 +354,7 @@ these responsibilities:
 | `internal/store/inspection.go` | reuse the current live-key lookup/lock contract; do not add a scan |
 | `testing_bridge.go`, `internal/testengine/`, `flowtest/` | runtime/test parity for `RunKey`, replacement, and transaction behavior |
 | `compile_contract_test.go` and focused store/runtime tests | public signature, type safety, removed misuse, concurrency, and SQL-shape guards |
-| `README.md`, `flow.go`, active specs, examples | transaction order, replacement semantics, and v0.3-to-v0.4 migration guidance |
+| `README.md`, `flow.go`, active specs, examples | transaction order, replacement semantics, and combined v0.2-to-v0.3 migration guidance |
 
 Do not create a `coordinator`, `workflow`, `replacement`, or transaction-
 framework package. Small request/result and lock-order helpers belong beside
@@ -364,10 +369,12 @@ For a library-owned client, replacement should use one short transaction:
 ```text
 validate definition, args, options, reason
 begin transaction
-  serialize/lock current holder for (definition, live key)
-  if current declaration is equivalent: return existing
-  assert current RunID == expected
-  lock and validate the expected run graph using existing cancellation path
+  lock the expected predecessor as the CAS serialization anchor
+  read the current holder for (definition, live key)
+  if current RunID != expected:
+    if current declaration is equivalent: return existing
+    otherwise: return ErrConflict
+  validate the expected run graph using the existing cancellation path
   cancel expected run and remove its runnable deliveries
   create replacement run/root command using existing start path
   append existing cancellation and start journal entries
@@ -380,9 +387,13 @@ transaction. Defer notifications until the existing caller-owned-transaction
 policy says they are safe; do not invent a pre-commit publish path.
 
 The live-key unique constraint remains the final concurrency arbiter. Locking
-and status changes must order the old terminal transition before the new insert
-within the same transaction so the replacement never creates two visible live
-holders and never exposes a gap after commit.
+the expected predecessor serializes every retry carrying that predecessor ID,
+including retries after it became terminal; this is what lets the second caller
+observe and rediscover the first caller's committed successor. Status changes
+must order the old terminal transition before the new insert within the same
+transaction, and the live-key unique constraint remains the final arbiter, so
+replacement never creates two visible live holders or exposes a gap after
+commit. Reading an unexpected current holder does not authorize mutating it.
 
 ### 4.2 Concurrency and retries
 
@@ -391,7 +402,11 @@ Required concurrent outcomes:
 - two callers replacing the same expected run with different declarations:
   one commits; the other returns `ErrConflict` and does not cancel the winner;
 - two callers replacing with equivalent declarations: one creates; the other
-  rediscovers the equivalent current run;
+  observes a current ID different from `expected` and rediscovers the
+  equivalent winner;
+- a replacement whose requested declaration is identical to the still-current
+  expected predecessor creates a distinct new run rather than returning the
+  predecessor unchanged;
 - a normal live-key `Enqueue` racing replacement: it either rediscovers an
   equivalent holder or conflicts according to existing start semantics; it
   never creates a second live holder;
@@ -399,8 +414,9 @@ Required concurrent outcomes:
   missing/terminal expected holder cannot be silently recreated by replacement;
 - cancellation, expiry, or another admin action racing replacement: no partial
   terminal journal and no ownerless committed state;
-- ambiguous commit: a repeated equivalent replacement returns the committed
-  current run, while a different current declaration conflicts;
+- ambiguous commit: when the current ID no longer equals `expected`, a repeated
+  equivalent replacement returns the committed current run, while a
+  non-equivalent declaration conflicts;
 - transaction rollback, context cancellation before commit, injected SQL
   errors, and process restart leave either the entire old state or the entire
   new state visible.
@@ -456,6 +472,8 @@ Required Trails tests include:
 - injected failures at every cancel/start/commit boundary expose no committed
   ownerless state;
 - rollback restores the old current run and application state;
+- replacing the exact expected run creates a distinct replacement even when
+  its declaration is identical to the requested declaration;
 - equivalent retry after ambiguous commit rediscovers the replacement;
 - a stale expected ID cannot replace or cancel a newer different run;
 - an enduring monitor delivers an exact generation-fenced fact into the
@@ -470,14 +488,15 @@ Required Trails tests include:
 
 Before production edits:
 
-1. confirm the exact Plan 9 release tag and clean worktree;
+1. confirm the exact untagged Plan 9 checkpoint and clean worktree;
 2. inventory `CommandInfo` construction, claim SQL/head loading, testing
    bridges, all `InTx` call sites, lock-order state, fresh-start insertion,
    cancellation, live-key lookup, notifications, and observations;
 3. write compile-only examples for `RunKey`, `TransactionClient`,
    `BeginApplicationWrites`, and `ReplaceCurrentRun`;
-4. freeze the replacement decision table in §3.3, including the exact
-   equivalence/fingerprint rule and public result/error classification;
+4. freeze the replacement decision table in §3.3, including expected-ID-first
+   ordering, the exact equivalence/fingerprint rule used only after an ID
+   mismatch, and the public result/error classification;
 5. prove with an isolated store test that a newly inserted row cannot create a
    cross-transaction run-lock cycle, while conflict rediscovery still locks a
    pre-existing row in order;
@@ -533,8 +552,8 @@ remaining byte/checksum identical.
 
 1. update README, package docs, architecture, engine/runtime/store components,
    transaction examples, and inspection docs;
-2. publish a v0.3-to-v0.4 migration guide for the `InTx` return type and new
-   APIs;
+2. extend the combined v0.2-to-v0.3 migration guide with the `InTx` return type
+   and new APIs;
 3. perform the disposable Trails adaptation in §5 and run its Flow-focused,
    queue-level, and race tests;
 4. record removed consumer queries, post-commit starts, repeated transaction
@@ -561,14 +580,14 @@ Run ordinary and race suites against every PostgreSQL major promised by the
 README with durability settings enabled. Audit named test output for skips.
 Review every changed hunk against this plan, repeat the Trails proof against
 the exact candidate commit, obtain human approval, then tag the approved
-release independently. Do not combine Plan 11.
+combined v0.3.0 release. Do not combine Plan 11.
 
 ## 7. Acceptance criteria
 
 Plan 10 is complete only when:
 
-1. Plan 9 is a released baseline and its Run/Enqueue/Emit/Deliver vocabulary
-   remains intact.
+1. Plan 9 is a reviewed implementation checkpoint and its
+   Run/Enqueue/Emit/Deliver vocabulary remains intact.
 2. `CommandInfo.RunKey` is exact for root and child work across first claim,
    retry, takeover, real runtime, testing bridge, and flowtest.
 3. Populating `RunKey` adds no per-claim SQL query and no durable field.
@@ -579,10 +598,12 @@ Plan 10 is complete only when:
 6. Documentation and examples require one transaction client per `pgx.Tx`;
    no cache, context protocol, generic transaction DSL, or application-SQL
    wrapper is added.
-7. `ReplaceCurrentRun` supports only live-key roots and atomically cancels the
-   expected current run plus creates its replacement.
-8. An equivalent current declaration is idempotently returned; a different
-   unexpected current ID conflicts; absence does not silently create.
+7. `ReplaceCurrentRun` supports only live-key roots and, whenever the current
+   ID equals `expected`, atomically cancels that run plus creates a distinct
+   replacement even if the two declarations are equivalent.
+8. Only an unexpected current ID with an equivalent declaration is
+   idempotently returned; an unexpected non-equivalent current ID conflicts,
+   and absence does not silently create.
 9. Cancellation and replacement reuse existing journal/projection semantics,
    observations, notifications, canonical fingerprints, and error classes.
 10. No replacement column, table, journal kind, migration, alternate live-key
@@ -609,13 +630,13 @@ Plan 10 is complete only when:
 19. All named Flow and Trails focused tests pass with no unintended skips;
     Flow ordinary/race suites pass on every supported PostgreSQL major.
 20. Formatting, build, vet, module, vulnerability, diff, and final human review
-    gates pass before the independent release tag.
+    gates pass before the combined v0.3.0 release tag.
 
 ## 8. STOP conditions
 
 Stop and report evidence rather than improvising if:
 
-1. the Plan 9 release baseline or worktree contains unexplained overlapping
+1. the Plan 9 checkpoint or worktree contains unexplained overlapping
    changes;
 2. `RunKey` requires an additional query per claim or changes a durable
    fingerprint/encoding;
@@ -627,8 +648,9 @@ Stop and report evidence rather than improvising if:
    changed durable bytes, or new live-key constraint;
 6. replacement needs UUIDv7 ordering, commits cancellation before replacement,
    or holds application locks before Flow locks;
-7. equivalent ambiguous-commit recovery can accept a different declaration or
-   stale ownership can cancel a newer run;
+7. expected-ID-first replacement is weakened, equivalent ambiguous-commit
+   recovery can accept a different declaration, or stale ownership can cancel
+   a newer run;
 8. a fresh inserted-row exception weakens ordering for any pre-existing row or
    creates a deadlock cycle;
 9. notifications/observations must publish before caller commit to make the
@@ -659,70 +681,75 @@ Stop and report evidence rather than improvising if:
 
 ### Baseline and design freeze
 
-- [ ] Confirm the exact Plan 9 v0.3.0 release and clean worktree.
-- [ ] Record Go/PostgreSQL versions, schema/version ledger, exported API, and
+- [x] Confirm the exact untagged Plan 9 checkpoint and clean worktree.
+- [x] Record Go/PostgreSQL versions, schema/version ledger, exported API, and
   full ordinary/race baselines.
-- [ ] Inventory claim/head data, `CommandInfo`, `InTx`, lock-order, start,
+- [x] Inventory claim/head data, `CommandInfo`, `InTx`, lock-order, start,
   live-key, cancellation, journal, notification, observation, and Flow/Trails
   consumer call sites.
-- [ ] Freeze compile examples and the replacement decision/error table.
-- [ ] Prove the pre-existing-lock versus transaction-owned-row model without
+- [x] Freeze compile examples and the expected-ID-first replacement
+  decision/error table, including identical-declaration replacement and
+  unexpected-equivalent rediscovery.
+- [x] Prove the pre-existing-lock versus transaction-owned-row model without
   UUID-order assumptions.
-- [ ] Confirm replacement reuses existing cancellation/start durable shapes
+- [x] Confirm replacement reuses existing cancellation/start durable shapes
   with no migration.
 
 ### Claim ownership context
 
-- [ ] Add `CommandInfo.RunKey`.
-- [ ] Populate it from the already loaded claim/run head in real runtime,
+- [x] Add `CommandInfo.RunKey`.
+- [x] Populate it from the already loaded claim/run head in real runtime,
   retries, and takeovers.
-- [ ] Update testing bridge and flowtest parity.
-- [ ] Prove root/child/keyed/unkeyed behavior and no extra claim query.
+- [x] Update testing bridge and flowtest parity.
+- [x] Prove root/child/keyed/unkeyed behavior and no extra claim query.
 
 ### Transaction client
 
-- [ ] Export the named transaction-scoped client and return it from `InTx`.
-- [ ] Expose `BeginApplicationWrites` over the existing order guard.
-- [ ] Document one-client-per-transaction, Flow-first, non-concurrent,
+- [x] Export the named transaction-scoped client and return it from `InTx`.
+- [x] Expose `BeginApplicationWrites` over the existing order guard.
+- [x] Document one-client-per-transaction, Flow-first, non-concurrent,
   non-owning lifetime.
-- [ ] Add compile/runtime/rollback/commit/phase-order/race coverage.
-- [ ] Guard against reintroducing broad anonymous transaction-client examples.
+- [x] Add compile/runtime/rollback/commit/phase-order/race coverage.
+- [x] Guard against reintroducing broad anonymous transaction-client examples.
 
 ### Atomic replacement
 
-- [ ] Add the typed public request/result and validation.
-- [ ] Add the dedicated store transaction and expected-current CAS.
-- [ ] Reuse canonical start equivalence and cancellation/start journal builders.
-- [ ] Add the narrowly proven owned-row lock-order path; preserve ordered locks
+- [x] Add the typed public request/result and validation.
+- [x] Add the dedicated store transaction and expected-current CAS.
+- [x] Reuse canonical start equivalence and cancellation/start journal builders.
+- [x] Prove an identical declaration still replaces the exact expected run,
+  while a retry rediscovers an equivalent winner whose ID differs from
+  `expected`.
+- [x] Add the narrowly proven owned-row lock-order path; preserve ordered locks
   for every pre-existing row and conflict rediscovery.
-- [ ] Preserve post-commit notifications and bounded observations.
-- [ ] Fault-inject every mutation/commit boundary.
-- [ ] Run the full repeated concurrency and ambiguous-commit matrix under race.
-- [ ] Prove migration/version/checksum and ordinary enqueue/cancel/replay non-
+- [x] Preserve post-commit notifications and bounded observations.
+- [x] Fault-inject every mutation/commit boundary.
+- [x] Run the full repeated concurrency and ambiguous-commit matrix under race.
+- [x] Prove migration/version/checksum and ordinary enqueue/cancel/replay non-
   regression.
 
 ### Documentation and consumer proof
 
-- [ ] Update README, package/normative/component docs, examples, and v0.3-to-
-  v0.4 migration guidance.
-- [ ] Perform the disposable Trails adaptation without committing it unless
+- [x] Update README, package/normative/component docs, examples, and combined
+  v0.2-to-v0.3 migration guidance.
+- [x] Perform the disposable Trails adaptation without committing it unless
   separately authorized.
-- [ ] Remove the jobqueue `GetRun` owner lookup and prove query reduction.
-- [ ] Replace split cancel/start with atomic replacement and remove only the
+- [x] Remove the jobqueue `GetRun` owner lookup and prove query reduction.
+- [x] Replace split cancel/start with atomic replacement and remove only the
   now-redundant repair path.
-- [ ] Create and thread one transaction client per Trails transaction; mark
+- [x] Create and thread one transaction client per Trails transaction; mark
   the application-write phase.
-- [ ] Retain `Event.Deliver`, exact generation fencing, and bounded anomaly/
+- [x] Retain `Event.Deliver`, exact generation fencing, and bounded anomaly/
   expiry reconciliation.
-- [ ] Prove queue dynamics, terminal propagation, and enduring monitor delivery.
-- [ ] Confirm no Trails `flow.Call` use.
+- [x] Prove queue dynamics, terminal propagation, and enduring monitor delivery.
+- [x] Confirm no Trails `flow.Call` use.
 
 ### Final verification and release
 
-- [ ] Run formatting, diff, build, vet, module, vulnerability, ordinary, race,
+- [x] Run formatting, diff, build, vet, module, vulnerability, ordinary, race,
   and supported-PostgreSQL gates with no unintended skips.
 - [ ] Review every changed hunk against all acceptance criteria and STOP
   conditions.
 - [ ] Repeat the Trails proof against the exact candidate commit.
-- [ ] Obtain human approval and tag Plan 10 independently; do not combine Plan
-  11.
+- [ ] Obtain human approval and tag the combined Plans 9–10 v0.3.0 candidate;
+  do not combine Plan 11.

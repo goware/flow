@@ -21,6 +21,32 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+type queryRecorder struct {
+	mu      sync.Mutex
+	queries []string
+}
+
+func (r *queryRecorder) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	r.mu.Lock()
+	r.queries = append(r.queries, data.SQL)
+	r.mu.Unlock()
+	return ctx
+}
+
+func (*queryRecorder) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (r *queryRecorder) reset() {
+	r.mu.Lock()
+	r.queries = nil
+	r.mu.Unlock()
+}
+
+func (r *queryRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.queries...)
+}
+
 func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 	t.Parallel()
 
@@ -29,14 +55,14 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatalf("Migrate() error = %v", err)
 	}
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(0))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerRun(0))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	command := DefineCommand[runtimeArgs, runtimeResult]("claim.handled", 1)
-	exec, err := command.With(runtime).Execute(ctx, "locked", runtimeArgs{})
+	exec, err := command.Enqueue(ctx, runtime, "locked", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatalf("Enqueue() error = %v", err)
 	}
 	kinds := []store.CommandKind{{Name: command.Name(), Version: command.Version()}}
 	candidates, err := runtime.store.ProbeCommands(ctx, kinds, 10)
@@ -48,14 +74,14 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTx() error = %v", err)
 	}
-	if _, err := lockTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
-		WHERE execution_id=$1 FOR UPDATE`, exec.ID); err != nil {
-		t.Fatalf("lock execution: %v", err)
+	if _, err := lockTx.Exec(ctx, `SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_runs")+`
+		WHERE run_id=$1 FOR UPDATE`, exec.ID); err != nil {
+		t.Fatalf("lock run: %v", err)
 	}
 	started := time.Now()
 	claim, err := runtime.store.ClaimCommand(ctx, candidates[0], time.Second, "claim-test", nil)
 	if err != nil || claim.Command != nil || time.Since(started) > 100*time.Millisecond {
-		t.Fatalf("execution-locked claim = %#v, %v in %s", claim, err, time.Since(started))
+		t.Fatalf("run-locked claim = %#v, %v in %s", claim, err, time.Since(started))
 	}
 	_ = lockTx.Rollback(ctx)
 
@@ -73,10 +99,55 @@ func TestClaimSkipsLockedRowsAndUnhandledBacklog(t *testing.T) {
 		t.Fatalf("queue-locked claim = %#v, %v in %s", claim, err, time.Since(started))
 	}
 	_ = lockTx.Rollback(ctx)
-	if err := CancelExecution(ctx, runtime, exec.ID, "claim lock test complete"); err != nil {
-		t.Fatalf("CancelExecution() error = %v", err)
+	if err := CancelRun(ctx, runtime, exec.ID, "claim lock test complete"); err != nil {
+		t.Fatalf("CancelRun() error = %v", err)
 	}
 
+}
+
+func TestClaimCommandsLoadsRunKeyInExistingHeadQuery(t *testing.T) {
+	t.Parallel()
+
+	recorder := &queryRecorder{}
+	database := testpg.OpenWithQueryTracer(t, recorder)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("claim.run_key_query_shape", 1)
+	run, err := command.Enqueue(ctx, runtime, "intent/42", None{}, WithLiveKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := runtime.store.ProbeCommands(ctx,
+		[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("ProbeCommands() = %#v, %v", candidates, err)
+	}
+
+	recorder.reset()
+	result, err := runtime.store.ClaimCommands(ctx, candidates, time.Minute, "run-key-query-test", fault.None{})
+	if err != nil || len(result.Commands) != 1 {
+		t.Fatalf("ClaimCommands() = %#v, %v", result, err)
+	}
+	if result.Commands[0].RunID != uuid.MustParse(string(run.ID)) || result.Commands[0].RunKey != "intent/42" {
+		t.Fatalf("claimed run identity = %s/%q, want %s/%q",
+			result.Commands[0].RunID, result.Commands[0].RunKey, run.ID, "intent/42")
+	}
+
+	var runKeyQueries []string
+	for _, query := range recorder.snapshot() {
+		if strings.Contains(query, "run_key") {
+			runKeyQueries = append(runKeyQueries, strings.Join(strings.Fields(query), " "))
+		}
+	}
+	if len(runKeyQueries) != 1 || !strings.Contains(runKeyQueries[0], "SELECT status,deadline_at,run_key FROM") {
+		t.Fatalf("claim run-key queries = %q, want one existing run-head projection", runKeyQueries)
+	}
 }
 
 func TestClaimBatchPersistsSixteenSiblingAttemptsTogether(t *testing.T) {
@@ -88,9 +159,9 @@ func TestClaimBatchPersistsSixteenSiblingAttemptsTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := DefineCommand[None, None]("claim.batch_sixteen_child", 1)
-	runtime, execution := stageClaimFixture(t, database, "sixteen", 16, func(work *Work[None]) {
+	runtime, run := stageClaimFixture(t, database, "sixteen", 16, func(work *Work[None]) {
 		for index := range 16 {
-			Execute(work, fmt.Sprintf("child/%02d", index), child, None{})
+			Enqueue(work, fmt.Sprintf("child/%02d", index), child, None{})
 		}
 	})
 	candidates := probeClaimCandidates(t, runtime, []store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 16)
@@ -114,15 +185,15 @@ func TestClaimBatchPersistsSixteenSiblingAttemptsTogether(t *testing.T) {
 	var runningCommands, runningQueues, starts, caused int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-		 WHERE execution_id=$1 AND parent_command_id=$2 AND state='running' AND attempt_ordinal=1),
+		 WHERE run_id=$1 AND parent_command_id=$2 AND state='running' AND attempt_ordinal=1),
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		 WHERE execution_id=$1 AND state='running' AND active_attempt_id IS NOT NULL AND lease_token IS NOT NULL),
+		 WHERE run_id=$1 AND state='running' AND active_attempt_id IS NOT NULL AND lease_token IS NOT NULL),
 		count(*),count(*) FILTER (WHERE j.causation_position=c.created_position)
 	FROM `+pgschema.Table(database.Schema, "flow_journal")+` j
 	JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c
-	  ON c.execution_id=j.execution_id AND c.command_id=j.command_id
-	WHERE j.execution_id=$1 AND j.entry_kind='attempt_started' AND c.parent_command_id=$2`,
-		execution.ID, execution.RootCommandID).Scan(&runningCommands, &runningQueues, &starts, &caused); err != nil {
+	  ON c.run_id=j.run_id AND c.command_id=j.command_id
+	WHERE j.run_id=$1 AND j.entry_kind='attempt_started' AND c.parent_command_id=$2`,
+		run.ID, run.RootCommandID).Scan(&runningCommands, &runningQueues, &starts, &caused); err != nil {
 		t.Fatal(err)
 	}
 	if runningCommands != 16 || runningQueues != 16 || starts != 16 || caused != 16 {
@@ -142,7 +213,7 @@ func TestClaimBatchSkipsOneLockedSibling(t *testing.T) {
 	child := DefineCommand[None, None]("claim.batch_locked_child", 1)
 	runtime, _ := stageClaimFixture(t, database, "locked_sibling", 4, func(work *Work[None]) {
 		for index := range 4 {
-			Execute(work, fmt.Sprintf("child/%d", index), child, None{})
+			Enqueue(work, fmt.Sprintf("child/%d", index), child, None{})
 		}
 	})
 	candidates := probeClaimCandidates(t, runtime, []store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 4)
@@ -184,9 +255,9 @@ func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := DefineCommand[None, None]("claim.renew_classification_child", 1)
-	runtime, execution := stageClaimFixture(t, database, "renew_classification", 2, func(work *Work[None]) {
-		Execute(work, "child/0", child, None{})
-		Execute(work, "child/1", child, None{})
+	runtime, run := stageClaimFixture(t, database, "renew_classification", 2, func(work *Work[None]) {
+		Enqueue(work, "child/0", child, None{})
+		Enqueue(work, "child/1", child, None{})
 	})
 	candidates := probeClaimCandidates(t, runtime,
 		[]store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 2)
@@ -264,7 +335,7 @@ func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := CancelExecution(ctx, reader, execution.ID, "renewal classification complete"); err != nil {
+	if err := CancelRun(ctx, reader, run.ID, "renewal classification complete"); err != nil {
 		t.Fatal(err)
 	}
 	results, err = runtime.store.RenewCommandLeases(ctx, renewals, time.Minute)
@@ -287,8 +358,8 @@ func TestClaimLocalLeaseDeadlineAnchorsAtClaimStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := DefineCommand[None, None]("claim.local_lease_anchor_child", 1)
-	runtime, execution := stageClaimFixture(t, database, "local_lease_anchor", 1, func(work *Work[None]) {
-		Execute(work, "child", child, None{})
+	runtime, run := stageClaimFixture(t, database, "local_lease_anchor", 1, func(work *Work[None]) {
+		Enqueue(work, "child", child, None{})
 	})
 	runtime.commandLease = 300 * time.Millisecond
 	candidates := probeClaimCandidates(t, runtime,
@@ -317,7 +388,7 @@ func TestClaimLocalLeaseDeadlineAnchorsAtClaimStart(t *testing.T) {
 	}
 	resultChannel := make(chan claimResult, 1)
 	go func() {
-		result, err := runtime.claimExecutionGroup(ctx, candidates)
+		result, err := runtime.claimRunGroup(ctx, candidates)
 		resultChannel <- claimResult{result: result, err: err}
 	}()
 	select {
@@ -341,7 +412,7 @@ func TestClaimLocalLeaseDeadlineAnchorsAtClaimStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := CancelExecution(ctx, reader, execution.ID, "claim-local deadline test complete"); err != nil {
+	if err := CancelRun(ctx, reader, run.ID, "claim-local deadline test complete"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -363,8 +434,8 @@ func TestClaimBatchGroupsEventInputsByCommand(t *testing.T) {
 				return
 			}
 		}
-		Execute(work, "child/no-inputs", child, None{})
-		withInputs := Execute(work, "child/inputs", child, None{})
+		Enqueue(work, "child/no-inputs", child, None{})
+		withInputs := Enqueue(work, "child/inputs", child, None{})
 		for index := range 256 {
 			withInputs.WaitFor(event, fmt.Sprintf("input/%03d", index))
 		}
@@ -442,32 +513,32 @@ func TestClaimEventInputSnapshotIntegrity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			execution, err := command.With(runtime).Execute(ctx, "claim/snapshot/integrity/"+suffix, None{}, WaitFor(event, "input"))
+			run, err := command.Enqueue(ctx, runtime, "claim/snapshot/integrity/"+suffix, None{}, WaitFor(event, "input"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := event.Emit(ctx, runtime, execution.ID, "input", "stable"); err != nil {
+			if err := event.Deliver(ctx, runtime, run.ID, "input", "stable"); err != nil {
 				t.Fatal(err)
 			}
 			candidates := probeClaimCandidates(t, runtime,
 				[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1)
 			if tt.selectorMismatch {
 				if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_journal")+`
-					SET event_key='different' WHERE execution_id=$1 AND event_class='application'`, execution.ID); err != nil {
+					SET event_key='different' WHERE run_id=$1 AND event_class='application'`, run.ID); err != nil {
 					t.Fatal(err)
 				}
 			} else {
 				body := tt.body()
 				if tt.retainStoredHash {
 					if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_journal")+`
-						SET body=$2 WHERE execution_id=$1 AND event_class='application'`, execution.ID, body); err != nil {
+						SET body=$2 WHERE run_id=$1 AND event_class='application'`, run.ID, body); err != nil {
 						t.Fatal(err)
 					}
 				} else {
 					digest := sha256.Sum256(body)
 					if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_journal")+`
-						SET body=$2,body_hash=$3 WHERE execution_id=$1 AND event_class='application'`,
-						execution.ID, body, digest[:]); err != nil {
+						SET body=$2,body_hash=$3 WHERE run_id=$1 AND event_class='application'`,
+						run.ID, body, digest[:]); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -481,10 +552,10 @@ func TestClaimEventInputSnapshotIntegrity(t *testing.T) {
 			if err := database.DB.Conn.QueryRow(ctx, `SELECT c.state,q.state,
 				(q.active_attempt_id IS NOT NULL OR q.lease_token IS NOT NULL),
 				(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-				 WHERE execution_id=$1 AND entry_kind='attempt_started')
+				 WHERE run_id=$1 AND entry_kind='attempt_started')
 			FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 			JOIN `+pgschema.Table(database.Schema, "flow_command_queue")+` q ON q.command_id=c.command_id
-			WHERE c.command_id=$2`, execution.ID, execution.RootCommandID).
+			WHERE c.command_id=$2`, run.ID, run.RootCommandID).
 				Scan(&commandState, &queueState, &activeFence, &starts); err != nil {
 				t.Fatal(err)
 			}
@@ -510,11 +581,11 @@ func TestClaimEventInputSnapshotStableAcrossRetryAndLeaseTakeover(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	execution, err := command.With(runtime).Execute(ctx, "claim/snapshot/stability", None{}, WaitFor(event, "input"))
+	run, err := command.Enqueue(ctx, runtime, "claim/snapshot/stability", None{}, WaitFor(event, "input"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := event.Emit(ctx, runtime, execution.ID, "input", "stable"); err != nil {
+	if err := event.Deliver(ctx, runtime, run.ID, "input", "stable"); err != nil {
 		t.Fatal(err)
 	}
 	claimNext := func() store.ClaimedCommand {
@@ -552,7 +623,7 @@ func TestClaimEventInputSnapshotStableAcrossRetryAndLeaseTakeover(t *testing.T) 
 		t.Fatal(err)
 	}
 	changed, err := runtime.store.RecoverExpiredCommandLease(ctx, store.ExpiredLeaseCandidate{
-		CommandID: retry.CommandID, ExecutionID: retry.ExecutionID,
+		CommandID: retry.CommandID, RunID: retry.RunID,
 	})
 	if err != nil || !changed {
 		t.Fatalf("RecoverExpiredCommandLease() = %t, %v", changed, err)
@@ -577,9 +648,9 @@ func TestClaimBatchSupportsMixedVersionsAndQueues(t *testing.T) {
 	v2 := DefineCommand[None, None]("claim.batch_mixed", 2, WithQueue("priority"))
 	other := DefineCommand[None, None]("claim.batch_other", 1, WithQueue("bulk"))
 	runtime, _ := stageClaimFixture(t, database, "mixed_kinds", 3, func(work *Work[None]) {
-		Execute(work, "child/v1", v1, None{})
-		Execute(work, "child/v2", v2, None{})
-		Execute(work, "child/other", other, None{})
+		Enqueue(work, "child/v1", v1, None{})
+		Enqueue(work, "child/v2", v2, None{})
+		Enqueue(work, "child/other", other, None{})
 	})
 	candidates := probeClaimCandidates(t, runtime, []store.CommandKind{
 		{Name: v1.Name(), Version: v1.Version()},
@@ -613,8 +684,8 @@ func TestClaimBatchTerminalizesElapsedRetryAlongsideEligibleSibling(t *testing.T
 	eligible := DefineCommand[None, None]("claim.batch_elapsed_eligible", 1)
 	expiring := DefineCommand[None, None]("claim.batch_elapsed_expired", 1, WithRetry(RetryFor(time.Millisecond)))
 	runtime, _ := stageClaimFixture(t, database, "retry_elapsed", 2, func(work *Work[None]) {
-		Execute(work, "child/eligible", eligible, None{})
-		Execute(work, "child/expired", expiring, None{})
+		Enqueue(work, "child/eligible", eligible, None{})
+		Enqueue(work, "child/expired", expiring, None{})
 	})
 	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_commands")+`
 		SET budget_started_at=clock_timestamp()-interval '1 second'
@@ -643,7 +714,7 @@ func TestClaimBatchTerminalizesElapsedRetryAlongsideEligibleSibling(t *testing.T
 	if state != "failed" || code != "retry_elapsed" || queueRows != 0 {
 		t.Fatalf("expired command state=%s code=%s queue=%d", state, code, queueRows)
 	}
-	var eligibleState, queueState, executionStatus, executionCode string
+	var eligibleState, queueState, runStatus, runCode string
 	var activeAttempt, leaseToken bool
 	var commandCount, openCommands int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.state,q.state,
@@ -651,22 +722,22 @@ func TestClaimBatchTerminalizesElapsedRetryAlongsideEligibleSibling(t *testing.T
 		e.command_count,e.open_commands
 	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 	JOIN `+pgschema.Table(database.Schema, "flow_command_queue")+` q ON q.command_id=c.command_id
-	JOIN `+pgschema.Table(database.Schema, "flow_executions")+` e ON e.execution_id=c.execution_id
+	JOIN `+pgschema.Table(database.Schema, "flow_runs")+` e ON e.run_id=c.run_id
 	WHERE c.command_id=$1`, result.Commands[0].CommandID).
-		Scan(&eligibleState, &queueState, &activeAttempt, &leaseToken, &executionStatus, &executionCode,
+		Scan(&eligibleState, &queueState, &activeAttempt, &leaseToken, &runStatus, &runCode,
 			&commandCount, &openCommands); err != nil {
 		t.Fatal(err)
 	}
 	if eligibleState != "running" || queueState != "running" || !activeAttempt || !leaseToken ||
-		executionStatus != "failing" || executionCode != "retry_elapsed" || commandCount != 3 || openCommands != 1 {
-		t.Fatalf("survivor command=%s queue=%s active=%t token=%t execution=%s code=%s counters=%d/%d",
-			eligibleState, queueState, activeAttempt, leaseToken, executionStatus, executionCode,
+		runStatus != "failing" || runCode != "retry_elapsed" || commandCount != 3 || openCommands != 1 {
+		t.Fatalf("survivor command=%s queue=%s active=%t token=%t run=%s code=%s counters=%d/%d",
+			eligibleState, queueState, activeAttempt, leaseToken, runStatus, runCode,
 			commandCount, openCommands)
 	}
 	rows, err := database.DB.Conn.Query(ctx, `SELECT entry_kind,COALESCE(command_id::text,''),COALESCE(terminal_status,'')
 	FROM (SELECT position,entry_kind,command_id,terminal_status
 		FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE execution_id=(SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1)
+		WHERE run_id=(SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1)
 		ORDER BY position DESC LIMIT 3) recent ORDER BY position`, result.Commands[0].CommandID)
 	if err != nil {
 		t.Fatal(err)
@@ -693,7 +764,7 @@ func TestClaimBatchTerminalizesElapsedRetryAlongsideEligibleSibling(t *testing.T
 	}
 	var failingBody []byte
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT body FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE execution_id=(SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1)
+		WHERE run_id=(SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1)
 		  AND entry_kind='execution_failing' ORDER BY position DESC LIMIT 1`, result.Commands[0].CommandID).
 		Scan(&failingBody); err != nil {
 		t.Fatal(err)
@@ -706,7 +777,7 @@ func TestClaimBatchTerminalizesElapsedRetryAlongsideEligibleSibling(t *testing.T
 		t.Fatal(err)
 	}
 	if fmt.Sprint(failing.Survivors) != "[child/eligible]" {
-		t.Fatalf("execution failing survivors=%v", failing.Survivors)
+		t.Fatalf("run failing survivors=%v", failing.Survivors)
 	}
 }
 
@@ -720,13 +791,13 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 			t.Fatal(err)
 		}
 		child := DefineCommand[None, None]("claim.batch_malformed_child", 1)
-		runtime, execution := stageClaimFixture(t, database, "malformed", 2, func(work *Work[None]) {
-			Execute(work, "child/good", child, None{})
-			Execute(work, "child/malformed", child, None{})
+		runtime, run := stageClaimFixture(t, database, "malformed", 2, func(work *Work[None]) {
+			Enqueue(work, "child/good", child, None{})
+			Enqueue(work, "child/malformed", child, None{})
 		})
 		if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_commands")+`
-			SET retry_policy=convert_to('{}','UTF8') WHERE execution_id=$1 AND command_key='child/malformed'`,
-			execution.ID); err != nil {
+			SET retry_policy=convert_to('{}','UTF8') WHERE run_id=$1 AND command_key='child/malformed'`,
+			run.ID); err != nil {
 			t.Fatal(err)
 		}
 		candidates := probeClaimCandidates(t, runtime,
@@ -737,9 +808,9 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 		var ready, starts int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-			 WHERE execution_id=$1 AND parent_command_id=$2 AND state='ready'),
+			 WHERE run_id=$1 AND parent_command_id=$2 AND state='ready'),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-			 WHERE execution_id=$1 AND entry_kind='attempt_started')`, execution.ID, execution.RootCommandID).
+			 WHERE run_id=$1 AND entry_kind='attempt_started')`, run.ID, run.RootCommandID).
 			Scan(&ready, &starts); err != nil {
 			t.Fatal(err)
 		}
@@ -756,16 +827,16 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 		}
 		event := DefineEvent[None]("claim.batch_malformed_event")
 		child := DefineCommand[None, None]("claim.batch_malformed_event_child", 1)
-		runtime, execution := stageClaimFixture(t, database, "malformed_event", 2, func(work *Work[None]) {
+		runtime, run := stageClaimFixture(t, database, "malformed_event", 2, func(work *Work[None]) {
 			if err := Emit(work, event, "input", None{}); err != nil {
 				t.Fatalf("Emit() error = %v", err)
 			}
-			Execute(work, "child/good", child, None{})
-			Execute(work, "child/corrupt", child, None{}).WaitFor(event, "input")
+			Enqueue(work, "child/good", child, None{})
+			Enqueue(work, "child/corrupt", child, None{}).WaitFor(event, "input")
 		})
 		if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_journal")+`
 			SET body=convert_to('{','UTF8')
-			WHERE execution_id=$1 AND entry_kind='event_recorded' AND event_class='application'`, execution.ID); err != nil {
+			WHERE run_id=$1 AND entry_kind='event_recorded' AND event_class='application'`, run.ID); err != nil {
 			t.Fatal(err)
 		}
 		candidates := probeClaimCandidates(t, runtime,
@@ -776,13 +847,13 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 		var readyCommands, readyQueues, activeFences, starts int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-			 WHERE execution_id=$1 AND parent_command_id=$2 AND state='ready'),
+			 WHERE run_id=$1 AND parent_command_id=$2 AND state='ready'),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-			 WHERE execution_id=$1 AND state='ready'),
+			 WHERE run_id=$1 AND state='ready'),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-			 WHERE execution_id=$1 AND (active_attempt_id IS NOT NULL OR lease_token IS NOT NULL)),
+			 WHERE run_id=$1 AND (active_attempt_id IS NOT NULL OR lease_token IS NOT NULL)),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-			 WHERE execution_id=$1 AND entry_kind='attempt_started')`, execution.ID, execution.RootCommandID).
+			 WHERE run_id=$1 AND entry_kind='attempt_started')`, run.ID, run.RootCommandID).
 			Scan(&readyCommands, &readyQueues, &activeFences, &starts); err != nil {
 			t.Fatal(err)
 		}
@@ -799,9 +870,9 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 			t.Fatal(err)
 		}
 		child := DefineCommand[None, None]("claim.batch_rollback_child", 1)
-		runtime, execution := stageClaimFixture(t, database, "rollback", 4, func(work *Work[None]) {
+		runtime, run := stageClaimFixture(t, database, "rollback", 4, func(work *Work[None]) {
 			for index := range 4 {
-				Execute(work, fmt.Sprintf("child/%d", index), child, None{})
+				Enqueue(work, fmt.Sprintf("child/%d", index), child, None{})
 			}
 		})
 		candidates := probeClaimCandidates(t, runtime, []store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 4)
@@ -818,9 +889,9 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 		var ready, starts int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-			 WHERE execution_id=$1 AND parent_command_id=$2 AND state='ready'),
+			 WHERE run_id=$1 AND parent_command_id=$2 AND state='ready'),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-			 WHERE execution_id=$1 AND entry_kind='attempt_started')`, execution.ID, execution.RootCommandID).
+			 WHERE run_id=$1 AND entry_kind='attempt_started')`, run.ID, run.RootCommandID).
 			Scan(&ready, &starts); err != nil {
 			t.Fatal(err)
 		}
@@ -838,8 +909,8 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 		}
 		child := DefineCommand[None, None]("claim.batch_commit_error_child", 1)
 		runtime, _ := stageClaimFixture(t, database, "commit_error", 2, func(work *Work[None]) {
-			Execute(work, "child/first", child, None{})
-			Execute(work, "child/second", child, None{})
+			Enqueue(work, "child/first", child, None{})
+			Enqueue(work, "child/second", child, None{})
 		})
 		candidates := probeClaimCandidates(t, runtime,
 			[]store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 2)
@@ -874,7 +945,7 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 		child := DefineCommand[None, None]("claim.batch_ambiguous_child", 1)
 		runtime, _ := stageClaimFixture(t, database, "ambiguous", 4, func(work *Work[None]) {
 			for index := range 4 {
-				Execute(work, fmt.Sprintf("child/%d", index), child, None{})
+				Enqueue(work, fmt.Sprintf("child/%d", index), child, None{})
 			}
 		})
 		candidates := probeClaimCandidates(t, runtime, []store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 4)
@@ -907,9 +978,9 @@ func TestClaimBatchCompetingReplicasCreateOneFencePerCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := DefineCommand[None, None]("claim.batch_replica_child", 1)
-	first, execution := stageClaimFixture(t, database, "replicas", 8, func(work *Work[None]) {
+	first, run := stageClaimFixture(t, database, "replicas", 8, func(work *Work[None]) {
 		for index := range 8 {
-			Execute(work, fmt.Sprintf("child/%d", index), child, None{})
+			Enqueue(work, fmt.Sprintf("child/%d", index), child, None{})
 		}
 	})
 	second, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
@@ -920,7 +991,7 @@ func TestClaimBatchCompetingReplicasCreateOneFencePerCommand(t *testing.T) {
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
 	hook := fault.Func(func(ctx context.Context, point fault.Point) error {
-		if point != fault.ClaimExecutionLock {
+		if point != fault.ClaimRunLock {
 			return nil
 		}
 		select {
@@ -954,7 +1025,7 @@ func TestClaimBatchCompetingReplicasCreateOneFencePerCommand(t *testing.T) {
 		select {
 		case <-entered:
 		case <-time.After(3 * time.Second):
-			t.Fatal("competing claim did not reach execution-lock barrier")
+			t.Fatal("competing claim did not reach run-lock barrier")
 		}
 	}
 	close(release)
@@ -973,7 +1044,7 @@ func TestClaimBatchCompetingReplicasCreateOneFencePerCommand(t *testing.T) {
 	var starts, distinctAttempts int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*),count(DISTINCT attempt_id)
 	FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-	WHERE execution_id=$1 AND entry_kind='attempt_started' AND command_id<>$2`, execution.ID, execution.RootCommandID).
+	WHERE run_id=$1 AND entry_kind='attempt_started' AND command_id<>$2`, run.ID, run.RootCommandID).
 		Scan(&starts, &distinctAttempts); err != nil {
 		t.Fatal(err)
 	}
@@ -988,11 +1059,11 @@ func stageClaimFixture(
 	suffix string,
 	children int,
 	stage func(*Work[None]),
-) (*Runtime, Execution) {
+) (*Runtime, Run) {
 	t.Helper()
 	ctx := context.Background()
 	parent := DefineCommand[None, None]("claim.fixture_parent_"+suffix, 1)
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(0),
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerRun(0),
 		WithWorkerConcurrency(1), WithPollInterval(5*time.Millisecond), WithNotifications(false))
 	if err != nil {
 		t.Fatal(err)
@@ -1004,7 +1075,7 @@ func stageClaimFixture(
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
-	execution, err := parent.With(runtime).Execute(ctx, "claim/fixture/"+suffix, None{})
+	run, err := parent.Enqueue(ctx, runtime, "claim/fixture/"+suffix, None{})
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -1013,7 +1084,7 @@ func stageClaimFixture(
 	for {
 		var count int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count FROM `+
-			pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, execution.ID).Scan(&count); err != nil {
+			pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, run.ID).Scan(&count); err != nil {
 			cancel()
 			t.Fatal(err)
 		}
@@ -1027,7 +1098,7 @@ func stageClaimFixture(
 		time.Sleep(5 * time.Millisecond)
 	}
 	stopRuntime(t, cancel, runResult)
-	return runtime, execution
+	return runtime, run
 }
 
 func probeClaimCandidates(

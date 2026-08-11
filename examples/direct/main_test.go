@@ -35,17 +35,17 @@ func TestDirectExampleEndToEnd(t *testing.T) {
 	if !strings.Contains(output.String(), "receipt sent: stub-example-order") {
 		t.Fatalf("example output = %q", output.String())
 	}
-	if trace.Execution.Status != "succeeded" || len(trace.Commands) != 1 ||
+	if trace.Run.Status != "succeeded" || len(trace.Commands) != 1 ||
 		string(trace.Commands[0].Result) != `{"provider_message_id":"stub-example-order"}` {
 		t.Fatalf("example trace = %#v", trace)
 	}
 	var queueRows, journalRows int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE execution_id=$1`, receipt.ID).Scan(&queueRows); err != nil {
+		WHERE run_id=$1`, receipt.ID).Scan(&queueRows); err != nil {
 		t.Fatalf("count queue rows: %v", err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE execution_id=$1`, receipt.ID).Scan(&journalRows); err != nil {
+		WHERE run_id=$1`, receipt.ID).Scan(&journalRows); err != nil {
 		t.Fatalf("count journal rows: %v", err)
 	}
 	if queueRows != 0 || journalRows != 6 || len(trace.History) != journalRows {

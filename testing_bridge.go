@@ -61,7 +61,7 @@ func testWorker(worker erasedWorker, request testengine.Request) (testengine.Res
 			scope.state.eventInputs[identity] = eventInputSnapshot{position: input.Position, payload: slices.Clone(input.Payload)}
 		}
 	}
-	value, handlerErr, panicked := invokeWorker(withAttemptScope(request.Context, &scope.state), worker, scope)
+	value, handlerErr, panicked := invokeWorker(request.Context, worker, scope)
 	if handlerErr == nil && !panicked {
 		handlerErr = validateDecisionCommands(scope.state.decision)
 	}
@@ -97,16 +97,11 @@ func testCommit(worker erasedWorker, request testengine.Request) (testengine.Res
 	if err != nil {
 		return testengine.Result{}, newError(ErrInvalid, "test", "commit result", worker.command.Name, "result does not match definition")
 	}
-	scope := scopeState{}
-	err = worker.commit(withAttemptScope(request.Context, &scope), tx, args, result, testCommandInfo(request.Info))
-	if scope.firstError != nil {
-		return testengine.Result{}, scope.firstError
-	}
-	return testengine.Result{}, err
+	return testengine.Result{}, worker.commit(request.Context, tx, args, result, testCommandInfo(request.Info))
 }
 
 func testCommandInfo(value testengine.Info) CommandInfo {
-	return CommandInfo{ExecutionID: ExecutionID(value.ExecutionID), CommandID: CommandID(value.CommandID),
+	return CommandInfo{RunID: RunID(value.RunID), RunKey: value.RunKey, CommandID: CommandID(value.CommandID),
 		CommandKey: value.CommandKey, Name: value.Name, Version: value.Version, CreatedAt: value.CreatedAt,
 		BudgetStartedAt: value.BudgetStartedAt, Attempt: value.Attempt, AttemptStartedAt: value.AttemptStartedAt}
 }

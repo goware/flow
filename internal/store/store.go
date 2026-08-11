@@ -23,7 +23,7 @@ import (
 
 const MaxHistoryLimit = 1000
 
-var ErrLockUnavailable = errors.New("flow store: execution lock unavailable")
+var ErrLockUnavailable = errors.New("flow store: run lock unavailable")
 
 type LockMode uint8
 
@@ -81,7 +81,7 @@ func ParseNotificationHint(payload string) (uuid.UUID, bool) {
 		Kind string `json:"kind"`
 		Key  string `json:"key"`
 	}
-	if err := json.Unmarshal([]byte(payload), &hint); err != nil || hint.V != 1 || hint.Kind != "execution" {
+	if err := json.Unmarshal([]byte(payload), &hint); err != nil || hint.V != 1 || hint.Kind != "run" {
 		return uuid.Nil, false
 	}
 	id, err := uuid.Parse(hint.Key)
@@ -91,7 +91,7 @@ func ParseNotificationHint(payload string) (uuid.UUID, bool) {
 type SemanticTx struct {
 	store             *Store
 	tx                pgx.Tx
-	executionID       uuid.UUID
+	runID             uuid.UUID
 	dbNow             time.Time
 	closed            bool
 	applied           bool
@@ -102,7 +102,7 @@ type SemanticTx struct {
 
 func (s *Store) BeginSemantic(ctx context.Context, id uuid.UUID, mode LockMode) (*SemanticTx, error) {
 	if id == uuid.Nil {
-		return nil, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
+		return nil, fmt.Errorf("%w: run ID is nil", flowerr.ErrInvalid)
 	}
 	if mode != LockBlocking && mode != LockSkipLocked {
 		return nil, fmt.Errorf("%w: unknown lock mode", flowerr.ErrInvalid)
@@ -119,7 +119,7 @@ func (s *Store) BeginSemantic(ctx context.Context, id uuid.UUID, mode LockMode) 
 	return semantic, nil
 }
 
-// AttachSemantic acquires an execution-first semantic lock inside a
+// AttachSemantic acquires a run-first semantic lock inside a
 // caller-owned transaction. The returned value never takes ownership of the
 // transaction; callers that use this entry point remain responsible for its
 // final commit or rollback.
@@ -128,12 +128,12 @@ func (s *Store) AttachSemantic(ctx context.Context, tx pgx.Tx, id uuid.UUID, mod
 		return nil, fmt.Errorf("%w: transaction is nil", flowerr.ErrInvalid)
 	}
 	if id == uuid.Nil {
-		return nil, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
+		return nil, fmt.Errorf("%w: run ID is nil", flowerr.ErrInvalid)
 	}
 	if mode != LockBlocking && mode != LockSkipLocked {
 		return nil, fmt.Errorf("%w: unknown lock mode", flowerr.ErrInvalid)
 	}
-	lockSQL := `SELECT execution_id FROM ` + pgschema.Table(s.schema, "flow_executions") + ` WHERE execution_id=$1 FOR UPDATE`
+	lockSQL := `SELECT run_id FROM ` + pgschema.Table(s.schema, "flow_runs") + ` WHERE run_id=$1 FOR UPDATE`
 	if mode == LockSkipLocked {
 		lockSQL += ` SKIP LOCKED`
 	}
@@ -142,23 +142,23 @@ func (s *Store) AttachSemantic(ctx context.Context, tx pgx.Tx, id uuid.UUID, mod
 		if mode == LockSkipLocked && errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrLockUnavailable
 		}
-		return nil, MapError("lock execution", err)
+		return nil, MapError("lock run", err)
 	}
 	var dbNow time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
 		return nil, MapError("capture database time", err)
 	}
-	return &SemanticTx{store: s, tx: tx, executionID: locked, dbNow: dbNow}, nil
+	return &SemanticTx{store: s, tx: tx, runID: locked, dbNow: dbNow}, nil
 }
 
-// AdoptSemantic wraps a newly inserted execution row that the supplied
+// AdoptSemantic wraps a newly inserted run row that the supplied
 // transaction already owns. It is used only by the start path after the insert
 // has established row ownership and database time has been captured.
 func (s *Store) AdoptSemantic(tx pgx.Tx, id uuid.UUID, dbNow time.Time) (*SemanticTx, error) {
 	if tx == nil || id == uuid.Nil || dbNow.IsZero() {
 		return nil, fmt.Errorf("%w: incomplete adopted semantic transaction", flowerr.ErrInvalid)
 	}
-	return &SemanticTx{store: s, tx: tx, executionID: id, dbNow: dbNow}, nil
+	return &SemanticTx{store: s, tx: tx, runID: id, dbNow: dbNow}, nil
 }
 
 func (tx *SemanticTx) PGX() pgx.Tx {
@@ -175,18 +175,18 @@ func (tx *SemanticTx) DBNow() time.Time {
 	return tx.dbNow
 }
 
-func (tx *SemanticTx) ExecutionID() uuid.UUID {
+func (tx *SemanticTx) RunID() uuid.UUID {
 	if tx == nil {
 		return uuid.Nil
 	}
-	return tx.executionID
+	return tx.runID
 }
 
 type EntryKind string
 
 const (
-	ExecutionStarted EntryKind = "execution_started"
-	ExecutionFailing EntryKind = "execution_failing"
+	RunStarted       EntryKind = "execution_started"
+	RunFailing       EntryKind = "execution_failing"
 	CommandCreated   EntryKind = "command_created"
 	AttemptStarted   EntryKind = "attempt_started"
 	AttemptConcluded EntryKind = "attempt_concluded"
@@ -252,7 +252,7 @@ func (tx *SemanticTx) Apply(ctx context.Context, changes PersistedChangeSet) (Ap
 	for i, entry := range changes.Journal {
 		position := first + int64(i)
 		causation := resolveValidatedCausation(entry, first)
-		row := rowFromEntry(tx.executionID, position, tx.dbNow, causation, entry)
+		row := rowFromEntry(tx.runID, position, tx.dbNow, causation, entry)
 		rows[i] = row
 		copyRows[i] = row.copyValues()
 	}
@@ -288,7 +288,7 @@ func (tx *SemanticTx) NotifyRunnableCommands(ctx context.Context) error {
 	if notificationState.notificationSent {
 		return nil
 	}
-	payload := `{"v":1,"kind":"execution","key":"` + tx.executionID.String() + `"}`
+	payload := `{"v":1,"kind":"run","key":"` + tx.runID.String() + `"}`
 	if _, err := tx.tx.Exec(ctx, `SELECT pg_notify($1, $2)`, tx.store.notificationChannel, payload); err != nil {
 		tx.failed = true
 		return MapError("notify runnable commands", err)
@@ -303,7 +303,7 @@ func (tx *SemanticTx) continueBatch() *SemanticTx {
 		notificationOwner = tx.notificationOwner
 	}
 	return &SemanticTx{
-		store: tx.store, tx: tx.tx, executionID: tx.executionID, dbNow: tx.dbNow,
+		store: tx.store, tx: tx.tx, runID: tx.runID, dbNow: tx.dbNow,
 		notificationOwner: notificationOwner,
 	}
 }
@@ -317,10 +317,10 @@ func (tx *SemanticTx) reserveJournal(ctx context.Context, count int, minimumFirs
 	// batch validation. It is not an allocator compare-and-swap: it preserves
 	// backward causation without a position pre-read and without leaving a
 	// caller-owned transaction able to commit a rejected reservation.
-	err := tx.tx.QueryRow(ctx, `UPDATE `+pgschema.Table(tx.store.schema, "flow_executions")+`
+	err := tx.tx.QueryRow(ctx, `UPDATE `+pgschema.Table(tx.store.schema, "flow_runs")+`
 		SET next_journal_position=next_journal_position+$2, updated_at=$3
-		WHERE execution_id=$1 AND next_journal_position >= $4
-		RETURNING next_journal_position-$2`, tx.executionID, count, tx.dbNow, minimumFirstPosition).Scan(&first)
+		WHERE run_id=$1 AND next_journal_position >= $4
+		RETURNING next_journal_position-$2`, tx.runID, count, tx.dbNow, minimumFirstPosition).Scan(&first)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("%w: journal allocator is missing or precedes causation", flowerr.ErrInvalidState)
 	}
@@ -367,7 +367,7 @@ func (tx *SemanticTx) ensureOpen(operation string) error {
 }
 
 type JournalRow struct {
-	ExecutionID       uuid.UUID
+	RunID             uuid.UUID
 	Position          int64
 	EntryID           uuid.UUID
 	Kind              EntryKind
@@ -386,15 +386,15 @@ type JournalRow struct {
 }
 
 var journalColumns = []string{
-	"execution_id", "position", "entry_id", "entry_kind", "recorded_at", "causation_position",
+	"run_id", "position", "entry_id", "entry_kind", "recorded_at", "causation_position",
 	"command_id", "attempt_id",
 	"event_id", "event_namespace", "event_name", "event_key", "event_class", "terminal_status",
 	"body", "body_hash",
 }
 
-func rowFromEntry(executionID uuid.UUID, position int64, recordedAt time.Time, causation *int64, entry JournalEntry) JournalRow {
+func rowFromEntry(runID uuid.UUID, position int64, recordedAt time.Time, causation *int64, entry JournalEntry) JournalRow {
 	return JournalRow{
-		ExecutionID: executionID, Position: position, EntryID: entry.EntryID, Kind: entry.Kind,
+		RunID: runID, Position: position, EntryID: entry.EntryID, Kind: entry.Kind,
 		RecordedAt: recordedAt, CausationPosition: clonePointer(causation),
 		CommandID: clonePointer(entry.CommandID), AttemptID: clonePointer(entry.AttemptID),
 		EventID: clonePointer(entry.EventID), EventNamespace: clonePointer(entry.EventNamespace),
@@ -406,7 +406,7 @@ func rowFromEntry(executionID uuid.UUID, position int64, recordedAt time.Time, c
 
 func (row JournalRow) copyValues() []any {
 	return []any{
-		row.ExecutionID, row.Position, row.EntryID, string(row.Kind), row.RecordedAt, row.CausationPosition,
+		row.RunID, row.Position, row.EntryID, string(row.Kind), row.RecordedAt, row.CausationPosition,
 		row.CommandID, row.AttemptID,
 		row.EventID, row.EventNamespace, row.EventName, row.EventKey, row.EventClass, row.TerminalStatus,
 		row.Body, row.BodyHash[:],
@@ -421,14 +421,14 @@ func (s *Store) History(ctx context.Context, id uuid.UUID, after uint64, limit i
 // inspection can observe its own uncommitted Flow writes.
 func (s *Store) HistoryInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, after uint64, limit int) ([]JournalRow, error) {
 	if id == uuid.Nil {
-		return nil, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
+		return nil, fmt.Errorf("%w: run ID is nil", flowerr.ErrInvalid)
 	}
 	if after > math.MaxInt64 || limit <= 0 || limit > MaxHistoryLimit {
 		return nil, fmt.Errorf("%w: history bounds are invalid", flowerr.ErrInvalid)
 	}
 	query := `SELECT ` + joinIdentifiers(journalColumns) + `
 		FROM ` + pgschema.Table(s.schema, "flow_journal") + `
-		WHERE execution_id=$1 AND position>$2
+		WHERE run_id=$1 AND position>$2
 		ORDER BY position LIMIT $3`
 	var rows pgx.Rows
 	var err error
@@ -460,7 +460,7 @@ func scanJournalRow(row pgx.Row) (JournalRow, error) {
 	var kind string
 	var bodyHash []byte
 	if err := row.Scan(
-		&result.ExecutionID, &result.Position, &result.EntryID, &kind, &result.RecordedAt, &result.CausationPosition,
+		&result.RunID, &result.Position, &result.EntryID, &kind, &result.RecordedAt, &result.CausationPosition,
 		&result.CommandID, &result.AttemptID,
 		&result.EventID, &result.EventNamespace, &result.EventName, &result.EventKey,
 		&result.EventClass, &result.TerminalStatus, &result.Body, &bodyHash,
@@ -515,7 +515,7 @@ func validateJournalBatch(entries []JournalEntry) (int64, error) {
 
 func validEntryKind(kind EntryKind) bool {
 	switch kind {
-	case ExecutionStarted, ExecutionFailing, CommandCreated, AttemptStarted,
+	case RunStarted, RunFailing, CommandCreated, AttemptStarted,
 		AttemptConcluded, EventRecorded:
 		return true
 	default:

@@ -37,12 +37,12 @@ func TestCrossDecisionCommandKeyReuseIsAConflict(t *testing.T) {
 			}
 			if err := runtime.Register(
 				Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
-					Execute(work, "declarer/1", declarer, crossDecisionArgs{Value: test.values[0]}).Optional()
-					Execute(work, "declarer/2", declarer, crossDecisionArgs{Value: test.values[1]}).Optional()
+					Enqueue(work, "declarer/1", declarer, crossDecisionArgs{Value: test.values[0]}).Optional()
+					Enqueue(work, "declarer/2", declarer, crossDecisionArgs{Value: test.values[1]}).Optional()
 					return None{}, nil
 				}),
 				Handle(declarer, func(_ context.Context, work *Work[crossDecisionArgs]) (None, error) {
-					Execute(work, "shared", child, work.Args)
+					Enqueue(work, "shared", child, work.Args)
 					return None{}, nil
 				}),
 				Handle(child, func(context.Context, *Work[crossDecisionArgs]) (None, error) {
@@ -53,11 +53,11 @@ func TestCrossDecisionCommandKeyReuseIsAConflict(t *testing.T) {
 			}
 			cancel, runResult := startRuntime(t, runtime)
 			defer stopRuntime(t, cancel, runResult)
-			exec, err := root.With(runtime).Execute(ctx, "key-conflict/"+test.name, None{})
+			exec, err := root.Enqueue(ctx, runtime, "key-conflict/"+test.name, None{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 			trace, err := Trace(ctx, runtime, exec.ID)
 			if err != nil {
 				t.Fatal(err)

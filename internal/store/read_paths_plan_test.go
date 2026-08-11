@@ -28,17 +28,17 @@ func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 		if index < 10 {
 			prefix = "needle"
 		}
-		_, err := target.With(runtime).Execute(ctx, fmt.Sprintf("release/%s/%03d", prefix, index), flow.None{}, flow.WithoutExecutionDeadline())
+		_, err := target.Enqueue(ctx, runtime, fmt.Sprintf("release/%s/%03d", prefix, index), flow.None{}, flow.WithoutRunDeadline())
 		if err != nil {
 			t.Fatalf("create target %d: %v", index, err)
 		}
 	}
 	for index := range 400 {
-		if _, err := filler.With(runtime).Execute(ctx, fmt.Sprintf("release/filler/%03d", index), flow.None{}, flow.WithoutExecutionDeadline()); err != nil {
+		if _, err := filler.Enqueue(ctx, runtime, fmt.Sprintf("release/filler/%03d", index), flow.None{}, flow.WithoutRunDeadline()); err != nil {
 			t.Fatalf("create filler %d: %v", index, err)
 		}
 	}
-	if _, err := db.Conn.Exec(ctx, `ANALYZE `+pgschema.Table(schema, "flow_executions")+`, `+
+	if _, err := db.Conn.Exec(ctx, `ANALYZE `+pgschema.Table(schema, "flow_runs")+`, `+
 		pgschema.Table(schema, "flow_commands")+`, `+pgschema.Table(schema, "flow_command_queue")+`, `+
 		pgschema.Table(schema, "flow_journal")); err != nil {
 		t.Fatal(err)
@@ -54,21 +54,21 @@ func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 	query, args := store.LiveWorkListQueryForTest(repository, store.LiveWorkListFilter{
 		Keys: []string{"release/needle/000"}, Limit: 11,
 	})
-	tests = append(tests, planTest{"live_work", query, args, "flow_executions_key_lookup_idx"})
+	tests = append(tests, planTest{"live_work", query, args, "flow_runs_key_lookup_idx"})
 	query, args = store.KeyedHistoryListQueryForTest(repository, store.KeyedHistoryListFilter{
 		Keys: []string{"release/needle/000"}, Limit: 11,
 	})
-	tests = append(tests, planTest{"keyed_history", query, args, "flow_executions_key_lookup_idx"})
-	query, args = store.ExecutionListQueryForTest(repository, store.ExecutionListFilter{Limit: 11})
-	tests = append(tests, planTest{"default_execution_list", query, args, "flow_executions_created_idx"})
+	tests = append(tests, planTest{"keyed_history", query, args, "flow_runs_key_lookup_idx"})
+	query, args = store.RunListQueryForTest(repository, store.RunListFilter{Limit: 11})
+	tests = append(tests, planTest{"default_run_list", query, args, "flow_runs_created_idx"})
 	tests = append(tests, planTest{
 		name: "queue_depth", query: store.QueueDepthQueryForTest(repository),
 		args: []any{"release.rare"}, wantIndex: "flow_command_queue_depth_idx",
 	})
-	query, args = store.ExecutionListQueryForTest(repository, store.ExecutionListFilter{
+	query, args = store.RunListQueryForTest(repository, store.RunListFilter{
 		DefinitionName: target.Name(), KeyPrefix: "release/needle/", Limit: 11,
 	})
-	tests = append(tests, planTest{"typed_prefix", query, args, "flow_executions_key_prefix_idx"})
+	tests = append(tests, planTest{"typed_prefix", query, args, "flow_runs_key_prefix_idx"})
 	for _, test := range tests {
 		rows, err := db.Conn.Query(ctx, `EXPLAIN (ANALYZE,BUFFERS,FORMAT TEXT) `+test.query, test.args...)
 		if err != nil {
@@ -96,23 +96,23 @@ func TestTraceWaitProductionQueryAvoidsUnrelatedSatisfiedWaits(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := flow.DefineCommand[flow.None, flow.None]("store.trace_wait_target", 1)
-	target, err := command.With(runtime).Execute(ctx, "trace/target", flow.None{}, flow.WithoutExecutionDeadline())
+	target, err := command.Enqueue(ctx, runtime, "trace/target", flow.None{}, flow.WithoutRunDeadline())
 	if err != nil {
 		t.Fatal(err)
 	}
-	filler, err := command.With(runtime).Execute(ctx, "trace/filler", flow.None{}, flow.WithoutExecutionDeadline())
+	filler, err := command.Enqueue(ctx, runtime, "trace/filler", flow.None{}, flow.WithoutRunDeadline())
 	if err != nil {
 		t.Fatal(err)
 	}
 	commands := pgschema.Table(schema, "flow_commands")
 	waits := pgschema.Table(schema, "flow_command_event_waits")
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+waits+`
-		(command_id,execution_id,event_name,event_key,satisfied_position)
+		(command_id,run_id,event_name,event_key,satisfied_position)
 		VALUES ($1,$2,'store.trace.target','target',1)`, target.RootCommandID, target.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+commands+` (
-		command_id,execution_id,command_key,name,version,parent_command_id,required,args,declaration_fingerprint,
+		command_id,run_id,command_key,name,version,parent_command_id,required,args,declaration_fingerprint,
 		state,unsatisfied_waits,queue,retry_policy,created_position,created_at,updated_at,status_at)
 		SELECT md5($1::text||':'||g::text)::uuid,$1::uuid,'trace/sparse/'||g::text,'store.trace.synthetic',1,$2::uuid,true,
 		       convert_to('{}','UTF8'),decode(repeat('00',32),'hex'),'pending',1,'default',convert_to('{}','UTF8'),
@@ -121,9 +121,9 @@ func TestTraceWaitProductionQueryAvoidsUnrelatedSatisfiedWaits(t *testing.T) {
 		t.Fatalf("seed unrelated commands: %v", err)
 	}
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+waits+`
-		(command_id,execution_id,event_name,event_key,satisfied_position)
-		SELECT command_id,execution_id,'store.trace.unrelated',command_key,1
-		FROM `+commands+` WHERE execution_id=$1 AND parent_command_id IS NOT NULL`, filler.ID); err != nil {
+		(command_id,run_id,event_name,event_key,satisfied_position)
+		SELECT command_id,run_id,'store.trace.unrelated',command_key,1
+		FROM `+commands+` WHERE run_id=$1 AND parent_command_id IS NOT NULL`, filler.ID); err != nil {
 		t.Fatalf("seed unrelated waits: %v", err)
 	}
 	if _, err := db.Conn.Exec(ctx, `ANALYZE `+commands+`, `+waits); err != nil {
@@ -139,7 +139,7 @@ func TestTraceWaitProductionQueryAvoidsUnrelatedSatisfiedWaits(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := strings.Join(lines, "\n")
-	for _, index := range []string{"flow_commands_execution_command_uq", "flow_command_event_waits_pkey"} {
+	for _, index := range []string{"flow_commands_run_command_uq", "flow_command_event_waits_pkey"} {
 		if !strings.Contains(plan, index) {
 			t.Fatalf("trace waits did not use %s:\n%s", index, plan)
 		}

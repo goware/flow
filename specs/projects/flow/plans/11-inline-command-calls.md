@@ -4,8 +4,8 @@ Status: Planned
 
 Planned at: `788c9b5` on 2026-08-11
 
-- **Target release:** no release is committed; if approved after Plans 9 and
-  10, this is a separately reviewed v0.5.0 candidate
+- **Target release:** no release is committed; if approved after the combined
+  Plans 9–10 v0.3.0 release, this is a separately reviewed v0.4.0 candidate
 - **Priority:** P2 optional feature; it does not block Plan 9, Plan 10, or the
   Trails integration
 - **Effort:** L
@@ -32,7 +32,8 @@ Planned at: `788c9b5` on 2026-08-11
 > implementation obstacle suggests a second concept, a seventh table, or a
 > weaker fence, stop and amend this plan.
 >
-> **Depends on:** Plan 9 released as v0.3.0 and Plan 10 completed and released.
+> **Depends on:** Plans 9 and 10 completed, reviewed, and released together as
+> v0.3.0.
 > Plan 9 establishes `Run`/`Enqueue`, direct-only root enqueue, migration 004,
 > and the explicit `flow.Emit` versus `Event.Deliver` distinction. Plan 10 adds
 > atomic current-run replacement, `CommandInfo.RunKey`, and a named

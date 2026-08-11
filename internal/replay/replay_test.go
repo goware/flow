@@ -13,14 +13,14 @@ import (
 func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	t.Parallel()
 
-	executionID := uuid.New()
+	runID := uuid.New()
 	commandID := uuid.New()
-	start := row(t, executionID, 1, store.ExecutionStarted, nil, journalcodec.ExecutionStartedBody{
-		V: 1, ExecutionID: executionID.String(), DefinitionName: "work",
-		DefinitionVersion: 1, ExecutionKey: "key", Input: json.RawMessage(`{"x":1}`),
+	start := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
+		V: 1, RunID: runID.String(), DefinitionName: "work",
+		DefinitionVersion: 1, RunKey: "key", Input: json.RawMessage(`{"x":1}`),
 		FailFast: true, DeadlineMode: "none", MaxCommands: 5, Metadata: json.RawMessage(`{}`),
 	})
-	created := row(t, executionID, 2, store.CommandCreated, &commandID, journalcodec.CommandCreatedBody{
+	created := row(t, runID, 2, store.CommandCreated, &commandID, journalcodec.CommandCreatedBody{
 		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
 		Args: json.RawMessage(`{"x":1}`), Required: true,
 		InitialState: "ready", Queue: "default", RetryPolicy: json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
@@ -30,7 +30,7 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fold() error = %v", err)
 	}
-	if state.ID != executionID || state.CommandCount != 1 || state.OpenCommands != 1 ||
+	if state.ID != runID || state.CommandCount != 1 || state.OpenCommands != 1 ||
 		state.RootCommandID == nil || *state.RootCommandID != commandID || state.Commands[commandID].State != "ready" {
 		t.Fatalf("Fold() = %#v", state)
 	}
@@ -62,13 +62,13 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 func TestFoldValidatesApplicationEventBodies(t *testing.T) {
 	t.Parallel()
 
-	executionID := uuid.New()
-	start := row(t, executionID, 1, store.ExecutionStarted, nil, journalcodec.ExecutionStartedBody{
-		V: 1, ExecutionID: executionID.String(), DefinitionName: "work",
-		DefinitionVersion: 1, ExecutionKey: "key", Input: json.RawMessage(`{}`),
+	runID := uuid.New()
+	start := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
+		V: 1, RunID: runID.String(), DefinitionName: "work",
+		DefinitionVersion: 1, RunKey: "key", Input: json.RawMessage(`{}`),
 		FailFast: true, DeadlineMode: "none", MaxCommands: 5, Metadata: json.RawMessage(`{}`),
 	})
-	application := row(t, executionID, 2, store.EventRecorded, nil, journalcodec.ApplicationEventBody{
+	application := row(t, runID, 2, store.EventRecorded, nil, journalcodec.ApplicationEventBody{
 		V: 2, Payload: json.RawMessage(`{"value":"future"}`),
 	})
 	eventID := uuid.New()
@@ -89,14 +89,14 @@ func TestFoldValidatesApplicationEventBodies(t *testing.T) {
 	}
 }
 
-func row(t *testing.T, executionID uuid.UUID, position int64, kind store.EntryKind, commandID *uuid.UUID, body any) store.JournalRow {
+func row(t *testing.T, runID uuid.UUID, position int64, kind store.EntryKind, commandID *uuid.UUID, body any) store.JournalRow {
 	t.Helper()
 	encoded, err := journalcodec.Encode(body)
 	if err != nil {
 		t.Fatalf("journalcodec.Encode() error = %v", err)
 	}
 	return store.JournalRow{
-		ExecutionID: executionID, Position: position, EntryID: uuid.New(), Kind: kind,
+		RunID: runID, Position: position, EntryID: uuid.New(), Kind: kind,
 		CommandID: commandID, Body: encoded.BytesCopy(), BodyHash: sha256.Sum256(encoded.Bytes),
 	}
 }

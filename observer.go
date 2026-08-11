@@ -10,33 +10,33 @@ import (
 type ObservationKind string
 
 const (
-	ObservationExecution ObservationKind = "execution"
-	ObservationCommand   ObservationKind = "command"
-	ObservationEvent     ObservationKind = "event"
-	ObservationAttempt   ObservationKind = "attempt"
-	ObservationClaim     ObservationKind = "claim"
-	ObservationLease     ObservationKind = "lease"
-	ObservationWait      ObservationKind = "wait"
-	ObservationRuntime   ObservationKind = "runtime"
+	ObservationRun     ObservationKind = "run"
+	ObservationCommand ObservationKind = "command"
+	ObservationEvent   ObservationKind = "event"
+	ObservationAttempt ObservationKind = "attempt"
+	ObservationClaim   ObservationKind = "claim"
+	ObservationLease   ObservationKind = "lease"
+	ObservationWait    ObservationKind = "wait"
+	ObservationRuntime ObservationKind = "runtime"
 )
 
 // Observation contains only bounded operational metadata. It intentionally
 // has no payload, result, raw SQL, connection, or lease
 // token field.
 type Observation struct {
-	Kind        ObservationKind
-	Operation   string
-	Outcome     string
-	ExecutionID ExecutionID
-	CommandID   CommandID
-	CommandKey  string
-	Name        string
-	Version     int
-	Queue       string
-	Worker      string
-	Count       int64
-	Duration    time.Duration
-	OccurredAt  time.Time
+	Kind       ObservationKind
+	Operation  string
+	Outcome    string
+	RunID      RunID
+	CommandID  CommandID
+	CommandKey string
+	Name       string
+	Version    int
+	Queue      string
+	Worker     string
+	Count      int64
+	Duration   time.Duration
+	OccurredAt time.Time
 }
 
 type Observer interface {

@@ -48,20 +48,6 @@ func (w *Work[A]) flowScope() *scopeState {
 	return w.scope
 }
 
-type attemptScopeContextKey struct{}
-
-func withAttemptScope(ctx context.Context, state *scopeState) context.Context {
-	return context.WithValue(ctx, attemptScopeContextKey{}, state)
-}
-
-func attemptScope(ctx context.Context) *scopeState {
-	if ctx == nil {
-		return nil
-	}
-	state, _ := ctx.Value(attemptScopeContextKey{}).(*scopeState)
-	return state
-}
-
 type WorkerOption[A, R any] interface {
 	applyWorker(*workerOptionState[A, R])
 }
@@ -261,16 +247,16 @@ func Emit[W, T any](work *Work[W], event Event[T], key string, payload T) error 
 	return nil
 }
 
-// Execute requests a command from a worker. It never invokes
+// Enqueue requests a command from a worker. It never invokes
 // the worker inline; the command is staged in the enclosing durable decision.
-func Execute[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) *Node {
-	state, err := usableWork(work, "execute")
+func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) *Node {
+	state, err := usableWork(work, "enqueue")
 	node := &Node{scope: state, key: key}
 	if err != nil {
 		return node
 	}
 	if cmd.def == nil || cmd.err != nil {
-		err = newError(ErrInvalid, "execute", "command", key, "invalid command definition")
+		err = newError(ErrInvalid, "enqueue", "command", key, "invalid command definition")
 		state.poison(err)
 		return node
 	}
@@ -294,7 +280,7 @@ func Execute[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) 
 		if equivalentStagedCommandIdentity(prior, staged) {
 			return node
 		}
-		err = newError(ErrConflict, "execute", "command", key, "command key was staged with a different declaration")
+		err = newError(ErrConflict, "enqueue", "command", key, "command key was staged with a different declaration")
 		state.poison(err)
 		return node
 	}
@@ -365,10 +351,10 @@ func addCommandEventWait(waits []commandEventWait, wait commandEventWait) []comm
 func validateDecisionCommands(state decisionState) error {
 	for _, command := range state.commands {
 		if command.within > 0 && len(command.waits) == 0 {
-			return newError(ErrInvalid, "execute", "within", command.key, "Within requires WaitFor")
+			return newError(ErrInvalid, "enqueue", "within", command.key, "Within requires WaitFor")
 		}
 		if len(command.waits) > maxCommandEventWaits {
-			return newError(ErrInvalid, "execute", "wait", command.key, "command exceeds the 256 event-wait limit")
+			return newError(ErrInvalid, "enqueue", "wait", command.key, "command exceeds the 256 event-wait limit")
 		}
 	}
 	return nil
@@ -401,45 +387,44 @@ func (state *decisionState) orderedCommands() []stagedCommand {
 }
 
 // GetEventValue returns the typed value attached to an exact event gate
-// declared by the current command. The value is already in memory when the
-// worker starts; this function does not wait or query the database.
-func GetEventValue[W, T any](work *Work[W], event Event[T], key string) (T, error) {
+// materialized for the current command. The value is already in memory when
+// the worker starts; this function does not wait or query the database.
+// found=false reports ordinary absence without poisoning the worker decision.
+func GetEventValue[W, T any](work *Work[W], event Event[T], key string) (T, bool, error) {
 	var zero T
 	state, err := usableWork(work, "get event value")
 	if err != nil {
-		return zero, err
+		return zero, false, err
 	}
 	if event.def == nil || event.def.Namespace != "application" || event.err != nil {
 		err = newError(ErrInvalid, "get", "event value", key, "invalid application event definition")
 		state.poison(err)
-		return zero, err
+		return zero, false, err
 	}
 	if err = validateStableKey(key, maxCommandKeyBytes, "event"); err != nil {
 		state.poison(err)
-		return zero, err
+		return zero, false, err
 	}
 	input, ok := state.eventInputs[event.def.Name+"\x00"+key]
 	if !ok {
-		err = newError(ErrInvalidState, "get", "event value", key, "event was not declared as an input to this command")
-		state.poison(err)
-		return zero, err
+		return zero, false, nil
 	}
 	decoded, err := event.def.Payload.Decode(input.payload)
 	if err != nil {
 		err = newError(ErrInvalidState, "get", "event value", key, "stored event payload cannot be decoded")
 		state.poison(err)
-		return zero, err
+		return zero, false, err
 	}
 	result, ok := decoded.(T)
 	if !ok {
 		err = newError(ErrInvalidState, "get", "event value", key, "stored event payload has an incompatible type")
 		state.poison(err)
-		return zero, err
+		return zero, false, err
 	}
-	return result, nil
+	return result, true, nil
 }
 
-func ResultOf[A, R any](trace ExecutionTrace, key string, cmd Command[A, R]) (R, error) {
+func ResultOf[A, R any](trace RunTrace, key string, cmd Command[A, R]) (R, error) {
 	var zero R
 	value, err := lookupTraceResult(trace, key, cmd.def)
 	if err != nil {
@@ -456,7 +441,7 @@ func ResultOf[A, R any](trace ExecutionTrace, key string, cmd Command[A, R]) (R,
 	return result, nil
 }
 
-func lookupTraceResult(trace ExecutionTrace, key string, command *definition.Command) (TraceCommand, error) {
+func lookupTraceResult(trace RunTrace, key string, command *definition.Command) (TraceCommand, error) {
 	if command == nil {
 		return TraceCommand{}, newError(ErrInvalid, "read", "command", key, "invalid command definition")
 	}

@@ -1,4 +1,4 @@
-// Package flow provides event-driven, durable, distributed work execution on
+// Package flow provides event-driven, durable, distributed work on
 // PostgreSQL.
 //
 // # Core model
@@ -14,7 +14,7 @@
 //   - [Event] is an immutable, typed definition of a durable fact. An event
 //     name describes the fact kind; its key carries domain and generation
 //     identity.
-//   - [Execution] is one durable command graph and its consistency boundary.
+//   - [Run] is one durable command graph and its consistency boundary.
 //     It owns the root command, staged descendants, exact event inputs,
 //     attempts, and ordered journal.
 //   - [Runtime] is both a [Client] for durable operations and, when passed to
@@ -22,21 +22,21 @@
 //
 // The usual shape is:
 //
-//	Command definition --Execute--> Execution
+//	Command definition --Enqueue--> Run
 //	Runtime.Run -----------claim----> Work
-//	Work ----------------Execute----> staged child command
+//	Work ----------------Enqueue----> staged child command
 //	Work -----------------Emit------> staged application event
 //	Event + WaitFor ----------------> runnable command
 //
-// Root execution starts are durable and asynchronous: Execute always enqueues
-// rather than calling a worker inline. Inside a worker, [Execute] and [Emit]
+// Root run starts are durable and asynchronous: Enqueue always enqueues
+// rather than calling a worker inline. Inside a worker, [Enqueue] and [Emit]
 // build one typed decision in memory. That decision, the worker result, and an
 // optional short same-database [WithCommit] callback settle atomically after
 // the attempt fence is rechecked.
 //
 // Exact event gates provide durable sequencing and all-of joins without
 // consuming a worker or database connection while waiting. Matching is scoped
-// to one execution and uses the tuple (event name, event key). Values for the
+// to one run and uses the tuple (event name, event key). Values for the
 // current command's declared gates are materialized before invocation and read
 // from memory with [GetEventValue].
 //
@@ -60,16 +60,16 @@
 // Handler invocation is at-least-once. Durable PostgreSQL progression is
 // fenced so that only the current attempt can settle. Application handlers
 // should therefore use stable idempotency keys for remote effects rather than
-// interpreting fenced settlement as exactly-once execution.
+// interpreting fenced settlement as exactly-once handler invocation.
 //
-// # Execution identity and history
+// # Run identity and history
 //
-// A stable non-empty execution key is permanently idempotent by default.
-// [WithLiveKey] instead gives at most one non-terminal execution for a command
-// definition and key; after that execution becomes terminal, a new generation
-// may start with the same key. [LookupLiveExecution] resolves the current
+// A stable non-empty run key is permanently idempotent by default.
+// [WithLiveKey] instead gives at most one non-terminal run for a command
+// definition and key; after that run becomes terminal, a new generation
+// may start with the same key. [GetCurrentRun] resolves the current
 // non-terminal generation when an external caller knows the domain key but not
-// its exact [ExecutionID]. Terminal generations remain durable history.
+// its exact [RunID]. Terminal generations remain durable history.
 //
 // Flow retains journal, payload, and terminal data indefinitely and exposes no
 // pruning API. Inspection, history, and trace APIs read durable state without
@@ -79,8 +79,8 @@
 //
 // A command should mark an independent retry, side-effect, isolation, queue,
 // timeout, external-wait, or parallelism boundary—not every deterministic
-// business-logic step. Keep causally related commands in one execution, but
-// use separate executions for independent bulk items because one execution is
+// business-logic step. Keep causally related commands in one run, but
+// use separate runs for independent bulk items because one run is
 // a serialized semantic aggregate.
 //
 // Large fan-outs should be chunked into bounded command batches and large
@@ -91,20 +91,37 @@
 // # Transactions, events, and operations
 //
 // [WithCommit] is intended for short same-database writes and must not contain
-// remote calls. Caller-owned transactions should also be short because an
-// execution lock remains held until the caller commits or rolls back.
+// remote calls. Caller-owned transactions should also be short because a run
+// lock remains held until the caller commits or rolls back. Create exactly one
+// [TransactionClient] with [Runtime.InTx] for each caller transaction, perform
+// Flow writes first, call [TransactionClient.BeginApplicationWrites], and then
+// perform application row locks/writes. The client is non-concurrent, does not
+// own the transaction, and must not outlive it.
 //
-// External callers record execution-scoped events with [Event.Emit].
-// [Event.Deliver] provides deliberately detached ingress to a known execution,
+// External callers record run-scoped events with [Event.Deliver], which
+// provides deliberately detached ingress to a known run,
 // including from an active worker; passing [Runtime.InTx] joins it to
-// caller-owned application writes. Same-execution worker events should
+// caller-owned application writes. Same-run worker events should
 // normally use staged [Emit] so they commit atomically with the worker result.
+// External code that knows a domain key rather than an exact run ID may compose
+// [GetCurrentRun] with [Event.Deliver], handling the ordinary race in which the
+// selected run settles before delivery. Event definitions should name stable
+// fact kinds; deterministic keys should carry entity and generation identity.
+//
+// [Command.ReplaceCurrentRun] atomically cancels an exact expected live-key
+// generation and creates a distinct successor. Retries can rediscover a
+// declaration-equivalent successor only after the current run ID differs from
+// the expected predecessor.
+//
+// Positive fractional public durations are rounded upward to a whole
+// millisecond before durable fingerprints or rows are produced. Stored and
+// decoded durations remain strictly exact milliseconds.
 //
 // Observer delivery is bounded and best-effort. Observers must return promptly
 // and should honor context cancellation; a blocked or failed observer never
-// changes durable execution correctness or prevents runtime shutdown.
+// changes durable run correctness or prevents runtime shutdown.
 //
-// The v0.1 release line supports Go 1.26 and PostgreSQL 17 and 18. Published
+// The current v0.x line supports Go 1.26 and PostgreSQL 17 and 18. Published
 // migrations are immutable and upgrades are forward-only. During v0.x,
 // intentional Go API changes may be described in release notes.
 package flow

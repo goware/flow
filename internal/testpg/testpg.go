@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/goware/pgkit/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,13 +24,24 @@ type Database struct {
 }
 
 func Open(t testing.TB) Database {
-	return OpenWithMaxConns(t, 12)
+	return open(t, 12, nil)
 }
 
 // OpenWithMaxConns creates an isolated real-PostgreSQL test database whose
 // application pool has the requested capacity. Small pools are useful for
 // proving that Flow releases its connection before invoking application code.
 func OpenWithMaxConns(t testing.TB, maxConns int32) Database {
+	return open(t, maxConns, nil)
+}
+
+// OpenWithQueryTracer creates an isolated database whose application
+// connections report SQL through tracer. It is intended for query-shape and
+// query-count regression tests.
+func OpenWithQueryTracer(t testing.TB, tracer pgx.QueryTracer) Database {
+	return open(t, 12, tracer)
+}
+
+func open(t testing.TB, maxConns int32, tracer pgx.QueryTracer) Database {
 	t.Helper()
 	if maxConns <= 0 {
 		t.Fatalf("max PostgreSQL connections must be positive")
@@ -45,6 +57,7 @@ func OpenWithMaxConns(t testing.TB, maxConns int32) Database {
 	if password := os.Getenv("FLOW_TEST_DATABASE_PASSWORD"); password != "" {
 		config.ConnConfig.Password = password
 	}
+	config.ConnConfig.Tracer = tracer
 	config.MaxConns = maxConns
 	db, err := pgkit.ConnectWithPGX("flow-test", config)
 	if err != nil {

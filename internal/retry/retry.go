@@ -33,6 +33,11 @@ type PublicPolicy struct {
 }
 
 func NewPublicFor(maxElapsed time.Duration) PublicPolicy {
+	if maxElapsed > 0 {
+		if normalized, _, err := durable.CeilMilliseconds("retry elapsed bound", maxElapsed); err == nil {
+			maxElapsed = normalized
+		}
+	}
 	policy := PublicPolicy{value: For(maxElapsed)}
 	policy.err = policy.value.Validate()
 	return policy
@@ -56,6 +61,14 @@ func (p PublicPolicy) Attempts(max int) PublicPolicy {
 func (p PublicPolicy) Backoff(delays ...time.Duration) PublicPolicy {
 	copy := p.clone()
 	copy.value.Backoff = slices.Clone(delays)
+	for index, delay := range copy.value.Backoff {
+		if delay <= 0 {
+			continue
+		}
+		if normalized, _, err := durable.CeilMilliseconds("retry backoff delay", delay); err == nil {
+			copy.value.Backoff[index] = normalized
+		}
+	}
 	copy.err = copy.value.Validate()
 	return copy
 }
@@ -284,13 +297,13 @@ const (
 )
 
 type Input struct {
-	DBNow             time.Time
-	BudgetStartedAt   time.Time
-	ConsumedAttempts  int
-	AttemptID         string
-	Classification    ErrorClass
-	ExplicitDelay     *time.Duration
-	ExecutionDeadline *time.Time
+	DBNow            time.Time
+	BudgetStartedAt  time.Time
+	ConsumedAttempts int
+	AttemptID        string
+	Classification   ErrorClass
+	ExplicitDelay    *time.Duration
+	RunDeadline      *time.Time
 }
 
 type Decision struct {
@@ -378,8 +391,8 @@ func effectiveDeadline(policy Policy, input Input) (time.Time, bool, error) {
 			return time.Time{}, false, err
 		}
 	}
-	if input.ExecutionDeadline != nil && (deadline.IsZero() || input.ExecutionDeadline.Before(deadline)) {
-		deadline = *input.ExecutionDeadline
+	if input.RunDeadline != nil && (deadline.IsZero() || input.RunDeadline.Before(deadline)) {
+		deadline = *input.RunDeadline
 	}
 	return deadline, !deadline.IsZero(), nil
 }

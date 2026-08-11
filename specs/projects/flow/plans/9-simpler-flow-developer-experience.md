@@ -1,12 +1,12 @@
 # Plan 9: Simplify Flow's developer experience without weakening its model
 
-Status: Planned
+Status: Implemented (combined v0.3 candidate; final review pending)
 
 Planned at: `788c9b5` on 2026-08-11; implementation baseline remains the
 tagged `v0.2.0` source at `3d2b29b`
 
-- **Target release:** v0.3.0; Plan 9 is implemented, verified, tagged, and
-  released independently before Plan 10 begins
+- **Target release:** intermediate milestone in the combined v0.3.0 candidate;
+  Plan 9 is implemented and reviewed before Plan 10, but is not tagged alone
 - **Priority:** P1 for the public API cleanup and Trails-facing ergonomics
 - **Effort:** L
 - **Risk:** MEDIUM-HIGH; the durable model remains unchanged, but this plan
@@ -40,12 +40,12 @@ tagged `v0.2.0` source at `3d2b29b`
 > helper requires a new durable concept, seventh table, scheduler branch, or
 > weaker fence, stop: that is evidence that the helper is outside this plan.
 >
-> **Release sequencing:** Plan 9 owns the complete v0.2-to-v0.3 migration and
-> release. Tag v0.3.0 only after its migration, consumer, documentation, and
-> release gates pass. Plan 10 starts from that exact tagged API and adds
-> run-ownership replacement, run-key inspection, and transaction-client
-> ergonomics. Plan 11 is a separately approved, optional inline-call proposal;
-> it does not block Plan 9 or the Trails migration.
+> **Release sequencing:** Plan 9 owns the breaking v0.2-to-v0.3 vocabulary and
+> schema migration, but it is an intermediate reviewed checkpoint rather than
+> a tag. Plan 10 is implemented on that same branch and the combined candidate
+> is tagged only after both plans' migration, consumer, documentation, and
+> verification gates pass. Plan 11 is a separately approved, optional inline-
+> call proposal and is not part of this release.
 >
 > **Initial drift check:**
 >
@@ -356,14 +356,14 @@ method `Emit`. Renaming run/queued-delivery vocabulary, changing
 `GetEventValue`, and applying migration 004 are already real breaking changes,
 so these deletions belong in the same pre-v1 upgrade. Therefore:
 
-- complete, review, and release Plan 9 as v0.3.0;
+- complete and review Plan 9 as the intermediate v0.3.0 API checkpoint;
 - do not move or rewrite the v0.2.0 tag;
 - publish one complete v0.2-to-v0.3 migration guide with mechanical before/
   after examples;
 - do not retain `Command.With`, `BoundCommand`, or method `Event.Emit` as
   deprecated wrappers; and
-- do not begin Plan 10 until the tagged v0.3.0 API, migration, and Trails
-  consumer proof are accepted.
+- do not begin Plan 10 until the Plan 9 API, migration, and Trails consumer
+  proof are accepted; do not tag the intermediate checkpoint.
 
 Trails Plan 004 is complete, and this feature work has not been deployed. Its
 V1 compatibility roots therefore do not constrain the Flow upgrade. The
@@ -975,7 +975,7 @@ transactional event, exact join, dynamic successor, `None`-result commands,
 optional input branch, and final trace. Keep test time deterministic and
 short.
 
-### Phase 5 — Documentation, consumer proof, and v0.3.0 release
+### Phase 5 — Documentation, consumer proof, and Plan 9 checkpoint
 
 1. synchronize the documentation listed in Section 5.2;
 2. finish the complete v0.2-to-v0.3 migration guide;
@@ -987,18 +987,19 @@ short.
    not commit cross-repository changes without separate authorization;
 5. run source scans for deleted and forbidden concepts;
 6. run the complete PostgreSQL and race gates; and
-7. report results for human review, tag the approved completion SHA as v0.3.0,
-   and record that tag as Plan 10's implementation baseline.
+7. report results for review, record the exact checkpoint SHA for Plan 10's
+   drift audit, and continue without creating a release tag.
 
-The Trails proof is a Plan 9 release gate because Trails is the concrete
+The Trails proof is a Plan 9 checkpoint gate because Trails is the concrete
 compatibility target. It must include a retained bridge, edge, OIF, or provider
 monitor delivering into the exact current `intent.run` generation; a deleted
 V1 compatibility path is not evidence.
 If the migration requires a lost engine capability rather than a mechanical/
 API-helper adjustment, stop and amend this plan.
 
-These complete gates certify the v0.3.0 release. Plan 10 performs its own drift,
-consumer, and release review from that tag.
+These complete gates certify the Plan 9 portion of the combined v0.3.0
+candidate. Plan 10 performs its own drift, consumer, and release review from
+the recorded checkpoint.
 
 Final commands, adjusted only for the repository's then-current supported
 matrix:
@@ -1119,7 +1120,7 @@ Plan 9 is complete only when all of the following are true:
     a shared composed event key, stale-generation isolation, and final
     inspection without a DSL.
 20. README, package docs, normative specs, component docs, examples, and the
-    complete v0.2-to-v0.3 migration guide agree on the released Plan 9 API.
+    complete v0.2-to-v0.3 migration guide agree on the Plan 9 API.
 21. Historical plans/evidence remain historically accurate, and a disposable
     Trails migration compiles with its Flow-focused tests passing against the
     repository's actual Plan 004 state. The proof includes an enduring
@@ -1128,8 +1129,8 @@ Plan 9 is complete only when all of the following are true:
 22. All named Flow tests run with no unintended skips against supported
     PostgreSQL majors; ordinary and race suites pass.
 23. Build, vet, formatting, module verification/tidiness, vulnerability, and
-    retained performance non-regression gates pass before human approval and
-    the v0.3.0 tag.
+    retained performance non-regression gates pass before the Plan 9
+    checkpoint is handed to Plan 10.
 
 ## 10. STOP conditions
 
@@ -1168,82 +1169,83 @@ discovered constraint.
 
 ### Baseline and decisions
 
-- [ ] Reconcile any accepted change-set rename and start from a clean reviewed base.
-- [ ] Record the implementation commit, Go version, PostgreSQL versions, schema version, and exported API inventory.
-- [ ] Inventory all exported/internal `Execution*`/`Lookup*` names and fields, every execution-named live catalog/SQL identifier, plus all Flow and Trails uses of bound/direct command starts, `Event.Deliver`, method `Event.Emit`, duration normalization, and command-key suffix input detection; identify the enduring independent-monitor paths retained after Trails Plan 004.
-- [ ] Confirm the Plan 9 v0.3 signatures with compile-only examples before
+- [x] Reconcile any accepted change-set rename and start from a clean reviewed base.
+- [ ] Record the final implementation commit; Go/PostgreSQL versions, schema
+  version, and the exported API inventory are recorded in candidate evidence.
+- [x] Inventory all exported/internal `Execution*`/`Lookup*` names and fields, every execution-named live catalog/SQL identifier, plus all Flow and Trails uses of bound/direct command starts, `Event.Deliver`, method `Event.Emit`, duration normalization, and command-key suffix input detection; identify the enduring independent-monitor paths retained after Trails Plan 004.
+- [x] Confirm the Plan 9 v0.3 signatures with compile-only examples before
   production edits.
-- [ ] Run and record the complete pre-change ordinary and race baseline.
+- [x] Run and record the complete pre-change ordinary and race baseline.
 
 ### Run and Enqueue vocabulary
 
-- [ ] Rename the complete exported `Execution*` type/function/field/constant family to `Run*`, including trace, read APIs, observations, history, testing surfaces, and examples.
-- [ ] Rename public `LookupLiveExecution` to `GetCurrentRun`; prove it returns only the current non-terminal live-key generation and that no other public `Lookup*` API exists.
-- [ ] Rename internal `LookupApplicationEvent`→`GetEvent`, `LookupCommandExecution`→`GetCommandRunID`, and `LookupLiveExecutionInTx`→`GetCurrentRun`; adopt explicit found/error contracts and leave no production `LookupX` symbol.
-- [ ] Rename queued root/child `Execute` to `Enqueue`; document deferred runnable projection and idempotent rediscovery rather than guaranteed immediate insertion.
-- [ ] Add migration 004: rename `flow_executions`→`flow_runs`, every ownership `execution_id`→`run_id`, `execution_key`→`run_key`, and every execution-named live constraint/index without changing definitions.
-- [ ] Update current production SQL/store/replay/error/observation/test vocabulary and public cursor encoding to Run; retain only migrations 001–003, migration 004 old-name operands, historical plans/evidence, and versioned journal wire strings as documented exceptions.
-- [ ] Prove clean 001→004 install and populated 003→004 upgrade, exact row/hash/FK/index preservation, six-table inventory, compatibility-version rejection, and byte-identical 001–003 checksums.
-- [ ] Add compile/API guards against old exported `Execution*`, `Execute`, and all production `LookupX` symbols without banning ordinary implementation prose that uses the English word “lookup.”
+- [x] Rename the complete exported `Execution*` type/function/field/constant family to `Run*`, including trace, read APIs, observations, history, testing surfaces, and examples.
+- [x] Rename public `LookupLiveExecution` to `GetCurrentRun`; prove it returns only the current non-terminal live-key generation and that no other public `Lookup*` API exists.
+- [x] Rename internal `LookupApplicationEvent`→`GetEvent`, `LookupCommandExecution`→`GetCommandRunID`, and `LookupLiveExecutionInTx`→`GetCurrentRun`; adopt explicit found/error contracts and leave no production `LookupX` symbol.
+- [x] Rename queued root/child `Execute` to `Enqueue`; document deferred runnable projection and idempotent rediscovery rather than guaranteed immediate insertion.
+- [x] Add migration 004: rename `flow_executions`→`flow_runs`, every ownership `execution_id`→`run_id`, `execution_key`→`run_key`, and every execution-named live constraint/index without changing definitions.
+- [x] Update current production SQL/store/replay/error/observation/test vocabulary and public cursor encoding to Run; retain only migrations 001–003, migration 004 old-name operands, historical plans/evidence, and versioned journal wire strings as documented exceptions.
+- [x] Prove clean 001→004 install and populated 003→004 upgrade, exact row/hash/FK/index preservation, six-table inventory, compatibility-version rejection, and byte-identical 001–003 checksums.
+- [x] Add compile/API guards against old exported `Execution*`, `Execute`, and all production `LookupX` symbols without banning ordinary implementation prose that uses the English word “lookup.”
 
 ### Public API ergonomics and deletion
 
-- [ ] Remove the hidden client field from `Command`, `Command.With`, and `BoundCommand`.
-- [ ] Make `Command.Enqueue(ctx, client, key, args, options...)` the sole root-start form.
-- [ ] Prove Runtime and `Runtime.InTx(tx)` direct starts preserve semantics, errors, observations, and lock order.
-- [ ] Retain `Event.Deliver(ctx, client, runID, key, payload)`.
-- [ ] Remove method `Event.Emit` and retain top-level worker `flow.Emit` unchanged.
-- [ ] Add a cross-run worker test matching an enduring Trails bridge/edge/OIF/provider-monitor-to-`intent.run` delivery shape, including exact generation fencing and caller-owned transaction commit and rollback.
-- [ ] Add compile/AST guards for removed APIs and compile-contract coverage for the direct command-start form while retaining generic type-safety checks.
-- [ ] Verify Runtime and `InTx` start/delivery commit, rollback, lock-order, and notification behavior.
+- [x] Remove the hidden client field from `Command`, `Command.With`, and `BoundCommand`.
+- [x] Make `Command.Enqueue(ctx, client, key, args, options...)` the sole root-start form.
+- [x] Prove Runtime and `Runtime.InTx(tx)` direct starts preserve semantics, errors, observations, and lock order.
+- [x] Retain `Event.Deliver(ctx, client, runID, key, payload)`.
+- [x] Remove method `Event.Emit` and retain top-level worker `flow.Emit` unchanged.
+- [x] Add a cross-run worker test matching an enduring Trails bridge/edge/OIF/provider-monitor-to-`intent.run` delivery shape, including exact generation fencing and caller-owned transaction commit and rollback.
+- [x] Add compile/AST guards for removed APIs and compile-contract coverage for the direct command-start form while retaining generic type-safety checks.
+- [x] Verify Runtime and `InTx` start/delivery commit, rollback, lock-order, and notification behavior.
 
 ### Durable duration ergonomics
 
-- [ ] Add one overflow-safe upward millisecond-normalization helper for public durable inputs.
-- [ ] Normalize run deadline, attempt timeout, initial delay, and root/child wait budgets.
-- [ ] Normalize retry elapsed bounds, backoff entries, and explicit retry-after delays.
-- [ ] Preserve strict exact-millisecond store and decode validation.
-- [ ] Prove equivalent normalized values have identical fingerprints and rediscovery behavior.
-- [ ] Add the full positive/fractional/zero/negative/maximum/overflow test matrix.
+- [x] Add one overflow-safe upward millisecond-normalization helper for public durable inputs.
+- [x] Normalize run deadline, attempt timeout, initial delay, and root/child wait budgets.
+- [x] Normalize retry elapsed bounds, backoff entries, and explicit retry-after delays.
+- [x] Preserve strict exact-millisecond store and decode validation.
+- [x] Prove equivalent normalized values have identical fingerprints and rediscovery behavior.
+- [x] Add the full positive/fractional/zero/negative/maximum/overflow test matrix.
 
 ### Optional event input
 
-- [ ] Change `GetEventValue` to return `(value, found, error)` without adding a second reader.
-- [ ] Update required-input callers to reject unexpected absence explicitly.
-- [ ] Prove the single helper remains O(1), in-memory, deterministic, and strict for corruption.
-- [ ] Guard against adding action aliases or a live-delivery routing abstraction.
+- [x] Change `GetEventValue` to return `(value, found, error)` without adding a second reader.
+- [x] Update required-input callers to reject unexpected absence explicitly.
+- [x] Prove the single helper remains O(1), in-memory, deterministic, and strict for corruption.
+- [x] Guard against adding action aliases or a live-delivery routing abstraction.
 
 ### Example
 
-- [ ] Add and test the realistic multi-queue pipeline example.
-- [ ] Keep every executable unit a command, including `None`-result work.
-- [ ] Use one deterministic entity/generation event-key helper at delivery, wait declaration, and lookup.
-- [ ] Prove an event for an earlier generation cannot release a later generation's wait.
-- [ ] Demonstrate explicit `GetCurrentRun` plus `Event.Deliver` composition and its terminal race.
-- [ ] Explain every command boundary and keep the example free of a DSL.
+- [x] Add and test the realistic multi-queue pipeline example.
+- [x] Keep every executable unit a command, including `None`-result work.
+- [x] Use one deterministic entity/generation event-key helper at delivery, wait declaration, and lookup.
+- [x] Prove an event for an earlier generation cannot release a later generation's wait.
+- [x] Demonstrate explicit `GetCurrentRun` plus `Event.Deliver` composition and its terminal race.
+- [x] Explain every command boundary and keep the example free of a DSL.
 
 ### Documentation and consumer proof
 
-- [ ] Update README and `flow.go` to make Run/Command/Queue/Worker/Event/Attempt plus Enqueue/Deliver/Runtime.Run the front-door vocabulary.
-- [ ] Update project overview, functional spec, architecture, and component docs.
-- [ ] Document presence-aware snapshot reads, explicit current-run get/emission races, and upward duration rounding.
-- [ ] Document stable typed event definitions plus deterministic composed rendezvous keys.
-- [ ] Finish the combined v0.2-to-v0.3 migration guide and explicit Trails
+- [x] Update README and `flow.go` to make Run/Command/Queue/Worker/Event/Attempt plus Enqueue/Deliver/Runtime.Run the front-door vocabulary.
+- [x] Update project overview, functional spec, architecture, and component docs.
+- [x] Document presence-aware snapshot reads, explicit current-run get/emission races, and upward duration rounding.
+- [x] Document stable typed event definitions plus deterministic composed rendezvous keys.
+- [x] Finish the combined v0.2-to-v0.3 migration guide and explicit Trails
   migration checklist.
-- [ ] Document the linear-workflow boundary rule and retained at-least-once/fencing semantics.
-- [ ] Preserve historical plans and benchmark evidence as historical records.
-- [ ] Perform the disposable Trails API migration against its actual Plan 004 state, without restoring deleted V1 call sites, and run its Flow-focused tests including an enduring independent-monitor delivery path.
+- [x] Document the linear-workflow boundary rule and retained at-least-once/fencing semantics.
+- [x] Preserve historical plans and benchmark evidence as historical records.
+- [x] Perform the disposable Trails API migration against its actual Plan 004 state, without restoring deleted V1 call sites, and run its Flow-focused tests including an enduring independent-monitor delivery path.
 
-### Final verification and v0.3.0 release
+### Final verification and Plan 9 checkpoint
 
-- [ ] Confirm exactly six Flow tables with `flow_runs` and no old live catalog identifiers; confirm only migration 004 was added and migrations 001–003 retain their checksums.
-- [ ] Scan for removed APIs and forbidden task/step/checkpoint/workflow concepts.
-- [ ] Confirm Plan 9 did not add `flow.Call`, inline delivery fields, journal
+- [x] Confirm exactly six Flow tables with `flow_runs` and no old live catalog identifiers; confirm only migration 004 was added and migrations 001–003 retain their checksums.
+- [x] Scan for removed APIs and forbidden task/step/checkpoint/workflow concepts.
+- [x] Confirm Plan 9 did not add `flow.Call`, inline delivery fields, journal
   rewrites, or migration 005; those remain deferred to Plan 11.
-- [ ] Run gofmt, diff check, module verify/tidy, build, vet, and vulnerability gates.
-- [ ] Run every named ordinary and race test with zero unintended PostgreSQL skips.
-- [ ] Run the supported PostgreSQL-major matrix with durability settings enabled.
-- [ ] Run retained performance shapes and record a non-regression conclusion.
+- [x] Run gofmt, diff check, module verify/tidy, build, vet, and vulnerability gates.
+- [x] Run every named ordinary and race test with zero unintended PostgreSQL skips.
+- [x] Run the supported PostgreSQL-major matrix with durability settings enabled.
+- [x] Run retained performance shapes and record a non-regression conclusion.
 - [ ] Review every changed hunk against this plan and all 23 acceptance criteria.
-- [ ] Obtain human approval of the exact Plan 9 completion SHA, tag it v0.3.0,
-  and record it for Plan 10's drift check.
+- [ ] Obtain review of the exact Plan 9 completion SHA and record it for Plan
+  10's drift check without creating an intermediate release tag.

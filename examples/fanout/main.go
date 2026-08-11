@@ -111,7 +111,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("execution %s completed with %d commands and %d journal entries\n",
+	fmt.Printf("run %s completed with %d commands and %d journal entries\n",
 		exec.ID, len(trace.Commands), len(trace.History))
 }
 
@@ -152,10 +152,10 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 }
 
 // runExampleCommand executes two command-owned fan-out/join phases.
-func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Execution, flow.ExecutionTrace, error) {
-	exec, err := prepareReport.With(runtime).Execute(ctx, "report/example", prepareReportArgs{Parts: []int{0, 1, 2}})
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Run, flow.RunTrace, error) {
+	exec, err := prepareReport.Enqueue(ctx, runtime, "report/example", prepareReportArgs{Parts: []int{0, 1, 2}})
 	if err != nil {
-		return flow.Execution{}, flow.ExecutionTrace{}, err
+		return flow.Run{}, flow.RunTrace{}, err
 	}
 	trace, err := waitForTerminal(ctx, runtime, exec.ID, 8*time.Second)
 	return exec, trace, err
@@ -166,14 +166,14 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Executi
 func (example *fanoutExample) prepareReport(_ context.Context, work *flow.Work[prepareReportArgs]) (prepareReportResult, error) {
 	fmt.Fprintf(example.output, "preparing %d report analyses\n", len(work.Args.Parts))
 	seen := make(map[int]struct{}, len(work.Args.Parts))
-	join := flow.Execute(work, "analysis/join", joinAnalysis, joinAnalysisArgs{Parts: work.Args.Parts})
+	join := flow.Enqueue(work, "analysis/join", joinAnalysis, joinAnalysisArgs{Parts: work.Args.Parts})
 	for _, part := range work.Args.Parts {
 		if _, duplicate := seen[part]; duplicate {
 			return prepareReportResult{}, flow.Permanent(fmt.Errorf("duplicate report part %d", part))
 		}
 		seen[part] = struct{}{}
 		key := fmt.Sprintf("analysis/%d", part)
-		flow.Execute(work, key, analyzePart, analyzePartArgs{Part: part})
+		flow.Enqueue(work, key, analyzePart, analyzePartArgs{Part: part})
 		join.WaitFor(partAnalyzed, key)
 	}
 	return prepareReportResult{Parts: len(work.Args.Parts)}, nil
@@ -194,15 +194,18 @@ func (example *fanoutExample) analyzePart(ctx context.Context, work *flow.Work[a
 // joinAnalysis consumes only its declared event inputs, then stages the
 // second fan-out and its next all-of join.
 func (example *fanoutExample) joinAnalysis(_ context.Context, work *flow.Work[joinAnalysisArgs]) (joinAnalysisResult, error) {
-	join := flow.Execute(work, "enrichment/join", joinEnrichment, joinEnrichmentArgs{Parts: work.Args.Parts})
+	join := flow.Enqueue(work, "enrichment/join", joinEnrichment, joinEnrichmentArgs{Parts: work.Args.Parts})
 	for _, part := range work.Args.Parts {
 		analysisKey := fmt.Sprintf("analysis/%d", part)
-		analyzed, err := flow.GetEventValue(work, partAnalyzed, analysisKey)
-		if err != nil {
+		analyzed, found, err := flow.GetEventValue(work, partAnalyzed, analysisKey)
+		if err != nil || !found {
+			if err == nil {
+				err = fmt.Errorf("required analysis %q is absent", analysisKey)
+			}
 			return joinAnalysisResult{}, err
 		}
 		enrichmentKey := fmt.Sprintf("enrichment/%d", part)
-		flow.Execute(work, enrichmentKey, enrichPart, enrichPartArgs{Part: analyzed.Part, Score: analyzed.Score})
+		flow.Enqueue(work, enrichmentKey, enrichPart, enrichPartArgs{Part: analyzed.Part, Score: analyzed.Score})
 		join.WaitFor(partEnriched, enrichmentKey)
 	}
 	return joinAnalysisResult{Parts: len(work.Args.Parts)}, nil
@@ -217,13 +220,17 @@ func (example *fanoutExample) enrichPart(_ context.Context, work *flow.Work[enri
 func (example *fanoutExample) joinEnrichment(_ context.Context, work *flow.Work[joinEnrichmentArgs]) (joinEnrichmentResult, error) {
 	total := 0
 	for _, part := range work.Args.Parts {
-		value, err := flow.GetEventValue(work, partEnriched, fmt.Sprintf("enrichment/%d", part))
-		if err != nil {
+		key := fmt.Sprintf("enrichment/%d", part)
+		value, found, err := flow.GetEventValue(work, partEnriched, key)
+		if err != nil || !found {
+			if err == nil {
+				err = fmt.Errorf("required enrichment %q is absent", key)
+			}
 			return joinEnrichmentResult{}, err
 		}
 		total += value.Score
 	}
-	flow.Execute(work, "generate", generateReport, generateReportArgs{Total: total})
+	flow.Enqueue(work, "generate", generateReport, generateReportArgs{Total: total})
 	return joinEnrichmentResult{Total: total}, nil
 }
 
@@ -250,7 +257,7 @@ func synchronized(writer io.Writer) io.Writer {
 	return &synchronizedWriter{writer: writer}
 }
 
-func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.ExecutionID, timeout time.Duration) (flow.ExecutionTrace, error) {
+func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.RunID, timeout time.Duration) (flow.RunTrace, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -258,19 +265,19 @@ func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.Executi
 	for {
 		trace, err := flow.Trace(ctx, runtime, id)
 		if err != nil {
-			return flow.ExecutionTrace{}, err
+			return flow.RunTrace{}, err
 		}
-		switch trace.Execution.Status {
+		switch trace.Run.Status {
 		case "succeeded":
 			return trace, nil
 		case "failed", "cancelled", "expired":
-			return flow.ExecutionTrace{}, fmt.Errorf("example execution ended %s", trace.Execution.Status)
+			return flow.RunTrace{}, fmt.Errorf("example run ended %s", trace.Run.Status)
 		}
 		select {
 		case <-ctx.Done():
-			return flow.ExecutionTrace{}, ctx.Err()
+			return flow.RunTrace{}, ctx.Err()
 		case <-timer.C:
-			return flow.ExecutionTrace{}, fmt.Errorf("example execution timed out")
+			return flow.RunTrace{}, fmt.Errorf("example run timed out")
 		case <-ticker.C:
 		}
 	}

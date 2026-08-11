@@ -16,8 +16,8 @@ func TestDecisionBufferCoalescesAndPoisonsConflicts(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_child", 1)
 	scope := &Work[None]{scope: &scopeState{}}
 
-	Execute(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
-	Execute(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
+	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
+	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
 	if scope.scope.firstError != nil {
 		t.Fatalf("equivalent duplicate poison = %v", scope.scope.firstError)
 	}
@@ -25,7 +25,7 @@ func TestDecisionBufferCoalescesAndPoisonsConflicts(t *testing.T) {
 		t.Fatalf("commands = %d, want 1", got)
 	}
 
-	Execute(scope, "child/1", command, decisionArgs{Value: "different"})
+	Enqueue(scope, "child/1", command, decisionArgs{Value: "different"})
 	if !errors.Is(scope.scope.firstError, ErrConflict) {
 		t.Fatalf("poison = %v", scope.scope.firstError)
 	}
@@ -37,12 +37,12 @@ func TestDecisionBufferUsesCanonicalRetryPolicyIdentity(t *testing.T) {
 	different := DefineCommand[decisionArgs, decisionResult]("decision_retry", 1, WithRetry(Attempts(3)))
 
 	scope := &Work[None]{scope: &scopeState{}}
-	Execute(scope, "child", equivalentA, decisionArgs{})
-	Execute(scope, "child", equivalentB, decisionArgs{})
+	Enqueue(scope, "child", equivalentA, decisionArgs{})
+	Enqueue(scope, "child", equivalentB, decisionArgs{})
 	if scope.scope.firstError != nil || len(scope.scope.decision.commands) != 1 {
 		t.Fatalf("equivalent canonical policies did not coalesce: %v", scope.scope.firstError)
 	}
-	Execute(scope, "child", different, decisionArgs{})
+	Enqueue(scope, "child", different, decisionArgs{})
 	if !errors.Is(scope.scope.firstError, ErrConflict) {
 		t.Fatalf("different canonical policies error = %v, want ErrConflict", scope.scope.firstError)
 	}
@@ -51,9 +51,9 @@ func TestDecisionBufferUsesCanonicalRetryPolicyIdentity(t *testing.T) {
 func TestDecisionBufferRejectsInvalidOptions(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_options", 1)
 	scope := &Work[None]{scope: &scopeState{}}
-	Execute(scope, "child", command, decisionArgs{}).Delay(0).Delay(time.Second)
+	Enqueue(scope, "child", command, decisionArgs{}).Delay(0).Delay(time.Second)
 	if !errors.Is(scope.scope.firstError, ErrInvalid) {
-		t.Fatalf("Execute poison = %v", scope.scope.firstError)
+		t.Fatalf("Enqueue poison = %v", scope.scope.firstError)
 	}
 }
 
@@ -63,11 +63,11 @@ func TestDecisionBufferNormalizesEventGates(t *testing.T) {
 	second := DefineEvent[None]("decision.second")
 	scope := &Work[None]{scope: &scopeState{}}
 
-	Execute(scope, "child", command, decisionArgs{}).
+	Enqueue(scope, "child", command, decisionArgs{}).
 		WaitFor(second, "b").
 		WaitFor(first, "a").
 		Within(time.Second)
-	Execute(scope, "child", command, decisionArgs{}).
+	Enqueue(scope, "child", command, decisionArgs{}).
 		WaitFor(first, "a").
 		Within(time.Second)
 
@@ -88,26 +88,26 @@ func TestDecisionBufferRejectsInvalidEventGates(t *testing.T) {
 	event := DefineEvent[None]("decision.gate")
 
 	conflict := &Work[None]{scope: &scopeState{}}
-	Execute(conflict, "child", command, decisionArgs{}).WaitFor(event, "event").Within(time.Second).Within(2 * time.Second)
+	Enqueue(conflict, "child", command, decisionArgs{}).WaitFor(event, "event").Within(time.Second).Within(2 * time.Second)
 	if !errors.Is(conflict.scope.firstError, ErrInvalid) {
 		t.Fatalf("conflicting Within poison = %v", conflict.scope.firstError)
 	}
 
 	missing := &Work[None]{scope: &scopeState{}}
-	Execute(missing, "child", command, decisionArgs{}).Within(time.Second)
+	Enqueue(missing, "child", command, decisionArgs{}).Within(time.Second)
 	if err := validateDecisionCommands(missing.scope.decision); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Within without WaitFor = %v", err)
 	}
 
 	empty := &Work[None]{scope: &scopeState{}}
-	Execute(empty, "child", command, decisionArgs{}).WaitFor(event, "")
+	Enqueue(empty, "child", command, decisionArgs{}).WaitFor(event, "")
 	if !errors.Is(empty.scope.firstError, ErrInvalid) {
 		t.Fatalf("empty event key poison = %v", empty.scope.firstError)
 	}
 
 	delayConflict := &Work[None]{scope: &scopeState{}}
-	Execute(delayConflict, "child", command, decisionArgs{}).Delay(time.Second)
-	Execute(delayConflict, "child", command, decisionArgs{}).Delay(2 * time.Second)
+	Enqueue(delayConflict, "child", command, decisionArgs{}).Delay(time.Second)
+	Enqueue(delayConflict, "child", command, decisionArgs{}).Delay(2 * time.Second)
 	if !errors.Is(delayConflict.scope.firstError, ErrInvalid) {
 		t.Fatalf("repeated declaration delay poison = %v", delayConflict.scope.firstError)
 	}
@@ -118,7 +118,7 @@ func TestDecisionBufferEnforcesEventWaitLimit(t *testing.T) {
 	event := DefineEvent[None]("decision.wait_limit")
 
 	accepted := &Work[None]{scope: &scopeState{}}
-	acceptedNode := Execute(accepted, "child", command, decisionArgs{})
+	acceptedNode := Enqueue(accepted, "child", command, decisionArgs{})
 	for index := range maxCommandEventWaits {
 		acceptedNode.WaitFor(event, fmt.Sprintf("event/%03d", index))
 	}
@@ -127,7 +127,7 @@ func TestDecisionBufferEnforcesEventWaitLimit(t *testing.T) {
 	}
 
 	rejected := &Work[None]{scope: &scopeState{}}
-	rejectedNode := Execute(rejected, "child", command, decisionArgs{})
+	rejectedNode := Enqueue(rejected, "child", command, decisionArgs{})
 	for index := range maxCommandEventWaits + 1 {
 		rejectedNode.WaitFor(event, fmt.Sprintf("event/%03d", index))
 	}
@@ -143,7 +143,7 @@ func TestResultOfEnforcesTraceSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := ExecutionTrace{Commands: []TraceCommand{
+	source := RunTrace{Commands: []TraceCommand{
 		{Key: "success", Name: command.Name(), Version: command.Version(), State: CommandStatusSucceeded, Result: encoded.Bytes},
 		{Key: "failure", Name: command.Name(), Version: command.Version(), State: CommandStatusFailed, Failure: &Failure{Code: "boom", Message: "failed"}},
 	}}

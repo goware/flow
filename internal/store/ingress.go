@@ -51,8 +51,8 @@ type EventWaitCreate struct {
 	Key  string
 }
 
-// Execution key scopes. Permanent keys identify one execution forever and
-// rediscover it idempotently; live keys are held only while their execution
+// Run key scopes. Permanent keys identify one run forever and
+// rediscover it idempotently; live keys are held only while their run
 // is non-terminal and are released at settlement.
 const (
 	KeyScopePermanent = "permanent"
@@ -74,15 +74,102 @@ type StartRequest struct {
 	Root              *CommandCreate
 }
 
-// StartResult carries the accepted execution row as of durable acceptance.
+// StartResult carries the accepted run row as of durable acceptance.
 // Created is false when an idempotent start rediscovered an existing
-// execution.
+// run.
 type StartResult struct {
-	Row     ExecutionRow
+	Row     RunRow
 	Created bool
 }
 
-// StartInTx creates or idempotently rediscovers an execution inside tx. It
+type ReplaceRunRequest struct {
+	Expected uuid.UUID
+	Start    StartRequest
+	Reason   string
+}
+
+type ReplaceRunResult struct {
+	Start    StartResult
+	Replaced bool
+}
+
+// ReplaceCurrentRunInTx atomically cancels the exact expected live-key run and
+// starts its successor. The expected predecessor is the serialization anchor:
+// a stale expected ID can rediscover an equivalent current successor but can
+// never mutate it.
+func (s *Store) ReplaceCurrentRunInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	request ReplaceRunRequest,
+	order *LockOrder,
+) (ReplaceRunResult, error) {
+	if tx == nil || request.Expected == uuid.Nil || request.Reason == "" {
+		return ReplaceRunResult{}, fmt.Errorf("%w: incomplete current-run replacement", flowerr.ErrInvalid)
+	}
+	if err := validateStartRequest(request.Start); err != nil {
+		return ReplaceRunResult{}, err
+	}
+	if request.Start.Key == "" || request.Start.KeyScope != KeyScopeLive || request.Start.Root == nil {
+		return ReplaceRunResult{}, fmt.Errorf("%w: replacement requires a live-key root", flowerr.ErrInvalid)
+	}
+	if request.Start.ID == request.Expected {
+		return ReplaceRunResult{}, fmt.Errorf("%w: replacement run must have a distinct identity", flowerr.ErrInvalid)
+	}
+	if order != nil {
+		if err := order.BeforeRun(request.Expected); err != nil {
+			return ReplaceRunResult{}, err
+		}
+	}
+	semantic, err := s.AttachSemantic(ctx, tx, request.Expected, LockBlocking)
+	if err != nil {
+		if errors.Is(err, flowerr.ErrNotFound) {
+			return ReplaceRunResult{}, fmt.Errorf("%w: expected run does not exist", flowerr.ErrInvalidState)
+		}
+		return ReplaceRunResult{}, err
+	}
+
+	var currentID uuid.UUID
+	var currentFingerprint []byte
+	err = tx.QueryRow(ctx, `SELECT run_id,start_fingerprint
+		FROM `+pgschema.Table(s.schema, "flow_runs")+`
+		WHERE definition_name=$1 AND run_key=$2 AND key_scope='live'
+		  AND status IN ('running','failing')`, request.Start.DefinitionName, request.Start.Key).
+		Scan(&currentID, &currentFingerprint)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ReplaceRunResult{}, fmt.Errorf("%w: no current live run", flowerr.ErrConflict)
+	}
+	if err != nil {
+		return ReplaceRunResult{}, MapError("load current run for replacement", err)
+	}
+	if currentID != request.Expected {
+		if !bytes.Equal(currentFingerprint, request.Start.StartFingerprint[:]) {
+			return ReplaceRunResult{}, fmt.Errorf("%w: current run declaration differs", flowerr.ErrConflict)
+		}
+		row, err := s.GetRunInTx(ctx, tx, currentID)
+		if err != nil {
+			return ReplaceRunResult{}, err
+		}
+		return ReplaceRunResult{Start: StartResult{Row: row}}, nil
+	}
+
+	cancelled, err := s.CancelRunLocked(ctx, semantic, request.Reason)
+	if err != nil {
+		return ReplaceRunResult{}, err
+	}
+	if !cancelled.Created {
+		return ReplaceRunResult{}, fmt.Errorf("%w: expected run was not cancelled", flowerr.ErrInvalidState)
+	}
+	started, err := s.StartInTx(ctx, tx, request.Start, order)
+	if err != nil {
+		return ReplaceRunResult{}, err
+	}
+	if !started.Created || started.Row.ID == request.Expected {
+		return ReplaceRunResult{}, fmt.Errorf("%w: replacement run was not created", flowerr.ErrInvalidState)
+	}
+	return ReplaceRunResult{Start: started, Replaced: true}, nil
+}
+
+// StartInTx creates or idempotently rediscovers a run inside tx. It
 // never commits or rolls back tx.
 func (s *Store) StartInTx(ctx context.Context, tx pgx.Tx, request StartRequest, order *LockOrder) (StartResult, error) {
 	if tx == nil {
@@ -131,30 +218,30 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 	}
 
 	var inserted uuid.UUID
-	err = tx.QueryRow(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_executions")+` (
-		execution_id,definition_name,definition_version,execution_key,key_scope,status,fail_fast,
+	err = tx.QueryRow(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_runs")+` (
+		run_id,definition_name,definition_version,run_key,key_scope,status,fail_fast,
 		start_fingerprint,input,metadata,metadata_canonical,
 		deadline_at,max_commands,command_count,open_commands,
 		next_journal_position,root_command_id,created_at,updated_at,status_at
 	) VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$13,1,$14,$15,$15,$15)
-	ON CONFLICT DO NOTHING RETURNING execution_id`,
+	ON CONFLICT DO NOTHING RETURNING run_id`,
 		request.ID, request.DefinitionName, request.DefinitionVersion, request.Key, request.KeyScope,
 		request.FailFast, request.StartFingerprint[:], request.Input.Bytes,
 		string(request.Metadata.Bytes), request.Metadata.Bytes, deadlineAt,
 		request.MaxCommands, commandCount, rootID, dbNow,
 	).Scan(&inserted)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return StartResult{}, false, MapError("insert execution", err)
+		return StartResult{}, false, MapError("insert run", err)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		result, retry, loadErr := s.loadEquivalentStart(ctx, tx, request, order)
 		return result, retry, loadErr
 	}
 	if inserted != request.ID {
-		return StartResult{}, false, fmt.Errorf("%w: inserted execution identity differs", flowerr.ErrInvalidState)
+		return StartResult{}, false, fmt.Errorf("%w: inserted run identity differs", flowerr.ErrInvalidState)
 	}
 	if order != nil {
-		if err := order.BeforeExecution(request.ID); err != nil {
+		if err := order.RegisterOwnedRun(request.ID); err != nil {
 			return StartResult{}, false, err
 		}
 	}
@@ -190,7 +277,7 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 		}
 	}
 	// Mirror the row this transaction just inserted instead of re-reading it.
-	return StartResult{Row: ExecutionRow{
+	return StartResult{Row: RunRow{
 		ID: request.ID, DefinitionName: request.DefinitionName, DefinitionVersion: request.DefinitionVersion,
 		Key: request.Key, RootCommandID: clonePointer(rootID), Status: "running", FailFast: request.FailFast,
 		MaxCommands: request.MaxCommands, CommandCount: commandCount, OpenCommands: commandCount,
@@ -200,10 +287,10 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 }
 
 // loadEquivalentStart resolves an insert that conflicted on the idempotency
-// index. Permanent keys rediscover the one execution that owns the key and
+// index. Permanent keys rediscover the one run that owns the key and
 // require an equivalent start identity. Live keys rediscover whichever live
-// execution currently holds the key, with no identity comparison — the caller
-// asked to ensure a live execution exists, not to describe a specific one.
+// run currently holds the key, with no identity comparison — the caller
+// asked to ensure a live run exists, not to describe a specific one.
 // retry=true means the conflicting live holder settled before the lookup;
 // the caller may attempt the insert again.
 func (s *Store) loadEquivalentStart(
@@ -217,9 +304,9 @@ func (s *Store) loadEquivalentStart(
 	}
 	if request.KeyScope == KeyScopeLive {
 		var id uuid.UUID
-		err := tx.QueryRow(ctx, `SELECT execution_id
-			FROM `+pgschema.Table(s.schema, "flow_executions")+`
-			WHERE definition_name=$1 AND execution_key=$2
+		err := tx.QueryRow(ctx, `SELECT run_id
+			FROM `+pgschema.Table(s.schema, "flow_runs")+`
+			WHERE definition_name=$1 AND run_key=$2
 			  AND key_scope=$3 AND status IN ('running','failing')`,
 			request.DefinitionName, request.Key, KeyScopeLive,
 		).Scan(&id)
@@ -227,67 +314,67 @@ func (s *Store) loadEquivalentStart(
 			return StartResult{}, true, fmt.Errorf("%w: live key holder settled during start", flowerr.ErrConflict)
 		}
 		if err != nil {
-			return StartResult{}, false, MapError("resolve live execution", err)
+			return StartResult{}, false, MapError("resolve live run", err)
 		}
 		if order != nil {
-			if err := order.BeforeExecution(id); err != nil {
+			if err := order.BeforeRun(id); err != nil {
 				return StartResult{}, false, err
 			}
 		}
-		var definitionName, executionKey, keyScope, status string
-		err = tx.QueryRow(ctx, `SELECT definition_name,execution_key,key_scope,status
-			FROM `+pgschema.Table(s.schema, "flow_executions")+`
-			WHERE execution_id=$1 FOR UPDATE`, id).
-			Scan(&definitionName, &executionKey, &keyScope, &status)
+		var definitionName, runKey, keyScope, status string
+		err = tx.QueryRow(ctx, `SELECT definition_name,run_key,key_scope,status
+			FROM `+pgschema.Table(s.schema, "flow_runs")+`
+			WHERE run_id=$1 FOR UPDATE`, id).
+			Scan(&definitionName, &runKey, &keyScope, &status)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StartResult{}, true, fmt.Errorf("%w: live key holder changed during start", flowerr.ErrConflict)
 		}
 		if err != nil {
-			return StartResult{}, false, MapError("lock live execution", err)
+			return StartResult{}, false, MapError("lock live run", err)
 		}
-		if definitionName != request.DefinitionName || executionKey != request.Key || keyScope != KeyScopeLive ||
+		if definitionName != request.DefinitionName || runKey != request.Key || keyScope != KeyScopeLive ||
 			status != "running" && status != "failing" {
 			return StartResult{}, true, fmt.Errorf("%w: live key holder changed during start", flowerr.ErrConflict)
 		}
-		row, err := s.GetExecutionInTx(ctx, tx, id)
+		row, err := s.GetRunInTx(ctx, tx, id)
 		if err != nil {
 			return StartResult{}, false, err
 		}
 		return StartResult{Row: row, Created: false}, false, nil
 	}
 	var id uuid.UUID
-	err := tx.QueryRow(ctx, `SELECT execution_id
-		FROM `+pgschema.Table(s.schema, "flow_executions")+`
-		WHERE definition_name=$1 AND execution_key=$2 AND key_scope=$3`,
+	err := tx.QueryRow(ctx, `SELECT run_id
+		FROM `+pgschema.Table(s.schema, "flow_runs")+`
+		WHERE definition_name=$1 AND run_key=$2 AND key_scope=$3`,
 		request.DefinitionName, request.Key, KeyScopePermanent,
 	).Scan(&id)
 	if err != nil {
-		return StartResult{}, false, MapError("resolve existing execution", err)
+		return StartResult{}, false, MapError("resolve existing run", err)
 	}
 	if order != nil {
-		if err := order.BeforeExecution(id); err != nil {
+		if err := order.BeforeRun(id); err != nil {
 			return StartResult{}, false, err
 		}
 	}
-	var definitionName, executionKey, keyScope string
+	var definitionName, runKey, keyScope string
 	var version int
 	var fingerprint, input, metadata []byte
-	err = tx.QueryRow(ctx, `SELECT definition_name,execution_key,key_scope,definition_version,
+	err = tx.QueryRow(ctx, `SELECT definition_name,run_key,key_scope,definition_version,
 		start_fingerprint,input,metadata_canonical
-		FROM `+pgschema.Table(s.schema, "flow_executions")+`
-		WHERE execution_id=$1 FOR UPDATE`, id).
-		Scan(&definitionName, &executionKey, &keyScope, &version, &fingerprint, &input, &metadata)
+		FROM `+pgschema.Table(s.schema, "flow_runs")+`
+		WHERE run_id=$1 FOR UPDATE`, id).
+		Scan(&definitionName, &runKey, &keyScope, &version, &fingerprint, &input, &metadata)
 	if err != nil {
-		return StartResult{}, false, MapError("lock existing execution", err)
+		return StartResult{}, false, MapError("lock existing run", err)
 	}
-	if definitionName != request.DefinitionName || executionKey != request.Key || keyScope != KeyScopePermanent {
-		return StartResult{}, false, fmt.Errorf("%w: execution key owner changed during start", flowerr.ErrConflict)
+	if definitionName != request.DefinitionName || runKey != request.Key || keyScope != KeyScopePermanent {
+		return StartResult{}, false, fmt.Errorf("%w: run key owner changed during start", flowerr.ErrConflict)
 	}
 	if version != request.DefinitionVersion || !bytes.Equal(fingerprint, request.StartFingerprint[:]) ||
 		!bytes.Equal(input, request.Input.Bytes) || !bytes.Equal(metadata, request.Metadata.Bytes) {
-		return StartResult{}, false, fmt.Errorf("%w: execution start identity differs", flowerr.ErrConflict)
+		return StartResult{}, false, fmt.Errorf("%w: run start identity differs", flowerr.ErrConflict)
 	}
-	row, err := s.GetExecutionInTx(ctx, tx, id)
+	row, err := s.GetRunInTx(ctx, tx, id)
 	if err != nil {
 		return StartResult{}, false, err
 	}
@@ -299,22 +386,22 @@ func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time
 	if request.KeyScope != KeyScopePermanent {
 		keyScope = request.KeyScope
 	}
-	deadlineMilliseconds, err := durable.ExactMilliseconds("execution deadline", request.Deadline.Duration)
+	deadlineMilliseconds, err := durable.ExactMilliseconds("run deadline", request.Deadline.Duration)
 	if err != nil {
 		return nil, err
 	}
-	body := journalcodec.ExecutionStartedBody{
-		V: 1, ExecutionID: request.ID.String(),
+	body := journalcodec.RunStartedBody{
+		V: 1, RunID: request.ID.String(),
 		DefinitionName: request.DefinitionName, DefinitionVersion: request.DefinitionVersion,
-		ExecutionKey: request.Key, KeyScope: keyScope,
+		RunKey: request.Key, KeyScope: keyScope,
 		Input: json.RawMessage(request.Input.BytesCopy()), FailFast: request.FailFast,
 		DeadlineMode: request.Deadline.Mode, DeadlineDuration: deadlineMilliseconds,
 		DeadlineAt: clonePointer(deadlineAt), MaxCommands: request.MaxCommands,
 		Metadata: json.RawMessage(request.Metadata.BytesCopy()),
 	}
-	start, err := NewJournalEntry(ExecutionStarted, body)
+	start, err := NewJournalEntry(RunStarted, body)
 	if err != nil {
-		return nil, fmt.Errorf("encode execution start: %w", err)
+		return nil, fmt.Errorf("encode run start: %w", err)
 	}
 	entries := []JournalEntry{start}
 	nextAttemptAt, err := durable.AddExactDuration("initial delay", dbNow, request.Root.InitialDelay)
@@ -484,22 +571,22 @@ func (batch preparedCommandBatch) initialJournalState(index int) (string, *time.
 func (s *Store) insertCommand(
 	ctx context.Context,
 	tx pgx.Tx,
-	executionID uuid.UUID,
+	runID uuid.UUID,
 	command CommandCreate,
 	createdPosition int64,
 	createdAt time.Time,
 	budgetStartedAt time.Time,
 	nextAttemptAt time.Time,
-	executionDeadline *time.Time,
+	runDeadline *time.Time,
 ) (bool, error) {
-	batch, err := s.prepareCommandBatch(ctx, tx, executionID, []commandBatchCreate{{
+	batch, err := s.prepareCommandBatch(ctx, tx, runID, []commandBatchCreate{{
 		command: command, createdPosition: createdPosition,
 		budgetStartedAt: budgetStartedAt, nextAttemptAt: nextAttemptAt,
-	}}, createdAt, executionDeadline, nil)
+	}}, createdAt, runDeadline, nil)
 	if err != nil {
 		return false, err
 	}
-	if err := s.insertPreparedCommandBatch(ctx, tx, executionID, createdAt, batch); err != nil {
+	if err := s.insertPreparedCommandBatch(ctx, tx, runID, createdAt, batch); err != nil {
 		return false, err
 	}
 	return batch.commands[0].state == "ready", nil
@@ -508,13 +595,13 @@ func (s *Store) insertCommand(
 func (s *Store) prepareCommandBatch(
 	ctx context.Context,
 	tx pgx.Tx,
-	executionID uuid.UUID,
+	runID uuid.UUID,
 	creates []commandBatchCreate,
 	createdAt time.Time,
-	executionDeadline *time.Time,
+	runDeadline *time.Time,
 	stagedEvents []ApplicationEvent,
 ) (preparedCommandBatch, error) {
-	if tx == nil || executionID == uuid.Nil || createdAt.IsZero() {
+	if tx == nil || runID == uuid.Nil || createdAt.IsZero() {
 		return preparedCommandBatch{}, fmt.Errorf("%w: invalid command batch context", flowerr.ErrInvalid)
 	}
 	if err := durable.PostgresInteger("command batch count", len(creates), 1, durable.PostgresIntegerMax); err != nil {
@@ -565,7 +652,7 @@ func (s *Store) prepareCommandBatch(
 		}
 	}
 
-	retained, err := s.lookupRetainedEventPositions(ctx, tx, executionID, wanted)
+	retained, err := s.lookupRetainedEventPositions(ctx, tx, runID, wanted)
 	if err != nil {
 		return preparedCommandBatch{}, err
 	}
@@ -620,8 +707,8 @@ func (s *Store) prepareCommandBatch(
 				if err != nil {
 					return preparedCommandBatch{}, err
 				}
-				if executionDeadline != nil && executionDeadline.Before(deadline) {
-					deadline = *executionDeadline
+				if runDeadline != nil && runDeadline.Before(deadline) {
+					deadline = *runDeadline
 				}
 				prepared.waitDeadlineAt = &deadline
 			}
@@ -644,7 +731,7 @@ func (s *Store) prepareCommandBatch(
 func (s *Store) lookupRetainedEventPositions(
 	ctx context.Context,
 	tx pgx.Tx,
-	executionID uuid.UUID,
+	runID uuid.UUID,
 	identities []applicationEventIdentity,
 ) (map[applicationEventIdentity]int64, error) {
 	result := make(map[applicationEventIdentity]int64, len(identities))
@@ -662,9 +749,9 @@ func (s *Store) lookupRetainedEventPositions(
 	SELECT j.event_name,j.event_key,j.position
 	FROM wanted
 	JOIN `+pgschema.Table(s.schema, "flow_journal")+` AS j
-	  ON j.execution_id=$1 AND j.entry_kind='event_recorded'
+	  ON j.run_id=$1 AND j.entry_kind='event_recorded'
 	 AND j.event_class='application' AND j.event_namespace='application'
-	 AND j.event_name=wanted.event_name AND j.event_key=wanted.event_key`, executionID, names, keys)
+	 AND j.event_name=wanted.event_name AND j.event_key=wanted.event_key`, runID, names, keys)
 	if err != nil {
 		return nil, MapError("load retained events for command batch", err)
 	}
@@ -692,7 +779,7 @@ func (s *Store) lookupRetainedEventPositions(
 func (s *Store) insertPreparedCommandBatch(
 	ctx context.Context,
 	tx pgx.Tx,
-	executionID uuid.UUID,
+	runID uuid.UUID,
 	createdAt time.Time,
 	batch preparedCommandBatch,
 ) error {
@@ -703,7 +790,7 @@ func (s *Store) insertPreparedCommandBatch(
 		}
 		command := prepared.command
 		commandRows[index] = []any{
-			command.ID, executionID, command.Key, command.Name, command.Version,
+			command.ID, runID, command.Key, command.Name, command.Version,
 			command.ParentCommandID, command.Required, command.Args.Bytes,
 			command.DeclarationFingerprint[:], prepared.state, prepared.unsatisfiedWaits,
 			command.Queue, prepared.attemptTimeoutMS, command.RetryPolicy.Bytes, prepared.initialDelayMS,
@@ -713,7 +800,7 @@ func (s *Store) insertPreparedCommandBatch(
 		}
 	}
 	count, err := tx.CopyFrom(ctx, pgx.Identifier{s.schema, "flow_commands"}, []string{
-		"command_id", "execution_id", "command_key", "name", "version", "parent_command_id", "required",
+		"command_id", "run_id", "command_key", "name", "version", "parent_command_id", "required",
 		"args", "declaration_fingerprint", "state", "unsatisfied_waits", "queue", "attempt_timeout_ms",
 		"retry_policy", "initial_delay_ms", "budget_started_at", "next_attempt_at", "wait_started_at",
 		"wait_deadline_at", "wait_timeout_ms", "created_position", "created_at", "updated_at", "status_at",
@@ -728,10 +815,10 @@ func (s *Store) insertPreparedCommandBatch(
 	if len(batch.waits) > 0 {
 		waitRows := make([][]any, len(batch.waits))
 		for index, wait := range batch.waits {
-			waitRows[index] = []any{wait.commandID, executionID, wait.name, wait.key, wait.satisfied}
+			waitRows[index] = []any{wait.commandID, runID, wait.name, wait.key, wait.satisfied}
 		}
 		count, err = tx.CopyFrom(ctx, pgx.Identifier{s.schema, "flow_command_event_waits"}, []string{
-			"command_id", "execution_id", "event_name", "event_key", "satisfied_position",
+			"command_id", "run_id", "event_name", "event_key", "satisfied_position",
 		}, pgx.CopyFromRows(waitRows))
 		if err != nil {
 			return MapError("insert command event wait batch", err)
@@ -745,11 +832,11 @@ func (s *Store) insertPreparedCommandBatch(
 		queueRows := make([][]any, len(batch.queues))
 		for index, queue := range batch.queues {
 			queueRows[index] = []any{
-				queue.commandID, executionID, queue.queue, queue.name, queue.version, "ready", queue.nextRunAt,
+				queue.commandID, runID, queue.queue, queue.name, queue.version, "ready", queue.nextRunAt,
 			}
 		}
 		count, err = tx.CopyFrom(ctx, pgx.Identifier{s.schema, "flow_command_queue"}, []string{
-			"command_id", "execution_id", "queue", "name", "version", "state", "next_run_at",
+			"command_id", "run_id", "queue", "name", "version", "state", "next_run_at",
 		}, pgx.CopyFromRows(queueRows))
 		if err != nil {
 			return MapError("insert command queue batch", err)
@@ -761,7 +848,7 @@ func (s *Store) insertPreparedCommandBatch(
 	return nil
 }
 
-type ExecutionHead struct {
+type RunHead struct {
 	ID           uuid.UUID
 	Status       string
 	FailFast     bool
@@ -770,16 +857,16 @@ type ExecutionHead struct {
 	OpenCommands int
 }
 
-func (s *Store) LoadExecutionHead(ctx context.Context, semantic *SemanticTx) (ExecutionHead, error) {
+func (s *Store) LoadRunHead(ctx context.Context, semantic *SemanticTx) (RunHead, error) {
 	if semantic == nil || semantic.PGX() == nil {
-		return ExecutionHead{}, fmt.Errorf("%w: semantic transaction is nil", flowerr.ErrInvalid)
+		return RunHead{}, fmt.Errorf("%w: semantic transaction is nil", flowerr.ErrInvalid)
 	}
-	var result ExecutionHead
-	err := semantic.PGX().QueryRow(ctx, `SELECT execution_id,status,fail_fast,max_commands,command_count,open_commands
-		FROM `+pgschema.Table(s.schema, "flow_executions")+` WHERE execution_id=$1`, semantic.ExecutionID()).
+	var result RunHead
+	err := semantic.PGX().QueryRow(ctx, `SELECT run_id,status,fail_fast,max_commands,command_count,open_commands
+		FROM `+pgschema.Table(s.schema, "flow_runs")+` WHERE run_id=$1`, semantic.RunID()).
 		Scan(&result.ID, &result.Status, &result.FailFast, &result.MaxCommands, &result.CommandCount, &result.OpenCommands)
 	if err != nil {
-		return ExecutionHead{}, MapError("load execution", err)
+		return RunHead{}, MapError("load run", err)
 	}
 	return result, nil
 }
@@ -830,10 +917,10 @@ func (s *Store) coalesceApplicationEvents(ctx context.Context, semantic *Semanti
 	SELECT j.event_name,j.event_key,j.body
 	FROM staged
 	JOIN `+pgschema.Table(s.schema, "flow_journal")+` AS j
-	  ON j.execution_id=$1 AND j.entry_kind='event_recorded'
+	  ON j.run_id=$1 AND j.entry_kind='event_recorded'
 	 AND j.event_class='application' AND j.event_namespace='application'
 	 AND j.event_name=staged.event_name AND j.event_key=staged.event_key`,
-		semantic.ExecutionID(), names, keys)
+		semantic.RunID(), names, keys)
 	if err != nil {
 		return nil, MapError("load staged application event identities", err)
 	}
@@ -871,50 +958,48 @@ func (s *Store) coalesceApplicationEvents(ctx context.Context, semantic *Semanti
 	return result, nil
 }
 
-type ExistingEvent struct {
-	ID    uuid.UUID
-	Body  []byte
-	Found bool
+type EventRecord struct {
+	ID   uuid.UUID
+	Body []byte
 }
 
-func (s *Store) LookupApplicationEvent(ctx context.Context, tx pgx.Tx, executionID uuid.UUID, name, key string) (ExistingEvent, error) {
+func (s *Store) GetEvent(ctx context.Context, tx pgx.Tx, runID uuid.UUID, name, key string) (EventRecord, bool, error) {
 	var row pgx.Row
 	query := `SELECT event_id,body FROM ` + pgschema.Table(s.schema, "flow_journal") + `
-		WHERE execution_id=$1 AND entry_kind='event_recorded' AND event_class='application'
+		WHERE run_id=$1 AND entry_kind='event_recorded' AND event_class='application'
 		AND event_namespace='application' AND event_name=$2 AND event_key=$3`
 	if tx != nil {
-		row = tx.QueryRow(ctx, query, executionID, name, key)
+		row = tx.QueryRow(ctx, query, runID, name, key)
 	} else {
-		row = s.db.Conn.QueryRow(ctx, query, executionID, name, key)
+		row = s.db.Conn.QueryRow(ctx, query, runID, name, key)
 	}
-	var result ExistingEvent
+	var result EventRecord
 	if err := row.Scan(&result.ID, &result.Body); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return ExistingEvent{}, nil
+			return EventRecord{}, false, nil
 		}
-		return ExistingEvent{}, MapError("lookup application event", err)
+		return EventRecord{}, false, MapError("get application event", err)
 	}
-	result.Found = true
-	return result, nil
+	return result, true, nil
 }
 
 func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event ApplicationEvent) (bool, error) {
-	existing, err := s.LookupApplicationEvent(ctx, semantic.PGX(), semantic.ExecutionID(), event.Name, event.Key)
+	existing, found, err := s.GetEvent(ctx, semantic.PGX(), semantic.RunID(), event.Name, event.Key)
 	if err != nil {
 		return false, err
 	}
-	if existing.Found {
+	if found {
 		if bytes.Equal(existing.Body, event.Body.Bytes) {
 			return false, nil
 		}
 		return false, fmt.Errorf("%w: application event identity differs", flowerr.ErrConflict)
 	}
-	head, err := s.LoadExecutionHead(ctx, semantic)
+	head, err := s.LoadRunHead(ctx, semantic)
 	if err != nil {
 		return false, err
 	}
 	if head.Status != "running" && head.Status != "failing" {
-		return false, fmt.Errorf("%w: execution is terminal", flowerr.ErrTerminal)
+		return false, fmt.Errorf("%w: run is terminal", flowerr.ErrTerminal)
 	}
 	entry := JournalEntry{
 		EntryID: uuid.New(), Kind: EventRecorded, EventID: clonePointer(&event.ID),
@@ -965,10 +1050,10 @@ func (s *Store) lockActiveCommandAttempt(
 	var attempt activeCommandAttempt
 	err := semantic.PGX().QueryRow(ctx, `SELECT q.active_attempt_id,c.attempt_ordinal,c.consumed_attempts,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
-		 WHERE execution_id=c.execution_id AND attempt_id=q.active_attempt_id AND entry_kind='attempt_started')
+		 WHERE run_id=c.run_id AND attempt_id=q.active_attempt_id AND entry_kind='attempt_started')
 		FROM `+pgschema.Table(s.schema, "flow_command_queue")+` q
 		JOIN `+pgschema.Table(s.schema, "flow_commands")+` c ON c.command_id=q.command_id
-		WHERE q.command_id=$1 AND q.execution_id=$2 FOR UPDATE OF q`, commandID, semantic.ExecutionID()).
+		WHERE q.command_id=$1 AND q.run_id=$2 FOR UPDATE OF q`, commandID, semantic.RunID()).
 		Scan(&attempt.ID, &attempt.Ordinal, &attempt.ConsumedAttempts, &attempt.StartedPosition)
 	if err != nil {
 		return nil, MapError("lock active command attempt", err)
@@ -998,23 +1083,23 @@ func cancelledAttemptEvent(
 	return entry, nil
 }
 
-func (s *Store) LookupCommandExecution(ctx context.Context, tx pgx.Tx, commandID uuid.UUID) (uuid.UUID, error) {
-	query := `SELECT execution_id FROM ` + pgschema.Table(s.schema, "flow_commands") + ` WHERE command_id=$1`
+func (s *Store) GetCommandRunID(ctx context.Context, tx pgx.Tx, commandID uuid.UUID) (uuid.UUID, error) {
+	query := `SELECT run_id FROM ` + pgschema.Table(s.schema, "flow_commands") + ` WHERE command_id=$1`
 	var row pgx.Row
 	if tx != nil {
 		row = tx.QueryRow(ctx, query, commandID)
 	} else {
 		row = s.db.Conn.QueryRow(ctx, query, commandID)
 	}
-	var executionID uuid.UUID
-	if err := row.Scan(&executionID); err != nil {
-		return uuid.Nil, MapError("lookup command execution", err)
+	var runID uuid.UUID
+	if err := row.Scan(&runID); err != nil {
+		return uuid.Nil, MapError("lookup command run", err)
 	}
-	return executionID, nil
+	return runID, nil
 }
 
 func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, commandID uuid.UUID, reason string) (CancelResult, error) {
-	head, err := s.LoadExecutionHead(ctx, semantic)
+	head, err := s.LoadRunHead(ctx, semantic)
 	if err != nil {
 		return CancelResult{}, err
 	}
@@ -1023,7 +1108,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	var failureBytes []byte
 	err = semantic.PGX().QueryRow(ctx, `SELECT command_key,state,required,COALESCE(terminal_failure,'null'::jsonb)
 		FROM `+pgschema.Table(s.schema, "flow_commands")+`
-		WHERE command_id=$1 AND execution_id=$2 FOR UPDATE`, commandID, head.ID).
+		WHERE command_id=$1 AND run_id=$2 FOR UPDATE`, commandID, head.ID).
 		Scan(&key, &state, &required, &failureBytes)
 	if err != nil {
 		return CancelResult{}, MapError("lock command for cancellation", err)
@@ -1035,7 +1120,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		return CancelResult{}, fmt.Errorf("%w: command is terminal", flowerr.ErrTerminal)
 	}
 	if head.Status != "running" && head.Status != "failing" {
-		return CancelResult{}, fmt.Errorf("%w: execution is terminal", flowerr.ErrTerminal)
+		return CancelResult{}, fmt.Errorf("%w: run is terminal", flowerr.ErrTerminal)
 	}
 	activeAttempt, err := s.lockActiveCommandAttempt(ctx, semantic, commandID, state)
 	if err != nil {
@@ -1071,7 +1156,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		for index, command := range failureEffects.survivors {
 			survivors[index] = command.key
 		}
-		failing, err := NewJournalEntry(ExecutionFailing, map[string]any{
+		failing, err := NewJournalEntry(RunFailing, map[string]any{
 			"v": 1, "status": "failing", "reason": reason, "command_key": key,
 			"fail_fast": head.FailFast, "survivors": survivors,
 		})
@@ -1087,29 +1172,29 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		return CancelResult{}, err
 	}
 	entries = append(entries, cancelledEntries...)
-	effectiveOpen, err := durable.AddPostgresInteger("execution open commands", head.OpenCommands,
+	effectiveOpen, err := durable.AddPostgresInteger("run open commands", head.OpenCommands,
 		-1, 0, durable.PostgresIntegerMax)
 	if err != nil {
 		return CancelResult{}, err
 	}
-	effectiveOpen, err = durable.AddPostgresInteger("execution open commands", effectiveOpen,
+	effectiveOpen, err = durable.AddPostgresInteger("run open commands", effectiveOpen,
 		-len(failureEffects.cancelled), 0, durable.PostgresIntegerMax)
 	if err != nil {
 		return CancelResult{}, err
 	}
-	executionFailed := required || head.Status == "failing"
-	terminalExecution := effectiveOpen == 0
-	if terminalExecution {
+	runFailed := required || head.Status == "failing"
+	terminalRun := effectiveOpen == 0
+	if terminalRun {
 		status, eventName, terminalReason := "succeeded", "flow.execution_succeeded", ""
-		if executionFailed {
+		if runFailed {
 			status, eventName, terminalReason = "failed", "flow.execution_failed", reason
 		}
-		executionEvent, err := executionTerminalEvent(status, terminalReason, eventName)
+		runEvent, err := runTerminalEvent(status, terminalReason, eventName)
 		if err != nil {
 			return CancelResult{}, err
 		}
-		executionEvent.CausationBatchIndex = clonePointer(&terminalIndex)
-		entries = append(entries, executionEvent)
+		runEvent.CausationBatchIndex = clonePointer(&terminalIndex)
+		entries = append(entries, runEvent)
 	}
 	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: entries})
 	if err != nil {
@@ -1131,54 +1216,54 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		}
 	}
 
-	if terminalExecution {
+	if terminalRun {
 		status := "succeeded"
-		if executionFailed {
+		if runFailed {
 			status = "failed"
 		}
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
+		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_runs")+`
 			SET status=$4,open_commands=0,failure=CASE WHEN $5 THEN $2::jsonb ELSE failure END,
 			    finished_at=$3,updated_at=$3,status_at=$3
-			WHERE execution_id=$1`, head.ID, jsonString(terminalFailure{Code: "command_cancelled", Message: reason}), semantic.DBNow(), status, executionFailed); err != nil {
-			return CancelResult{}, MapError("fail execution after command cancellation", err)
+			WHERE run_id=$1`, head.ID, jsonString(terminalFailure{Code: "command_cancelled", Message: reason}), semantic.DBNow(), status, runFailed); err != nil {
+			return CancelResult{}, MapError("fail run after command cancellation", err)
 		}
 	} else {
 		status := head.Status
 		if becameFailing {
 			status = "failing"
 		}
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
+		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_runs")+`
 			SET status=$2,open_commands=$4,updated_at=$3,status_at=CASE WHEN status<>$2 THEN $3 ELSE status_at END
-			WHERE execution_id=$1`, head.ID, status, semantic.DBNow(), effectiveOpen); err != nil {
-			return CancelResult{}, MapError("update execution after command cancellation", err)
+			WHERE run_id=$1`, head.ID, status, semantic.DBNow(), effectiveOpen); err != nil {
+			return CancelResult{}, MapError("update run after command cancellation", err)
 		}
 	}
 	return CancelResult{Created: true}, nil
 }
 
-func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx, reason string) (CancelResult, error) {
-	head, err := s.LoadExecutionHead(ctx, semantic)
+func (s *Store) CancelRunLocked(ctx context.Context, semantic *SemanticTx, reason string) (CancelResult, error) {
+	head, err := s.LoadRunHead(ctx, semantic)
 	if err != nil {
 		return CancelResult{}, err
 	}
-	var executionFailure []byte
+	var runFailure []byte
 	if err := semantic.PGX().QueryRow(ctx, `SELECT COALESCE(failure,'null'::jsonb) FROM `+
-		pgschema.Table(s.schema, "flow_executions")+` WHERE execution_id=$1`, head.ID).Scan(&executionFailure); err != nil {
-		return CancelResult{}, MapError("load execution cancellation", err)
+		pgschema.Table(s.schema, "flow_runs")+` WHERE run_id=$1`, head.ID).Scan(&runFailure); err != nil {
+		return CancelResult{}, MapError("load run cancellation", err)
 	}
 	if head.Status != "running" && head.Status != "failing" {
-		if head.Status == "cancelled" && sameTerminalReason(executionFailure, reason) {
+		if head.Status == "cancelled" && sameTerminalReason(runFailure, reason) {
 			return CancelResult{}, nil
 		}
-		return CancelResult{}, fmt.Errorf("%w: execution is terminal", flowerr.ErrTerminal)
+		return CancelResult{}, fmt.Errorf("%w: run is terminal", flowerr.ErrTerminal)
 	}
 
 	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,state FROM `+
 		pgschema.Table(s.schema, "flow_commands")+`
-		WHERE execution_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired')
+		WHERE run_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired')
 		ORDER BY command_id FOR UPDATE`, head.ID)
 	if err != nil {
-		return CancelResult{}, MapError("lock execution commands for cancellation", err)
+		return CancelResult{}, MapError("lock run commands for cancellation", err)
 	}
 	type command struct {
 		id      uuid.UUID
@@ -1191,17 +1276,17 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		var item command
 		if err := rows.Scan(&item.id, &item.key, &item.state); err != nil {
 			rows.Close()
-			return CancelResult{}, MapError("scan execution commands for cancellation", err)
+			return CancelResult{}, MapError("scan run commands for cancellation", err)
 		}
 		commands = append(commands, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return CancelResult{}, MapError("read execution commands for cancellation", err)
+		return CancelResult{}, MapError("read run commands for cancellation", err)
 	}
 	rows.Close()
 	if len(commands) != head.OpenCommands {
-		return CancelResult{}, fmt.Errorf("%w: execution open-command counter differs from materialized commands", flowerr.ErrInvalidState)
+		return CancelResult{}, fmt.Errorf("%w: run open-command counter differs from materialized commands", flowerr.ErrInvalidState)
 	}
 	slices.SortFunc(commands, func(a, b command) int {
 		if a.key < b.key {
@@ -1242,15 +1327,15 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		terminalBatchIndex[command.id] = len(entries)
 		entries = append(entries, entry)
 	}
-	executionEvent, err := executionTerminalEvent("cancelled", reason, "flow.execution_cancelled")
+	runEvent, err := runTerminalEvent("cancelled", reason, "flow.execution_cancelled")
 	if err != nil {
 		return CancelResult{}, err
 	}
 	if len(entries) > 0 {
 		index := len(entries) - 1
-		executionEvent.CausationBatchIndex = &index
+		runEvent.CausationBatchIndex = &index
 	}
-	entries = append(entries, executionEvent)
+	entries = append(entries, runEvent)
 	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: entries})
 	if err != nil {
 		return CancelResult{}, err
@@ -1261,11 +1346,11 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 	for index, command := range commands {
 		journalIndex, exists := terminalBatchIndex[command.id]
 		if !exists || journalIndex < 0 || journalIndex >= len(journal.Journal) {
-			return CancelResult{}, fmt.Errorf("%w: execution cancellation journal mapping is invalid", flowerr.ErrInvalidState)
+			return CancelResult{}, fmt.Errorf("%w: run cancellation journal mapping is invalid", flowerr.ErrInvalidState)
 		}
 		row := journal.Journal[journalIndex]
 		if row.CommandID == nil || *row.CommandID != command.id || row.TerminalStatus == nil || *row.TerminalStatus != "cancelled" {
-			return CancelResult{}, fmt.Errorf("%w: execution cancellation journal mapping differs", flowerr.ErrInvalidState)
+			return CancelResult{}, fmt.Errorf("%w: run cancellation journal mapping differs", flowerr.ErrInvalidState)
 		}
 		commandIDs[index], terminalPositions[index] = command.id, row.Position
 	}
@@ -1273,22 +1358,22 @@ func (s *Store) CancelExecutionLocked(ctx context.Context, semantic *SemanticTx,
 		SET state='cancelled',terminal_failure=$4::jsonb,terminal_position=cancelled.position,
 		    finished_at=$5,updated_at=$5,status_at=$5
 		FROM unnest($1::uuid[],$2::bigint[]) AS cancelled(command_id,position)
-		WHERE c.execution_id=$3 AND c.command_id=cancelled.command_id
+		WHERE c.run_id=$3 AND c.command_id=cancelled.command_id
 		  AND c.state NOT IN ('succeeded','failed','cancelled','expired')`,
 		commandIDs, terminalPositions, head.ID, failure, semantic.DBNow())
 	if err != nil {
-		return CancelResult{}, MapError("cancel execution command batch", err)
+		return CancelResult{}, MapError("cancel run command batch", err)
 	}
 	if commandTag.RowsAffected() != int64(len(commandIDs)) {
-		return CancelResult{}, fmt.Errorf("%w: execution cancellation set changed", flowerr.ErrInvalidState)
+		return CancelResult{}, fmt.Errorf("%w: run cancellation set changed", flowerr.ErrInvalidState)
 	}
-	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE execution_id=$1`, head.ID); err != nil {
-		return CancelResult{}, MapError("remove execution deliveries", err)
+	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE run_id=$1`, head.ID); err != nil {
+		return CancelResult{}, MapError("remove run deliveries", err)
 	}
-	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_executions")+`
+	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_runs")+`
 		SET status='cancelled',open_commands=0,failure=$2::jsonb,finished_at=$3,updated_at=$3,status_at=$3
-		WHERE execution_id=$1`, head.ID, failure, semantic.DBNow()); err != nil {
-		return CancelResult{}, MapError("cancel execution", err)
+		WHERE run_id=$1`, head.ID, failure, semantic.DBNow()); err != nil {
+		return CancelResult{}, MapError("cancel run", err)
 	}
 	return CancelResult{Created: true}, nil
 }
@@ -1315,7 +1400,7 @@ func terminalEventWithCode(commandID uuid.UUID, key, status, code, reason, name,
 	return body, nil
 }
 
-func executionTerminalEvent(status, reason, name string) (JournalEntry, error) {
+func runTerminalEvent(status, reason, name string) (JournalEntry, error) {
 	body, err := NewJournalEntry(EventRecorded, journalcodec.TerminalEventBody{V: 1, Status: status, Reason: reason})
 	if err != nil {
 		return JournalEntry{}, err
@@ -1352,7 +1437,7 @@ func deadlineAt(now time.Time, spec DeadlineSpec) (*time.Time, error) {
 	if spec.Mode == "none" {
 		return nil, nil
 	}
-	value, err := durable.AddExactDuration("execution deadline", now, spec.Duration)
+	value, err := durable.AddExactDuration("run deadline", now, spec.Duration)
 	if err != nil {
 		return nil, err
 	}
@@ -1362,22 +1447,22 @@ func deadlineAt(now time.Time, spec DeadlineSpec) (*time.Time, error) {
 func validateStartRequest(request StartRequest) error {
 	if request.ID == uuid.Nil || request.DefinitionName == "" || request.DefinitionVersion <= 0 ||
 		request.MaxCommands < 0 || len(request.Input.Bytes) == 0 || len(request.Metadata.Bytes) == 0 {
-		return fmt.Errorf("%w: incomplete execution start", flowerr.ErrInvalid)
+		return fmt.Errorf("%w: incomplete run start", flowerr.ErrInvalid)
 	}
 	if request.KeyScope != "" && request.KeyScope != KeyScopePermanent && request.KeyScope != KeyScopeLive {
-		return fmt.Errorf("%w: invalid execution key scope", flowerr.ErrInvalid)
+		return fmt.Errorf("%w: invalid run key scope", flowerr.ErrInvalid)
 	}
 	if request.KeyScope == KeyScopeLive && request.Key == "" {
-		return fmt.Errorf("%w: live key scope requires an execution key", flowerr.ErrInvalid)
+		return fmt.Errorf("%w: live key scope requires a run key", flowerr.ErrInvalid)
 	}
 	if request.Deadline.Mode != "none" && request.Deadline.Mode != "duration" {
 		return fmt.Errorf("%w: invalid deadline mode", flowerr.ErrInvalid)
 	}
 	if request.Deadline.Mode == "duration" && request.Deadline.Duration <= 0 {
-		return fmt.Errorf("%w: invalid execution deadline", flowerr.ErrInvalid)
+		return fmt.Errorf("%w: invalid run deadline", flowerr.ErrInvalid)
 	}
 	if request.Deadline.Mode == "duration" {
-		if _, err := durable.ExactMilliseconds("execution deadline", request.Deadline.Duration); err != nil {
+		if _, err := durable.ExactMilliseconds("run deadline", request.Deadline.Duration); err != nil {
 			return err
 		}
 	}

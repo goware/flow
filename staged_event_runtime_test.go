@@ -24,14 +24,14 @@ func TestRuntimeStagesOneHundredChildrenAsOnePersistenceBatch(t *testing.T) {
 	}
 	parent := DefineCommand[None, None]("staged.batch_100_parent", 1)
 	child := DefineCommand[None, None]("staged.batch_100_child", 1)
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(0),
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerRun(0),
 		WithWorkerConcurrency(1), WithPollInterval(5*time.Millisecond), WithNotifications(false))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.Register(Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
 		for index := range 100 {
-			Execute(work, fmt.Sprintf("child/%03d", index), child, None{})
+			Enqueue(work, fmt.Sprintf("child/%03d", index), child, None{})
 		}
 		return None{}, nil
 	})); err != nil {
@@ -39,7 +39,7 @@ func TestRuntimeStagesOneHundredChildrenAsOnePersistenceBatch(t *testing.T) {
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	exec, err := parent.With(runtime).Execute(ctx, "batch/100", None{})
+	exec, err := parent.Enqueue(ctx, runtime, "batch/100", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,12 +49,12 @@ func TestRuntimeStagesOneHundredChildrenAsOnePersistenceBatch(t *testing.T) {
 		var commandCount, openCommands, children, queued, waits int
 		err := database.DB.Conn.QueryRow(ctx, `SELECT e.command_count,e.open_commands,
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
-			 WHERE c.execution_id=e.execution_id AND c.parent_command_id=$2),
+			 WHERE c.run_id=e.run_id AND c.parent_command_id=$2),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` q
-			 WHERE q.execution_id=e.execution_id AND q.command_id<>$2),
+			 WHERE q.run_id=e.run_id AND q.command_id<>$2),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w
-			 WHERE w.execution_id=e.execution_id)
-			FROM `+pgschema.Table(database.Schema, "flow_executions")+` e WHERE e.execution_id=$1`,
+			 WHERE w.run_id=e.run_id)
+			FROM `+pgschema.Table(database.Schema, "flow_runs")+` e WHERE e.run_id=$1`,
 			exec.ID, exec.RootCommandID).Scan(&commandCount, &openCommands, &children, &queued, &waits)
 		if err == nil && commandCount == 101 && openCommands == 100 && children == 100 && queued == 100 && waits == 0 {
 			break
@@ -69,16 +69,16 @@ func TestRuntimeStagesOneHundredChildrenAsOnePersistenceBatch(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
 		FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 		JOIN `+pgschema.Table(database.Schema, "flow_journal")+` j
-		  ON j.execution_id=c.execution_id AND j.position=c.created_position
+		  ON j.run_id=c.run_id AND j.position=c.created_position
 		 AND j.entry_kind='command_created' AND j.command_id=c.command_id
-		WHERE c.execution_id=$1 AND c.parent_command_id=$2`, exec.ID, exec.RootCommandID).Scan(&mapped); err != nil {
+		WHERE c.run_id=$1 AND c.parent_command_id=$2`, exec.ID, exec.RootCommandID).Scan(&mapped); err != nil {
 		t.Fatal(err)
 	}
 	if mapped != 100 {
 		t.Fatalf("journal-created child mappings=%d, want 100", mapped)
 	}
 	assertReplayMatches(t, runtime, exec.ID)
-	if err := CancelExecution(ctx, runtime, exec.ID, "batch test complete"); err != nil {
+	if err := CancelRun(ctx, runtime, exec.ID, "batch test complete"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -91,13 +91,13 @@ func TestRuntimeStagesMixedRetainedAndNewEventWaitBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := database.DB.Conn.Exec(ctx, `CREATE TABLE `+pgschema.Table(database.Schema, "batched_decision_commits")+`
-		(execution_id text PRIMARY KEY)`); err != nil {
+		(run_id text PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
 	fact := DefineEvent[None]("staged.batch_wait_fact")
 	parent := DefineCommand[None, None]("staged.batch_wait_parent", 1)
 	child := DefineCommand[None, None]("staged.batch_wait_child", 1)
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerExecution(0),
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerRun(0),
 		WithWorkerConcurrency(1), WithPollInterval(5*time.Millisecond), WithNotifications(false))
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +109,7 @@ func TestRuntimeStagesMixedRetainedAndNewEventWaitBatch(t *testing.T) {
 			}
 		}
 		for index := range 100 {
-			node := Execute(work, fmt.Sprintf("child/%03d", index), child, None{})
+			node := Enqueue(work, fmt.Sprintf("child/%03d", index), child, None{})
 			switch {
 			case index < 20:
 			case index < 40:
@@ -125,16 +125,16 @@ func TestRuntimeStagesMixedRetainedAndNewEventWaitBatch(t *testing.T) {
 		return None{}, nil
 	}, WithCommit(func(ctx context.Context, tx Tx, commit Commit[None, None]) error {
 		_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "batched_decision_commits")+`
-			(execution_id) VALUES ($1)`, commit.Info.ExecutionID)
+			(run_id) VALUES ($1)`, commit.Info.RunID)
 		return err
 	}))); err != nil {
 		t.Fatal(err)
 	}
-	exec, err := parent.With(runtime).Execute(ctx, "batch/mixed", None{}, WithStartDelay(100*time.Millisecond))
+	exec, err := parent.Enqueue(ctx, runtime, "batch/mixed", None{}, WithStartDelay(100*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fact.Emit(ctx, runtime, exec.ID, "retained/shared", None{}); err != nil {
+	if err := fact.Deliver(ctx, runtime, exec.ID, "retained/shared", None{}); err != nil {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
@@ -144,7 +144,7 @@ func TestRuntimeStagesMixedRetainedAndNewEventWaitBatch(t *testing.T) {
 	for {
 		var commandCount int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT command_count FROM `+
-			pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, exec.ID).Scan(&commandCount); err != nil {
+			pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, exec.ID).Scan(&commandCount); err != nil {
 			t.Fatal(err)
 		}
 		if commandCount == 101 {
@@ -162,20 +162,20 @@ func TestRuntimeStagesMixedRetainedAndNewEventWaitBatch(t *testing.T) {
 			count(*) FILTER (WHERE c.state='pending'),
 			coalesce(sum(c.unsatisfied_waits),0),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` q
-			 WHERE q.execution_id=$1 AND q.command_id<>$2),
+			 WHERE q.run_id=$1 AND q.command_id<>$2),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w
-			 WHERE w.execution_id=$1),
+			 WHERE w.run_id=$1),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w
-			 WHERE w.execution_id=$1 AND w.satisfied_position IS NOT NULL),
+			 WHERE w.run_id=$1 AND w.satisfied_position IS NOT NULL),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+` mapped_command
 			 JOIN `+pgschema.Table(database.Schema, "flow_journal")+` j
-			   ON j.execution_id=mapped_command.execution_id AND j.position=mapped_command.created_position
+			   ON j.run_id=mapped_command.run_id AND j.position=mapped_command.created_position
 			  AND j.entry_kind='command_created' AND j.command_id=mapped_command.command_id
-			 WHERE mapped_command.execution_id=$1 AND mapped_command.parent_command_id=$2),
+			 WHERE mapped_command.run_id=$1 AND mapped_command.parent_command_id=$2),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "batched_decision_commits")+`
-			 WHERE execution_id=$1::text)
+			 WHERE run_id=$1::text)
 		FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
-		WHERE c.execution_id=$1 AND c.parent_command_id=$2`, exec.ID, exec.RootCommandID).
+		WHERE c.run_id=$1 AND c.parent_command_id=$2`, exec.ID, exec.RootCommandID).
 		Scan(&ready, &pending, &unsatisfied, &queued, &waits, &satisfied, &mapped, &commitRows); err != nil {
 		t.Fatal(err)
 	}
@@ -188,22 +188,22 @@ func TestRuntimeStagesMixedRetainedAndNewEventWaitBatch(t *testing.T) {
 	var retainedMatches, stagedMatches, missingMatches int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT
 			(SELECT position FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-			 WHERE execution_id=$1 AND event_class='application' AND event_name=$2 AND event_key='retained/shared'),
+			 WHERE run_id=$1 AND event_class='application' AND event_name=$2 AND event_key='retained/shared'),
 			count(*) FILTER (WHERE w.event_key='retained/shared' AND w.satisfied_position IS NOT NULL),
 			count(*) FILTER (WHERE w.event_key LIKE 'staged/%' AND j.position IS NOT NULL
 			 AND j.event_name=w.event_name AND j.event_key=w.event_key),
 			count(*) FILTER (WHERE w.event_key='missing/shared' AND w.satisfied_position IS NULL)
 		FROM `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w
 		LEFT JOIN `+pgschema.Table(database.Schema, "flow_journal")+` j
-		  ON j.execution_id=w.execution_id AND j.position=w.satisfied_position
-		WHERE w.execution_id=$1`, exec.ID, fact.Name()).
+		  ON j.run_id=w.run_id AND j.position=w.satisfied_position
+		WHERE w.run_id=$1`, exec.ID, fact.Name()).
 		Scan(&retainedPosition, &retainedMatches, &stagedMatches, &missingMatches); err != nil {
 		t.Fatal(err)
 	}
 	var exactRetainedMatches int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+
 		pgschema.Table(database.Schema, "flow_command_event_waits")+`
-		WHERE execution_id=$1 AND event_key='retained/shared' AND satisfied_position=$2`,
+		WHERE run_id=$1 AND event_key='retained/shared' AND satisfied_position=$2`,
 		exec.ID, retainedPosition).Scan(&exactRetainedMatches); err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestRuntimeStagesMixedRetainedAndNewEventWaitBatch(t *testing.T) {
 		t.Fatalf("mixed batch trace commands=%d, want 101", len(trace.Commands))
 	}
 	assertReplayMatches(t, runtime, exec.ID)
-	if err := CancelExecution(ctx, runtime, exec.ID, "mixed batch test complete"); err != nil {
+	if err := CancelRun(ctx, runtime, exec.ID, "mixed batch test complete"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -232,7 +232,7 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := database.DB.Conn.Exec(ctx, `CREATE TABLE `+pgschema.Table(database.Schema, "staged_event_commits")+`
-		(execution_id text PRIMARY KEY)`); err != nil {
+		(run_id text PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -241,7 +241,6 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 	success := DefineCommand[None, None]("staged.success", 1, WithRetry(Attempts(1)))
 	failure := DefineCommand[None, None]("staged.failure", 1, WithRetry(Attempts(1)))
 	commitFailure := DefineCommand[None, None]("staged.commit_failure", 1, WithRetry(Attempts(1)))
-	commitIngress := DefineCommand[None, None]("staged.commit_ingress", 1, WithRetry(Attempts(1)))
 	observer := &recordingObserver{}
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(4),
 		WithPollInterval(5*time.Millisecond), WithNotifications(false), WithObserver(observer))
@@ -252,7 +251,7 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 		_ = Emit(work, event, "z", stagedEventPayload{Value: "last"})
 		_ = Emit(work, event, "a", stagedEventPayload{Value: "first"})
 		_ = Emit(work, event, "a", stagedEventPayload{Value: "first"})
-		Execute(work, "child", child, None{})
+		Enqueue(work, "child", child, None{})
 	}
 	if err := runtime.Register(
 		Handle(child, func(context.Context, *Work[None]) (None, error) { return None{}, nil }),
@@ -261,7 +260,7 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 			return None{}, nil
 		}, WithCommit(func(ctx context.Context, tx Tx, commit Commit[None, None]) error {
 			_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "staged_event_commits")+`
-				(execution_id) VALUES ($1)`, commit.Info.ExecutionID)
+				(run_id) VALUES ($1)`, commit.Info.RunID)
 			return err
 		})),
 		Handle(failure, func(_ context.Context, work *Work[None]) (None, error) {
@@ -274,50 +273,27 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 		}, WithCommit(func(context.Context, Tx, Commit[None, None]) error {
 			return Permanent(errors.New("commit rejected"))
 		})),
-		Handle(commitIngress, func(_ context.Context, work *Work[None]) (None, error) {
-			stage(work)
-			return None{}, nil
-		}, WithCommit(func(ctx context.Context, tx Tx, commit Commit[None, None]) error {
-			if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "staged_event_commits")+`
-				(execution_id) VALUES ($1)`, commit.Info.ExecutionID); err != nil {
-				return err
-			}
-			_ = event.Emit(ctx, runtime, commit.Info.ExecutionID, "forbidden-ingress", stagedEventPayload{Value: "must-not-commit"})
-			return nil
-		})),
 	); err != nil {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
 
-	successHandle, err := success.With(runtime).Execute(ctx, "success", None{})
+	successHandle, err := success.Enqueue(ctx, runtime, "success", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	failureHandle, err := failure.With(runtime).Execute(ctx, "failure", None{})
+	failureHandle, err := failure.Enqueue(ctx, runtime, "failure", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitFailureHandle, err := commitFailure.With(runtime).Execute(ctx, "commit-failure", None{})
+	commitFailureHandle, err := commitFailure.Enqueue(ctx, runtime, "commit-failure", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitIngressHandle, err := commitIngress.With(runtime).Execute(ctx, "commit-ingress", None{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, successHandle.ID, "succeeded", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, failureHandle.ID, "failed", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, commitFailureHandle.ID, "failed", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, commitIngressHandle.ID, "failed", 5*time.Second)
-	poisonedTrace, err := Trace(ctx, runtime, commitIngressHandle.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(poisonedTrace.Commands) != 1 || poisonedTrace.Commands[0].Failure == nil || poisonedTrace.Commands[0].Failure.Code != "invalid_decision" {
-		t.Fatalf("poisoned commit trace=%+v", poisonedTrace)
-	}
+	waitForRunStatus(t, database.Schema, database.DB.Conn, successHandle.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, failureHandle.ID, "failed", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, commitFailureHandle.ID, "failed", 5*time.Second)
 
 	trace, err := Trace(ctx, runtime, successHandle.ID)
 	if err != nil {
@@ -335,16 +311,16 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 	}
 	var committed int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "staged_event_commits")+`
-		WHERE execution_id=$1`, successHandle.ID).Scan(&committed); err != nil || committed != 1 {
+		WHERE run_id=$1`, successHandle.ID).Scan(&committed); err != nil || committed != 1 {
 		t.Fatalf("commit rows=%d err=%v", committed, err)
 	}
-	for _, exec := range []Execution{failureHandle, commitFailureHandle, commitIngressHandle} {
+	for _, exec := range []Run{failureHandle, commitFailureHandle} {
 		var eventCount, childCount int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT
 			count(*) FILTER (WHERE event_class='application'),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-			 WHERE execution_id=$1 AND parent_command_id IS NOT NULL)
-			FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, exec.ID).
+			 WHERE run_id=$1 AND parent_command_id IS NOT NULL)
+			FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1`, exec.ID).
 			Scan(&eventCount, &childCount); err != nil {
 			t.Fatal(err)
 		}
@@ -352,13 +328,8 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 			t.Fatalf("rolled-back decision %s exposed events=%d children=%d", exec.ID, eventCount, childCount)
 		}
 	}
-	var poisonedCommitRows int
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "staged_event_commits")+`
-		WHERE execution_id=$1`, commitIngressHandle.ID).Scan(&poisonedCommitRows); err != nil || poisonedCommitRows != 0 {
-		t.Fatalf("poisoned commit rows=%d err=%v", poisonedCommitRows, err)
-	}
 	settled := waitForMatchingObservations(t, observer, 3, func(observation Observation) bool {
-		return observation.ExecutionID == successHandle.ID && observation.Operation == "settle" &&
+		return observation.RunID == successHandle.ID && observation.Operation == "settle" &&
 			(observation.Kind == ObservationEvent ||
 				(observation.Kind == ObservationAttempt && observation.CommandID == successHandle.RootCommandID))
 	})
@@ -381,14 +352,14 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 	if eventObservations != 2 || attemptObservations != 1 {
 		t.Fatalf("worker settle observations=%+v", settled)
 	}
-	rolledBack := map[ExecutionID]bool{
-		failureHandle.ID: true, commitFailureHandle.ID: true, commitIngressHandle.ID: true,
+	rolledBack := map[RunID]bool{
+		failureHandle.ID: true, commitFailureHandle.ID: true,
 	}
 	waitForMatchingObservations(t, observer, len(rolledBack), func(observation Observation) bool {
-		return rolledBack[observation.ExecutionID] && observation.Kind == ObservationAttempt && observation.Operation == "conclude"
+		return rolledBack[observation.RunID] && observation.Kind == ObservationAttempt && observation.Operation == "conclude"
 	})
 	for _, observation := range observer.snapshot() {
-		if rolledBack[observation.ExecutionID] && observation.Kind == ObservationEvent && observation.Operation == "settle" {
+		if rolledBack[observation.RunID] && observation.Kind == ObservationEvent && observation.Operation == "settle" {
 			t.Fatalf("rolled-back worker decision emitted settlement observation=%+v", observation)
 		}
 	}
@@ -439,29 +410,29 @@ func TestWorkerStagedEventCoalescesOrConflictsWithDurableIdentity(t *testing.T) 
 	})); err != nil {
 		t.Fatal(err)
 	}
-	equivalent, err := command.With(runtime).Execute(ctx, "equivalent", runtimeArgs{Value: "same"}, WithStartDelay(100*time.Millisecond))
+	equivalent, err := command.Enqueue(ctx, runtime, "equivalent", runtimeArgs{Value: "same"}, WithStartDelay(100*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-	conflicting, err := command.With(runtime).Execute(ctx, "conflicting", runtimeArgs{Value: "new"}, WithStartDelay(100*time.Millisecond))
+	conflicting, err := command.Enqueue(ctx, runtime, "conflicting", runtimeArgs{Value: "new"}, WithStartDelay(100*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := event.Emit(ctx, runtime, equivalent.ID, "same", stagedEventPayload{Value: "same"}); err != nil {
+	if err := event.Deliver(ctx, runtime, equivalent.ID, "same", stagedEventPayload{Value: "same"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := event.Emit(ctx, runtime, conflicting.ID, "same", stagedEventPayload{Value: "old"}); err != nil {
+	if err := event.Deliver(ctx, runtime, conflicting.ID, "same", stagedEventPayload{Value: "old"}); err != nil {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, equivalent.ID, "succeeded", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, conflicting.ID, "failed", 5*time.Second)
-	for _, exec := range []Execution{equivalent, conflicting} {
+	waitForRunStatus(t, database.Schema, database.DB.Conn, equivalent.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, conflicting.ID, "failed", 5*time.Second)
+	for _, exec := range []Run{equivalent, conflicting} {
 		var count int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-			WHERE execution_id=$1 AND event_class='application'`, exec.ID).Scan(&count); err != nil || count != 1 {
-			t.Fatalf("execution=%s application events=%d err=%v", exec.ID, count, err)
+			WHERE run_id=$1 AND event_class='application'`, exec.ID).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("run=%s application events=%d err=%v", exec.ID, count, err)
 		}
 	}
 }
