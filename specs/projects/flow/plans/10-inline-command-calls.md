@@ -12,15 +12,20 @@ Planned at: `3d2b29b` (`v0.2.0`) on 2026-08-10
 - **Effort:** L
 - **Risk:** MEDIUM-HIGH; this plan deliberately expands the durable product
   model with one additive delivery mode and one forward migration
-- **Schema impact:** additive migration 004 only — one commands column and its
+- **Schema impact:** additive migration 005 only — one commands column and its
   `CHECK`; no new table, no changes to existing rows
+- **Combined v0.2-to-v0.3 schema impact:** Plan 9 migration 004 performs the
+  breaking execution-to-run catalog rename; Plan 10 migration 005 then adds
+  inline delivery
 - **Durable format impact:** additive; existing journal kinds are reused, and
   tagged v0.2.0 data remains readable and replayable
 - **Plan 10 API impact:** additive `flow.Call` and
   `TraceCommand.Inline`; no existing signature changes
-- **Combined v0.2-to-v0.3 API impact:** includes Plan 9's removal of
-  `Event.Deliver`, additive direct-client command start alongside retained
-  bound starts, presence-returning `GetEventValue`, and duration behavior
+- **Combined v0.2-to-v0.3 API impact:** includes Plan 9's public
+  `Execution`→`Run` and `Execute`→`Enqueue` vocabulary, removal of
+  `Event.Deliver`, additive direct-client command enqueue alongside retained
+  bound enqueue forms, presence-returning `GetEventValue`, and duration
+  behavior
 
 > **Executor instructions:** Read this document completely before editing.
 > This plan is the deliberate model expansion that Plans 8 and 9 explicitly
@@ -32,8 +37,10 @@ Planned at: `3d2b29b` (`v0.2.0`) on 2026-08-10
 >
 > **Depends on:** `specs/projects/flow/plans/9-simpler-flow-developer-experience.md`
 > completed, reviewed, and committed as an untagged intermediate on top of
-> v0.2.0. Plan 9 retains `Command.With` through an explicit bound-command
-> adapter, removes `Event.Deliver`, preserves the minimal private
+> v0.2.0. Plan 9 establishes the `Run`/`Enqueue` vocabulary and migration 004's
+> run-named live schema, retains
+> `Command.With` through an explicit bound-command adapter, removes
+> `Event.Deliver`, preserves the minimal private
 > handler-context to `Work`-scope carrier required here, and records its
 > completion SHA. Do not
 > create a Plan 9 tag; Plan 10 owns the next tag and combined release review.
@@ -74,13 +81,13 @@ result. When the parent attempt retries, reaching the same call returns the
 stored result from the database without invoking the worker again.
 
 ```go
-flow.Execute(work, key, cmd, args)            // async command, independent lifecycle
+flow.Enqueue(work, key, cmd, args)          // async command, independent lifecycle
 flow.Call(ctx, work, key, cmd, args) (R, err) // synchronous durable subroutine
 ```
 
-The model stays exactly `execution -> command -> worker -> event`. There is
+The model stays exactly `run -> command -> worker -> event`. There is
 no `Task`, `Step`, `Checkpoint`, or replay-from-the-top runtime. An inline
-child is a command: keyed within its execution, typed, fingerprinted,
+child is a command: keyed within its run, typed, fingerprinted,
 journaled, counted against the command ceiling, visible in history and
 `Trace`, and result-projected in `flow_commands` like every other command.
 
@@ -97,18 +104,18 @@ The user-facing mental model is deliberately small:
 |---|---|
 | ordinary Go function | cheap or deterministic work that is safe to repeat |
 | `flow.Call` | synchronous durable subroutine whose result the parent needs now |
-| `flow.Execute` | asynchronous command needing an independent queue, lease, retry, wait, delay, or concurrency boundary |
+| `flow.Enqueue` | asynchronous command needing an independent queue, lease, retry, wait, delay, or concurrency boundary |
 
-`Call` is not a general replacement for `Execute`. If the called work deserves
+`Call` is not a general replacement for `Enqueue`. If the called work deserves
 queue isolation or an independent durable lifecycle, it must remain an
-`Execute` child.
+independently enqueued child.
 
 ## 2. What already exists, and the exact gap
 
 Plan 10 must not rebuild what Flow already provides:
 
-1. **Execution-level idempotency.** A permanent-keyed start is an idempotent
-   spawn: repeating it returns the existing execution and its stored outcome.
+1. **Run-level idempotency.** A permanent-keyed enqueue is idempotent:
+   repeating it returns the existing run and its stored outcome.
 2. **Command results are stored.** Successful settlement writes the result
    projection and terminal journal entry; point reads never replay.
 3. **Cross-settlement memoization.** A retried parent attempt may repeat an
@@ -125,7 +132,7 @@ invocation. Plan 10 closes only that gap.
 
 ```go
 // Call invokes cmd's registered worker inline and durably records its
-// success as an ordinary command of the same execution. If an equivalent
+// success as an ordinary command of the same run. If an equivalent
 // inline call under key already succeeded — in this attempt, an earlier
 // attempt, or a previous holder of the lease — the stored result is
 // returned without invoking the worker.
@@ -152,7 +159,7 @@ Notes:
   command's worker. Unregistered name/version is `ErrInvalid` and poisons the
   change set: an executable unit without a registered worker is a
   programming error, not a deferral case.
-- `key` obeys existing command-key rules and uniqueness within the execution.
+- `key` obeys existing command-key rules and uniqueness within the run.
   Explicit keys are deliberate: there is no auto-numbering. A loop writes
   `fmt.Sprintf("turn/%d", i)` and owns its own ordering, which removes the
   silent replay-reordering corruption class that auto-numbered step names
@@ -161,16 +168,16 @@ Notes:
   and returned directly on the invoked path; both paths validate against
   `cmd`'s codec.
 - The inline child's `CommandInfo.CommandID` is deterministic for
-  `(execution ID, command key)` and is therefore stable before acceptance and
+  `(run ID, command key)` and is therefore stable before acceptance and
   across parent retries. Use one private fixed UUID namespace and UUIDv5 over
-  the canonical bytes `execution UUID || 0x00 || UTF-8 command key`; freeze the
+  the canonical bytes `run UUID || 0x00 || UTF-8 command key`; freeze the
   namespace and byte recipe with golden vectors. Do not allocate a fresh child
   ID on every invocation.
 - `CommandInfo.Attempt` is `1` for the accepted success-only inline lifecycle.
   Failed invocations are failures of the parent attempt and do not create
   phantom child attempts.
 
-### 3.2 Execution semantics
+### 3.2 Run semantics
 
 An inline call proceeds as follows:
 
@@ -190,12 +197,12 @@ An inline call proceeds as follows:
    attempt-local caching only; durable truth is always re-read after retry or
    takeover.
 
-   `flow.Execute` must perform the inverse check so a later queued declaration
+   `flow.Enqueue` must perform the inverse check so a later queued declaration
    under a successfully called/reserved key also conflicts immediately. This
    prevents an expensive subroutine from running only for the parent decision
    to become doomed by a key collision at settlement.
-2. **Preflight lookup.** In one short execution-locked transaction, validate
-   the parent's current attempt/lease fence and execution deadline, then load
+2. **Preflight lookup.** In one short run-locked transaction, validate
+   the parent's current attempt/lease fence and run deadline, then load
    the keyed durable command:
    - existing `inline` + `succeeded` + equivalent fingerprint: decode, cache in
      the attempt-local reservation, and return the stored result;
@@ -208,15 +215,15 @@ An inline call proceeds as follows:
    - absent with capacity: capture database time for the child created/start
      timestamps, then commit/rollback the lookup transaction before invocation.
 
-   No execution or queue lock remains held while application code runs.
+   No run or queue lock remains held while application code runs.
 3. **Invoke.** Run the registered worker in the parent's goroutine under a
    context derived from the parent attempt context and capped by the inline
    command's `WithTimeout`, if any. Use the deterministic child command ID and
    captured database time in `CommandInfo`. Recover panics exactly as queued
-   workers do. Inline execution does not acquire another worker or queue slot.
+   workers do. Inline invocation does not acquire another worker or queue slot.
 4. **Record accepted success.** Encode the result, then begin one transaction
-   which locks the execution and revalidates the parent's command ID, attempt
-   ID, lease token, unexpired lease, and execution deadline. Re-read the key
+   which locks the run and revalidates the parent's command ID, attempt ID,
+   lease token, unexpired lease, and run deadline. Re-read the key
    because another active command or takeover attempt may have raced while
    user code ran:
    - if an equivalent inline success won the race, discard the local result,
@@ -236,7 +243,7 @@ An inline call proceeds as follows:
    `command_created`, `attempt_started`, successful `attempt_concluded`, and
    the ordinary `event_recorded` command-terminal success containing the typed
    result. Insert the `flow_commands` row directly in `succeeded` state, set
-   its result and terminal position, update execution counters, and create no
+   its result and terminal position, update run counters, and create no
    queue row. The journal records durable acceptance after the handler returns;
    `AttemptStartedBody.StartedAt`, `AttemptConcludedBody.FinishedAt`, and the
    command projection retain the actual captured invocation times.
@@ -277,14 +284,14 @@ crash between an external effect and the recording transaction re-runs it);
 the recorded result is **effectively once** per key; and recording is
 **fenced** — a stale parent attempt's inline result is rejected loudly, never
 last-write-wins. External idempotency keys should derive from the stable tuple
-`(execution ID, inline command key, command name/version)` or the deterministic
+`(run ID, inline command key, command name/version)` or the deterministic
 inline `CommandID`, never from an invocation-local attempt ID.
 
 ### 3.3 Fencing and concurrency
 
 The recording transaction validates the parent's current attempt ID and lease
 token against the parent's queue row, exactly as settlement does, and it
-requires the lease and execution deadline to remain live at the acceptance
+requires the lease and run deadline to remain live at the acceptance
 boundary. It does not extend or otherwise special-case the parent's lease.
 The ordinary lease manager continues to renew the queued parent while its
 handler is active. After lease takeover, the stale parent's next `Call`
@@ -293,20 +300,20 @@ attempt sees every result accepted before takeover and re-runs only the call
 that had not been accepted.
 
 The same command key may also be reached concurrently from work in one
-execution. The execution lock serializes recording transactions. A retry of
+run. The run lock serializes recording transactions. A retry of
 an ambiguously committed equivalent record returns the stored winner; a call
 from a different parent command conflicts because parent provenance is part of
 the fingerprint. The local body may therefore have run before discovering a
 winner or conflict, which is part of the documented at-least-once contract.
 
 Two goroutines inside one handler must not `Call` concurrently against the
-same execution; the change-set scope is already documented as single-threaded
+same run; the change-set scope is already documented as single-threaded
 per attempt, and this plan does not change that contract.
 
 An inline command's own registered `WithCommit` callback is supported and
 runs inside the inline recording transaction. Calling `Call` *from* any
 `WithCommit` callback is forbidden: both ordinary settlement and inline
-recording already hold the execution lock, so a nested recording transaction
+recording already holds the run lock, so a nested recording transaction
 would wait on itself. Track an explicit private `inCommit` attempt-scope flag,
 set it around every commit callback, and reject before lookup or user code
 with `ErrInvalidState`. The rejection poisons the owning decision. Error and
@@ -314,13 +321,13 @@ panic handling for the inline callback must match ordinary command settlement
 and roll back the whole inline acceptance transaction. These are required
 tests, not documentation-only rules.
 
-### 3.4 Durable representation and migration 004
+### 3.4 Durable representation and migration 005
 
 Inline children are rows in `flow_commands` with:
 
 - a new `delivery text NOT NULL DEFAULT 'queued'` column with a named `CHECK
   (delivery IN ('queued','inline'))`, so every existing row is valid without
-  rewrite; forward migration `004_inline_commands.sql` adds only this column
+  rewrite; forward migration `005_inline_commands.sql` adds only this column
   and its inline-shape checks;
 - no `flow_command_queue` row at any point in their lifecycle;
 - states restricted to `succeeded` (v1 records success only), enforced by a
@@ -329,7 +336,7 @@ Inline children are rows in `flow_commands` with:
   and wait fields, attempt ordinal `1`, consumed attempts `0`, equal non-null
   budget/next-attempt timestamps, and null failure fields; and
 - ordinary provenance: `parent_command_id` = the calling command, same
-  execution, same composite FK discipline.
+  run, same composite FK discipline.
 
 The database cannot express “no queue or wait row exists” as a row-local
 `CHECK`, so store integration tests must assert both at acceptance,
@@ -386,30 +393,31 @@ these entries; their durable evidence is the parent's ordinary failed attempt.
 Six-table inventory is preserved. If implementation finds a seventh table,
 journal-kind redesign, or non-additive migration necessary, that is a STOP.
 
-Migration 004 remains format-additive: queued writers omit the journal delivery
+Migration 005 remains format-additive: queued writers omit the journal delivery
 field and rely on the new column default, while readers treat an absent field
-as queued. Record `min_reader_version=1` and `min_writer_version=1` only after
+as queued. Record `min_reader_version=2` and `min_writer_version=2` only after
 compatibility tests prove those exact claims; otherwise stop and amend this
 plan rather than silently changing the compatibility tuple.
 
 The deployment boundary is nevertheless coordinated, not an arbitrary mixed-
 library rolling upgrade. `CheckSchema` requires the library's exact current
-migration set: v0.3 code must see schema 4, while a restarted v0.2 binary does
-not know migration 004. The combined release guide must prescribe:
+migration set: v0.3 code must see schema 5, while a restarted v0.2 binary does
+not know migrations 004–005. The combined release guide must prescribe:
 
 1. drain and stop v0.2 Flow runtimes and publisher processes;
-2. back up the Flow schema and apply migration 004 once;
+2. back up the Flow schema and apply migrations 004 and 005 in order;
 3. deploy/start only the combined v0.3 binary; and
 4. retain the documented rollback procedure as application/database restore,
    not running v0.2 code against a schema it rejects.
 
 Plan 9 is never deployed as a separately tagged compatibility stage. Test
-clean install, schema-3-to-4 upgrade, pre-migration v0.3 rejection, post-
-migration v0.3 acceptance, and v0.2 rejection of the unknown schema-4 ledger.
+clean install, populated schema-3-to-5 upgrade, reviewed Plan 9 schema-4-to-5
+upgrade, pre-migration v0.3 rejection, post-migration v0.3 acceptance, and v0.2
+rejection of the unknown schema-5 ledger.
 
 ### 3.5 Bounds
 
-- Inline children count against the execution's existing `MaxCommands`
+- Inline children count against the run's existing `MaxCommands`
   ceiling and the `open_commands <= command_count` relationship (they are
   created terminal, so they never contribute to `open_commands`).
 - Existing per-command argument/result canonical byte bounds apply unchanged.
@@ -431,7 +439,7 @@ migration v0.3 acceptance, and v0.2 rejection of the unknown schema-4 ledger.
 ### 3.6 Queue, retry, and commit semantics
 
 `Call` deliberately bypasses the independent lifecycle represented by
-`Execute`:
+`Enqueue`:
 
 - the target queue name is retained for definition identity and inspection,
   but no queue capacity, queue ordering, or queue-specific concurrency limit
@@ -447,7 +455,7 @@ migration v0.3 acceptance, and v0.2 rejection of the unknown schema-4 ledger.
 
 This is the central selection rule: use `Call` only when synchronous execution
 inside the current worker is intended. If queue isolation, independent retry,
-waits, delay, fan-out, or separate concurrency control matter, use `Execute`.
+waits, delay, fan-out, or separate concurrency control matter, use `Enqueue`.
 Plan 9's duration normalization applies before either delivery path computes
 identity: the inline timeout/defaults are already canonical integer
 milliseconds, and Plan 10 must not add a second rounding rule. Equivalent
@@ -455,26 +463,26 @@ positive fractional timeout inputs therefore coalesce after Plan 9's upward
 normalization.
 
 At the root there is no `Call`: Plan 9's
-`cmd.Execute(ctx, client, key, args, ...)` starts or rediscovers the queued
-execution. Inside a worker, `flow.Execute(...)` stages a queued child and
+`cmd.Enqueue(ctx, client, key, args, ...)` starts or rediscovers the queued run.
+Inside a worker, `flow.Enqueue(...)` stages a queued child and
 `flow.Call(...)` invokes a synchronous durable subroutine.
 
 The same `Command[A, R]` definition and registered handler may be used through
 either verb; delivery is chosen at the call site, not by defining an `Action`,
-`Step`, or second handler type. Within one execution, a particular command key
+`Step`, or second handler type. Within one run, a particular command key
 must choose one delivery mode forever.
 
 ### 3.7 v1 restrictions (deliberate)
 
 Inside an inline child's worker:
 
-- staging (`flow.Execute`, `flow.Emit`) is rejected and poisons the parent's
+- staging (`flow.Enqueue`, `flow.Emit`) is rejected and poisons the parent's
   change set — an inline child is a leaf in v1;
 - `flow.Call` nesting is rejected in v1 (depth 1); and
 - `GetEventValue` returns `found=false` from an empty snapshot — inline
   children declare no waits.
 
-Plan 9's method form `event.Emit(ctx, client, targetID, key, value)` remains
+Plan 9's method form `event.Emit(ctx, client, targetRunID, key, value)` remains
 legal because it is explicit immediate targeted ingress, not staged child
 composition. Treat it like any other external side effect: it is detached from
 inline acceptance, may survive a failed/retried call, and therefore needs a
@@ -487,9 +495,11 @@ Loosening any of them now multiplies the semantics this plan must prove.
 
 ### 3.8 Naming
 
-`Call` pairs with `Execute` as the second verb of one vocabulary: *execute* a
-command through its independent durable lifecycle, or *call* it inline as a
-durable subroutine. The rejected names are recorded so they stay rejected: no
+`Call` pairs with `Enqueue` as the second verb of one vocabulary: *enqueue* a
+command for its independent durable lifecycle, or *call* it inline as a
+durable subroutine. Enqueue describes asynchronous delivery intent; a wait,
+gate, or delay may defer the runnable queue projection. The rejected names are
+recorded so they stay rejected: no
 `Step`, `Checkpoint`, `Task`, `Memo`, or `Log` appears in the public API, docs,
 or schema. Every durable unit remains a command.
 
@@ -539,7 +549,7 @@ var RunAgentWorker = flow.Handle(
                     Turns:         turn + 1,
                     TranscriptRef: transcriptRef,
                 }
-                flow.Execute(work, "publish", PublishAnswer,
+                flow.Enqueue(work, "publish", PublishAnswer,
                     PublishArgs{SessionID: work.Args.SessionID, Answer: answer})
                 return answer, nil
             }
@@ -550,19 +560,19 @@ var RunAgentWorker = flow.Handle(
 
 // Register RunAgentWorker together with the AgentTurn and PublishAnswer
 // handlers on the runtime. AgentTurn can be invoked through either Call or
-// Execute; the delivery choice belongs to the caller, not a second definition.
+// Enqueue; the delivery choice belongs to the caller, not a second definition.
 ```
 
 The transcript lives in application/object storage and each durable command
 carries only a stable reference, so retained arguments do not grow
 quadratically with the number of turns. The turn worker uses the stable
-execution/key identity for any external idempotency it needs.
+run/key identity for any external idempotency it needs.
 
 A crash after turn 7 returns turns 0–7 from their stored command results and
 re-runs only turn 8. `Trace` shows every accepted turn as an ordinary command
-with its arguments, result, and timing. Publishing remains `Execute` because
+with its arguments, result, and timing. Publishing remains `Enqueue` because
 it deserves its own queue/retry boundary and is not needed synchronously by
-the loop. The boundary rule from Plan 9 gains its second half: *execute* a
+the loop. The boundary rule from Plan 9 gains its second half: *enqueue* a
 command for an independent retry, queue, fence, wait, delay, or fan-out
 boundary; *call* a durable subroutine when its result is needed now; keep
 everything cheaper and safely repeatable in plain Go.
@@ -580,7 +590,7 @@ everything cheaper and safely repeatable in plain Go.
    and flowtest seams that the implementation will reuse. Record file/symbol
    evidence in a Plan 10 evidence document before editing production code.
 3. Build a disposable, test-only proof against an isolated PostgreSQL schema
-   for the preflight/body/record split. Prove that no transaction or execution
+   for the preflight/body/record split. Prove that no transaction or run
    lock is held during the body, the parent fence is rechecked at acceptance,
    and one four-entry batch can reproduce the proposed projection. Delete the
    prototype before Phase 1; do not let a spike become a second path.
@@ -602,15 +612,16 @@ held across user code, cannot preserve the ordinary parent fence and replay
 model, needs a new durable noun/table/kind, or does not provide a clear DX and
 recovery advantage over queued composition.
 
-### Phase 1 — Migration 004 and store recording path
+### Phase 1 — Migration 005 and store recording path
 
-1. Add `004_inline_commands.sql` (delivery column, checks), registration,
-   catalog assertions, clean-install and 003-to-004 upgrade tests; checksums
-   of 001–003 unchanged. Record and verify the 1/1 reader/writer compatibility
-   tuple plus the coordinated v0.2-to-v0.3 schema checks described in §3.4.
+1. Add `005_inline_commands.sql` (delivery column, checks), registration,
+   catalog assertions, clean-install, 003-to-005, and 004-to-005 upgrade tests;
+   checksums of 001–004 unchanged. Record and verify the 2/2 reader/writer
+   compatibility tuple plus the coordinated v0.2-to-v0.3 schema checks
+   described in §3.4.
 2. Extend the journal codec and command declaration fingerprint with the
    backward-compatible delivery marker. Add the fixed private UUID namespace
-   and deterministic `(execution ID, command key)` child-ID derivation with
+   and deterministic `(run ID, command key)` child-ID derivation with
    golden-vector tests.
 3. Implement the short store preflight and fenced single-transaction recording
    path: exact four-entry journal batch, succeeded command projection,
@@ -632,7 +643,7 @@ no queue/wait row or independent lease ever exists for an inline child.
    encode/decode, memoized return, invocation with derived timeout context,
    panic recovery, poison-on-misuse, active context/work identity validation,
    and the private real-runtime/flowtest dispatch bridge.
-2. Add attempt-local inline key reservation and result caching; make `Execute`
+2. Add attempt-local inline key reservation and result caching; make `Enqueue`
    and `Call` reject cross-delivery key reuse in either order before user code
    or settlement. Delivery remains part of the durable conflict fingerprint.
 3. Add the explicit inline/in-commit guards. Support the inline worker's own
@@ -670,17 +681,17 @@ no queue/wait row or independent lease ever exists for an inline child.
 1. Add `examples/agent-loop` (or extend the agent example) exercising crash
    recovery across inline turns against real PostgreSQL. Carry a stable
    transcript/state reference rather than copying growing history into every
-   command, and include a final `Execute` child to demonstrate the boundary.
+   command, and include a final `Enqueue` child to demonstrate the boundary.
 2. Update README, flow.go, functional spec (§ terms: inline command), schema
    and engine/runtime components, and the boundary-rule documentation; state
    the at-least-once body / effectively-once result / fenced recording
    contract explicitly. Finalize one combined v0.2-to-v0.3 migration guide
    covering Plan 9's removed/replaced APIs and duration behavior plus Plan
-   10's `Call`, trace field, migration 004, and selection rule.
+   10's `Call`, trace field, migration 005, and selection rule.
 3. Repeat Plan 9's disposable Trails migration against the combined Plan
    9+10 Flow head. Prove the retained independent-monitor-to-`intent.run`
    targeted event path, run Trails's Flow-focused tests, and run Flow
-   migration 004 in the application's test database. Trails need not adopt
+   migrations 004–005 in the application's test database. Trails need not adopt
    `Call` to pass; this is a compatibility gate, not forced feature usage.
 4. Full gates on all supported PostgreSQL majors with durability on; focused
    ten-count race set including takeover during an inline loop, ambiguous
@@ -688,7 +699,7 @@ no queue/wait row or independent lease ever exists for an inline child.
    Phase 0 matrix and record memoized/invoked call cost, transaction count,
    journal bytes, and queued comparison as evidence, not a timing promise;
    govulncheck; rerun Plan 9's removed-API/forbidden-concept/schema checks and
-   confirm its 20 acceptance criteria still hold; human review of every hunk
+   confirm its 23 acceptance criteria still hold; human review of every hunk
    against this plan; merge the exact reviewed combined commit; verify clean
    local/remote `master`; and only then create the sole v0.3.0 tag.
 
@@ -697,23 +708,24 @@ no queue/wait row or independent lease ever exists for an inline child.
 1. Phase 0 records the current baselines, inventory, prototype proof,
    semantic decision table, and fair queued-vs-inline measurements; its
    go/no-go gate passes before migration or production implementation begins.
-2. The public model remains execution/command/worker/event. `flow.Call` is the
+2. The public model remains run/command/worker/event. `flow.Call` is the
    only new callable concept, documented as a durable subroutine;
    `TraceCommand.Inline` exposes delivery without adding a second definition
    type or renaming either form as a step.
-3. Schema remains exactly six tables. Migration 004 is forward-only and
-   additive, 001–003 checksums are unchanged, clean install and 3-to-4 upgrade
-   pass, the migration's 1/1 format compatibility is proven, tagged v0.2.0
-   rows/journal replay unchanged, and exact-schema startup/deployment behavior
+3. Schema remains exactly six tables. Plan 9 migration 004 provides the
+   run-named catalog; migration 005 is forward-only and additive; 001–004
+   checksums are unchanged; clean install plus 3-to-5 and 4-to-5 upgrades pass;
+   migration 005's 2/2 format compatibility is proven; tagged v0.2.0
+   rows/journal replay unchanged; and exact-schema startup/deployment behavior
    matches §3.4.
 4. Every inline child has the deterministic UUIDv5 identity derived from its
-   execution and key. Delivery participates in the full declaration
-   fingerprint, and `Call`/`Execute` key reuse conflicts immediately in both
+   run and key. Delivery participates in the full declaration
+   fingerprint, and `Call`/`Enqueue` key reuse conflicts immediately in both
    orders and durably across attempts.
 5. A newly accepted inline child is one succeeded `flow_commands` row with
    ordinary parent provenance, result and terminal position, ordinal `1`,
    consumed attempts `0`, no wait/delay fields, no queue or wait row, no
-   independent lease, and correct execution counters.
+   independent lease, and correct run counters.
 6. Its journal is exactly four contiguous existing-kind entries — created,
    started, concluded, terminal result — with the specified backward
    causation. Body timestamps describe invocation; positions describe durable
@@ -723,7 +735,7 @@ no queue/wait row or independent lease ever exists for an inline child.
    equivalent record, without invoking the worker or local commit callback
    again.
 8. Acceptance reuses the parent's attempt ID, lease token, live lease, and
-   execution-deadline fence. A stale parent cannot record; no special parent
+   run-deadline fence. A stale parent cannot record; no special parent
    lease extension is introduced; the successor sees every accepted result.
 9. Every `Call` error associated with an active `Work` poisons the parent
    decision even when application code ignores the returned Go error. An
@@ -736,10 +748,10 @@ no queue/wait row or independent lease ever exists for an inline child.
     Calling `Call` from any commit callback fails before SQL or user code with
     `ErrInvalidState` and cannot deadlock.
 11. `WithTimeout` is honored. Queue and retry settings remain part of identity
-    and inspection but do not govern execution. Plan 9's upward duration
+    and inspection but do not govern invocation. Plan 9's upward duration
     normalization is reused without a second canonicalization rule. Work
     requiring queue, independent retry/lease, wait, delay, fan-out, or
-    concurrency isolation remains an `Execute` command.
+    concurrency isolation remains an enqueued command.
 12. Leaf-only, depth-1, no-wait, no-staging restrictions and the existing
     single-threaded work-scope contract are enforced and tested. Plan 9's
     method `Event.Emit` remains allowed only with its documented detached,
@@ -752,7 +764,7 @@ no queue/wait row or independent lease ever exists for an inline child.
     cover invoked, memoized, conflict, and failure paths without exposing
     payloads in observations.
 15. The example and normative docs teach plain Go versus `Call` versus
-    `Execute`, use stable references for growing data, and make the
+    `Enqueue`, use stable references for growing data, and make the
     at-least-once body / effectively-once result / fenced acceptance contract
     explicit. The combined v0.2-to-v0.3 guide covers both plans, and no
     `Step`/`Checkpoint`/`Task`/`Memo` vocabulary is added.
@@ -810,12 +822,12 @@ Stop and report rather than improvising if:
 - No transactional coupling between an inline child's external effect and its
   recording; exactly-once side effects remain unpromised.
 - No batching, async pipelining, or concurrency inside one attempt's calls.
-- No root, publisher, detached, or cross-execution `Call`; it is only a worker
+- No root, publisher, detached, or cross-run `Call`; it is only a worker
   subroutine API.
 - No retention or compaction changes; inline rows age exactly like other
   command rows and are the retention plan's problem alongside them.
 - No changes to Absurd-comparison positioning docs beyond one paragraph
-  documenting the execute-vs-call rule.
+  documenting the enqueue-vs-call rule.
 
 ## 9. Punchlist
 
@@ -835,10 +847,10 @@ Stop and report rather than improvising if:
 
 ### Schema, codec, and store
 
-- [ ] Add migration 004 with the delivery column and named checks; register
-  version 4; prove 001–003 checksums unchanged; test clean install and
-  3-to-4 upgrade.
-- [ ] Prove the migration 004 reader/writer tuple is 1/1 while exact-schema
+- [ ] Add migration 005 with the delivery column and named checks; register
+  version 5; prove 001–004 checksums unchanged; test clean install plus
+  3-to-5 and 4-to-5 upgrades.
+- [ ] Prove the migration 005 reader/writer tuple is 2/2 while exact-schema
   startup enforces the coordinated v0.2-to-v0.3 deployment sequence; document
   backup/restore rather than mixed-version rollback.
 - [ ] Extend catalog assertions; preserve the six-table inventory.
@@ -860,7 +872,7 @@ Stop and report rather than improvising if:
   context, panic recovery, active context/work checks, and a private runtime/
   flowtest dispatch bridge.
 - [ ] Add attempt-local inline key reservation/result caching and make
-  `Execute`/`Call` reject cross-delivery key reuse in either order.
+  `Enqueue`/`Call` reject cross-delivery key reuse in either order.
 - [ ] Add inline/in-commit scope guards; honor the inline worker's callback
   atomically while prohibiting `Call` from every commit callback.
 - [ ] Enforce leaf-only, depth-1, no-wait/no-staging behavior and unconditional
@@ -886,19 +898,19 @@ Stop and report rather than improvising if:
 ### Example, docs, release
 
 - [ ] Add the agent-loop example using stable transcript references, a final
-  queued `Execute`, and a crash-recovery integration test.
-- [ ] Document the plain-Go/call/execute selection rule and the
+  queued `Enqueue`, and a crash-recovery integration test.
+- [ ] Document the plain-Go/call/enqueue selection rule and the
   at-least-once/effectively-once/fenced contract in README, flow.go, and the
   normative specs.
 - [ ] Finalize one combined v0.2-to-v0.3 migration guide covering Plan 9 API/
   duration changes and Plan 10 API/schema/durability changes.
 - [ ] Repeat the disposable Trails proof against the combined head, including
   an enduring independent-monitor targeted event, Flow-focused tests, and
-  migration 004; do not require Trails to adopt `Call`.
+  migrations 004–005; do not require Trails to adopt `Call`.
 - [ ] Run full ordinary/race/vulnerability gates on all supported PostgreSQL
   majors; rerun and record the Phase 0 measurement matrix without promises.
 - [ ] Rerun Plan 9's removed-API, forbidden-concept, six-table/no-historical-
-  rewrite, and consumer guards; confirm all 20 Plan 9 criteria still pass.
+  rewrite, and consumer guards; confirm all 23 Plan 9 criteria still pass.
 - [ ] Review every hunk against this plan; obtain human approval before
   merging the combined release commit; verify local/remote `master` and the
   clean worktree agree, then create the sole v0.3.0 tag. Confirm no Plan 9-only
