@@ -1,67 +1,60 @@
-# Plan 10: Durable subroutine calls — inline progress, one command vocabulary
+# Plan 11: Durable subroutine calls — inline progress, one command vocabulary
 
 Status: Planned
 
-Planned at: `3d2b29b` (`v0.2.0`) on 2026-08-10
+Planned at: `788c9b5` on 2026-08-11
 
-- **Target release:** v0.3.0 — the single combined tag for untagged Plan 9
-  plus Plan 10
-- **Priority:** P2 as a feature, but release-blocking once untagged Plan 9
-  lands; the Phase 0 proof must justify the model expansion before production
-  edits
+- **Target release:** no release is committed; if approved after Plans 9 and
+  10, this is a separately reviewed v0.5.0 candidate
+- **Priority:** P2 optional feature; it does not block Plan 9, Plan 10, or the
+  Trails integration
 - **Effort:** L
 - **Risk:** MEDIUM-HIGH; this plan deliberately expands the durable product
   model with one additive delivery mode and one forward migration
 - **Schema impact:** additive migration 005 only — one commands column and its
   `CHECK`; no new table, no changes to existing rows
-- **Combined v0.2-to-v0.3 schema impact:** Plan 9 migration 004 performs the
-  breaking execution-to-run catalog rename; Plan 10 migration 005 then adds
-  inline delivery
+- **Upgrade schema impact:** Plan 9 migration 004 performs the breaking
+  execution-to-run catalog rename; Plan 11 migration 005 then adds inline
+  delivery after Plan 10, which has no schema migration
 - **Durable format impact:** additive; existing journal kinds are reused, and
   tagged v0.2.0 data remains readable and replayable
-- **Plan 10 API impact:** additive `flow.Call` and
+- **Plan 11 API impact:** additive `flow.Call` and
   `TraceCommand.Inline`; no existing signature changes
-- **Combined v0.2-to-v0.3 API impact:** includes Plan 9's public
-  `Execution`→`Run` and `Execute`→`Enqueue` vocabulary, removal of
-  `Event.Deliver`, additive direct-client command enqueue alongside retained
-  bound enqueue forms, presence-returning `GetEventValue`, and duration
-  behavior
+- **Baseline API:** Plan 9's public `Run`/`Enqueue` vocabulary, direct-only
+  root enqueue, retained detached `Event.Deliver`, presence-returning
+  `GetEventValue`, and Plan 10's run-ownership/transaction ergonomics
 
 > **Executor instructions:** Read this document completely before editing.
-> This plan is the deliberate model expansion that Plans 8 and 9 explicitly
+> This plan is the deliberate model expansion that Plans 8–10 explicitly
 > deferred. It must be implemented as designed here or stopped — not shrunk
 > into a side-table memo API and not grown into a task/step/checkpoint
 > vocabulary. Every durable progress record in Flow remains a command. If an
 > implementation obstacle suggests a second concept, a seventh table, or a
 > weaker fence, stop and amend this plan.
 >
-> **Depends on:** `specs/projects/flow/plans/9-simpler-flow-developer-experience.md`
-> completed, reviewed, and committed as an untagged intermediate on top of
-> v0.2.0. Plan 9 establishes the `Run`/`Enqueue` vocabulary and migration 004's
-> run-named live schema, retains
-> `Command.With` through an explicit bound-command adapter, removes
-> `Event.Deliver`, preserves the minimal private
-> handler-context to `Work`-scope carrier required here, and records its
-> completion SHA. Do not
-> create a Plan 9 tag; Plan 10 owns the next tag and combined release review.
+> **Depends on:** Plan 9 released as v0.3.0 and Plan 10 completed and released.
+> Plan 9 establishes `Run`/`Enqueue`, direct-only root enqueue, migration 004,
+> and the explicit `flow.Emit` versus `Event.Deliver` distinction. Plan 10 adds
+> atomic current-run replacement, `CommandInfo.RunKey`, and a named
+> transaction-scoped client without adding inline execution. Trails is not
+> expected to adopt `flow.Call`.
 >
 > **Initial drift check:**
 >
 > ```text
 > git status --short --branch
 > git log -1 --decorate --oneline
-> test -z "$(git tag --points-at HEAD)"  # Plan 9 head is intentionally untagged
-> git diff --stat 3d2b29b..HEAD -- \
+> git describe --tags --always
+> git diff --stat <approved-plan-10-release-tag>..HEAD -- \
 >   definitions.go execute.go worker.go node.go command_runtime.go runtime.go \
 >   trace.go types.go testing_bridge.go migrations.go migrations migrations_test.go \
 >   internal/store internal/replay internal/testengine \
 >   flowtest examples README.md flow.go specs/projects/flow
 > ```
 >
-> HEAD must equal the reviewed Plan 9 completion SHA, and the diff from
-> `3d2b29b` must match Plan 9's described changes. Unreconciled public API,
-> journal, replay, or schema drift beyond Plan 9 is a STOP condition until this
-> plan is amended.
+> Start from the reviewed Plan 10 release tag and reconcile all later drift.
+> Unreconciled public API, journal, replay, transaction, or schema changes are
+> a STOP condition until this plan is amended.
 
 ## 1. Purpose
 
@@ -73,7 +66,7 @@ progress on any crash, timeout, or lease loss. The only current remedy is one
 queued command per step, which costs a scheduler round trip, a claim, and a
 settlement per step and forces state to travel by reference between them.
 
-Plan 10 adds the missing synchronous tier without adding a new durable noun: a
+Plan 11 adds the missing synchronous tier without adding a new durable noun: a
 **durable subroutine call** represented by an inline command. A worker may call
 a registered command *now*, in process, under its own attempt's fence. The
 inline child's accepted success is durably recorded as an ordinary command
@@ -112,7 +105,7 @@ independently enqueued child.
 
 ## 2. What already exists, and the exact gap
 
-Plan 10 must not rebuild what Flow already provides:
+Plan 11 must not rebuild what Flow already provides:
 
 1. **Run-level idempotency.** A permanent-keyed enqueue is idempotent:
    repeating it returns the existing run and its stored outcome.
@@ -124,7 +117,7 @@ Plan 10 must not rebuild what Flow already provides:
 
 The gap is precisely intra-attempt: staged children do not exist until the
 parent settles, so durable progress cannot accumulate inside one handler
-invocation. Plan 10 closes only that gap.
+invocation. Plan 11 closes only that gap.
 
 ## 3. Design
 
@@ -401,19 +394,18 @@ plan rather than silently changing the compatibility tuple.
 
 The deployment boundary is nevertheless coordinated, not an arbitrary mixed-
 library rolling upgrade. `CheckSchema` requires the library's exact current
-migration set: v0.3 code must see schema 5, while a restarted v0.2 binary does
-not know migrations 004–005. The combined release guide must prescribe:
+migration set: Plan 11 code must see schema 5, while the prior release knows
+only migrations through 004. The Plan 11 release guide must prescribe:
 
-1. drain and stop v0.2 Flow runtimes and publisher processes;
-2. back up the Flow schema and apply migrations 004 and 005 in order;
-3. deploy/start only the combined v0.3 binary; and
+1. drain and stop prior Flow runtimes and publisher processes;
+2. back up the Flow schema and apply migration 005;
+3. deploy/start only the Plan 11 release; and
 4. retain the documented rollback procedure as application/database restore,
-   not running v0.2 code against a schema it rejects.
+   not running the prior binary against a schema it rejects.
 
-Plan 9 is never deployed as a separately tagged compatibility stage. Test
-clean install, populated schema-3-to-5 upgrade, reviewed Plan 9 schema-4-to-5
-upgrade, pre-migration v0.3 rejection, post-migration v0.3 acceptance, and v0.2
-rejection of the unknown schema-5 ledger.
+Plan 9's schema 4 is an already released starting point. Test clean install,
+populated schema-4-to-5 upgrade, pre-migration Plan 11 rejection, post-migration
+Plan 11 acceptance, and prior-release rejection of the unknown schema-5 ledger.
 
 ### 3.5 Bounds
 
@@ -458,7 +450,7 @@ inside the current worker is intended. If queue isolation, independent retry,
 waits, delay, fan-out, or separate concurrency control matter, use `Enqueue`.
 Plan 9's duration normalization applies before either delivery path computes
 identity: the inline timeout/defaults are already canonical integer
-milliseconds, and Plan 10 must not add a second rounding rule. Equivalent
+milliseconds, and Plan 11 must not add a second rounding rule. Equivalent
 positive fractional timeout inputs therefore coalesce after Plan 9's upward
 normalization.
 
@@ -482,7 +474,7 @@ Inside an inline child's worker:
 - `GetEventValue` returns `found=false` from an empty snapshot — inline
   children declare no waits.
 
-Plan 9's method form `event.Emit(ctx, client, targetRunID, key, value)` remains
+Plan 9's method form `event.Deliver(ctx, client, targetRunID, key, value)` remains
 legal because it is explicit immediate targeted ingress, not staged child
 composition. Treat it like any other external side effect: it is detached from
 inline acceptance, may survive a failed/retried call, and therefore needs a
@@ -581,14 +573,13 @@ everything cheaper and safely repeatable in plain Go.
 
 ### Phase 0 — Base, inventory, and go/no-go proof
 
-1. Confirm HEAD is the reviewed, untagged Plan 9 completion SHA on top of the
-   tagged v0.2.0 base; confirm the minimal private context/work-scope carrier
-   remains; record schema version, exported API, `go list -m all`, and clean
-   ordinary/race baselines.
+1. Confirm HEAD is the reviewed Plan 10 release on top of tagged v0.3.0; record
+   schema version, exported API, `go list -m all`, and clean ordinary/race
+   baselines.
 2. Inventory the exact worker registry, decision-state, declaration
    fingerprint, fence, success-settlement, journal, replay, trace, observer,
    and flowtest seams that the implementation will reuse. Record file/symbol
-   evidence in a Plan 10 evidence document before editing production code.
+   evidence in a Plan 11 evidence document before editing production code.
 3. Build a disposable, test-only proof against an isolated PostgreSQL schema
    for the preflight/body/record split. Prove that no transaction or run
    lock is held during the body, the parent fence is rechecked at acceptance,
@@ -606,19 +597,23 @@ everything cheaper and safely repeatable in plain Go.
    semantic decision table covering invoked, memoized, ambiguous-commit,
    different-parent conflict, ceiling, timeout, callback, and stale-fence
    outcomes.
+6. Locate an approved retention/archival decision that covers terminal inline
+   command and journal accumulation, or record an explicit operator decision
+   that the proposed usage volume accepts unbounded growth. Do not assume that
+   command projections make the journal redundant.
 
-**Gate:** stop and amend or reject Plan 10 if the proof needs a transaction
+**Gate:** stop and amend or reject Plan 11 if the proof needs a transaction
 held across user code, cannot preserve the ordinary parent fence and replay
 model, needs a new durable noun/table/kind, or does not provide a clear DX and
-recovery advantage over queued composition.
+recovery advantage over queued composition. A high-volume production release
+also stops without the retention decision in item 6.
 
 ### Phase 1 — Migration 005 and store recording path
 
 1. Add `005_inline_commands.sql` (delivery column, checks), registration,
    catalog assertions, clean-install, 003-to-005, and 004-to-005 upgrade tests;
    checksums of 001–004 unchanged. Record and verify the 2/2 reader/writer
-   compatibility tuple plus the coordinated v0.2-to-v0.3 schema checks
-   described in §3.4.
+   compatibility tuple plus the schema-4-to-5 checks described in §3.4.
 2. Extend the journal codec and command declaration fingerprint with the
    backward-compatible delivery marker. Add the fixed private UUID namespace
    and deterministic `(run ID, command key)` child-ID derivation with
@@ -657,7 +652,7 @@ no queue/wait row or independent lease ever exists for an inline child.
    re-run of an unaccepted invocation; timeout/panic/error classification;
    callback success/error/panic; ignored-error poisoning; preflight and
    recording-time ceiling races; rejection of top-level staging from inline
-   workers; detached method-`Event.Emit` parity; and repeated race runs.
+   workers; detached method-`Event.Deliver` parity; and repeated race runs.
 
 ### Phase 3 — Replay, trace, inspection, flowtest
 
@@ -685,14 +680,14 @@ no queue/wait row or independent lease ever exists for an inline child.
 2. Update README, flow.go, functional spec (§ terms: inline command), schema
    and engine/runtime components, and the boundary-rule documentation; state
    the at-least-once body / effectively-once result / fenced recording
-   contract explicitly. Finalize one combined v0.2-to-v0.3 migration guide
-   covering Plan 9's removed/replaced APIs and duration behavior plus Plan
-   10's `Call`, trace field, migration 005, and selection rule.
-3. Repeat Plan 9's disposable Trails migration against the combined Plan
-   9+10 Flow head. Prove the retained independent-monitor-to-`intent.run`
-   targeted event path, run Trails's Flow-focused tests, and run Flow
-   migrations 004–005 in the application's test database. Trails need not adopt
-   `Call` to pass; this is a compatibility gate, not forced feature usage.
+   contract explicitly. Publish a Plan 11 migration guide for `Call`, the trace
+   field, migration 005, and the selection rule; link to rather than duplicate
+   Plan 9's v0.2-to-v0.3 guide.
+3. Repeat the disposable Trails compatibility proof against the Plan 11 head.
+   Prove the retained independent-monitor-to-`intent.run` targeted delivery,
+   run Trails's Flow-focused tests, and run migration 005 in the application's
+   test database. Trails must not adopt `Call`; this is only a compatibility
+   and non-regression gate.
 4. Full gates on all supported PostgreSQL majors with durability on; focused
    ten-count race set including takeover during an inline loop, ambiguous
    commit resolution, and different parent commands racing one key; rerun the
@@ -700,8 +695,8 @@ no queue/wait row or independent lease ever exists for an inline child.
    journal bytes, and queued comparison as evidence, not a timing promise;
    govulncheck; rerun Plan 9's removed-API/forbidden-concept/schema checks and
    confirm its 23 acceptance criteria still hold; human review of every hunk
-   against this plan; merge the exact reviewed combined commit; verify clean
-   local/remote `master`; and only then create the sole v0.3.0 tag.
+   against this plan; merge the exact reviewed commit; verify clean local/
+   remote `master`; and only then create the separately approved release tag.
 
 ## 6. Acceptance criteria
 
@@ -754,7 +749,7 @@ no queue/wait row or independent lease ever exists for an inline child.
     concurrency isolation remains an enqueued command.
 12. Leaf-only, depth-1, no-wait, no-staging restrictions and the existing
     single-threaded work-scope contract are enforced and tested. Plan 9's
-    method `Event.Emit` remains allowed only with its documented detached,
+    method `Event.Deliver` remains allowed only with its documented detached,
     immediate semantics.
 13. Preflight and recording-time `MaxCommands` checks, canonical byte bounds,
     and `open_commands <= command_count` are tested, including the last-slot
@@ -766,14 +761,17 @@ no queue/wait row or independent lease ever exists for an inline child.
 15. The example and normative docs teach plain Go versus `Call` versus
     `Enqueue`, use stable references for growing data, and make the
     at-least-once body / effectively-once result / fenced acceptance contract
-    explicit. The combined v0.2-to-v0.3 guide covers both plans, and no
+    explicit. The Plan 11 migration guide covers this feature, and no
     `Step`/`Checkpoint`/`Task`/`Memo` vocabulary is added.
 16. Full ordinary and race gates pass on every supported PostgreSQL major
     with durability enabled and zero unintended skips; focused race tests are
-    repeated; govulncheck passes; the combined Trails compatibility proof
+    repeated; govulncheck passes; the Trails compatibility proof
     passes; all Plan 9 acceptance criteria and deletion guards still pass; the
     final benchmark/evidence rerun makes no timing-threshold test or
-    unsupported throughput promise; and only then is v0.3.0 tagged.
+    unsupported throughput promise; and only then is the Plan 11 release tagged.
+17. High-volume production use has an approved retention/archival decision or
+    an explicit documented acceptance of unbounded terminal command and
+    journal growth; the journal is never disabled as a substitute.
 
 ## 7. STOP conditions
 
@@ -801,12 +799,13 @@ Stop and report rather than improvising if:
 10. mixed queued/inline replay conformance cannot be proven or older journal
     bodies would change meaning;
 11. any existing invariant from Plan 9 §3.1 would be weakened;
-12. the combined Trails proof requires restoring `Event.Deliver`, a V1
-    compatibility root, or any other capability that Plan 9 deliberately
-    removed; or
+12. the Trails proof requires a V1 compatibility root or any other capability
+    deliberately removed by Plans 9 or 10; or
 13. the example cannot be written within the leaf/depth-1 rules without
     copying growing state into every command — evidence that the v1 shape
-    needs amendment rather than a workaround.
+    needs amendment rather than a workaround; or
+14. high-volume release is proposed without an approved retention decision or
+    explicit operational acceptance of unbounded growth.
 
 ## 8. Explicit non-goals
 
@@ -824,8 +823,10 @@ Stop and report rather than improvising if:
 - No batching, async pipelining, or concurrency inside one attempt's calls.
 - No root, publisher, detached, or cross-run `Call`; it is only a worker
   subroutine API.
-- No retention or compaction changes; inline rows age exactly like other
-  command rows and are the retention plan's problem alongside them.
+- No retention or compaction changes. Before high-volume production use, an
+  approved retention decision must bound or explicitly accept accumulation of
+  terminal inline commands and journal entries; absent that decision, release
+  approval stops.
 - No changes to Absurd-comparison positioning docs beyond one paragraph
   documenting the enqueue-vs-call rule.
 
@@ -833,8 +834,7 @@ Stop and report rather than improvising if:
 
 ### Phase 0 proof
 
-- [ ] Confirm the reviewed, untagged Plan 9 completion SHA on the tagged
-  v0.2.0 base; verify its private context/work-scope carrier; record clean
+- [ ] Confirm the reviewed Plan 10 release on top of tagged v0.3.0; record clean
   API/schema/dependency/ordinary/race baselines.
 - [ ] Inventory the registry, decision, fingerprint, fence, journal, replay,
   trace, observer, and flowtest seams with file/symbol evidence.
@@ -844,15 +844,17 @@ Stop and report rather than improvising if:
   injected-crash recovery boundary; approve the go/no-go gate.
 - [ ] Freeze compile fixtures and the invoked/memoized/ambiguous-commit/
   different-parent-conflict/failure semantic decision table.
+- [ ] Record the approved retention/archival decision for high-volume inline
+  use, or explicit operator acceptance of unbounded command/journal growth.
 
 ### Schema, codec, and store
 
 - [ ] Add migration 005 with the delivery column and named checks; register
   version 5; prove 001–004 checksums unchanged; test clean install plus
   3-to-5 and 4-to-5 upgrades.
-- [ ] Prove the migration 005 reader/writer tuple is 2/2 while exact-schema
-  startup enforces the coordinated v0.2-to-v0.3 deployment sequence; document
-  backup/restore rather than mixed-version rollback.
+- [ ] Prove the migration 005 reader/writer tuple while exact-schema startup
+  enforces the schema-4-to-5 deployment sequence; document backup/restore
+  rather than mixed-version rollback.
 - [ ] Extend catalog assertions; preserve the six-table inventory.
 - [ ] Add the backward-compatible command-created delivery marker and include
   delivery in declaration fingerprints.
@@ -878,7 +880,7 @@ Stop and report rather than improvising if:
 - [ ] Enforce leaf-only, depth-1, no-wait/no-staging behavior and unconditional
   poison semantics for every returned error.
 - [ ] Prove top-level `flow.Emit` is rejected from inline work while Plan 9's
-  method `Event.Emit` remains explicit detached ingress with unchanged
+  method `Event.Deliver` remains explicit detached ingress with unchanged
   idempotency/conflict behavior.
 - [ ] Prove deterministic identity, same-attempt/across-retry/takeover/
   ambiguous-commit memoization, at-least-once unaccepted bodies, callback and
@@ -902,16 +904,15 @@ Stop and report rather than improvising if:
 - [ ] Document the plain-Go/call/enqueue selection rule and the
   at-least-once/effectively-once/fenced contract in README, flow.go, and the
   normative specs.
-- [ ] Finalize one combined v0.2-to-v0.3 migration guide covering Plan 9 API/
-  duration changes and Plan 10 API/schema/durability changes.
-- [ ] Repeat the disposable Trails proof against the combined head, including
+- [ ] Publish a Plan 11 migration guide for `Call`, trace, schema, and
+  durability changes; link to the already released Plan 9 guide.
+- [ ] Repeat the disposable Trails proof against the Plan 11 head, including
   an enduring independent-monitor targeted event, Flow-focused tests, and
-  migrations 004–005; do not require Trails to adopt `Call`.
+  migration 005; Trails must not adopt `Call`.
 - [ ] Run full ordinary/race/vulnerability gates on all supported PostgreSQL
   majors; rerun and record the Phase 0 measurement matrix without promises.
 - [ ] Rerun Plan 9's removed-API, forbidden-concept, six-table/no-historical-
   rewrite, and consumer guards; confirm all 23 Plan 9 criteria still pass.
 - [ ] Review every hunk against this plan; obtain human approval before
-  merging the combined release commit; verify local/remote `master` and the
-  clean worktree agree, then create the sole v0.3.0 tag. Confirm no Plan 9-only
-  tag exists.
+  merging the release commit; verify local/remote `master` and the clean
+  worktree agree, then create the separately approved release tag.

@@ -2,10 +2,11 @@
 
 Status: Planned
 
-Planned at: `3d2b29b` (`v0.2.0`) on 2026-08-10
+Planned at: `788c9b5` on 2026-08-11; implementation baseline remains the
+tagged `v0.2.0` source at `3d2b29b`
 
-- **Release boundary:** none — this is an untagged intermediate milestone;
-  Plans 9 and 10 ship together under one v0.3.0 tag after Plan 10 passes
+- **Target release:** v0.3.0; Plan 9 is implemented, verified, tagged, and
+  released independently before Plan 10 begins
 - **Priority:** P1 for the public API cleanup and Trails-facing ergonomics
 - **Effort:** L
 - **Risk:** MEDIUM-HIGH; the durable model remains unchanged, but this plan
@@ -19,11 +20,12 @@ Planned at: `3d2b29b` (`v0.2.0`) on 2026-08-10
   but does not rewrite append-only journal bytes or their versioned wire
   strings
 - **Public API impact:** breaking `Execution`→`Run` family and
-  `Execute`→`Enqueue` vocabulary cleanup; breaking removal of `Event.Deliver`;
-  additive direct `Command.Enqueue(ctx, client, ...)` while retaining
-  `Command.With(client).Enqueue(...)` through an explicit `BoundCommand`;
-  breaking addition of a `found` result to `GetEventValue`; compatible
-  expansion of accepted positive durable durations
+  `Execute`→`Enqueue` vocabulary cleanup; one direct root-enqueue form,
+  `Command.Enqueue(ctx, client, ...)`, with removal of `Command.With` and its
+  hidden client binding; removal of redundant method `Event.Emit` while
+  retaining `Event.Deliver` for immediate targeted ingress; breaking addition
+  of a `found` result to `GetEventValue`; compatible expansion of accepted
+  positive durable durations
 
 > **Planning snapshot:** this plan was written against the clean v0.2.0
 > `master` source at `3d2b29b`. A separate decision/change-set naming refactor
@@ -38,12 +40,12 @@ Planned at: `3d2b29b` (`v0.2.0`) on 2026-08-10
 > helper requires a new durable concept, seventh table, scheduler branch, or
 > weaker fence, stop: that is evidence that the helper is outside this plan.
 >
-> **Release sequencing:** Plan 9 may be committed, reviewed, and merged as an
-> intermediate implementation milestone, but it must not be tagged or
-> published independently. Hand its verified completion SHA directly to Plan
-> 10 at `specs/projects/flow/plans/10-inline-command-calls.md`. The next
-> release tag is v0.3.0 only after both plans and the combined consumer/release
-> gates pass.
+> **Release sequencing:** Plan 9 owns the complete v0.2-to-v0.3 migration and
+> release. Tag v0.3.0 only after its migration, consumer, documentation, and
+> release gates pass. Plan 10 starts from that exact tagged API and adds
+> run-ownership replacement, run-key inspection, and transaction-client
+> ergonomics. Plan 11 is a separately approved, optional inline-call proposal;
+> it does not block Plan 9 or the Trails migration.
 >
 > **Initial drift check:**
 >
@@ -90,24 +92,23 @@ about developer experience:
 1. common cases should read like ordinary Go;
 2. callers should not need small duration-normalization helpers; and
 3. optional event input should not be inferred from a command-key suffix; and
-4. the public vocabulary should distinguish a durable `Run`, an asynchronously
-   enqueued command, and a synchronously called durable subroutine.
+4. the public vocabulary should distinguish a durable `Run` from an
+   asynchronously enqueued command without pre-committing to another
+   composition primitive.
 
 Plan 9 applies those lessons while explicitly rejecting an Absurd-style
-procedural checkpoint/replay layer. It consolidates targeted event ingress,
-supports both direct and intentionally client-bound command starts, changes the
-existing typed event-input reader to report presence, and supplies one
-realistic multi-queue example.
+procedural checkpoint/replay layer. It keeps one explicit detached targeted
+event-ingress verb, keeps root starts dependency-explicit, changes the existing
+typed event-input reader to report presence, and supplies one realistic
+multi-queue example.
 
-The target after Plan 9 is an intermediate API foundation for the combined
-v0.3.0 release. Plan 10 adds `flow.Call` before that release is tagged:
+The target v0.3.0 API is:
 
 ```text
 start once:        command.Enqueue(ctx, client, key, args, ...)
-bind and reuse:    command.With(client).Enqueue(ctx, key, args, ...)
 stage a child:     flow.Enqueue(work, key, command, args)
 stage a fact:      flow.Emit(work, event, key, payload)
-emit a targeted fact: event.Emit(ctx, client, runID, key, payload)
+deliver a targeted fact: event.Deliver(ctx, client, runID, key, payload)
 read a fact input: value, found, err := flow.GetEventValue(work, event, key)
 ```
 
@@ -146,12 +147,10 @@ Flow. A new `Task`, `Step`, checkpoint, replay cursor, or workflow function
 would create two composition models, two sets of retry expectations, and an
 unclear boundary between a command result and a step result.
 
-Plan 10 deliberately narrows the linear-workflow syntax gap without changing
-that conclusion: `flow.Call` invokes a command as a synchronous durable
-subroutine, and every accepted call is still a run-owned command with
-ordinary identity, history, and fencing. It does not add procedural replay or
-a second durable unit. Plan 9 must leave that seam clean, but must not implement
-it early.
+Plan 11 separately evaluates one possible way to narrow the linear-workflow
+syntax gap with a durable synchronous command call. That proposal is optional,
+has its own release and storage review, and is neither a prerequisite nor a
+partially implemented seam in Plan 9.
 
 ### 2.2 Trails demonstrates why Flow's model stays
 
@@ -200,26 +199,16 @@ This plan addresses demonstrated usage rather than hypothetical shorthand:
    `exactFlowDuration` helper that rounds positive durations upward to the next
    millisecond.
 3. Every root start currently requires `command.With(client).Execute(...)`.
-   That form is useful when a service binds definitions once and starts them
-   repeatedly, while a direct `command.Enqueue(ctx, client, ...)` form avoids
-   a throwaway bound value for one-shot starts. Both usages are legitimate and
-   should share one implementation.
-4. Trails still requires immediate targeted emission from inside a Flow worker,
-   but its current call sites fall into two different lifecycle categories.
-   `lib/jobqueue.Queue.Handle` adapts every queue handler through `flow.Handle`.
-   The separately rooted `txn.confirm` compatibility handler calls
-   `DeliverStageChildTerminalTx`, whose shared
-   `lib/intentmachine/deliverIntentRunEventTx` helper looks up the separate live
-   `intent.run` generation and calls `Event.Deliver` through `Runtime.InTx(tx)`.
-   Trails Plan 004 removes that V1 compatibility root and its legacy terminal
-   fan-in; it is transitional evidence, not the enduring reason for this Flow
-   capability. Independently rooted bridge, edge, OIF, and provider monitors
-   use the same targeted path and are deliberately retained because their
-   observation lifecycle must survive replacement or cancellation of the
-   parent intent run. Those monitor facts remain cross-run: the source is a
-   monitor/jobqueue run and the target is the exact current
-   `intent.run` generation, so top-level `flow.Emit(work, ...)` cannot replace
-   the targeted operation after the V1 roots are gone.
+   The bound value is usually temporary, hides transaction lifetime inside a
+   copied definition, and creates a second root-start shape. A direct
+   `command.Enqueue(ctx, client, ...)` form is simpler and sufficient.
+4. Trails requires immediate targeted delivery from independently rooted
+   bridge, edge, OIF, and provider monitors. Their observation lifecycle is
+   separate from the exact current `intent.run`, and delivery often joins a
+   caller-owned application transaction. Top-level `flow.Emit(work, ...)`
+   cannot replace this cross-run operation. Completed Trails Plan 004 removed
+   the transitional V1 compatibility roots; the enduring monitor paths are the
+   only consumer proof Plan 9 should use.
 
 These are good candidates for library improvements because the replacements
 remain typed wrappers over behavior Flow already has.
@@ -234,7 +223,7 @@ Three ideas from the comparison are deliberately **not** part of Plan 9:
   another way to register workers merely to avoid returning `None{}`. Keeping
   every executable unit visibly a `Command[A, R]` is simpler.
 - **No `DeliverToLive` helper.** Trails has one small domain helper that calls
-  `GetCurrentRun` and then `Event.Emit`. The two calls have a meaningful
+  `GetCurrentRun` and then `Event.Deliver`. The two calls have a meaningful
   race: the observed current run may settle before delivery, and Flow must
   not silently retarget a generation-specific payload. Keeping this composition
   explicit in Trails makes that race and its domain error handling visible.
@@ -295,14 +284,13 @@ Do not add any of the following:
 - queue-owned run identity or physical tables per queue; or
 - a second retry, cancellation, or leasing subsystem.
 
-A useful intermediate rule belongs in the Plan 9 documentation: keep
+A useful boundary rule belongs in the Plan 9 documentation: keep
 deterministic, inexpensive microsteps in one worker function, and use
 `flow.Enqueue` when work needs its own retry boundary, queue/concurrency lane,
 side-effect fence, timeout, external wait, observability identity, or
-fan-out/join lifecycle. Plan 10 then adds `flow.Call` for a different case: a
-synchronous durable subroutine whose result is needed now and whose accepted
-progress should survive parent retry. Do not pre-implement `Call` in Plan 9;
-do not write Plan 9 docs so absolutely that Plan 10 must reverse them.
+fan-out/join lifecycle. Plan 11 separately evaluates whether a synchronous
+durable subroutine is valuable enough to add; Plan 9 neither implements nor
+depends on it.
 
 ### 3.3 Use composed rendezvous keys with stable typed events
 
@@ -331,7 +319,7 @@ func txnTerminalKey(txnID string, generation uint64) string {
 key := txnTerminalKey(txnID, generation)
 
 // Publisher: immediate targeted ingress.
-err := TxnTerminal.Emit(ctx, client, runID, key, payload)
+err := TxnTerminal.Deliver(ctx, client, runID, key, payload)
 
 // Parent worker: declare the exact rendezvous in the same run.
 flow.Enqueue(parentWork, "join/"+key, JoinTxn, args).WaitFor(TxnTerminal, key)
@@ -358,49 +346,42 @@ Document and demonstrate this convention:
 - do not add an untyped string-event API or concatenate dynamic identity into
   `DefineEvent` names.
 
-### 3.4 Use one combined v0.x compatibility window deliberately
+### 3.4 Ship one coherent v0.3 compatibility window
 
-`Command.With` and `Event.Deliver` are public in v0.2.0. Plan 9 retains the
-useful bound-command form, adds a direct one-shot form, and removes only the
-redundant delivery verb. Changing `Command.With` to return an explicit bound
-adapter, renaming run/queued-delivery vocabulary, changing `GetEventValue`,
-and applying the forward-only run-vocabulary migration are real breaking
-changes. Plan 9 owns migration 004; Plan 10 adds the inline command API and
-migration 005 immediately afterward. Therefore:
+`Command.With`, method `Event.Emit`, and `Event.Deliver` are public in v0.2.0.
+The smallest coherent v0.3 surface removes client binding from command
+definitions, keeps one direct root-enqueue spelling, keeps the semantically
+clear `Deliver` verb for detached targeted ingress, and removes the redundant
+method `Emit`. Renaming run/queued-delivery vocabulary, changing
+`GetEventValue`, and applying migration 004 are already real breaking changes,
+so these deletions belong in the same pre-v1 upgrade. Therefore:
 
-- complete and review Plan 9 as an untagged intermediate milestone;
-- continue directly into Plan 10 and ship both plans only in v0.3.0;
+- complete, review, and release Plan 9 as v0.3.0;
 - do not move or rewrite the v0.2.0 tag;
-- draft Plan 9's migration table and before/after examples now, then fold them
-  into the combined v0.2-to-v0.3 migration guide in Plan 10;
-- do not retain `Event.Deliver` as a deprecated wrapper merely to avoid a
-  pre-v1 break; and
-- do not create a v0.2.x, v0.3.0-preview, or other interim tag merely to mark
-  the Plan 9 handoff;
-- do not publish v0.3.0 until Plan 10 and a Trails migration branch against the
-  combined API compile and their Flow integration tests pass.
+- publish one complete v0.2-to-v0.3 migration guide with mechanical before/
+  after examples;
+- do not retain `Command.With`, `BoundCommand`, or method `Event.Emit` as
+  deprecated wrappers; and
+- do not begin Plan 10 until the tagged v0.3.0 API, migration, and Trails
+  consumer proof are accepted.
 
-Trails Plan 004 is a separate application-graph cleanup, not a dependency of
-the Flow engine change. Prefer completing its V1-root deletion before the final
-Trails v0.3 upgrade so call sites scheduled for deletion are not migrated only
-to be removed. If Plan 004's production observation window is still running,
-Flow Plan 9 may proceed independently, but the disposable Trails migration must
-classify each targeted-emission call site as either transitional V1
-compatibility or an enduring independent-monitor path. Do not combine the
-Trails graph deletion and the Flow dependency/API migration in one production
-PR.
+Trails Plan 004 is complete, and this feature work has not been deployed. Its
+V1 compatibility roots therefore do not constrain the Flow upgrade. The
+consumer proof must exercise an enduring bridge, edge, OIF, or provider
+monitor delivering an exact generation-fenced fact into the current
+`intent.run`; it must not restore deleted compatibility roots merely to test an
+obsolete path.
 
 ### 3.5 Name the public aggregate `Run` and queued delivery `Enqueue`
 
 The top-level public object is one concrete durable generation containing its
-root command, every enqueued or called command, exact events, queued-command
+root command, every enqueued command, exact events, queued-command
 attempts, counters, and ordered history. Call it a `Run`:
 
 ```text
 Run
 ├── root Command
 ├── enqueued Commands
-├── called Commands (added by Plan 10)
 ├── Events
 ├── Attempts for queued Commands
 └── ordered Journal
@@ -469,9 +450,7 @@ Rename queued/asynchronous command delivery from `Execute` to `Enqueue`:
 
 - root `Command.Enqueue` creates or idempotently rediscovers a `Run`;
 - worker `flow.Enqueue` stages an independently delivered child command in the
-  current `Run`; and
-- Plan 10's `flow.Call` invokes a durable subroutine in that same `Run` when
-  the result is needed synchronously.
+  current `Run`.
 
 `Enqueue` names the asynchronous delivery intent, not an immediate runnable
 queue-row insertion: waits, gates, and delays may defer runnable projection,
@@ -481,8 +460,8 @@ declaration. Document both points explicitly. Keep
 long-lived processor loop and is unambiguous beside the `Run` noun.
 
 The resulting front-door vocabulary is `Run`, `Command`, `Queue`, `Worker`,
-`Event`, and `Attempt`, with `Enqueue` for asynchronous delivery and Plan 10's
-`Call` for an inline durable subroutine. A `Queue` remains a routing and
+`Event`, and `Attempt`, with `Enqueue` for asynchronous delivery. A `Queue`
+remains a routing and
 concurrency lane: one Run may contain Commands assigned to several Queues, and
 one Queue serves Commands from many Runs. It therefore cannot replace `Run`.
 Do not add a public `Task`, `Job`, `Ack`, or `Nack` layer. A worker's returned
@@ -529,13 +508,13 @@ must record `min_reader_version=2` and `min_writer_version=2`, with the Plan 9
 library's current reader/writer versions raised to 2 for the coordinated v0.3
 deployment. It runs under the existing migration advisory lock, preserves all
 rows and journal hashes, and supports both clean install (001→004) and
-populated v0.2 upgrade (003→004). Plan 10 then owns migration 005.
+populated v0.2 upgrade (003→004). Plan 11 owns any later migration 005.
 
 ## 4. Target public API
 
-### 4.1 Support both direct and bound command enqueues
+### 4.1 Use one direct root-enqueue form
 
-Support the direct one-shot form:
+Root enqueue always names the client at the operation boundary:
 
 ```go
 run, err := SendEmail.Enqueue(
@@ -547,20 +526,7 @@ run, err := SendEmail.Enqueue(
 )
 ```
 
-Retain the bound form for a component that repeatedly uses the same client:
-
-```go
-sendEmail := SendEmail.With(client)
-
-run, err := sendEmail.Enqueue(
-    ctx,
-    "email/order-42",
-    SendEmailArgs{OrderID: "42"},
-    flow.WithLiveKey(),
-)
-```
-
-The target shapes are:
+The target shape is:
 
 ```go
 func (cmd Command[A, R]) Enqueue(
@@ -570,45 +536,25 @@ func (cmd Command[A, R]) Enqueue(
     args A,
     opts ...RunOption,
 ) (Run, error)
-
-func (cmd Command[A, R]) With(client Client) BoundCommand[A, R]
-
-func (cmd BoundCommand[A, R]) Enqueue(
-    ctx context.Context,
-    key string,
-    args A,
-    opts ...RunOption,
-) (Run, error)
 ```
 
-`BoundCommand` is an ergonomic client-bound view of the same immutable command
-definition, not a second durable command kind. It owns only the definition and
-client association needed by the bound `Enqueue`; it is never registered,
-staged, called inline, persisted, journaled, or passed where a `Command` is
-required. `Command` itself should no longer carry a hidden client field.
-
-Both `Enqueue` methods must delegate immediately to one private typed start
-implementation. They must have identical validation, option normalization,
-start identity, transactions, observations, and errors. A bound command may be
-stored in a service struct or local variable and reused concurrently whenever
-its client supports that use. As today, a value bound to `Runtime.InTx(tx)` is
-transaction-scoped and must not outlive or be used concurrently beyond that
-transaction.
+`Command` is only an immutable typed definition. Remove its hidden client field,
+`Command.With`, and any `BoundCommand` adapter. Services already retain a
+`Runtime` or another `Client`; binding that dependency into every copied command
+adds a second root-start spelling and makes transaction lifetime less visible.
+Passing `runtime.InTx(tx)` directly keeps caller-owned transaction scope explicit
+at the exact operation that joins it.
 
 Why this is worthwhile:
 
-- one-shot code can pass its dependency explicitly at the operation site;
-- services can bind a runtime once and keep concise repeated starts;
-- the direct start API matches `Event.Emit`, inspection, cancellation, and
-  trace without taking away the existing ergonomic form;
-- the immutable definition cannot accidentally acquire a client through a
-  copied `Command`; the association is visible in `BoundCommand`; and
-- one shared implementation prevents the two conveniences from acquiring
-  different durable behavior.
+- every root start has one searchable spelling;
+- transaction ownership and client lifetime remain explicit;
+- command definitions remain safe package-level values with no operational
+  dependency hidden inside them; and
+- docs, examples, compile contracts, and consumer migrations become smaller.
 
 This changes no start identity, store request, lock, transaction, notification,
-or error behavior. Passing `runtime.InTx(tx)` directly must behave exactly as
-binding that same client and calling the bound form.
+or error behavior.
 
 ### 4.2 Reduce event ingress from three forms to two
 
@@ -617,18 +563,17 @@ Retain only these concepts:
 | API | Meaning |
 |---|---|
 | `flow.Emit(work, event, key, value)` | stage an event in the active worker change set; commit or discard it with fenced settlement |
-| `event.Emit(ctx, client, runID, key, value)` | immediate targeted ingress in its own or a caller-owned transaction; detached from any worker result |
+| `event.Deliver(ctx, client, runID, key, value)` | immediate targeted ingress in its own or a caller-owned transaction; detached from any worker result |
 
-Delete `Event.Deliver(ctx, client, runID, key, value)` and remove the
-active-attempt rejection from method `Event.Emit`.
+Delete method `Event.Emit(ctx, client, runID, key, value)` and retain
+`Event.Deliver` unchanged.
 
-Today `Event.Emit` and `Event.Deliver` use the same target-side implementation;
-the only difference is an active-attempt guard. Having both makes external
-ingress vocabulary harder to explain and leaves developers deciding between
-two nearly identical verbs. `Emit` is the natural event verb and matches the
-terminology developers already expect. Its explicit `Client` and target
-`RunID` arguments distinguish immediate targeted ingress from the
-attempt-scoped top-level helper.
+Today method `Event.Emit` and `Event.Deliver` reach the same target-side
+implementation, but `Deliver` names the important semantic distinction:
+immediate ingress to a named run is detached from the current worker's staged
+decision. `Emit` belongs to the top-level `flow.Emit(work, ...)` operation that
+is committed or discarded with worker settlement. Keeping those verbs distinct
+prevents code review from mistaking a detached write for an atomic staged fact.
 
 The targeted capability itself is required. The enduring proof is Trails's
 independently rooted bridge, edge, OIF, and provider monitors, which deliver an
@@ -640,16 +585,15 @@ rooted receipt-transaction fan-in, but explicitly retains these monitor roots
 and their targeted exact-event delivery. Removing the Flow capability would
 therefore require a larger Trails redesign, such as a separate transactional
 outbox publisher, and would add a durable concept rather than simplify Flow.
-Plan 9 removes only the redundant `Deliver` name and keeps its behavior under
-method `Event.Emit`.
+Plan 9 keeps `Deliver` and removes only the redundant method `Emit`.
 
 After deletion:
 
-- external/application publishers use `Event.Emit`;
+- external/application publishers use `Event.Deliver`;
 - worker facts that must be atomic with success use top-level `flow.Emit`;
 - deliberately detached cross-run ingress from a worker uses method
-  `Event.Emit` with an explicit client and target; and
-- docs must warn that method emission to the current run is legal but
+  `Event.Deliver` with an explicit client and target; and
+- docs must warn that delivery to the current run is legal but
   detached and is almost never the right replacement for `flow.Emit`.
 
 The distinction is therefore structural, not a second vocabulary word:
@@ -657,19 +601,14 @@ The distinction is therefore structural, not a second vocabulary word:
 ```go
 flow.Emit(work, TxnTerminal, key, payload) // current decision, atomic
 
-TxnTerminal.Emit(ctx, client, targetRunID, key, payload) // named target, immediate
+TxnTerminal.Deliver(ctx, client, targetRunID, key, payload) // named target, immediate
 ```
 
-Remove the active-attempt rejection from method `Event.Emit`, but retain the
-minimal private association between the handler context and its `Work` scope.
-Plan 10 immediately uses that seam to validate `flow.Call` context ownership,
-detect commit-callback re-entry, and install a private inline-dispatch bridge.
-Deleting it in this untagged intermediate only to recreate it in Plan 10 adds
-churn and risks mismatched worker/flowtest behavior. This does not authorize
-broad context plumbing or a public context protocol: preserve only the current
-private scope carrier and the worker scope needed by staged commands/events,
-poisoning, snapshots, `WithCommit`, and test parity. Compile-contract tests
-must continue proving typed event payload safety through method `Event.Emit`.
+Retain `Event.Deliver`'s existing ability to run from an active attempt and its
+documented detached semantics. Delete method `Event.Emit` and its attempt guard
+together; do not preserve private context plumbing solely for that removed
+guard or for speculative future inline execution. Compile-contract tests must
+continue proving typed event payload safety through `Event.Deliver`.
 
 ### 4.3 Make event-input presence explicit through one API
 
@@ -780,8 +719,7 @@ with those equivalent inputs must not conflict.
 
 This is a compatible expansion for exact-millisecond callers but a behavioral
 change for callers that previously expected `ErrInvalid` from fractional
-durations. Draft its entry for the combined v0.3.0 migration notes; Plan 10
-finalizes those notes at the actual release boundary.
+durations. Plan 9 documents it in the final v0.2-to-v0.3 migration guide.
 
 ## 5. Example and documentation improvements
 
@@ -801,9 +739,8 @@ matters to Trails without copying Trails domain code:
 
 The example must keep every executable unit a `Command`, use the `found` result
 from `GetEventValue` for optional first-pass versus resumed behavior, compose
-`GetCurrentRun` and `Event.Emit` explicitly where current-run emission
-is useful, and demonstrate both a reusable bound command and a one-shot direct
-`Command.Enqueue` call. It should
+`GetCurrentRun` and `Event.Deliver` explicitly where current-run delivery is
+useful, and demonstrate direct `Command.Enqueue`. It should
 explain the possible settle-between-lookup-and-emission race and why each
 command boundary exists: queue, retry, side effect, external wait, or join.
 Keep the example small enough to read in one sitting and test it like the
@@ -829,8 +766,7 @@ Update at least:
 - `specs/projects/flow/components/engine.md`;
 - relevant runtime/inspection component docs;
 - examples and their tests; and
-- a draft Plan 9 section for the combined v0.2-to-v0.3 migration guide; Plan
-  10 finalizes the release document after its additive API/schema work.
+- one complete v0.2-to-v0.3 migration guide owned by Plan 9.
 
 The documentation must say plainly:
 
@@ -843,8 +779,8 @@ The documentation must say plainly:
   event keys carry entity and generation identity;
 - `GetEventValue` looks only at the current immutable attempt snapshot and its
   `found` result distinguishes absent input from a present typed value;
-- method `Event.Emit` is targeted and detached while top-level `flow.Emit` is
-  attempt-atomic;
+- method `Event.Deliver` is targeted and detached while top-level `flow.Emit`
+  is attempt-atomic;
 - fractional positive durable durations are rounded upward;
 - Flow provides at-least-once handler invocation with exactly-once fenced
   durable settlement, not exactly-once remote side effects.
@@ -859,9 +795,9 @@ The documentation must say plainly:
 | internal `LookupCommandExecution` | internal `GetCommandRunID` | exact rename clarifying that only the UUID is returned | reads `flow_commands.run_id` |
 | internal `LookupLiveExecutionInTx` | internal `GetCurrentRun` | exact rename; remove misleading optional-transaction suffix | same live-key query on `flow_runs` |
 | `flow_executions`, `execution_id`, `execution_key`, execution-named constraints/indexes | `flow_runs`, `run_id`, `run_key`, run-named constraints/indexes | breaking transactional catalog rename in migration 004 | all rows, keys, predicates, and relationships preserved |
-| `cmd.With(client).Execute(ctx, key, args, opts...)` | `cmd.With(client).Enqueue(ctx, key, args, opts...)` or direct `cmd.Enqueue(ctx, client, key, args, opts...)` | breaking verb rename; direct form additive; inferred bound values remain natural | none |
-| explicitly typed or rebound client-bearing `Command` values | `BoundCommand[A, R]` returned by `Command.With(client)` | breaking only for callers that name or rebind the old copied-command shape | none |
-| `event.Deliver(ctx, client, id, key, value)` | `event.Emit(ctx, client, id, key, value)` | breaking, mechanical for deliberately detached ingress | none |
+| `cmd.With(client).Execute(ctx, key, args, opts...)` | `cmd.Enqueue(ctx, client, key, args, opts...)` | breaking verb rename and removal of hidden client binding | none |
+| explicitly typed or rebound client-bearing `Command` values | immutable client-free `Command[A, R]`; keep the `Client` in the service/component | breaking removal of `Command.With` and copied client-bearing definitions | none |
+| `event.Emit(ctx, client, id, key, value)` | `event.Deliver(ctx, client, id, key, value)` | breaking removal of the redundant immediate-ingress spelling; detached semantics remain under the clearer verb | none |
 | `value, err := GetEventValue(...)` and command-key suffix tests | `value, found, err := GetEventValue(...)` | breaking, mechanical; `found` replaces presentation-key inference | none |
 | app-local millisecond ceiling helper | pass positive duration directly | compatible input expansion | same integer-ms form |
 
@@ -871,32 +807,27 @@ commands. Historical completed plans and historical benchmark evidence must
 not be rewritten to pretend the old API never existed; add a short historical
 note only where a command would otherwise be impossible to reproduce.
 
-For Trails, first determine whether Plan 004's V1 compatibility-root deletion
-has landed. The migration checklist is then specifically:
+Trails Plan 004 is complete and the feature branch has not been deployed, so
+the migration checklist is specifically:
 
-1. do not migrate or restore V1 compatibility call sites already deleted by
-   Plan 004;
-2. classify any remaining V1 receipt-root delivery as transitional if Plan 004
-   is still observing or draining it;
-3. migrate the complete public `Execution*` family and embedded fields to
+1. do not restore V1 compatibility call sites deleted by Plan 004;
+2. migrate the complete public `Execution*` family and embedded fields to
    `Run*`, including `GetCurrentRun`, and update any application SQL that
    deliberately reads Flow's now-renamed `flow_runs`/`run_id` catalog;
-4. rename every queued root/child `Execute` call to `Enqueue`; keep reusable
-   `.With(client).Enqueue` values where binding improves the component, and use
-   direct `Command.Enqueue(ctx, client, ...)` for genuinely one-shot starts;
-5. convert every remaining `Event.Deliver` call to method `Event.Emit`;
-6. replace the two `exactFlowDuration` helpers with direct duration values;
-7. replace `/await/<gate>` suffix branching with the `found` result from
+3. rename every queued root/child `Execute` call to `Enqueue` and replace every
+   bound root start with direct `Command.Enqueue(ctx, client, ...)`;
+4. retain `Event.Deliver` for all enduring independent-monitor ingress and
+   remove any method-`Event.Emit` usage;
+5. replace the two `exactFlowDuration` helpers with direct duration values;
+6. replace `/await/<gate>` suffix branching with the `found` result from
    `GetEventValue`; and
-8. retain the domain-local current-run delivery helper, including its existing
+7. retain the domain-local current-run delivery helper, including its existing
    error context and explicit generation behavior, for independently rooted
    bridge, edge, OIF, and provider monitors.
 
-The disposable migration must prove an enduring monitor-to-`intent.run` path;
-a legacy `txn.confirm` compatibility path alone is not sufficient evidence that
-the targeted API still serves the post-Plan-004 architecture. Keep the Trails
-Plan 004 deletion and the Flow v0.3 dependency/API migration in separate
-production changes, even if their disposable verification branches overlap.
+The disposable migration must prove an enduring monitor-to-`intent.run` path.
+No compatibility root or legacy-only test is valid evidence for the current
+architecture.
 
 ## 7. Phased implementation
 
@@ -915,11 +846,10 @@ Before editing production code:
    durable-duration validation,
    and attempt-scope use in production, tests, examples, and docs;
 4. inventory the corresponding Trails call sites without editing that
-   repository, classify each targeted delivery as V1 compatibility or an
-   enduring independent-monitor path, and record whether Trails Plan 004 has
-   landed;
+   repository and identify the enduring independent-monitor paths retained
+   after completed Plan 004;
 5. write small compile-only target examples for the `Run` family,
-   `GetCurrentRun`, direct and reusable bound enqueues, staged/detached event
+   `GetCurrentRun`, direct enqueues, staged/detached event
    ingress, and presence-aware event-input reads; and
 6. run the full baseline suite before changing behavior.
 
@@ -952,15 +882,13 @@ once:
   rename the live table/columns/constraints/indexes from execution to run,
   and update every current SQL/store/replay identifier while preserving the
   versioned journal wire strings described in §3.6;
-- remove the hidden client field from `Command`, add the explicit
-  `BoundCommand` adapter returned by `Command.With`, and retain bound starts;
-- add the direct-client `Command.Enqueue` signature and route both enqueue forms
-  through one private implementation;
-- remove `Event.Deliver`, convert its call sites to method `Event.Emit`, and
-  remove method `Event.Emit`'s active-attempt rejection;
+- remove the hidden client field from `Command`, `Command.With`, and any
+  `BoundCommand` adapter;
+- add the direct-client `Command.Enqueue` signature as the only root-start
+  form;
+- retain `Event.Deliver`, convert any method-`Event.Emit` call sites to
+  `Deliver`, and delete method `Event.Emit`;
 - retain top-level worker `flow.Emit` unchanged;
-- retain the minimal private context-to-work scope carrier for Plan 10 while
-  removing only the event-ingress rejection that consumed it here; and
 - update generic compile-misuse tests and the removed-API AST guard.
 
 Required tests:
@@ -980,29 +908,23 @@ Required tests:
 - `GetCurrentRun` returns only the current non-terminal live-key generation,
   returns `found=false` after terminal settlement, and never returns an older
   terminal run;
-- direct and bound Runtime starts produce identical creation, rediscovery,
-  conflict, observation, and error behavior;
-- direct and bound `Runtime.InTx(tx)` starts retain identical commit/rollback
-  visibility;
-- reusable bound commands work across sequential and supported concurrent
-  starts, while transaction-bound lifetime rules are documented and tested;
-- zero/nil/mismatched direct and bound clients retain current error
-  classification;
+- direct Runtime and `Runtime.InTx(tx)` starts retain current creation,
+  rediscovery, conflict, observation, error, commit, and rollback behavior;
+- zero/nil/mismatched direct clients retain current error classification;
 - typed command arguments still fail at compile time;
-- typed event payloads still fail at compile time through method `Emit`;
-- targeted method emission from an active independent-monitor worker can
+- typed event payloads still fail at compile time through method `Deliver`;
+- targeted delivery from an independent monitor can
   release an exact generation-fenced gate in a different `intent.run`
   run and remains independent of the source worker settlement;
-- targeted method emission through `Runtime.InTx(tx)` follows caller-owned
+- targeted delivery through `Runtime.InTx(tx)` follows caller-owned
   transaction commit and rollback visibility;
 - staged `flow.Emit` still commits and rolls back with settlement; and
-- compile-contract coverage preserves `With` while preventing removed
-  `Execute`, `Deliver`, and old public/internal execution/lookup vocabulary from being
+- compile-contract coverage prevents removed `With`, method `Event.Emit`,
+  `Execute`, and old public/internal execution/lookup vocabulary from being
   accidentally reintroduced.
 
-Do not add deprecated forwarding methods. One clean combined v0.3.0 break
-after Plans 9 and 10 is simpler than two permanent ways to do the same
-operation.
+Do not add deprecated forwarding methods. One clean v0.3.0 break is simpler
+than permanent duplicate spellings.
 
 ### Phase 2 — Normalize durable durations at public boundaries
 
@@ -1053,11 +975,10 @@ transactional event, exact join, dynamic successor, `None`-result commands,
 optional input branch, and final trace. Keep test time deterministic and
 short.
 
-### Phase 5 — Documentation, consumer proof, and Plan 10 handoff
+### Phase 5 — Documentation, consumer proof, and v0.3.0 release
 
 1. synchronize the documentation listed in Section 5.2;
-2. draft Plan 9's section of the combined v0.2-to-v0.3 migration guide; Plan
-   10 owns its final release form;
+2. finish the complete v0.2-to-v0.3 migration guide;
 3. ensure examples and doc snippets compile;
 4. in a disposable Trails worktree or branch, perform the mechanical API
    migration against the repository's actual Plan 004 state and run its
@@ -1066,20 +987,18 @@ short.
    not commit cross-repository changes without separate authorization;
 5. run source scans for deleted and forbidden concepts;
 6. run the complete PostgreSQL and race gates; and
-7. report results for human review, record the exact Plan 9 completion SHA,
-   and hand it to Plan 10 without creating a tag or publishing a release.
+7. report results for human review, tag the approved completion SHA as v0.3.0,
+   and record that tag as Plan 10's implementation baseline.
 
-The Trails proof is a Plan 10 progression gate because Trails is the concrete
+The Trails proof is a Plan 9 release gate because Trails is the concrete
 compatibility target. It must include a retained bridge, edge, OIF, or provider
-monitor delivering into the exact current `intent.run` generation; a separately
-rooted V1 receipt transaction scheduled for deletion by Plan 004 is not enough.
+monitor delivering into the exact current `intent.run` generation; a deleted
+V1 compatibility path is not evidence.
 If the migration requires a lost engine capability rather than a mechanical/
 API-helper adjustment, stop and amend this plan.
 
-These complete gates certify that Plan 9 is a safe intermediate, not that a
-release is ready. Plan 10 must rerun the supported PostgreSQL matrix, the
-combined Trails proof, documentation/API scans, migration upgrade tests, and
-release review before v0.3.0 is tagged.
+These complete gates certify the v0.3.0 release. Plan 10 performs its own drift,
+consumer, and release review from that tag.
 
 Final commands, adjusted only for the repository's then-current supported
 matrix:
@@ -1171,16 +1090,14 @@ Plan 9 is complete only when all of the following are true:
    public `Lookup*` function. Internal store operations are `GetEvent`,
    `GetCommandRunID`, and `GetCurrentRun`; their exact value/found/error
    contracts are tested and no production `LookupX` symbol remains.
-7. `Command` no longer stores a hidden client; `Command.With(client)` returns
-   an explicit `BoundCommand` that may be retained and reused.
-8. Direct `Command.Enqueue(ctx, client, key, args, options...)` and bound
-   `Command.With(client).Enqueue(ctx, key, args, options...)` share one start
-   implementation and have identical transactional, idempotency, validation,
+7. `Command` no longer stores a hidden client; `Command.With` and
+   `BoundCommand` do not exist.
+8. `Command.Enqueue(ctx, client, key, args, options...)` is the only root-start
+   spelling and retains existing transactional, idempotency, validation,
    observation, and error behavior.
-9. `Event` has one targeted `Emit` method and no `Deliver` method.
+9. `Event` has one targeted `Deliver` method and no method `Emit`.
 10. Top-level `flow.Emit(work, ...)` retains fenced atomic settlement behavior.
-   Method `Event.Emit` remains usable from an active worker when the caller
-   deliberately supplies a client and target run.
+   `Event.Deliver` remains explicitly detached, targeted ingress.
 11. Removed API names are guarded against accidental reintroduction.
 12. `GetEventValue` is the only event-input reader. It is O(1), in-memory,
    returns `(zero, false, nil)` for absence, returns `found=true` for a present
@@ -1202,8 +1119,7 @@ Plan 9 is complete only when all of the following are true:
     a shared composed event key, stale-generation isolation, and final
     inspection without a DSL.
 20. README, package docs, normative specs, component docs, examples, and the
-    draft combined-migration guidance agree on the Plan 9 intermediate API
-    without making statements that Plan 10 must reverse.
+    complete v0.2-to-v0.3 migration guide agree on the released Plan 9 API.
 21. Historical plans/evidence remain historically accurate, and a disposable
     Trails migration compiles with its Flow-focused tests passing against the
     repository's actual Plan 004 state. The proof includes an enduring
@@ -1212,8 +1128,8 @@ Plan 9 is complete only when all of the following are true:
 22. All named Flow tests run with no unintended skips against supported
     PostgreSQL majors; ordinary and race suites pass.
 23. Build, vet, formatting, module verification/tidiness, vulnerability, and
-    retained performance non-regression gates pass before human approval of
-    the exact untagged Plan 9 completion SHA and handoff to Plan 10.
+    retained performance non-regression gates pass before human approval and
+    the v0.3.0 tag.
 
 ## 10. STOP conditions
 
@@ -1225,12 +1141,11 @@ Stop implementation and report the evidence if any of these occurs:
    definition/path, and journal hash, requires an append-only journal rewrite,
    or cannot produce the exact six-table run-named catalog without compatibility
    views/duplicate columns;
-3. direct and bound `Enqueue` cannot share one implementation or differ in
-   start identity, transaction ownership, validation, observation, error
-   classification, or lock order;
-4. deleting `Event.Deliver` or removing method `Event.Emit`'s attempt guard
-   changes target-side identity, transaction, lock, idempotency, conflict, or
-   cross-run behavior instead of only consolidating the public verb;
+3. direct `Enqueue` cannot retain current start identity, transaction
+   ownership, validation, observation, error classification, or lock order;
+4. deleting method `Event.Emit` or retaining `Event.Deliver` changes
+   target-side identity, transaction, lock, idempotency, conflict, or cross-run
+   behavior instead of only consolidating the public verb;
 5. `GetEventValue` cannot report ordinary absence without poisoning the
    decision, or cannot distinguish absence from present corruption;
 6. duration normalization changes already exact values, stored integer-ms
@@ -1241,9 +1156,8 @@ Stop implementation and report the evidence if any of these occurs:
 9. the Trails migration reveals loss of per-command queues, exact event gates,
    transactional ingress, independently rooted monitor delivery, version
    drains, cancellation, or generation fencing;
-10. a schema/durable change beyond migration 004 or any Plan 10
-   `flow.Call`/inline-delivery/migration-005 work appears necessary in this
-   intermediate; or
+10. a schema/durable change beyond migration 004 or any Plan 11
+    `flow.Call`/inline-delivery/migration-005 work appears necessary; or
 11. any full PostgreSQL/race gate fails repeatedly for an in-scope reason.
 
 Do not weaken an invariant, preserve a redundant API indefinitely, or expand
@@ -1256,9 +1170,9 @@ discovered constraint.
 
 - [ ] Reconcile any accepted change-set rename and start from a clean reviewed base.
 - [ ] Record the implementation commit, Go version, PostgreSQL versions, schema version, and exported API inventory.
-- [ ] Inventory all exported/internal `Execution*`/`Lookup*` names and fields, every execution-named live catalog/SQL identifier, plus all Flow and Trails uses of bound/direct command starts, `Event.Deliver`, method `Event.Emit`, duration normalization, and command-key suffix input detection; classify Trails targeted delivery as transitional V1 compatibility or enduring independent-monitor behavior.
-- [ ] Confirm the Plan 9 intermediate signatures with compile-only examples
-  before production edits; reserve final v0.3.0 API approval for Plan 10.
+- [ ] Inventory all exported/internal `Execution*`/`Lookup*` names and fields, every execution-named live catalog/SQL identifier, plus all Flow and Trails uses of bound/direct command starts, `Event.Deliver`, method `Event.Emit`, duration normalization, and command-key suffix input detection; identify the enduring independent-monitor paths retained after Trails Plan 004.
+- [ ] Confirm the Plan 9 v0.3 signatures with compile-only examples before
+  production edits.
 - [ ] Run and record the complete pre-change ordinary and race baseline.
 
 ### Run and Enqueue vocabulary
@@ -1274,17 +1188,13 @@ discovered constraint.
 
 ### Public API ergonomics and deletion
 
-- [ ] Remove the hidden client field from `Command`; add explicit `BoundCommand` storage while retaining `Command.With(client)`.
-- [ ] Add `Command.Enqueue(ctx, client, key, args, options...)` and keep bound `Enqueue(ctx, key, args, options...)`.
-- [ ] Route both forms through one private typed start implementation.
-- [ ] Prove reusable bound commands and direct/bound Runtime and `Runtime.InTx(tx)` parity for semantics, errors, observations, and lock order.
-- [ ] Remove `Event.Deliver(ctx, client, runID, key, payload)`.
-- [ ] Make method `Event.Emit` the sole immediate targeted ingress and retain top-level worker `flow.Emit` unchanged.
-- [ ] Permit deliberate method `Event.Emit` calls from an active worker while preserving detached transaction semantics.
+- [ ] Remove the hidden client field from `Command`, `Command.With`, and `BoundCommand`.
+- [ ] Make `Command.Enqueue(ctx, client, key, args, options...)` the sole root-start form.
+- [ ] Prove Runtime and `Runtime.InTx(tx)` direct starts preserve semantics, errors, observations, and lock order.
+- [ ] Retain `Event.Deliver(ctx, client, runID, key, payload)`.
+- [ ] Remove method `Event.Emit` and retain top-level worker `flow.Emit` unchanged.
 - [ ] Add a cross-run worker test matching an enduring Trails bridge/edge/OIF/provider-monitor-to-`intent.run` delivery shape, including exact generation fencing and caller-owned transaction commit and rollback.
-- [ ] Remove only the method-`Event.Emit` attempt rejection; retain the minimal
-  private context/work-scope carrier required by immediately following Plan 10.
-- [ ] Add compile/AST guards for removed APIs and compile-contract coverage for both command-start forms while retaining generic type-safety checks.
+- [ ] Add compile/AST guards for removed APIs and compile-contract coverage for the direct command-start form while retaining generic type-safety checks.
 - [ ] Verify Runtime and `InTx` start/delivery commit, rollback, lock-order, and notification behavior.
 
 ### Durable duration ergonomics
@@ -1309,31 +1219,31 @@ discovered constraint.
 - [ ] Keep every executable unit a command, including `None`-result work.
 - [ ] Use one deterministic entity/generation event-key helper at delivery, wait declaration, and lookup.
 - [ ] Prove an event for an earlier generation cannot release a later generation's wait.
-- [ ] Demonstrate explicit `GetCurrentRun` plus `Event.Emit` composition and its terminal race.
+- [ ] Demonstrate explicit `GetCurrentRun` plus `Event.Deliver` composition and its terminal race.
 - [ ] Explain every command boundary and keep the example free of a DSL.
 
 ### Documentation and consumer proof
 
-- [ ] Update README and `flow.go` to make Run/Command/Queue/Worker/Event/Attempt plus Enqueue/Call/Runtime.Run the front-door vocabulary.
+- [ ] Update README and `flow.go` to make Run/Command/Queue/Worker/Event/Attempt plus Enqueue/Deliver/Runtime.Run the front-door vocabulary.
 - [ ] Update project overview, functional spec, architecture, and component docs.
 - [ ] Document presence-aware snapshot reads, explicit current-run get/emission races, and upward duration rounding.
 - [ ] Document stable typed event definitions plus deterministic composed rendezvous keys.
-- [ ] Draft Plan 9's section of the combined v0.2-to-v0.3 migration guide and
-  the explicit Trails migration checklist for Plan 10 to finalize.
+- [ ] Finish the combined v0.2-to-v0.3 migration guide and explicit Trails
+  migration checklist.
 - [ ] Document the linear-workflow boundary rule and retained at-least-once/fencing semantics.
 - [ ] Preserve historical plans and benchmark evidence as historical records.
 - [ ] Perform the disposable Trails API migration against its actual Plan 004 state, without restoring deleted V1 call sites, and run its Flow-focused tests including an enduring independent-monitor delivery path.
 
-### Final verification and Plan 10 handoff
+### Final verification and v0.3.0 release
 
 - [ ] Confirm exactly six Flow tables with `flow_runs` and no old live catalog identifiers; confirm only migration 004 was added and migrations 001–003 retain their checksums.
 - [ ] Scan for removed APIs and forbidden task/step/checkpoint/workflow concepts.
 - [ ] Confirm Plan 9 did not add `flow.Call`, inline delivery fields, journal
-  rewrites, or migration 005; those begin only after the reviewed handoff.
+  rewrites, or migration 005; those remain deferred to Plan 11.
 - [ ] Run gofmt, diff check, module verify/tidy, build, vet, and vulnerability gates.
 - [ ] Run every named ordinary and race test with zero unintended PostgreSQL skips.
 - [ ] Run the supported PostgreSQL-major matrix with durability settings enabled.
 - [ ] Run retained performance shapes and record a non-regression conclusion.
 - [ ] Review every changed hunk against this plan and all 23 acceptance criteria.
-- [ ] Obtain human approval of the exact Plan 9 completion SHA, record it for
-  Plan 10's drift check, and create no tag or release.
+- [ ] Obtain human approval of the exact Plan 9 completion SHA, tag it v0.3.0,
+  and record it for Plan 10's drift check.
