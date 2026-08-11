@@ -28,12 +28,23 @@ type Commit[A, R any] struct {
 	Info   CommandInfo
 }
 
+// Work is the attempt-local command scope passed to a worker. It represents
+// one invocation of one claimed command, not the whole Run and not the
+// immutable Command definition. Args contains the command's typed arguments;
+// Info returns its durable run, command, and attempt identity. The private
+// scope backs Enqueue, Emit, and GetEventValue for the decision being built by
+// this invocation.
+//
+// A fresh Work is created for every command attempt. It is valid only during
+// the worker call and must not be retained or used concurrently.
 type Work[A any] struct {
 	Args  A
 	info  CommandInfo
 	scope *scopeState
 }
 
+// Info returns immutable identity and timing information for the claimed
+// command and its current attempt.
 func (w *Work[A]) Info() CommandInfo {
 	if w == nil {
 		return CommandInfo{}

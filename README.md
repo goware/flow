@@ -64,6 +64,13 @@ run, err := sendEmail.Enqueue(ctx, runtime, "email/order-42", emailArgs{
 })
 ```
 
+`Work[A]` is the attempt-local scope for one claimed command. It is not the
+whole `Run` and it is not the immutable `Command[A, R]` definition. Each
+worker invocation receives a fresh `Work` containing typed arguments,
+run/command/attempt identity, materialized event inputs, and the private
+decision state used by `Enqueue`, `Emit`, and `GetEventValue`. It is valid only
+for that worker call and must not be retained or used concurrently.
+
 `Enqueue` always creates or rediscovers durable asynchronous work; it never calls a worker inline. A stable non-empty run key is permanently idempotent by default. `flow.WithLiveKey()` instead deduplicates only while a run is non-terminal.
 
 `Enqueue` returns the `Run` snapshot as of durable acceptance; `Created`

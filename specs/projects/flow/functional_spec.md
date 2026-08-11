@@ -114,7 +114,15 @@ Starting through `runtime.InTx(tx)` makes the run visible only according to the 
 
 ## 5. Worker invocation and command composition
 
-A worker receives `*Work[A]` containing typed `Args`, immutable `CommandInfo`, and private attempt-local decision state. `CommandInfo` identifies the exact `RunID` and root `RunKey`, command, stable command key, exact definition version, creation/budget times, and attempt ordinal. `RunKey` is populated from the run head already loaded during claim; it adds no point query.
+A worker receives a fresh `*Work[A]` for each invocation. `Work` is the
+attempt-local scope for one claimed command, not the run aggregate or immutable
+command definition. It contains typed `Args`, immutable `CommandInfo`,
+materialized event inputs, and private attempt-local decision state.
+`CommandInfo` identifies the exact `RunID` and root `RunKey`, command, stable
+command key, exact definition version, creation/budget times, and attempt
+ordinal. `RunKey` is populated from the run head already loaded during claim;
+it adds no point query. A `Work` value is valid only during its worker call and
+must not be retained or used concurrently.
 
 The runtime loads arguments and declared event inputs, releases all database resources, then calls application worker code. No PostgreSQL connection is held during ordinary worker execution.
 

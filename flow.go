@@ -9,8 +9,10 @@
 //     result types are part of the Go API, while its stable name and version
 //     are part of durable identity.
 //   - A worker, registered with [Handle], implements one command definition.
-//     Each invocation receives a [Work] value containing the typed arguments
-//     and durable command identity.
+//     Each invocation receives a fresh [Work]: the attempt-local scope for one
+//     claimed command, containing typed arguments, durable identity, event
+//     inputs, and the decision being built. Work is neither the whole Run nor
+//     the immutable Command definition.
 //   - [Event] is an immutable, typed definition of a durable fact. An event
 //     name describes the fact kind; its key carries domain and generation
 //     identity.
@@ -23,7 +25,7 @@
 // The usual shape is:
 //
 //	Command definition --Enqueue--> Run
-//	Runtime.Run -----------claim----> Work
+//	Runtime.Run -----------claim----> attempt-local Work
 //	Work ----------------Enqueue----> staged child command
 //	Work -----------------Emit------> staged application event
 //	Event + WaitFor ----------------> runnable command
