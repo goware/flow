@@ -1,8 +1,10 @@
 # Plan 13: Simplify the shipped core, make reads definition-safe, and bound retention
 
-Status: Implemented — independently reviewed; accepted commit pending record
+Status: Complete — independently reviewed and accepted
 
 Planned at: `7abfb8c` on 2026-08-12
+
+Accepted at: `c450ff4b060d1a862fde0540c794fb2d9876147b` on 2026-08-12
 
 - **Target release:** v0.4.0 candidate; this is an intentional breaking v0.x
   API and schema release, but implementation must not tag or publish a release
@@ -16,9 +18,8 @@ Planned at: `7abfb8c` on 2026-08-12
   maintenance fixes retained; Plan 8 runtime/release verification guarantees
   retained except its migration-immutability policy, which this development-only
   reset deliberately supersedes
-- **Precedes:** Plan 12. Its amendment is drafted against this plan's
-  implementation-closure commit; Plan 12 remains blocked until the accepted
-  Plan 13 commit is recorded and the amendment is reconciled with it
+- **Precedes:** Plan 12. Its amendment is reconciled against accepted Plan 13
+  commit `c450ff4`; Plan 12 remains planned and unimplemented
 - **Defers:** Plan 11 durable inline calls. Plan 11 is not implemented; its old
   migration-number proposal is discarded with the old schema history
 - **Primary consumer target:**
@@ -421,12 +422,11 @@ run delete count must equal the number selected; otherwise return
 
 ### 3.8 Plan ordering
 
-Implement Plan 13 before Plan 12. This plan removes state and rewrites the
+Plan 13 was implemented before Plan 12 because it removes state and rewrites the
 command/start/claim-adjacent public shapes on which Plan 12 is based. Plan 12's
-amendment is now drafted against implementation-closure commit `e5f0a7a` and
-explicitly designs mixed-lease renewal around the current global ticker and
-one-duration batch. Do not implement it until Plan 13 is independently reviewed
-and the amendment is reconciled with the exact accepted commit.
+amendment is reconciled against accepted commit `c450ff4` and explicitly
+designs mixed-lease renewal around the current global ticker and one-duration
+batch. Plan 12 may begin only from that commit or a reviewed descendant.
 
 Plan 11 remains deferred. If a concrete consumer later needs durable inline
 subroutines, write a new plan against the post-Plan-13 schema. Its old migration
@@ -1216,9 +1216,8 @@ Plan 13 is complete only when all of the following are true:
 12. The migration chain is one clean Run-named `001_initial.sql`, contains no
     002-005 files, retains exactly six tables, and does not contain an old-schema
     upgrade path; active docs require a reset.
-13. Plan 11 is deferred and not implemented; Plan 12 is amended against the
-    implementation-closure commit but remains blocked until this plan's final
-    review and accepted commit.
+13. Plan 11 is deferred and not implemented; Plan 12 is reconciled against the
+    accepted Plan 13 commit and remains planned but unimplemented.
 14. The disposable Trails adaptation compiles and its Flow-focused tests pass
     without locally recreating removed Flow features.
 15. PostgreSQL 17/18 ordinary and race suites, build, vet, formatting, module,
@@ -1244,8 +1243,8 @@ The required sequence is:
 9. performance/concurrency/final verification; and
 10. independent final review.
 
-Do not begin Plan 12 until step 10 is accepted and its drafted amendment is
-reconciled with the exact accepted commit.
+Plan 12 may begin from accepted Plan 13 commit `c450ff4` or a reviewed
+descendant, subject to its own initial drift audit.
 
 ## 15. Punchlist
 
@@ -1369,5 +1368,5 @@ reconciled with the exact accepted commit.
 - [x] Draft the Plan 12 amendment against implementation-closure commit
   `e5f0a7a` without beginning its implementation.
 - [x] Review every hunk against Plan 13 and obtain an independent final review.
-- [ ] Record the final accepted commit and reconcile Plan 12's drafted
-  amendment against it before implementation.
+- [x] Record accepted implementation commit `c450ff4` and reconcile Plan 12's
+  drafted amendment against it before implementation.

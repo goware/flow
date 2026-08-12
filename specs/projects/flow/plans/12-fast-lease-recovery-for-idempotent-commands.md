@@ -1,8 +1,8 @@
 # Plan 12: Fast lease recovery for idempotent commands
 
-Status: Planned — amended against Plan 13; implement after Plan 13 is accepted
+Status: Planned — reconciled against accepted Plan 13
 
-Amended at: `e5f0a7a4b54d091fc2c55b8cadf41f0f4865c848` on 2026-08-12
+Reconciled at: `c450ff4b060d1a862fde0540c794fb2d9876147b` on 2026-08-12
 
 - **Priority:** P2 — reduce dead-worker recovery latency for commands whose
   duplicate execution is safe
@@ -10,7 +10,7 @@ Amended at: `e5f0a7a4b54d091fc2c55b8cadf41f0f4865c848` on 2026-08-12
 - **Risk:** MEDIUM-HIGH — the public option is small, but its durable value
   crosses definition, command creation, replay, batched claim, renewal timing,
   the local watchdog, and maintenance recovery
-- **Depends on:** Plan 13 being independently reviewed and accepted; Plan 7's
+- **Depends on:** accepted Plan 13 commit `c450ff4`; Plan 7's
   lease fencing, local watchdog, and maintenance fixes remain controlling
 - **Public API impact:** additive — one `CommandOption`,
   `WithRecoveryLease(time.Duration)`
@@ -25,11 +25,9 @@ Amended at: `e5f0a7a4b54d091fc2c55b8cadf41f0f4865c848` on 2026-08-12
   or one goroutine per attempt
 - **Release impact:** implementation does not tag or publish a release
 
-> **Sequencing:** Plan 13 is implemented at the commit above but still awaits
-> independent final review. Do not begin this plan on an older branch or merge
-> it into an unaccepted Plan 13 result. After Plan 13 is accepted, start from
-> that exact accepted commit (or its descendant), repeat the initial drift
-> audit, and record the new implementation base here if it differs.
+> **Sequencing:** Plan 13 was independently reviewed and accepted at the commit
+> above. Start this plan from that exact commit (or its descendant), repeat the
+> initial drift audit, and record the implementation base here if it differs.
 >
 > **Executor rule:** This plan changes how long an attempt remains recoverable;
 > it does not change what owns an attempt. The attempt ID, lease token,

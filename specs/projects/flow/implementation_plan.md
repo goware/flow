@@ -8,7 +8,7 @@ completed_at: 2026-08-04
 ## Controlling amendments
 
 [`plans/13-simpler-core-retention-and-typed-reads.md`](plans/13-simpler-core-retention-and-typed-reads.md)
-is the current controlling implementation plan. It keeps the command-only
+was independently reviewed and accepted at `c450ff4`. It keeps the command-only
 architecture while removing unused semantic modes and duplicate storage,
 adding definition-bound reads, batched queue statistics, decision bounds, and
 explicit bounded retention. Existing development data is disposable, so the
@@ -16,8 +16,8 @@ schema is one clean Run-named baseline rather than a compatibility chain.
 
 [`plans/11-inline-command-calls.md`](plans/11-inline-command-calls.md) remains
 deferred. [`plans/12-fast-lease-recovery-for-idempotent-commands.md`](plans/12-fast-lease-recovery-for-idempotent-commands.md)
-has been amended against Plan 13 commit `e5f0a7a`; implementation remains
-blocked until Plan 13's exact accepted commit is recorded and reconciled.
+has been reconciled against accepted Plan 13 commit `c450ff4`; it remains
+planned and unimplemented.
 
 ## Implemented Plans 9–10 outcomes
 
