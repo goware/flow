@@ -66,7 +66,7 @@ type ActiveCommandFilter struct {
 // ActiveCommandPage contains one bounded page and an opaque cursor for the next
 // page. NextCursor is empty when no later row was observed.
 type ActiveCommandPage struct {
-	Work       []ActiveCommand
+	Commands   []ActiveCommand
 	NextCursor string
 }
 
@@ -85,24 +85,24 @@ func ListActiveCommands(ctx context.Context, c Client, filter ActiveCommandFilte
 		return ActiveCommandPage{}, err
 	}
 	if len(keys) == 0 {
-		return ActiveCommandPage{Work: []ActiveCommand{}}, nil
+		return ActiveCommandPage{Commands: []ActiveCommand{}}, nil
 	}
-	storeFilter := store.LiveWorkListFilter{Keys: keys, Limit: pageSize + 1}
+	storeFilter := store.ActiveCommandListFilter{Keys: keys, Limit: pageSize + 1}
 	if cursor != nil {
-		storeFilter.Cursor = &store.LiveWorkCursor{
+		storeFilter.Cursor = &store.ActiveCommandCursor{
 			RunKey: cursor.RunKey, DefinitionName: cursor.DefinitionName,
 			RunCreatedAt: cursor.RunCreatedAt,
 			RunID:        uuid.MustParse(cursor.RunID),
 			CommandID:    uuid.MustParse(cursor.CommandID),
 		}
 	}
-	rows, err := client.runtime.store.ListLiveWorkInTx(ctx, client.tx, storeFilter)
+	rows, err := client.runtime.store.ListActiveCommandsInTx(ctx, client.tx, storeFilter)
 	if err != nil {
 		return ActiveCommandPage{}, err
 	}
-	page := ActiveCommandPage{Work: make([]ActiveCommand, min(len(rows), pageSize))}
-	for index := range page.Work {
-		page.Work[index], err = activeCommandFromStore(rows[index])
+	page := ActiveCommandPage{Commands: make([]ActiveCommand, min(len(rows), pageSize))}
+	for index := range page.Commands {
+		page.Commands[index], err = activeCommandFromStore(rows[index])
 		if err != nil {
 			return ActiveCommandPage{}, err
 		}
@@ -198,7 +198,7 @@ func ListHistoryByRunKeys(ctx context.Context, c Client, filter KeyedHistoryFilt
 	return page, nil
 }
 
-func activeCommandFromStore(row store.LiveWorkRow) (ActiveCommand, error) {
+func activeCommandFromStore(row store.ActiveCommandRow) (ActiveCommand, error) {
 	keyScope, err := keyScopeFromString(row.KeyScope)
 	if err != nil {
 		return ActiveCommand{}, newError(ErrInvalidState, "decode", "key scope", row.KeyScope, "stored key scope is unknown")

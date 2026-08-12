@@ -19,7 +19,7 @@ import (
 // queued work is addressable by its key through ListActiveCommands, its journal
 // through ListHistoryByRunKeys, and settling the run removes it from live
 // work while its history remains.
-func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
+func TestReadGettersExposeActiveCommandsAndHistory(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -45,7 +45,7 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListActiveCommands() error = %v", err)
 	}
-	work := workPage.Work
+	work := workPage.Commands
 	if len(work) != 1 {
 		t.Fatalf("live work rows = %d, want 1 (missing keys contribute none)", len(work))
 	}
@@ -76,7 +76,7 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListActiveCommands() after settle error = %v", err)
 	}
-	work = workPage.Work
+	work = workPage.Commands
 	if len(work) != 0 {
 		t.Fatalf("settled run still has %d live-work rows", len(work))
 	}
@@ -125,14 +125,14 @@ func TestBoundedReadPaginationIsStableAndFilterBound(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListActiveCommands() error = %v", err)
 		}
-		if len(page.Work) > liveFilter.PageSize {
-			t.Fatalf("live page length = %d, want at most %d", len(page.Work), liveFilter.PageSize)
+		if len(page.Commands) > liveFilter.PageSize {
+			t.Fatalf("active-command page length = %d, want at most %d", len(page.Commands), liveFilter.PageSize)
 		}
-		work = append(work, page.Work...)
+		work = append(work, page.Commands...)
 		if page.NextCursor == "" {
 			break
 		}
-		if len(work) == len(page.Work) {
+		if len(work) == len(page.Commands) {
 			if _, err := ListHistoryByRunKeys(ctx, runtime, KeyedHistoryFilter{Keys: inputKeys, Cursor: page.NextCursor}); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("cross-query cursor error = %v, want ErrInvalid", err)
 			}
@@ -269,7 +269,7 @@ func TestBoundedReadValidationAndCursorStrictness(t *testing.T) {
 	}
 
 	emptyLive, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{})
-	if err != nil || emptyLive.NextCursor != "" || len(emptyLive.Work) != 0 {
+	if err != nil || emptyLive.NextCursor != "" || len(emptyLive.Commands) != 0 {
 		t.Fatalf("empty live filter = %#v, %v", emptyLive, err)
 	}
 	emptyHistory, err := ListHistoryByRunKeys(ctx, runtime, KeyedHistoryFilter{})
@@ -301,7 +301,7 @@ func TestBoundedReadsObserveCallerTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	live, err := ListActiveCommands(ctx, client, ActiveCommandFilter{Keys: []string{"transaction/read"}})
-	if err != nil || len(live.Work) != 1 {
+	if err != nil || len(live.Commands) != 1 {
 		t.Fatalf("transaction ListActiveCommands() = %#v, %v", live, err)
 	}
 	history, err := ListHistoryByRunKeys(ctx, client, KeyedHistoryFilter{Keys: []string{"transaction/read"}})
@@ -309,7 +309,7 @@ func TestBoundedReadsObserveCallerTransaction(t *testing.T) {
 		t.Fatalf("transaction ListHistoryByRunKeys() = %#v, %v", history, err)
 	}
 	outside, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: []string{"transaction/read"}})
-	if err != nil || len(outside.Work) != 0 {
+	if err != nil || len(outside.Commands) != 0 {
 		t.Fatalf("outside ListActiveCommands() = %#v, %v", outside, err)
 	}
 }

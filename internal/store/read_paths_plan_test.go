@@ -57,7 +57,7 @@ func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 		wantIndex string
 	}
 	var tests []planTest
-	query, args := store.LiveWorkListQueryForTest(repository, store.LiveWorkListFilter{
+	query, args := store.ActiveCommandListQueryForTest(repository, store.ActiveCommandListFilter{
 		Keys: []string{"release/needle/000"}, Limit: 11,
 	})
 	tests = append(tests, planTest{"live_work", query, args, "flow_runs_key_lookup_idx"})
@@ -69,7 +69,7 @@ func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 	tests = append(tests, planTest{"default_run_list", query, args, "flow_runs_created_idx"})
 	tests = append(tests, planTest{
 		name: "queue_stats", query: store.QueueStatsQueryForTest(repository),
-		args: []any{[]string{"release.rare"}}, wantIndex: "flow_command_queue_depth_idx",
+		args: []any{[]string{"release.rare"}}, wantIndex: "flow_command_queue_stats_idx",
 	})
 	query, args = store.RunListQueryForTest(repository, store.RunListFilter{
 		DefinitionName: target.Name(), KeyPrefix: "release/needle/", Limit: 11,

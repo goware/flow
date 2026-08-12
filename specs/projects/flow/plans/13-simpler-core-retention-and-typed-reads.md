@@ -500,7 +500,9 @@ Perform these breaking renames without aliases:
 | `RunFilter.Type` | `RunFilter.RootCommandName` |
 
 `flow.Enqueue` returns `*StagedCommand`. Keep the fluent `WaitFor`, `Within`,
-and `Delay` methods. `Optional` is deleted.
+and `Delay` methods. `Optional` is deleted. `ActiveCommandPage` exposes its
+rows as `Commands`, not the retired `Work` field; `Work` remains reserved for
+the attempt-local handler scope.
 
 Renaming the active-command read cursor kind is allowed to invalidate opaque
 v0.3 cursor strings. Document that cursors are release/query specific and must

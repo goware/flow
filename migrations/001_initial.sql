@@ -206,7 +206,7 @@ CREATE INDEX flow_command_queue_lease_idx
 CREATE INDEX flow_command_queue_run_idx
     ON {{schema}}.flow_command_queue (run_id, command_id);
 
-CREATE INDEX flow_command_queue_depth_idx
+CREATE INDEX flow_command_queue_stats_idx
     ON {{schema}}.flow_command_queue (queue, state, next_run_at);
 
 CREATE TABLE {{schema}}.flow_command_event_waits (

@@ -338,12 +338,16 @@ func (s *Store) loadEquivalentStart(
 	var definitionName, runKey, keyScope string
 	var version int
 	var fingerprint, input []byte
-	err = tx.QueryRow(ctx, `SELECT r.definition_name,r.run_key,r.key_scope,r.definition_version,
-		r.start_fingerprint,c.args
-		FROM `+pgschema.Table(s.schema, "flow_runs")+` r
-		JOIN `+pgschema.Table(s.schema, "flow_commands")+` c
-		  ON c.run_id=r.run_id AND c.command_id=r.root_command_id
-		WHERE r.run_id=$1 FOR UPDATE OF r,c`, id).
+	err = tx.QueryRow(ctx, `WITH locked_run AS MATERIALIZED (
+		SELECT definition_name,run_key,key_scope,definition_version,start_fingerprint,root_command_id
+		FROM `+pgschema.Table(s.schema, "flow_runs")+`
+		WHERE run_id=$1 FOR UPDATE
+	)
+	SELECT r.definition_name,r.run_key,r.key_scope,r.definition_version,r.start_fingerprint,c.args
+	FROM locked_run r
+	JOIN `+pgschema.Table(s.schema, "flow_commands")+` c
+	  ON c.run_id=$1 AND c.command_id=r.root_command_id
+	FOR UPDATE OF c`, id).
 		Scan(&definitionName, &runKey, &keyScope, &version, &fingerprint, &input)
 	if err != nil {
 		return StartResult{}, false, MapError("lock existing run", err)
@@ -1126,9 +1130,8 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		for index, command := range failureEffects.survivors {
 			survivors[index] = command.key
 		}
-		failing, err := NewJournalEntry(RunFailing, map[string]any{
-			"v": 1, "status": "failing", "reason": reason, "command_key": key,
-			"survivors": survivors,
+		failing, err := NewJournalEntry(RunFailing, journalcodec.RunFailingBody{
+			V: 1, Status: "failing", Reason: reason, CommandKey: key, Survivors: survivors,
 		})
 		if err != nil {
 			return CancelResult{}, err

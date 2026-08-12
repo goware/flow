@@ -122,6 +122,9 @@ func (state *Run) Apply(row store.JournalRow) error {
 	} else if row.Position != state.LastPosition+1 || row.RunID != state.ID {
 		return fmt.Errorf("journal position or run changed at %d", row.Position)
 	}
+	if state.Initialized && state.RootCommandID == nil && row.Kind != store.CommandCreated {
+		return errors.New("root CommandCreated does not immediately follow RunStarted")
+	}
 
 	switch row.Kind {
 	case store.RunStarted:
@@ -151,6 +154,9 @@ func (state *Run) Apply(row store.JournalRow) error {
 		if !state.Initialized || row.CommandID == nil {
 			return errors.New("CommandCreated has no initialized run or command")
 		}
+		if state.RootCommandID == nil && row.Position != 2 {
+			return errors.New("root CommandCreated does not immediately follow RunStarted")
+		}
 		if _, exists := state.Commands[*row.CommandID]; exists {
 			return errors.New("command created more than once")
 		}
@@ -176,21 +182,22 @@ func (state *Run) Apply(row store.JournalRow) error {
 			Waits: slices.Clone(body.Waits), WithinMS: pointerClone(body.WithinMS),
 		}
 		copy(command.DeclarationFingerprint[:], declarationFingerprint)
-		state.Commands[bodyID] = command
 		if body.ParentCommandID != "" {
+			if state.RootCommandID == nil {
+				return errors.New("child CommandCreated precedes the root command")
+			}
 			parentID, err := uuid.Parse(body.ParentCommandID)
 			if err != nil {
 				return errors.New("CommandCreated parent identity is invalid")
 			}
-			command := state.Commands[bodyID]
 			command.ParentCommandID = &parentID
-			state.Commands[bodyID] = command
 		} else {
 			if state.RootCommandID != nil {
 				return errors.New("run has more than one root command")
 			}
 			state.RootCommandID = pointer(bodyID)
 		}
+		state.Commands[bodyID] = command
 		state.CommandCount++
 		state.OpenCommands++
 	case store.AttemptStarted:
@@ -265,6 +272,16 @@ func (state *Run) Apply(row store.JournalRow) error {
 		state.Commands[*row.CommandID] = command
 
 	case store.RunFailing:
+		if state.Status != "running" {
+			return errors.New("RunFailing has invalid prior state")
+		}
+		body, err := journalcodec.Decode[journalcodec.RunFailingBody](row.Body)
+		if err != nil {
+			return err
+		}
+		if body.Status != "failing" || body.CommandKey == "" {
+			return errors.New("RunFailing body is incomplete")
+		}
 		state.Status = "failing"
 		state.StatusAt = row.RecordedAt
 

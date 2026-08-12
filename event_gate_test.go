@@ -481,9 +481,9 @@ func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	event := DefineEvent[None]("gate.optional")
-	parent := DefineCommand[bool, None]("gate.optional_parent", 1)
-	child := DefineCommand[None, None]("gate.optional_child", 1)
+	event := DefineEvent[None]("gate.lifecycle")
+	parent := DefineCommand[bool, None]("gate.lifecycle_parent", 1)
+	child := DefineCommand[None, None]("gate.lifecycle_child", 1)
 	var calls atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
 	if err != nil {
@@ -507,7 +507,7 @@ func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
 
-	open, err := parent.Enqueue(ctx, runtime, "optional/open", false)
+	open, err := parent.Enqueue(ctx, runtime, "lifecycle/open", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +524,7 @@ func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	}
 	waitForRunStatus(t, database.Schema, database.DB.Conn, open.RunID, "succeeded", 5*time.Second)
 
-	expiring, err := parent.Enqueue(ctx, runtime, "optional/expiring", true)
+	expiring, err := parent.Enqueue(ctx, runtime, "lifecycle/expiring", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,17 +533,17 @@ func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var optionalState CommandStatus
+	var waitingState CommandStatus
 	for _, command := range trace.Commands {
 		if command.Key == "waiting" {
-			optionalState = command.Status
+			waitingState = command.Status
 		}
 	}
-	if len(trace.Commands) != 2 || optionalState != CommandStatusExpired {
-		t.Fatalf("optional expiry trace=%+v", trace.Commands)
+	if len(trace.Commands) != 2 || waitingState != CommandStatusExpired {
+		t.Fatalf("wait expiry trace=%+v", trace.Commands)
 	}
 
-	deadline, err := parent.Enqueue(ctx, runtime, "optional/deadline", false, WithRunDeadline(250*time.Millisecond))
+	deadline, err := parent.Enqueue(ctx, runtime, "lifecycle/deadline", false, WithRunDeadline(250*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,10 +559,10 @@ func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 		}
 	}
 	if deadlineWaiting.Status != CommandStatusCancelled || deadlineWaiting.Failure == nil || deadlineWaiting.Failure.Code != "run_expired" {
-		t.Fatalf("optional deadline trace=%+v", deadlineTrace.Commands)
+		t.Fatalf("run deadline trace=%+v", deadlineTrace.Commands)
 	}
 	if calls.Load() != 1 {
-		t.Fatalf("optional child calls=%d, want 1", calls.Load())
+		t.Fatalf("gated child calls=%d, want 1", calls.Load())
 	}
 }
 

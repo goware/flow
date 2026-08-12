@@ -771,10 +771,7 @@ func TestClaimBatchTerminalizesElapsedRetryAlongsideEligibleSibling(t *testing.T
 		Scan(&failingBody); err != nil {
 		t.Fatal(err)
 	}
-	failing, err := journalcodec.Decode[struct {
-		V         int      `json:"v"`
-		Survivors []string `json:"survivors"`
-	}](failingBody)
+	failing, err := journalcodec.Decode[journalcodec.RunFailingBody](failingBody)
 	if err != nil {
 		t.Fatal(err)
 	}

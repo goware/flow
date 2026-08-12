@@ -12,6 +12,7 @@ import (
 	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
+	"github.com/goware/flow/internal/store/journalcodec"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -214,9 +215,8 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		for index, command := range failureEffects.survivors {
 			survivors[index] = command.key
 		}
-		failing, err := NewJournalEntry(RunFailing, map[string]any{
-			"v": 1, "status": "failing", "reason": "awaited event deadline expired", "command_key": key,
-			"survivors": survivors,
+		failing, err := NewJournalEntry(RunFailing, journalcodec.RunFailingBody{
+			V: 1, Status: "failing", Reason: "awaited event deadline expired", CommandKey: key, Survivors: survivors,
 		})
 		if err != nil {
 			return false, err

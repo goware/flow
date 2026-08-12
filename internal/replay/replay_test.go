@@ -56,6 +56,25 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	if _, err := Fold([]store.JournalRow{duplicateKey}); err == nil {
 		t.Fatal("Fold() accepted a matching-hash duplicate-key body")
 	}
+	unknownVersion := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
+		V: 2, RunID: runID.String(), DefinitionName: "work",
+		DefinitionVersion: 1, RunKey: "key", DeadlineMode: "none", MaxCommands: 5,
+	})
+	if _, err := Fold([]store.JournalRow{unknownVersion}); err == nil {
+		t.Fatal("Fold() accepted an unknown run-start body version")
+	}
+	legacyCommand := row(t, runID, 2, store.CommandCreated, &commandID, struct {
+		journalcodec.CommandCreatedBody
+		Required bool `json:"required"`
+	}{CommandCreatedBody: journalcodec.CommandCreatedBody{
+		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
+		Args: json.RawMessage(`{"x":1}`), InitialState: "ready", Queue: "default",
+		RetryPolicy:            json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
+		DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
+	}, Required: true})
+	if _, err := Fold([]store.JournalRow{start, legacyCommand}); err == nil {
+		t.Fatal("Fold() accepted a retired required field")
+	}
 }
 
 func TestFoldValidatesApplicationEventBodies(t *testing.T) {

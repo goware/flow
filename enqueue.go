@@ -492,8 +492,8 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 	if len(options.waits) > maxCommandEventWaits {
 		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "wait", "", "command exceeds the 256 event-wait limit")
 	}
-	// key_scope and start_delay_ms are omitted when zero so fingerprints of
-	// starts that predate these options remain rediscoverable.
+	// Omit zero-value optional fields so the current fingerprint stays minimal
+	// and identical equivalent starts have one canonical identity.
 	deadlineMilliseconds, err := durable.ExactMilliseconds("run deadline", options.deadline.Duration)
 	if err != nil {
 		return runOptions{}, [32]byte{}, err
@@ -510,7 +510,7 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 		V                 int                      `json:"v"`
 		DefinitionName    string                   `json:"definition_name"`
 		DefinitionVersion int                      `json:"definition_version"`
-		RunKey            string                   `json:"execution_key"`
+		RunKey            string                   `json:"run_key"`
 		KeyScope          string                   `json:"key_scope,omitempty"`
 		Input             json.RawMessage          `json:"input"`
 		DeadlineMode      string                   `json:"deadline_mode"`

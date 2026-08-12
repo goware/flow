@@ -113,7 +113,7 @@ func TestMigrationReleaseReadPaths(t *testing.T) {
 	want := []indexShape{
 		{name: "flow_runs_key_lookup_idx", columns: []string{"run_key", "definition_name", "created_at", "run_id"}, collation: ptr("C"), opclass: ptr("text_ops")},
 		{name: "flow_runs_created_idx", columns: []string{"created_at", "run_id"}, contains: "(created_at DESC, run_id DESC)"},
-		{name: "flow_command_queue_depth_idx", columns: []string{"queue", "state", "next_run_at"}},
+		{name: "flow_command_queue_stats_idx", columns: []string{"queue", "state", "next_run_at"}},
 	}
 	for _, expected := range want {
 		var columns []string

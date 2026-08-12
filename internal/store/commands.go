@@ -621,9 +621,8 @@ func (s *Store) failBeforeClaimLocked(
 		for index, command := range failureEffects.survivors {
 			survivors[index] = command.key
 		}
-		failing, err := NewJournalEntry(RunFailing, map[string]any{
-			"v": 1, "status": "failing", "reason": message, "command_key": key,
-			"survivors": survivors,
+		failing, err := NewJournalEntry(RunFailing, journalcodec.RunFailingBody{
+			V: 1, Status: "failing", Reason: message, CommandKey: key, Survivors: survivors,
 		})
 		if err != nil {
 			return err
@@ -1429,9 +1428,8 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 			for index, command := range failureEffects.survivors {
 				survivors[index] = command.key
 			}
-			failing, err := NewJournalEntry(RunFailing, map[string]any{
-				"v": 1, "status": "failing", "reason": failure.Message, "command_key": fence.Key,
-				"survivors": survivors,
+			failing, err := NewJournalEntry(RunFailing, journalcodec.RunFailingBody{
+				V: 1, Status: "failing", Reason: failure.Message, CommandKey: fence.Key, Survivors: survivors,
 			})
 			if err != nil {
 				return SettleResult{}, err
