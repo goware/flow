@@ -77,6 +77,16 @@ for that worker call and must not be retained or used concurrently.
 reports whether this call created it. `GetRun` and `AwaitRun`
 return the same type with the run's current or final state.
 
+Read one successful command result by its stable key without loading the full
+run trace:
+
+```go
+value, found, err := flow.GetResult(ctx, runtime, run.ID, "finalize", finalizeOrder)
+```
+
+`found=false` means no successful result is currently available. Use `Trace`
+when the complete command graph, attempts, events, or journal is needed.
+
 ## Composing work
 
 A successful worker may atomically emit events and stage sub-commands:

@@ -75,7 +75,9 @@
 //
 // Flow retains journal, payload, and terminal data indefinitely and exposes no
 // pruning API. Inspection, history, and trace APIs read durable state without
-// invoking application code.
+// invoking application code. [GetResult] reads one typed successful command
+// result by run and command key directly from its projection, without replaying
+// the run journal.
 //
 // # Choosing command boundaries
 //

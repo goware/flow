@@ -163,7 +163,17 @@ Sibling/external data may be supplied through:
 - stable references in arguments, resolved from application storage; or
 - application tables read by the worker.
 
-`ResultOf(trace, key, command)` is an inspection helper that decodes a successful command result from a `RunTrace`. It fails permanently for a missing command, mismatched definition, non-successful command, or undecodable result. It is not worker-time dataflow.
+`GetResult(ctx, client, runID, key, command)` is a point inspection read over
+the command projection. It returns the decoded typed value with `found=true`
+only for a successful command. A missing command or one without a successful
+result returns `found=false`; a missing run returns `ErrNotFound`; a mismatched
+command name/version returns `ErrConflict`; and malformed retained result data
+returns `ErrInvalidState`. It does not replay the run journal.
+
+`ResultOf(trace, key, command)` decodes a successful command result already
+present in a `RunTrace`. It fails permanently for a missing command, mismatched
+definition, non-successful command, or undecodable result. Both APIs are
+inspection helpers, not worker-time dataflow.
 
 ### 5.3 Composition granularity
 

@@ -49,6 +49,61 @@ type RunListFilter struct {
 	Limit          int
 }
 
+// CommandResultRow is the result projection metadata for one command.
+// Result is populated only when State is succeeded.
+type CommandResultRow struct {
+	Name    string
+	Version int
+	State   string
+	Result  []byte
+}
+
+// GetCommandResultInTx reads one command projection without replaying the
+// run journal. found=false means the run exists but the command key does not.
+func (s *Store) GetCommandResultInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+	key string,
+) (CommandResultRow, bool, error) {
+	if runID == uuid.Nil {
+		return CommandResultRow{}, false, fmt.Errorf("%w: run ID is nil", flowerr.ErrInvalid)
+	}
+	if key == "" {
+		return CommandResultRow{}, false, fmt.Errorf("%w: command key is required", flowerr.ErrInvalid)
+	}
+	query := `SELECT r.run_id,c.name,c.version,c.state,c.result
+		FROM ` + pgschema.Table(s.schema, "flow_runs") + ` r
+		LEFT JOIN ` + pgschema.Table(s.schema, "flow_commands") + ` c
+			ON c.run_id=r.run_id AND c.command_key=$2
+		WHERE r.run_id=$1`
+	var scan pgx.Row
+	if tx != nil {
+		scan = tx.QueryRow(ctx, query, runID, key)
+	} else {
+		scan = s.db.Conn.QueryRow(ctx, query, runID, key)
+	}
+	var observedRunID uuid.UUID
+	var name, state *string
+	var version *int
+	var result []byte
+	if err := scan.Scan(&observedRunID, &name, &version, &state, &result); err != nil {
+		return CommandResultRow{}, false, MapError("get command result", err)
+	}
+	if observedRunID != runID {
+		return CommandResultRow{}, false, fmt.Errorf("%w: command result run identity differs", flowerr.ErrInvalidState)
+	}
+	if name == nil && version == nil && state == nil && result == nil {
+		return CommandResultRow{}, false, nil
+	}
+	if name == nil || version == nil || state == nil {
+		return CommandResultRow{}, false, fmt.Errorf("%w: command result projection is incomplete", flowerr.ErrInvalidState)
+	}
+	return CommandResultRow{
+		Name: *name, Version: *version, State: *state, Result: append([]byte(nil), result...),
+	}, true, nil
+}
+
 func (s *Store) GetRunInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (RunRow, error) {
 	if id == uuid.Nil {
 		return RunRow{}, fmt.Errorf("%w: run ID is nil", flowerr.ErrInvalid)

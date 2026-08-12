@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/testpg"
 	"github.com/jackc/pgx/v5"
 )
@@ -19,6 +20,111 @@ type inspectionArgs struct {
 
 type inspectionResult struct {
 	Value string `json:"value"`
+}
+
+func TestGetResultReadsTypedCommandProjection(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(10*time.Millisecond), WithWorkerConcurrency(2))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	child := DefineCommand[inspectionArgs, inspectionResult]("inspection.result.child", 1)
+	root := DefineCommand[inspectionArgs, None]("inspection.result.root", 1)
+	failed := DefineCommand[inspectionArgs, inspectionResult]("inspection.result.failed", 1)
+	if err := runtime.Register(
+		Handle(root, func(_ context.Context, work *Work[inspectionArgs]) (None, error) {
+			Enqueue(work, "child", child, work.Args)
+			return None{}, nil
+		}),
+		Handle(child, func(_ context.Context, work *Work[inspectionArgs]) (inspectionResult, error) {
+			return inspectionResult{Value: "result/" + work.Args.Value}, nil
+		}),
+		Handle(failed, func(context.Context, *Work[inspectionArgs]) (inspectionResult, error) {
+			return inspectionResult{}, Permanent(errors.New("expected failure"))
+		}),
+	); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	run, err := root.Enqueue(ctx, runtime, "result/read", inspectionArgs{Value: "typed"})
+	if err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+	if result, found, err := GetResult(ctx, runtime, run.ID, "root", root); err != nil || found || result != (None{}) {
+		t.Fatalf("GetResult(pending root) = %#v, %t, %v", result, found, err)
+	}
+	if _, found, err := GetResult(ctx, runtime, run.ID, "missing", child); err != nil || found {
+		t.Fatalf("GetResult(missing command) found=%t error=%v", found, err)
+	}
+	wrongVersion := DefineCommand[inspectionArgs, None](root.Name(), root.Version()+1)
+	if _, _, err := GetResult(ctx, runtime, run.ID, "root", wrongVersion); !errors.Is(err, ErrConflict) {
+		t.Fatalf("GetResult(mismatched definition) error = %v", err)
+	}
+	if _, _, err := GetResult(ctx, runtime, RunID("00000000-0000-0000-0000-000000000001"), "root", root); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetResult(missing run) error = %v", err)
+	}
+	invalid := DefineCommand[inspectionArgs, None]("", 1)
+	if _, _, err := GetResult(ctx, runtime, run.ID, "root", invalid); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("GetResult(invalid command) error = %v", err)
+	}
+	if _, _, err := GetResult(ctx, runtime, run.ID, " invalid ", root); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("GetResult(invalid key) error = %v", err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runtime.Run(runCtx) }()
+	t.Cleanup(func() {
+		cancelRun()
+		select {
+		case err := <-runDone:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run() error = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("Run() did not stop")
+		}
+	})
+	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelWait()
+	settled, err := AwaitRun(waitCtx, runtime, run.ID)
+	if err != nil || settled.Status != RunStatusSucceeded {
+		t.Fatalf("AwaitRun() = %#v, %v", settled, err)
+	}
+	result, found, err := GetResult(ctx, runtime, run.ID, "child", child)
+	if err != nil || !found || result != (inspectionResult{Value: "result/typed"}) {
+		t.Fatalf("GetResult(child) = %#v, %t, %v", result, found, err)
+	}
+	if _, found, err := GetResult(ctx, runtime, run.ID, "root", root); err != nil || !found {
+		t.Fatalf("GetResult(root) found=%t error=%v", found, err)
+	}
+
+	failedRun, err := failed.Enqueue(ctx, runtime, "result/failed", inspectionArgs{Value: "failed"})
+	if err != nil {
+		t.Fatalf("Enqueue(failed) error = %v", err)
+	}
+	failedWaitCtx, cancelFailedWait := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelFailedWait()
+	failedState, err := AwaitRun(failedWaitCtx, runtime, failedRun.ID)
+	if err != nil || failedState.Status != RunStatusFailed {
+		t.Fatalf("AwaitRun(failed) = %#v, %v", failedState, err)
+	}
+	if _, found, err := GetResult(ctx, runtime, failedRun.ID, "root", failed); err != nil || found {
+		t.Fatalf("GetResult(failed) found=%t error=%v", found, err)
+	}
+
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_commands")+` SET result=$3
+		WHERE run_id=$1 AND command_key=$2`, run.ID, "child", []byte(`{"value":`)); err != nil {
+		t.Fatalf("corrupt command result: %v", err)
+	}
+	if _, _, err := GetResult(ctx, runtime, run.ID, "child", child); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("GetResult(corrupt result) error = %v", err)
+	}
 }
 
 func TestRunInspectionAndStablePagination(t *testing.T) {
@@ -134,6 +240,12 @@ func TestTransactionScopedInspectionAndAwait(t *testing.T) {
 	}
 	if _, err := GetRun(ctx, txClient, uncommitted.ID); err != nil {
 		t.Fatalf("transaction GetRun() error = %v", err)
+	}
+	if _, found, err := GetResult(ctx, txClient, uncommitted.ID, "root", command); err != nil || found {
+		t.Fatalf("transaction GetResult() found=%t error=%v", found, err)
+	}
+	if _, _, err := GetResult(ctx, runtime, uncommitted.ID, "root", command); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("outside GetResult(uncommitted) error = %v", err)
 	}
 	if _, err := GetRun(ctx, runtime, uncommitted.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("outside GetRun(uncommitted) error = %v", err)

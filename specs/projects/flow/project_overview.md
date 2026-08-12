@@ -209,7 +209,14 @@ Worker registration matches exact command name/version pairs. Unhandled versions
 
 ## Inspection and testing
 
-`GetRun`, `GetCurrentRun`, `ListRuns`, `AwaitRun`, `GetQueueDepth`, `History`, and `Trace` expose durable state without invoking application code. Trace includes command provenance, exact waits and satisfying positions, attempts, results/failures, events, operational lease state, and ordered history. `ResultOf` decodes a successful command result from a trace snapshot; workers do not use it as implicit dataflow.
+`GetRun`, `GetCurrentRun`, `ListRuns`, `AwaitRun`, `GetResult`,
+`GetQueueDepth`, `History`, and `Trace` expose durable state without invoking
+application code. `GetResult` decodes one successful command result directly
+from its `(run ID, command key)` projection without replay. Trace includes
+command provenance, exact waits and satisfying positions, attempts,
+results/failures, events, operational lease state, and ordered history.
+`ResultOf` decodes a successful command result already held in a trace snapshot;
+workers use neither helper as implicit dataflow.
 
 `flowtest` exercises the production decision recorder, codecs, retry calculation, and commit callback without PostgreSQL. PostgreSQL integration tests cover migrations, claims, fencing, retries, exact event inputs, fail-fast, cancellation, replay conformance, transaction ownership, notification loss, multi-replica behavior, and all examples.
 

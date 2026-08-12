@@ -58,6 +58,61 @@ func GetRun(ctx context.Context, c Client, id RunID) (Run, error) {
 	return runFromStore(row)
 }
 
+// GetResult reads the typed result projection for one command key without
+// loading or replaying the run trace. found=false means that the run exists
+// but the command has no successful result yet, including when the command is
+// absent, pending, running, or terminal without success. A stored command with
+// a different name or version returns ErrConflict.
+func GetResult[A, R any](
+	ctx context.Context,
+	c Client,
+	id RunID,
+	key string,
+	cmd Command[A, R],
+) (R, bool, error) {
+	var zero R
+	if cmd.def == nil || cmd.err != nil {
+		return zero, false, newError(ErrInvalid, "get", "command result", key, "invalid command definition")
+	}
+	runID, err := parseRunID(id)
+	if err != nil {
+		return zero, false, err
+	}
+	if err := validateStableKey(key, maxCommandKeyBytes, "command"); err != nil {
+		return zero, false, err
+	}
+	client, err := resolveClient(c)
+	if err != nil {
+		return zero, false, err
+	}
+	row, exists, err := client.runtime.store.GetCommandResultInTx(ctx, client.tx, runID, key)
+	if err != nil || !exists {
+		return zero, false, err
+	}
+	if row.Name != cmd.Name() || row.Version != cmd.Version() {
+		return zero, false, newError(ErrConflict, "get", "command result", key, "stored command definition differs")
+	}
+	status, err := commandStatusFromString(row.State)
+	if err != nil {
+		return zero, false, newError(ErrInvalidState, "get", "command result", key, "stored command status is unknown")
+	}
+	if status != CommandStatusSucceeded {
+		return zero, false, nil
+	}
+	if len(row.Result) == 0 {
+		return zero, false, newError(ErrInvalidState, "get", "command result", key, "stored successful result is missing")
+	}
+	decoded, err := cmd.def.Result.Decode(row.Result)
+	if err != nil {
+		return zero, false, newError(ErrInvalidState, "get", "command result", key, "stored result cannot be decoded")
+	}
+	result, ok := decoded.(R)
+	if !ok {
+		return zero, false, newError(ErrInvalidState, "get", "command result", key, "stored result has an incompatible type")
+	}
+	return result, true, nil
+}
+
 // GetCurrentRun finds the one non-terminal run currently holding
 // a live-scoped key for the definition, if any. Live keys admit many settled
 // runs per key over time but at most one live holder; this is the
