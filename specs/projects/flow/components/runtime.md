@@ -24,7 +24,11 @@ Database resources are released before worker code runs. Invocation adds
 attempt timeout, panic recovery, error classification, and private decision
 state.
 
-Success settlement atomically accepts commit callback SQL, result, events, sub-commands, readiness changes, and run progression under the attempt fence. Failure settlement records retry or terminal failure and applies reduced fail-fast/completion.
+Success settlement atomically accepts commit callback SQL, result, events,
+sub-commands, readiness changes, and run progression under the attempt fence.
+Failure settlement records retry or terminal failure; any unsuccessful terminal
+command fails the run, cancels non-running siblings, and preserves running
+fences until they settle.
 
 ## Event ingress and readiness
 
@@ -55,3 +59,8 @@ Cancellation stops claims/listening/maintenance, waits through shutdown grace, t
 Observers receive bounded command, run, event-ingress, renewal classification/local cancellation, maintenance probe/transition, notification, and shutdown facts. Delivery and shutdown drain remain best-effort and secret-free. Observers must return promptly and should honor context cancellation; a blocked callback cannot block runtime shutdown. Fault hooks cover journal, projection, queue, fence, commit, notification, and ambiguous-commit boundaries.
 
 Deployments may combine all workers, run selected command pools, or use API-only publishers. PostgreSQL remains the sole coordination authority.
+
+Operational callers can batch queue-lane measurements with `GetQueueStats`.
+Retention is explicit rather than a runtime service: `PruneTerminalRuns` owns
+one short bounded transaction, skips locked candidates, and never runs
+automatically in the background.

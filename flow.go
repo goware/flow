@@ -40,7 +40,8 @@
 // consuming a worker or database connection while waiting. Matching is scoped
 // to one run and uses the tuple (event name, event key). Values for the
 // current command's declared gates are materialized before invocation and read
-// from memory with [GetEventValue].
+// from memory with [GetEventValue]. A command may declare at most 256 waits,
+// and one worker decision may stage at most 256 distinct application events.
 //
 // # Definitions, clients, and processing
 //
@@ -69,15 +70,21 @@
 // A stable non-empty run key is permanently idempotent by default.
 // [WithLiveKey] instead gives at most one non-terminal run for a command
 // definition and key; after that run becomes terminal, a new generation
-// may start with the same key. [GetCurrentRun] resolves the current
-// non-terminal generation when an external caller knows the domain key but not
-// its exact [RunID]. Terminal generations remain durable history.
+// may start with the same key. [Command.GetCurrentRun] is the preferred typed
+// read when the definition is available; [GetCurrentRun] supports dynamic
+// definition names. Both resolve the same current non-terminal generation.
+// Run and command keys remain strings.
 //
-// Flow retains journal, payload, and terminal data indefinitely and exposes no
-// pruning API. Inspection, history, and trace APIs read durable state without
-// invoking application code. [GetResult] reads one typed successful command
-// result by run and command key directly from its projection, without replaying
-// the run journal.
+// [Command.Enqueue] returns a compact [EnqueueResult]; full snapshots come from
+// [GetRun] or [AwaitRun]. Inspection, history, and trace APIs read durable state
+// without invoking application code. [Command.GetResult] is the preferred
+// typed point read; [GetResult] retains the equivalent top-level form. Neither
+// replays the run journal.
+//
+// [PruneTerminalRuns] explicitly removes a bounded batch of old terminal
+// unkeyed or live-key aggregates. Permanent non-empty keys are retained to
+// preserve durable idempotency, and application tables are outside Flow's
+// pruning ownership.
 //
 // # Choosing command boundaries
 //
@@ -121,11 +128,16 @@
 // millisecond before durable fingerprints or rows are produced. Stored and
 // decoded durations remain strictly exact milliseconds.
 //
+// A terminal command failure, cancellation, or expiry fails its run. Flow
+// cancels non-running siblings while already running attempts remain fenced and
+// settleable.
+//
 // Observer delivery is bounded and best-effort. Observers must return promptly
 // and should honor context cancellation; a blocked or failed observer never
 // changes durable run correctness or prevents runtime shutdown.
 //
-// The current v0.x line supports Go 1.26 and PostgreSQL 17 and 18. Published
-// migrations are immutable and upgrades are forward-only. During v0.x,
-// intentional Go API changes may be described in release notes.
+// The current development line supports Go 1.26 and PostgreSQL 17 and 18. Its
+// single-migration schema is a clean baseline. Older development schemas are
+// not upgraded in place; drop and recreate the configured Flow schema before
+// running [Migrate].
 package flow

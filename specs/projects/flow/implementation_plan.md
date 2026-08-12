@@ -7,7 +7,16 @@ completed_at: 2026-08-04
 
 ## Controlling amendments
 
-[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. [`plans/5-hot-path-efficiency.md`](plans/5-hot-path-efficiency.md) reduces hot-path work without changing the public command/event model or six-table durability boundary. Plan 6 was a discarded `hardening-2` planning draft and was never committed; [`plans/7-lease-and-maintenance-bug-fixes.md`](plans/7-lease-and-maintenance-bug-fixes.md) retained only its necessary bug-fix subset. [`plans/8-v0.1.0-release-hardening.md`](plans/8-v0.1.0-release-hardening.md) is the controlling v0.1 release-hardening amendment. [`plans/9-simpler-flow-developer-experience.md`](plans/9-simpler-flow-developer-experience.md) and [`plans/10-run-ownership-and-transactional-ergonomics.md`](plans/10-run-ownership-and-transactional-ergonomics.md) were released together in v0.3.0; they retain the command-only architecture and six-table schema. [`plans/11-inline-command-calls.md`](plans/11-inline-command-calls.md) remains a separate, unimplemented proposal. The Go API may still change intentionally during v0.x with release notes, while published migrations remain immutable and forward-only after v0.1.0.
+[`plans/13-simpler-core-retention-and-typed-reads.md`](plans/13-simpler-core-retention-and-typed-reads.md)
+is the current controlling implementation plan. It keeps the command-only
+architecture while removing unused semantic modes and duplicate storage,
+adding definition-bound reads, batched queue statistics, decision bounds, and
+explicit bounded retention. Existing development data is disposable, so the
+schema is one clean Run-named baseline rather than a compatibility chain.
+
+[`plans/11-inline-command-calls.md`](plans/11-inline-command-calls.md) remains
+deferred. [`plans/12-fast-lease-recovery-for-idempotent-commands.md`](plans/12-fast-lease-recovery-for-idempotent-commands.md)
+must be amended against the final Plan 13 commit before implementation.
 
 ## Implemented Plans 9–10 outcomes
 
@@ -40,7 +49,8 @@ criterion-by-criterion release evidence are recorded in the
 ## Completed delivery
 
 - [x] Make commands the only execution root and durable orchestration unit.
-- [x] Return one `Execution` snapshot type from `Execute` and inspection; `Created` distinguishes creation from rediscovery.
+- [x] Return compact start/replacement operation results; inspection returns
+  full `Run` snapshots.
 - [x] Add bounded exact event snapshots and typed `GetEventValue` access.
 - [x] Enforce at most 256 exact waits per command and expose satisfying positions in trace.
 - [x] Keep worker-staged events/sub-commands/result/application commit atomic and fenced.

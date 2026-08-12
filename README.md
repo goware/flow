@@ -5,7 +5,7 @@
 ```text
 command -> worker -> result + events
                          |
-                         +-> optional sub-commands
+                         +-> staged sub-commands
 ```
 
 Commands are the only durable unit of orchestration. Workers perform typed work, emit immutable run-scoped events, and stage bounded sub-commands. Exact event gates provide sequencing and joins. PostgreSQL stores the queue, leases, projections, and a gap-free journal for each run.
@@ -18,10 +18,11 @@ go get github.com/goware/flow
 
 Flow uses the application's existing PostgreSQL database. Its six tables use a `flow_` prefix and default to the `public` schema. `flow.WithSchema` selects another schema.
 
-The current v0.x line supports Go 1.26 and PostgreSQL 17 and 18. During v0.x,
-intentional Go API changes may be made with release notes. Published migration
-files are immutable: upgrades add forward migrations, and applications must run
-`Migrate` before starting a newer runtime. Back up durable data before upgrades.
+The current development line supports Go 1.26 and PostgreSQL 17 and 18. Its
+schema is a clean, single-migration baseline. Databases created by an older
+multi-migration development release are intentionally unsupported: drop and
+recreate the configured Flow schema, then run `Migrate`. There is no in-place
+upgrade or retained-data compatibility path in this development window.
 
 Run migrations explicitly during deployment:
 
@@ -59,7 +60,7 @@ if err := runtime.Register(flow.Handle(sendEmail, sendEmailWorker)); err != nil 
 }
 go runtime.Run(ctx)
 
-run, err := sendEmail.Enqueue(ctx, runtime, "email/order-42", emailArgs{
+started, err := sendEmail.Enqueue(ctx, runtime, "email/order-42", emailArgs{
 	To: "person@example.com",
 })
 ```
@@ -78,19 +79,23 @@ for that worker call and must not be retained or used concurrently.
 
 `Enqueue` always creates or rediscovers durable asynchronous work; it never calls a worker inline. A stable non-empty run key is permanently idempotent by default. `flow.WithLiveKey()` instead deduplicates only while a run is non-terminal.
 
-`Enqueue` returns the `Run` snapshot as of durable acceptance; `Created`
-reports whether this call created it. `GetRun` and `AwaitRun`
-return the same type with the run's current or final state.
+`Enqueue` returns the compact `EnqueueResult{RunID, Created}` needed by the
+operation. `GetRun` and `AwaitRun` return a full durable `Run` snapshot when
+current state, counters, timestamps, or failure details are needed.
 
 Read one successful command result by its stable key without loading the full
 run trace:
 
 ```go
-value, found, err := flow.GetResult(ctx, runtime, run.ID, "finalize", finalizeOrder)
+value, found, err := finalizeOrder.GetResult(ctx, runtime, started.RunID, "finalize")
 ```
 
 `found=false` means no successful result is currently available. Use `Trace`
 when the complete command graph, attempts, events, or journal is needed.
+The top-level `flow.GetResult(ctx, runtime, runID, key, finalizeOrder)` form is
+also available. Likewise, prefer `rootCommand.GetCurrentRun(ctx, runtime, key)`
+when the definition is in hand; top-level `flow.GetCurrentRun` remains useful
+for dynamic command names. Run and command keys remain ordinary strings.
 
 ## Composing work
 
@@ -109,7 +114,11 @@ func chargeWorker(ctx context.Context, work *flow.Work[chargeArgs]) (chargeResul
 }
 ```
 
-Repeated declarations with the same key and canonical content coalesce. Conflicting declarations poison the complete decision. A `WithCommit` callback can update application tables in the same fenced transaction as Flow settlement.
+Repeated declarations with the same key and canonical content coalesce.
+Conflicting declarations poison the complete decision. One worker decision may
+stage at most 256 distinct application events; exact duplicate emissions remain
+idempotent. A `WithCommit` callback can update application tables in the same
+fenced transaction as Flow settlement.
 
 Choose command boundaries around independent retry, side effects, isolation,
 timeouts, queue ownership, or useful parallelism. Keep small deterministic
@@ -243,18 +252,29 @@ always replaced, even when its declaration equals the requested successor.
 - Workers are at-least-once at the application boundary; settlement is fenced and durable progression commits once. External effects still need stable idempotency keys.
 - Lease renewal is bounded and skip-locked: one busy settlement cannot block unrelated renewals. A locked row remains uncertain until settlement, a later renewal, or the conservative local-expiry watchdog resolves it.
 - Deadline, wait-expiry, and lease-recovery maintenance drains full progressing pages promptly but remains sequential and bounded; locked/no-op pages fall back to polling.
-- Required command failure enters reduced fail-fast by default. `flow.WithFailFast(false)` lets remaining work continue.
+- Any command failure, cancellation, or expiry makes the run fail. Flow cancels
+  queued/non-running siblings while already running attempts retain their
+  fences and may settle before the run becomes terminal.
 - Run deadlines, retries, queues, concurrency limits, graceful shutdown, polling, notification hints, observers, history, trace, cancellation, and caller-owned transactions are supported.
 - Publishers may use a `Runtime` without calling `Run` or registering workers. Worker pools may be deployed independently.
 - Observer delivery and shutdown drain are best-effort. Observers must return promptly and should honor context cancellation; observation loss never changes durable correctness.
-- Flow has no pruning or archival API. Journal, payload, and terminal run data remain retained until an operator deliberately archives or removes them outside Flow's supported API.
+- `PruneTerminalRuns` removes one explicit bounded batch of old terminal
+  unkeyed/live-key run aggregates. Permanent non-empty keys are never eligible,
+  application tables are never touched, and there is no automatic TTL or
+  archival service.
 
-For bounded domain-row decoration, `ListLiveWork` and `ListHistoryByKeys`
+For bounded domain-row decoration, `ListActiveCommands` and
+`ListHistoryByRunKeys`
 accept at most 200 exact run keys and return cursor pages of 100 rows by
 default (maximum 1,000). Ordinary pages are not a cross-page snapshot; use a
 Repeatable Read or Serializable caller transaction when one coherent snapshot
 is required. The same rule applies to caller-owned `Trace`; Flow-owned `Trace`
 uses Repeatable Read automatically.
+
+`GetQueueStats(ctx, runtime, queues...)` returns ready, delayed, running, and
+oldest-ready measurements for all requested queue lanes through one SQL
+statement and one shared database timestamp. It includes zero-valued entries
+for empty requested lanes.
 
 ## Tests
 

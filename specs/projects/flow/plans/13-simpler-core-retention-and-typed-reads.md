@@ -1249,12 +1249,12 @@ exact accepted commit.
 - [ ] Record Flow/Trails/Absurd commits, dirty state, Go/PostgreSQL versions,
   migration checksums, schema catalog, supported durability settings, and exact
   baseline test/benchmark commands.
-- [ ] Confirm Trails has no production `Optional`, `WithFailFast(false)`, or
+- [x] Confirm Trails has no production `Optional`, `WithFailFast(false)`, or
   Flow run metadata use.
-- [ ] Confirm Plan 13 executes before Plan 12 and Plan 11 remains deferred.
-- [ ] Confirm the target release is a breaking v0.4.0 candidate and no release
+- [x] Confirm Plan 13 executes before Plan 12 and Plan 11 remains deferred.
+- [x] Confirm the target release is a breaking v0.4.0 candidate and no release
   or tag is created by implementation alone.
-- [ ] Confirm with the operator that every existing Flow database may be dropped
+- [x] Confirm with the operator that every existing Flow database may be dropped
   and recreated and record that authorization in implementation evidence.
 
 ### Definition-bound reads and compact results
@@ -1289,7 +1289,7 @@ exact accepted commit.
 
 - [x] Rewrite `001_initial.sql` as the direct final Run-named schema, fold in
   retained 002-004 behavior, delete 002-004, and add no 005.
-- [ ] Reset the registry to one schema-version-1, reader/writer-1 migration and
+- [x] Reset the registry to one schema-version-1, reader/writer-1 migration and
   document drop/recreate as the only transition from the old catalog.
 - [x] Omit five projection columns and the metadata GIN index from the clean
   baseline.
@@ -1311,7 +1311,7 @@ exact accepted commit.
   `NopObserver`.
 - [x] Preserve `ResultOf`, history options, queue/event/transaction/cancellation
   capabilities, and `Work`.
-- [ ] Update examples and `go doc`; exclude only historical plan/evidence prose,
+- [x] Update examples and `go doc`; exclude only historical plan/evidence prose,
   ordinary execute verbs, and explicit negative compile tests from old-name
   scans.
 - [x] Pass build, vet, formatting, diff, API-surface, example, and focused read
@@ -1348,11 +1348,11 @@ exact accepted commit.
 
 ### Consumer, performance, and final closure
 
-- [ ] Update package docs, README, functional spec, architecture, schema,
+- [x] Update package docs, README, functional spec, architecture, schema,
   engine/runtime components, examples, and implementation evidence.
-- [ ] Perform the disposable Trails adaptation without touching its live dirty
+- [x] Perform the disposable Trails adaptation without touching its live dirty
   worktree and record every required consumer edit.
-- [ ] Pass Trails Flow-focused compile/tests with all core graphs, delivery, and
+- [x] Pass Trails Flow-focused compile/tests with all core graphs, delivery, and
   transaction ownership intact.
 - [ ] Repeat retained benchmarks and add compact rediscovery, 16-lane stats,
   and 100/1,000-run pruning measurements.

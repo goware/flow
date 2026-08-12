@@ -24,7 +24,10 @@ and must not be retained or used concurrently. Worker-scoped `Enqueue` and
 `Event.Deliver` requires a client and target run ID because it is not part of
 the decision.
 
-Durable arguments, results, event payloads, metadata, retry settings, and journal bodies use bounded canonical JSON and hashes. A command fingerprint covers definition, key, arguments, parent, required flag, exact waits, delay, wait budget, queue, timeout, and retry policy.
+Durable arguments, results, event payloads, retry settings, and journal bodies
+use bounded canonical JSON and hashes. A command fingerprint covers definition,
+key, arguments, parent, exact waits, delay, wait budget, queue, timeout, and
+retry policy.
 
 A useful command boundary introduces independent retry, side effects,
 isolation, timeout, queue ownership, or parallelism. Small deterministic
@@ -32,24 +35,27 @@ transformations remain in one worker. Parent-produced data goes directly into
 child arguments; exact events carry sibling, cross-branch, or external facts;
 large or sensitive values use stable application-storage references.
 
-## Node grammar and event inputs
+## Staged-command grammar and event inputs
 
-`Node` is a non-generic ephemeral staging builder:
+`StagedCommand` is a non-generic ephemeral staging builder:
 
 - `Key` returns its durable key;
-- `Optional` clears required status;
 - `Delay` sets one initial delay;
 - `WaitFor` adds one exact event selector;
 - `Within` sets one wait budget.
 
-Distinct waits on a repeated same-decision declaration merge as AND gates. Other disagreement poisons the decision. Nodes are valid only during their owning worker invocation.
+Distinct waits on a repeated same-decision declaration merge as AND gates.
+Other disagreement poisons the decision. Staged commands are valid only during
+their owning worker invocation.
 
 Before a worker runs, the runtime supplies immutable canonical snapshots for
 accepted event inputs. `GetEventValue` performs an O(1) exact name/key lookup
 and returns `(value, found, error)` from memory. Ordinary absence is
 `found=false`; invalid selectors or corrupt typed payloads become decision
 defects. The function does not wait or query the database. At most 256 waits
-may exist on one command.
+may exist on one command. One worker decision may stage at most 256 distinct
+application events; exact duplicate emission remains idempotent and overflow
+poisons the whole decision.
 
 Positive public durations are rounded upward once to durable millisecond
 precision before declaration fingerprints are computed. Internal store and
@@ -66,6 +72,8 @@ they form one atomic change. Very large fan-outs should be chunked through
 bounded batch commands, and large all-of inputs reduced through hierarchical
 joins.
 
-Required command failure may enter reduced fail-fast. Optional failure is observable but does not determine success. Running attempts remain fenced and settleable; sub-commands staged after failure begins are recorded cancelled.
+Every unsuccessful terminal command makes the run fail. Queued/non-running
+siblings are cancelled, running attempts remain fenced and settleable, and
+sub-commands staged after failure begins are recorded cancelled.
 
 `flowtest` uses the production recorder and codecs. It supports worker invocation, declared event fixtures, staged event/command inspection, modifier inspection, commit callbacks, and command-ceiling validation without PostgreSQL.

@@ -211,7 +211,7 @@ func (publisher approvalPublisher) approve(ctx context.Context, order orderArgs,
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	flowTx := publisher.runtime.InTx(tx)
-	current, found, err := flow.GetCurrentRun(ctx, flowTx, startOrder.Name(), order.OrderID)
+	current, found, err := startOrder.GetCurrentRun(ctx, flowTx, order.OrderID)
 	if err != nil {
 		return err
 	}

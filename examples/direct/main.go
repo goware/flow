@@ -103,7 +103,20 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Run, fl
 		return flow.Run{}, flow.RunTrace{}, err
 	}
 	trace, err := waitForTerminal(ctx, runtime, run.RunID, 5*time.Second)
-	return trace.Run, trace, err
+	if err != nil {
+		return flow.Run{}, flow.RunTrace{}, err
+	}
+	result, found, err := sendReceipt.GetResult(ctx, runtime, run.RunID, "root")
+	if err != nil || !found {
+		if err == nil {
+			err = fmt.Errorf("root receipt result is absent")
+		}
+		return flow.Run{}, flow.RunTrace{}, err
+	}
+	if result.ProviderMessageID == "" {
+		return flow.Run{}, flow.RunTrace{}, fmt.Errorf("root receipt result has no provider message ID")
+	}
+	return trace.Run, trace, nil
 }
 
 // sendReceipt is the worker handler
