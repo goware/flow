@@ -25,10 +25,10 @@ var errRuntimeShutdown = errors.New("flow runtime is stopping")
 var errAttemptTimeout = errors.New("flow command attempt timed out")
 
 const (
-	maintenanceExecutionPage = 64
-	maintenanceWaitPage      = 128
-	maintenanceLeasePage     = 128
-	maintenanceDrainPasses   = 8
+	maintenanceRunPage     = 64
+	maintenanceWaitPage    = 128
+	maintenanceLeasePage   = 128
+	maintenanceDrainPasses = 8
 )
 
 type wakeHub struct {
@@ -529,14 +529,14 @@ func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult 
 	var result maintenancePassResult
 
 	started := time.Now()
-	executions, err := r.store.ProbeExpiredExecutions(ctx, maintenanceExecutionPage)
-	r.observeMaintenanceProbe(ctx, "deadline_probe", len(executions), err, started)
+	runs, err := r.store.ProbeExpiredRuns(ctx, maintenanceRunPage)
+	r.observeMaintenanceProbe(ctx, "deadline_probe", len(runs), err, started)
 	if err == nil {
 		transitionStarted := time.Now()
-		changed, transitionErr := r.runExecutionDeadlinePage(ctx, executions)
-		result.recordCategory(len(executions), maintenanceExecutionPage, changed)
-		if len(executions) > 0 {
-			r.observeMaintenanceTransition(ctx, "deadline", len(executions), changed, transitionErr, transitionStarted)
+		changed, transitionErr := r.runRunDeadlinePage(ctx, runs)
+		result.recordCategory(len(runs), maintenanceRunPage, changed)
+		if len(runs) > 0 {
+			r.observeMaintenanceTransition(ctx, "deadline", len(runs), changed, transitionErr, transitionStarted)
 		}
 	}
 
@@ -575,7 +575,7 @@ func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult 
 	return result
 }
 
-func (r *Runtime) runExecutionDeadlinePage(ctx context.Context, candidates []uuid.UUID) (int, error) {
+func (r *Runtime) runRunDeadlinePage(ctx context.Context, candidates []uuid.UUID) (int, error) {
 	if len(candidates) > 0 {
 		if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
 			return 0, err
@@ -584,7 +584,7 @@ func (r *Runtime) runExecutionDeadlinePage(ctx context.Context, candidates []uui
 	changed := 0
 	var firstErr error
 	for _, id := range candidates {
-		progressed, err := r.store.ExpireExecution(ctx, id, "execution deadline reached")
+		progressed, err := r.store.ExpireRun(ctx, id, "run deadline reached")
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}

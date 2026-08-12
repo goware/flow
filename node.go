@@ -32,7 +32,7 @@ func (node *Node) WaitFor(event EventRef, key string) *Node {
 	}
 	if command, ok := node.decisionCommand("wait for"); ok {
 		if !slices.Contains(command.waits, wait) && len(command.waits) >= maxCommandEventWaits {
-			node.scope.poison(newError(ErrInvalid, "execute", "wait", node.key, "command exceeds the 256 event-wait limit"))
+			node.scope.poison(newError(ErrInvalid, "enqueue", "wait", node.key, "command exceeds the 256 event-wait limit"))
 			return node
 		}
 		command.waits = addCommandEventWait(command.waits, wait)
@@ -45,23 +45,24 @@ func (node *Node) Within(duration time.Duration) *Node {
 	if node == nil {
 		return node
 	}
-	if duration < time.Millisecond {
-		node.poison(newError(ErrInvalid, "execute", "within", node.key, "within must be at least one millisecond"))
+	if duration <= 0 {
+		node.poison(newError(ErrInvalid, "enqueue", "within", node.key, "within must be positive"))
 		return node
 	}
-	if _, err := durable.ExactMilliseconds("within", duration); err != nil {
-		node.poison(newError(ErrInvalid, "execute", "within", node.key, err.Error()))
+	normalized, _, err := durable.CeilMilliseconds("within", duration)
+	if err != nil {
+		node.poison(newError(ErrInvalid, "enqueue", "within", node.key, err.Error()))
 		return node
 	}
 	if command, ok := node.decisionCommand("within"); ok {
-		if command.within == duration {
+		if command.within == normalized {
 			return node
 		}
 		if command.within > 0 {
-			node.scope.poison(newError(ErrInvalid, "execute", "within", node.key, "within configured with different values"))
+			node.scope.poison(newError(ErrInvalid, "enqueue", "within", node.key, "within configured with different values"))
 			return node
 		}
-		command.within = duration
+		command.within = normalized
 		node.scope.decision.commands[node.key] = command
 	}
 	return node
@@ -71,23 +72,24 @@ func (node *Node) Delay(duration time.Duration) *Node {
 	if node == nil {
 		return node
 	}
-	if duration < time.Millisecond {
-		node.poison(newError(ErrInvalid, "execute", "delay", node.key, "delay must be at least one millisecond"))
+	if duration <= 0 {
+		node.poison(newError(ErrInvalid, "enqueue", "delay", node.key, "delay must be positive"))
 		return node
 	}
-	if _, err := durable.ExactMilliseconds("delay", duration); err != nil {
-		node.poison(newError(ErrInvalid, "execute", "delay", node.key, err.Error()))
+	normalized, _, err := durable.CeilMilliseconds("delay", duration)
+	if err != nil {
+		node.poison(newError(ErrInvalid, "enqueue", "delay", node.key, err.Error()))
 		return node
 	}
 	if command, ok := node.decisionCommand("delay"); ok {
-		if command.startAfter == duration {
+		if command.startAfter == normalized {
 			return node
 		}
 		if command.startAfter > 0 {
-			node.scope.poison(newError(ErrInvalid, "execute", "delay", node.key, "delay configured more than once"))
+			node.scope.poison(newError(ErrInvalid, "enqueue", "delay", node.key, "delay configured more than once"))
 			return node
 		}
-		command.startAfter = duration
+		command.startAfter = normalized
 		node.scope.decision.commands[node.key] = command
 	}
 	return node
@@ -113,7 +115,7 @@ func (node *Node) decisionCommand(operation string) (stagedCommand, bool) {
 	}
 	command, ok := node.scope.decision.commands[node.key]
 	if !ok {
-		node.scope.poison(newError(ErrInvalidState, "execute", operation, node.key, "command is unavailable"))
+		node.scope.poison(newError(ErrInvalidState, "enqueue", operation, node.key, "command is unavailable"))
 	}
 	return command, ok
 }

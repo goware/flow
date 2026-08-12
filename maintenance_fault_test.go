@@ -36,15 +36,15 @@ func TestMaintenanceFaultLeavesDeadlineRecoverableByAnotherRuntime(t *testing.T)
 		return nil
 	})
 	cancelFirst, firstResult := startRuntime(t, first)
-	exec, err := command.With(first).Execute(ctx, "maintenance/fault", None{}, WithExecutionDeadline(40*time.Millisecond))
+	exec, err := command.Enqueue(ctx, first, "maintenance/fault", None{}, WithRunDeadline(40*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(120 * time.Millisecond)
 	waitForObservation(t, observer, "deadline", "error", 1, time.Second)
-	execution, err := GetExecution(ctx, first, exec.ID)
-	if err != nil || execution.Status != "running" {
-		t.Fatalf("faulted maintenance execution = %#v, %v", execution, err)
+	run, err := GetRun(ctx, first, exec.ID)
+	if err != nil || run.Status != "running" {
+		t.Fatalf("faulted maintenance run = %#v, %v", run, err)
 	}
 	stopRuntime(t, cancelFirst, firstResult)
 
@@ -53,10 +53,10 @@ func TestMaintenanceFaultLeavesDeadlineRecoverableByAnotherRuntime(t *testing.T)
 		t.Fatal(err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "expired", 3*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "expired", 3*time.Second)
 	stopRuntime(t, cancelSecond, secondResult)
 	trace, err := Trace(ctx, mustReader(t, database), exec.ID)
-	if err != nil || trace.Execution.Status != "expired" || trace.Execution.OpenCommands != 0 {
+	if err != nil || trace.Run.Status != "expired" || trace.Run.OpenCommands != 0 {
 		t.Fatalf("recovered maintenance trace = %#v, %v", trace, err)
 	}
 }
@@ -74,10 +74,10 @@ func TestMaintenancePassReportsAndDrainsFullDeadlinePage(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := DefineCommand[None, None]("maintenance.backlog", 1)
-	const executions = maintenanceExecutionPage + 1
-	for index := range executions {
-		if _, err := command.With(runtime).Execute(ctx, fmt.Sprintf("maintenance/backlog/%03d", index), None{},
-			WithExecutionDeadline(30*time.Millisecond)); err != nil {
+	const runs = maintenanceRunPage + 1
+	for index := range runs {
+		if _, err := command.Enqueue(ctx, runtime, fmt.Sprintf("maintenance/backlog/%03d", index), None{},
+			WithRunDeadline(30*time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -93,11 +93,11 @@ func TestMaintenancePassReportsAndDrainsFullDeadlinePage(t *testing.T) {
 	}
 	var expired int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+
-		pgschema.Table(database.Schema, "flow_executions")+` WHERE status='expired'`).Scan(&expired); err != nil {
+		pgschema.Table(database.Schema, "flow_runs")+` WHERE status='expired'`).Scan(&expired); err != nil {
 		t.Fatal(err)
 	}
-	if expired != executions {
-		t.Fatalf("expired executions = %d, want %d", expired, executions)
+	if expired != runs {
+		t.Fatalf("expired runs = %d, want %d", expired, runs)
 	}
 }
 
@@ -114,9 +114,9 @@ func TestMaintenanceFullLockedPageMakesNoProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := DefineCommand[None, None]("maintenance.locked_backlog", 1)
-	for index := range maintenanceExecutionPage {
-		if _, err := command.With(runtime).Execute(ctx, fmt.Sprintf("maintenance/locked/%03d", index), None{},
-			WithExecutionDeadline(30*time.Millisecond)); err != nil {
+	for index := range maintenanceRunPage {
+		if _, err := command.Enqueue(ctx, runtime, fmt.Sprintf("maintenance/locked/%03d", index), None{},
+			WithRunDeadline(30*time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -126,9 +126,9 @@ func TestMaintenanceFullLockedPageMakesNoProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = lockTx.Rollback(context.Background()) }()
-	if _, err := lockTx.Exec(ctx, `SELECT execution_id FROM `+
-		pgschema.Table(database.Schema, "flow_executions")+`
-		WHERE status='running' ORDER BY execution_id FOR UPDATE`); err != nil {
+	if _, err := lockTx.Exec(ctx, `SELECT run_id FROM `+
+		pgschema.Table(database.Schema, "flow_runs")+`
+		WHERE status='running' ORDER BY run_id FOR UPDATE`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -157,17 +157,17 @@ func TestMaintenanceCategoryErrorDoesNotStarveOtherCategories(t *testing.T) {
 	waitCommand := DefineCommand[None, None]("maintenance.category_wait", 1)
 	leaseCommand := DefineCommand[None, None]("maintenance.category_lease", 1)
 	waitEvent := DefineEvent[None]("maintenance.category_event")
-	deadlineExecution, err := deadlineCommand.With(runtime).Execute(ctx, "maintenance/category/deadline", None{},
-		WithExecutionDeadline(30*time.Millisecond))
+	deadlineRun, err := deadlineCommand.Enqueue(ctx, runtime, "maintenance/category/deadline", None{},
+		WithRunDeadline(30*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitExecution, err := waitCommand.With(runtime).Execute(ctx, "maintenance/category/wait", None{},
+	waitRun, err := waitCommand.Enqueue(ctx, runtime, "maintenance/category/wait", None{},
 		WaitFor(waitEvent, "missing"), Within(30*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaseExecution, err := leaseCommand.With(runtime).Execute(ctx, "maintenance/category/lease", None{})
+	leaseRun, err := leaseCommand.Enqueue(ctx, runtime, "maintenance/category/lease", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,17 +202,17 @@ func TestMaintenanceCategoryErrorDoesNotStarveOtherCategories(t *testing.T) {
 	waitForObservation(t, observer, "deadline", "error", 1, time.Second)
 	var deadlineStatus, waitStatus, leaseState string
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT status FROM `+
-		pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, deadlineExecution.ID).
+		pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, deadlineRun.ID).
 		Scan(&deadlineStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT status FROM `+
-		pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1`, waitExecution.ID).
+		pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, waitRun.ID).
 		Scan(&waitStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT state FROM `+
-		pgschema.Table(database.Schema, "flow_commands")+` WHERE execution_id=$1`, leaseExecution.ID).
+		pgschema.Table(database.Schema, "flow_commands")+` WHERE run_id=$1`, leaseRun.ID).
 		Scan(&leaseState); err != nil {
 		t.Fatal(err)
 	}
@@ -238,14 +238,14 @@ func TestWaitExpiryScanErrorIsReported(t *testing.T) {
 	defer runtime.observations.close()
 	command := DefineCommand[None, None]("maintenance.wait_scan_error", 1)
 	event := DefineEvent[None]("maintenance.wait_scan_error_event")
-	execution, err := command.With(runtime).Execute(ctx, "maintenance/wait-scan-error", None{},
+	run, err := command.Enqueue(ctx, runtime, "maintenance/wait-scan-error", None{},
 		WaitFor(event, "missing"), Within(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	schema := pgschema.Table(database.Schema, "flow_commands")
 	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+schema+`
-		SET wait_deadline_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, execution.RootCommandID); err != nil {
+		SET wait_deadline_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, run.RootCommandID); err != nil {
 		t.Fatal(err)
 	}
 	// The expiry probe does not read required, while ExpireCommandWait scans it
@@ -282,10 +282,10 @@ func TestMaintenanceReplicasApplyEachDeadlineOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := DefineCommand[None, None]("maintenance.replica_deadline", 1)
-	const executions = 20
-	for index := range executions {
-		if _, err := command.With(first).Execute(ctx, fmt.Sprintf("maintenance/replica/%03d", index), None{},
-			WithExecutionDeadline(30*time.Millisecond)); err != nil {
+	const runs = 20
+	for index := range runs {
+		if _, err := command.Enqueue(ctx, first, fmt.Sprintf("maintenance/replica/%03d", index), None{},
+			WithRunDeadline(30*time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -302,7 +302,7 @@ func TestMaintenanceReplicasApplyEachDeadlineOnce(t *testing.T) {
 	group.Wait()
 	var expired, terminalEntries int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+
-		pgschema.Table(database.Schema, "flow_executions")+` WHERE status='expired'`).Scan(&expired); err != nil {
+		pgschema.Table(database.Schema, "flow_runs")+` WHERE status='expired'`).Scan(&expired); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+
@@ -310,8 +310,8 @@ func TestMaintenanceReplicasApplyEachDeadlineOnce(t *testing.T) {
 		Scan(&terminalEntries); err != nil {
 		t.Fatal(err)
 	}
-	if expired != executions || terminalEntries != executions {
-		t.Fatalf("replica maintenance expired=%d terminal_entries=%d, want %d", expired, terminalEntries, executions)
+	if expired != runs || terminalEntries != runs {
+		t.Fatalf("replica maintenance expired=%d terminal_entries=%d, want %d", expired, terminalEntries, runs)
 	}
 }
 
@@ -361,7 +361,7 @@ func TestMaintenancePromptDrainDelayIsBounded(t *testing.T) {
 
 func TestMaintenanceContinuationRequiresProgressInFullCategory(t *testing.T) {
 	var result maintenancePassResult
-	result.recordCategory(maintenanceExecutionPage, maintenanceExecutionPage, 0)
+	result.recordCategory(maintenanceRunPage, maintenanceRunPage, 0)
 	result.recordCategory(1, maintenanceWaitPage, 1)
 	if !result.saturated || !result.progressed || result.drainable {
 		t.Fatalf("cross-category maintenance result = %+v", result)

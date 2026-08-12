@@ -19,10 +19,19 @@ func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 	}
 	denied := map[string]struct{}{
 		"Plan": {}, "PlanDef": {}, "DefinePlan": {}, "Fact": {}, "Facts": {},
+		"Action": {}, "DefineAction": {}, "HandleAction": {},
+		"Task": {}, "Step": {}, "Checkpoint": {}, "Workflow": {},
 		"Coordinator": {}, "Coordination": {}, "Handler": {}, "DefineCoordinator": {},
 		"OnStart": {}, "OnEvent": {}, "OnOutcome": {}, "Received": {}, "CoordinatorID": {},
 		"Outcome": {}, "OutcomeOf": {}, "ResultSource": {}, "Scope": {}, "WithCoordinatorConcurrency": {},
-		"ReadEvent": {}, "ExecutionHandle": {}, "ExecutionReceipt": {},
+		"ReadEvent": {}, "LookupEventValue": {}, "DeliverToLive": {},
+		"RunHandle": {}, "RunReceipt": {}, "Execute": {}, "Call": {},
+		"Execution": {}, "ExecutionID": {}, "ExecutionStatus": {}, "ExecutionOption": {},
+		"ExecutionFilter": {}, "ExecutionPage": {}, "ExecutionTrace": {},
+		"GetExecution": {}, "AwaitExecution": {}, "ListExecutions": {}, "CancelExecution": {},
+		"LookupLiveExecution": {}, "WithExecutionDeadline": {}, "WithoutExecutionDeadline": {},
+		"WithMaxCommandsPerExecution": {}, "ObservationExecution": {},
+		"HistoryExecutionStarted": {}, "HistoryExecutionFailing": {}, "BoundCommand": {},
 	}
 	entries, err := os.ReadDir(filepath.Dir(currentFile))
 	if err != nil {
@@ -50,11 +59,23 @@ func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 			switch value := declaration.(type) {
 			case *ast.FuncDecl:
 				check(value.Name)
+				if value.Recv != nil && (value.Name.Name == "With" || value.Name.Name == "Execute" || value.Name.Name == "Emit") {
+					t.Errorf("removed method %s reappeared in %s", value.Name.Name, name)
+				}
 			case *ast.GenDecl:
 				for _, specification := range value.Specs {
 					switch specification := specification.(type) {
 					case *ast.TypeSpec:
 						check(specification.Name)
+						if structure, ok := specification.Type.(*ast.StructType); ok {
+							for _, field := range structure.Fields.List {
+								for _, name := range field.Names {
+									if name.IsExported() && strings.HasPrefix(name.Name, "Execution") {
+										t.Errorf("removed public field %s.%s reappeared in %s", specification.Name.Name, name.Name, entry.Name())
+									}
+								}
+							}
+						}
 					case *ast.ValueSpec:
 						for _, identifier := range specification.Names {
 							check(identifier)
@@ -63,6 +84,43 @@ func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestProductionLookupSymbolsStayRemoved(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate flow module")
+	}
+	root := filepath.Dir(currentFile)
+	files := token.NewFileSet()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != root && (entry.Name() == ".git" || entry.Name() == "specs") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(files, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if ok && strings.HasPrefix(function.Name.Name, "Lookup") {
+				t.Errorf("production Lookup symbol %s reappeared in %s", function.Name.Name, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -83,7 +141,7 @@ import (
 )
 var command = flow.DefineCommand[string, int]("compile.command", 1)
 func invalid(rt *flow.Runtime) {
-	_, _ = command.With(rt).Execute(context.Background(), "key", 42)
+	_, _ = command.Enqueue(context.Background(), rt, "key", 42)
 }
 `,
 		"worker_result": `package misuse
@@ -102,8 +160,8 @@ import (
 	flow "github.com/goware/flow"
 )
 var event = flow.DefineEvent[string]("compile.event")
-func invalid(client flow.Client, id flow.ExecutionID) {
-	_ = event.Emit(context.Background(), client, id, "key", 42)
+func invalid(client flow.Client, id flow.RunID) {
+	_ = event.Deliver(context.Background(), client, id, "key", 42)
 }
 `,
 	}

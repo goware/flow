@@ -26,7 +26,7 @@ func TestObserverAdapterIsBoundedAndPanicIsolated(t *testing.T) {
 		adapter.emit(Observation{Kind: ObservationCommand, Operation: "queued"})
 	}
 	if time.Since(start) > 100*time.Millisecond {
-		t.Fatal("bounded observer queue blocked execution")
+		t.Fatal("bounded observer queue blocked run")
 	}
 	if adapter.dropped.Load() == 0 {
 		t.Fatal("observer queue overflow was not counted")

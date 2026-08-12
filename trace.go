@@ -13,18 +13,18 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Execution is a durable execution state snapshot. Execute returns the
-// snapshot as of durable acceptance; GetExecution, AwaitExecution, and other
+// Run is a durable run state snapshot. Enqueue returns the
+// snapshot as of durable acceptance; GetRun, AwaitRun, and other
 // inspection reads return the current or final state. Created reports whether
-// the producing Execute call created the execution; it is false for an
+// the producing Enqueue call created the run; it is false for an
 // idempotent rediscovery and always false on inspection reads.
-type Execution struct {
-	ID            ExecutionID
+type Run struct {
+	ID            RunID
 	Type          string
 	Version       int
 	Key           string
 	RootCommandID CommandID
-	Status        ExecutionStatus
+	Status        RunStatus
 	FailFast      bool
 	MaxCommands   int
 	CommandCount  int
@@ -108,11 +108,11 @@ type TraceEvent struct {
 	Body              json.RawMessage
 }
 
-type ExecutionTrace struct {
-	Execution Execution
-	Commands  []TraceCommand
-	Events    []TraceEvent
-	History   []HistoryEntry
+type RunTrace struct {
+	Run      Run
+	Commands []TraceCommand
+	Events   []TraceEvent
+	History  []HistoryEntry
 }
 
 type TraceOption interface {
@@ -123,18 +123,18 @@ type traceOptions struct{ errs []error }
 
 const maxTraceEntries = 100_000
 
-// Trace reconstructs one execution and overlays its current operational
+// Trace reconstructs one run and overlays its current operational
 // projections. A Runtime client gets one Flow-owned Repeatable Read snapshot.
 // A transaction-scoped client inherits the caller's isolation; callers needing
 // a coherent multi-statement snapshot must use Repeatable Read or Serializable.
-func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (ExecutionTrace, error) {
-	executionID, err := parseExecutionID(id)
+func Trace(ctx context.Context, c Client, id RunID, opts ...TraceOption) (RunTrace, error) {
+	runID, err := parseRunID(id)
 	if err != nil {
-		return ExecutionTrace{}, err
+		return RunTrace{}, err
 	}
 	client, err := resolveClient(c)
 	if err != nil {
-		return ExecutionTrace{}, err
+		return RunTrace{}, err
 	}
 	options := traceOptions{}
 	for _, option := range opts {
@@ -145,13 +145,13 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		option.applyTrace(&options)
 	}
 	if err := errors.Join(options.errs...); err != nil {
-		return ExecutionTrace{}, newError(ErrInvalid, "trace", "options", "", err.Error())
+		return RunTrace{}, newError(ErrInvalid, "trace", "options", "", err.Error())
 	}
 	var ownedTx pgx.Tx
 	if client.tx == nil {
 		ownedTx, err = client.runtime.db.Conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 		if err != nil {
-			return ExecutionTrace{}, store.MapError("begin trace snapshot", err)
+			return RunTrace{}, store.MapError("begin trace snapshot", err)
 		}
 		defer ownedTx.Rollback(context.WithoutCancel(ctx))
 		client.tx = ownedTx
@@ -159,9 +159,9 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 	rows := make([]store.JournalRow, 0, 64)
 	var after uint64
 	for len(rows) < maxTraceEntries {
-		page, err := client.runtime.store.HistoryInTx(ctx, client.tx, executionID, after, store.MaxHistoryLimit)
+		page, err := client.runtime.store.HistoryInTx(ctx, client.tx, runID, after, store.MaxHistoryLimit)
 		if err != nil {
-			return ExecutionTrace{}, err
+			return RunTrace{}, err
 		}
 		rows = append(rows, page...)
 		if len(page) < store.MaxHistoryLimit {
@@ -170,31 +170,31 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		after = uint64(page[len(page)-1].Position)
 	}
 	if len(rows) == 0 {
-		return ExecutionTrace{}, newError(ErrNotFound, "trace", "execution", string(id), "execution does not exist")
+		return RunTrace{}, newError(ErrNotFound, "trace", "run", string(id), "run does not exist")
 	}
 	if len(rows) >= maxTraceEntries {
-		return ExecutionTrace{}, newError(ErrInvalid, "trace", "execution", string(id), "trace exceeds the initial bounded history limit")
+		return RunTrace{}, newError(ErrInvalid, "trace", "run", string(id), "trace exceeds the initial bounded history limit")
 	}
 	state, err := replay.Fold(rows)
 	if err != nil {
-		return ExecutionTrace{}, newError(ErrInvalidState, "trace", "execution", string(id), "retained history cannot be replayed")
+		return RunTrace{}, newError(ErrInvalidState, "trace", "run", string(id), "retained history cannot be replayed")
 	}
-	live, err := client.runtime.store.GetExecutionInTx(ctx, client.tx, executionID)
+	live, err := client.runtime.store.GetRunInTx(ctx, client.tx, runID)
 	if err != nil {
-		return ExecutionTrace{}, err
+		return RunTrace{}, err
 	}
-	execution, err := executionFromStore(live)
+	run, err := runFromStore(live)
 	if err != nil {
-		return ExecutionTrace{}, err
+		return RunTrace{}, err
 	}
 	history, err := historyEntries(rows)
 	if err != nil {
-		return ExecutionTrace{}, err
+		return RunTrace{}, err
 	}
-	result := ExecutionTrace{Execution: execution, History: history}
-	operational, err := client.runtime.store.TraceOperationalInTx(ctx, client.tx, executionID)
+	result := RunTrace{Run: run, History: history}
+	operational, err := client.runtime.store.TraceOperationalInTx(ctx, client.tx, runID)
 	if err != nil {
-		return ExecutionTrace{}, err
+		return RunTrace{}, err
 	}
 	operationalCommands := make(map[string]store.TraceCommandRow, len(operational.Commands))
 	for _, command := range operational.Commands {
@@ -208,7 +208,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 	for _, command := range state.Commands {
 		status, err := commandStatusFromString(command.State)
 		if err != nil {
-			return ExecutionTrace{}, newError(ErrInvalidState, "trace", "command status", command.State, "replayed status is unknown")
+			return RunTrace{}, newError(ErrInvalidState, "trace", "command status", command.State, "replayed status is unknown")
 		}
 		item := TraceCommand{
 			ID: CommandID(command.ID.String()), Key: command.Key, Name: command.Name, Version: command.Version,
@@ -224,13 +224,13 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		if command.InitialDelayMS != nil {
 			item.InitialDelay, err = durable.MillisecondsDuration("replayed command initial delay", *command.InitialDelayMS)
 			if err != nil {
-				return ExecutionTrace{}, newError(ErrInvalidState, "trace", "initial delay", "", "replayed duration is out of range")
+				return RunTrace{}, newError(ErrInvalidState, "trace", "initial delay", "", "replayed duration is out of range")
 			}
 		}
 		if command.WithinMS != nil {
 			item.Within, err = durable.MillisecondsDuration("replayed command within", *command.WithinMS)
 			if err != nil {
-				return ExecutionTrace{}, newError(ErrInvalidState, "trace", "within", "", "replayed duration is out of range")
+				return RunTrace{}, newError(ErrInvalidState, "trace", "within", "", "replayed duration is out of range")
 			}
 		}
 		for _, wait := range command.Waits {
@@ -248,7 +248,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		if current, ok := operationalCommands[command.ID.String()]; ok {
 			item.State, err = commandStatusFromString(current.State)
 			if err != nil {
-				return ExecutionTrace{}, newError(ErrInvalidState, "trace", "command status", current.State, "stored status is unknown")
+				return RunTrace{}, newError(ErrInvalidState, "trace", "command status", current.State, "stored status is unknown")
 			}
 			item.BudgetStartedAt = cloneTimePointer(current.BudgetStartedAt)
 			item.NextAttemptAt = cloneTimePointer(current.NextAttemptAt)
@@ -259,7 +259,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 			if current.DeliveryState != "" {
 				item.DeliveryState, err = queueStateFromString(current.DeliveryState)
 				if err != nil {
-					return ExecutionTrace{}, newError(ErrInvalidState, "trace", "queue state", current.DeliveryState, "stored state is unknown")
+					return RunTrace{}, newError(ErrInvalidState, "trace", "queue state", current.DeliveryState, "stored state is unknown")
 				}
 			}
 			item.LeaseOwner = current.LeaseOwner
@@ -291,7 +291,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 		if event.TerminalStatus != "" {
 			terminalStatus, err = terminalStatusFromString(event.TerminalStatus)
 			if err != nil {
-				return ExecutionTrace{}, newError(ErrInvalidState, "trace", "terminal status", event.TerminalStatus, "replayed status is unknown")
+				return RunTrace{}, newError(ErrInvalidState, "trace", "terminal status", event.TerminalStatus, "replayed status is unknown")
 			}
 		}
 		item := TraceEvent{
@@ -308,7 +308,7 @@ func Trace(ctx context.Context, c Client, id ExecutionID, opts ...TraceOption) (
 	}
 	if ownedTx != nil {
 		if err := ownedTx.Commit(ctx); err != nil {
-			return ExecutionTrace{}, store.MapError("commit trace snapshot", err)
+			return RunTrace{}, store.MapError("commit trace snapshot", err)
 		}
 	}
 	return result, nil

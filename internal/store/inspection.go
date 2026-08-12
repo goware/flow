@@ -13,11 +13,11 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// MaxExecutionListLimit includes the one-row look-ahead used to construct a
-// public page cursor. Public pages remain capped at 200 executions.
-const MaxExecutionListLimit = 201
+// MaxRunListLimit includes the one-row look-ahead used to construct a
+// public page cursor. Public pages remain capped at 200 runs.
+const MaxRunListLimit = 201
 
-type ExecutionRow struct {
+type RunRow struct {
 	ID                uuid.UUID
 	DefinitionName    string
 	DefinitionVersion int
@@ -37,7 +37,7 @@ type ExecutionRow struct {
 	Metadata          []byte
 }
 
-type ExecutionListFilter struct {
+type RunListFilter struct {
 	DefinitionName string
 	KeyPrefix      string
 	Statuses       []string
@@ -49,48 +49,48 @@ type ExecutionListFilter struct {
 	Limit          int
 }
 
-func (s *Store) GetExecutionInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (ExecutionRow, error) {
+func (s *Store) GetRunInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (RunRow, error) {
 	if id == uuid.Nil {
-		return ExecutionRow{}, fmt.Errorf("%w: execution ID is nil", flowerr.ErrInvalid)
+		return RunRow{}, fmt.Errorf("%w: run ID is nil", flowerr.ErrInvalid)
 	}
-	query := s.executionSelect() + ` WHERE execution_id=$1`
+	query := s.runSelect() + ` WHERE run_id=$1`
 	if tx != nil {
-		return scanExecution(tx.QueryRow(ctx, query, id))
+		return scanRun(tx.QueryRow(ctx, query, id))
 	}
-	return scanExecution(s.db.Conn.QueryRow(ctx, query, id))
+	return scanRun(s.db.Conn.QueryRow(ctx, query, id))
 }
 
-// LookupLiveExecutionInTx finds the non-terminal execution holding a
+// GetCurrentRun finds the non-terminal run holding a
 // live-scoped key for one definition. The live-key partial unique index
 // guarantees at most one match.
-func (s *Store) LookupLiveExecutionInTx(ctx context.Context, tx pgx.Tx, definitionName, key string) (ExecutionRow, bool, error) {
+func (s *Store) GetCurrentRun(ctx context.Context, tx pgx.Tx, definitionName, key string) (RunRow, bool, error) {
 	if definitionName == "" || key == "" {
-		return ExecutionRow{}, false, fmt.Errorf("%w: lookup type and key are required", flowerr.ErrInvalid)
+		return RunRow{}, false, fmt.Errorf("%w: lookup type and key are required", flowerr.ErrInvalid)
 	}
-	query := s.executionSelect() + ` WHERE definition_name=$1 AND execution_key=$2
+	query := s.runSelect() + ` WHERE definition_name=$1 AND run_key=$2
 		AND key_scope='live' AND status IN ('running','failing') LIMIT 1`
-	rows, err := s.queryExecutions(ctx, tx, query, definitionName, key)
+	rows, err := s.queryRuns(ctx, tx, query, definitionName, key)
 	if err != nil {
-		return ExecutionRow{}, false, err
+		return RunRow{}, false, err
 	}
 	if len(rows) == 0 {
-		return ExecutionRow{}, false, nil
+		return RunRow{}, false, nil
 	}
 	return rows[0], true, nil
 }
 
-func (s *Store) ListExecutionsInTx(ctx context.Context, tx pgx.Tx, filter ExecutionListFilter) ([]ExecutionRow, error) {
-	if filter.Limit <= 0 || filter.Limit > MaxExecutionListLimit {
-		return nil, fmt.Errorf("%w: execution list limit is invalid", flowerr.ErrInvalid)
+func (s *Store) ListRunsInTx(ctx context.Context, tx pgx.Tx, filter RunListFilter) ([]RunRow, error) {
+	if filter.Limit <= 0 || filter.Limit > MaxRunListLimit {
+		return nil, fmt.Errorf("%w: run list limit is invalid", flowerr.ErrInvalid)
 	}
 	if (filter.CursorCreated == nil) != (filter.CursorID == nil) {
-		return nil, fmt.Errorf("%w: execution list cursor is incomplete", flowerr.ErrInvalid)
+		return nil, fmt.Errorf("%w: run list cursor is incomplete", flowerr.ErrInvalid)
 	}
-	query, args := s.listExecutionsQuery(filter)
-	return s.queryExecutions(ctx, tx, query, args...)
+	query, args := s.listRunsQuery(filter)
+	return s.queryRuns(ctx, tx, query, args...)
 }
 
-func (s *Store) listExecutionsQuery(filter ExecutionListFilter) (string, []any) {
+func (s *Store) listRunsQuery(filter RunListFilter) (string, []any) {
 	clauses := make([]string, 0, 7)
 	args := make([]any, 0, 8)
 	add := func(sql string, value any) {
@@ -102,7 +102,7 @@ func (s *Store) listExecutionsQuery(filter ExecutionListFilter) (string, []any) 
 	}
 	if filter.KeyPrefix != "" {
 		escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(filter.KeyPrefix)
-		add(`execution_key LIKE $%d || '%%' ESCAPE '!'`, escaped)
+		add(`run_key LIKE $%d || '%%' ESCAPE '!'`, escaped)
 	}
 	if len(filter.Statuses) != 0 {
 		add(`status=ANY($%d::text[])`, filter.Statuses)
@@ -118,26 +118,26 @@ func (s *Store) listExecutionsQuery(filter ExecutionListFilter) (string, []any) 
 	}
 	if filter.CursorCreated != nil {
 		args = append(args, *filter.CursorCreated, *filter.CursorID)
-		clauses = append(clauses, fmt.Sprintf(`(created_at,execution_id) < ($%d,$%d)`, len(args)-1, len(args)))
+		clauses = append(clauses, fmt.Sprintf(`(created_at,run_id) < ($%d,$%d)`, len(args)-1, len(args)))
 	}
 	args = append(args, filter.Limit)
-	query := s.executionSelect()
+	query := s.runSelect()
 	if len(clauses) != 0 {
 		query += ` WHERE ` + strings.Join(clauses, ` AND `)
 	}
-	query += fmt.Sprintf(` ORDER BY created_at DESC,execution_id DESC LIMIT $%d`, len(args))
+	query += fmt.Sprintf(` ORDER BY created_at DESC,run_id DESC LIMIT $%d`, len(args))
 	return query, args
 }
 
-const executionSelectColumns = `SELECT execution_id,definition_name,definition_version,execution_key,status,
+const runSelectColumns = `SELECT run_id,definition_name,definition_version,run_key,status,
 	fail_fast,max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
 	finished_at,metadata,root_command_id FROM `
 
-func (s *Store) executionSelect() string {
-	return executionSelectColumns + pgschema.Table(s.schema, "flow_executions")
+func (s *Store) runSelect() string {
+	return runSelectColumns + pgschema.Table(s.schema, "flow_runs")
 }
 
-func (s *Store) queryExecutions(ctx context.Context, tx pgx.Tx, query string, args ...any) ([]ExecutionRow, error) {
+func (s *Store) queryRuns(ctx context.Context, tx pgx.Tx, query string, args ...any) ([]RunRow, error) {
 	var rows pgx.Rows
 	var err error
 	if tx != nil {
@@ -146,25 +146,25 @@ func (s *Store) queryExecutions(ctx context.Context, tx pgx.Tx, query string, ar
 		rows, err = s.db.Conn.Query(ctx, query, args...)
 	}
 	if err != nil {
-		return nil, MapError("list executions", err)
+		return nil, MapError("list runs", err)
 	}
 	defer rows.Close()
-	result := make([]ExecutionRow, 0, min(len(args)+8, MaxExecutionListLimit))
+	result := make([]RunRow, 0, min(len(args)+8, MaxRunListLimit))
 	for rows.Next() {
-		value, err := scanExecution(rows)
+		value, err := scanRun(rows)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, value)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, MapError("read execution rows", err)
+		return nil, MapError("read run rows", err)
 	}
 	return result, nil
 }
 
-func scanExecution(row pgx.Row) (ExecutionRow, error) {
-	var value ExecutionRow
+func scanRun(row pgx.Row) (RunRow, error) {
+	var value RunRow
 	var failureBytes, metadata []byte
 	if err := row.Scan(
 		&value.ID, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
@@ -172,12 +172,12 @@ func scanExecution(row pgx.Row) (ExecutionRow, error) {
 		&failureBytes, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
 		&value.RootCommandID,
 	); err != nil {
-		return ExecutionRow{}, MapError("scan execution", err)
+		return RunRow{}, MapError("scan run", err)
 	}
 	if len(failureBytes) != 0 && string(failureBytes) != "null" {
 		decoded, err := failure.Decode(failureBytes)
 		if err != nil {
-			return ExecutionRow{}, fmt.Errorf("%w: invalid execution failure projection", flowerr.ErrInvalidState)
+			return RunRow{}, fmt.Errorf("%w: invalid run failure projection", flowerr.ErrInvalidState)
 		}
 		value.Failure = decoded
 	}

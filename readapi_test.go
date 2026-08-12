@@ -15,9 +15,9 @@ import (
 )
 
 // The bounded by-keys reads are the supported surface for consumers that
-// decorate their own domain rows with flow state: a live-keyed execution's
+// decorate their own domain rows with flow state: a live-keyed run's
 // queued work is addressable by its key through ListLiveWork, its journal
-// through ListHistoryByKeys, and settling the execution removes it from live
+// through ListHistoryByKeys, and settling the run removes it from live
 // work while its history remains.
 func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 	t.Parallel()
@@ -33,12 +33,12 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 	}
 
 	command := DefineCommand[ingressArgs, ingressResult]("readapi.work", 1)
-	started, err := command.With(runtime).Execute(ctx, "txn:42", ingressArgs{Value: "a"}, WithLiveKey())
+	started, err := command.Enqueue(ctx, runtime, "txn:42", ingressArgs{Value: "a"}, WithLiveKey())
 	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatalf("Enqueue() error = %v", err)
 	}
 	if !started.Created {
-		t.Fatalf("execution not created: %#v", started)
+		t.Fatalf("run not created: %#v", started)
 	}
 
 	workPage, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"txn:42", "txn:missing"}})
@@ -50,7 +50,7 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 		t.Fatalf("live work rows = %d, want 1 (missing keys contribute none)", len(work))
 	}
 	row := work[0]
-	if row.ExecutionKey != "txn:42" || row.KeyScope != "live" || row.ExecutionStatus != "running" ||
+	if row.RunKey != "txn:42" || row.KeyScope != "live" || row.RunStatus != "running" ||
 		row.DefinitionName != command.Name() || row.Queue == "" || row.QueueState == "" {
 		t.Fatalf("live work row = %#v", row)
 	}
@@ -61,15 +61,15 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 	}
 	history := historyPage.Entries
 	if len(history) == 0 {
-		t.Fatal("history by keys is empty for the started execution")
+		t.Fatal("history by keys is empty for the started run")
 	}
-	if history[0].ExecutionKey != "txn:42" || history[0].DefinitionName != command.Name() ||
-		history[0].Kind != HistoryExecutionStarted {
+	if history[0].RunKey != "txn:42" || history[0].DefinitionName != command.Name() ||
+		history[0].Kind != HistoryRunStarted {
 		t.Fatalf("first history entry = %#v", history[0])
 	}
 
-	if err := CancelExecution(ctx, runtime, started.ID, "test settle"); err != nil {
-		t.Fatalf("CancelExecution() error = %v", err)
+	if err := CancelRun(ctx, runtime, started.ID, "test settle"); err != nil {
+		t.Fatalf("CancelRun() error = %v", err)
 	}
 
 	workPage, err = ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"txn:42"}})
@@ -78,7 +78,7 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 	}
 	work = workPage.Work
 	if len(work) != 0 {
-		t.Fatalf("settled execution still has %d live-work rows", len(work))
+		t.Fatalf("settled run still has %d live-work rows", len(work))
 	}
 	historyPage, err = ListHistoryByKeys(ctx, runtime, KeyedHistoryFilter{Keys: []string{"txn:42"}})
 	if err != nil {
@@ -113,8 +113,8 @@ func TestBoundedReadPaginationIsStableAndFilterBound(t *testing.T) {
 	inputKeys := []string{"read/z", "read/A", "read/a", "read/é", "read/A"}
 	originalKeys := slices.Clone(inputKeys)
 	for index, key := range inputKeys[:4] {
-		if _, err := command.With(runtime).Execute(ctx, key, ingressArgs{Value: fmt.Sprint(index)}); err != nil {
-			t.Fatalf("Execute(%q) error = %v", key, err)
+		if _, err := command.Enqueue(ctx, runtime, key, ingressArgs{Value: fmt.Sprint(index)}); err != nil {
+			t.Fatalf("Enqueue(%q) error = %v", key, err)
 		}
 	}
 
@@ -154,8 +154,8 @@ func TestBoundedReadPaginationIsStableAndFilterBound(t *testing.T) {
 			t.Fatalf("duplicate live command %s", row.CommandID)
 		}
 		liveSeen[row.CommandID] = struct{}{}
-		if index > 0 && work[index-1].ExecutionKey > row.ExecutionKey {
-			t.Fatalf("live keys are not bytewise sorted at %q > %q", work[index-1].ExecutionKey, row.ExecutionKey)
+		if index > 0 && work[index-1].RunKey > row.RunKey {
+			t.Fatalf("live keys are not bytewise sorted at %q > %q", work[index-1].RunKey, row.RunKey)
 		}
 	}
 
@@ -186,8 +186,8 @@ func TestBoundedReadPaginationIsStableAndFilterBound(t *testing.T) {
 		historySeen[entry.EntryID] = struct{}{}
 		if index > 0 {
 			previous := history[index-1]
-			if previous.ExecutionKey > entry.ExecutionKey ||
-				(previous.ExecutionID == entry.ExecutionID && previous.Position >= entry.Position) {
+			if previous.RunKey > entry.RunKey ||
+				(previous.RunID == entry.RunID && previous.Position >= entry.Position) {
 				t.Fatalf("history order regressed at %#v then %#v", previous, entry)
 			}
 		}
@@ -219,11 +219,11 @@ func TestBoundedReadValidationAndCursorStrictness(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := DefineCommand[ingressArgs, ingressResult]("readapi.cursor", 1)
-	if _, err := command.With(runtime).Execute(ctx, "cursor/key", ingressArgs{}); err != nil {
+	if _, err := command.Enqueue(ctx, runtime, "cursor/key", ingressArgs{}); err != nil {
 		t.Fatal(err)
 	}
 	other := DefineCommand[ingressArgs, ingressResult]("readapi.cursor.other", 1)
-	if _, err := other.With(runtime).Execute(ctx, "cursor/key", ingressArgs{}); err != nil {
+	if _, err := other.Enqueue(ctx, runtime, "cursor/key", ingressArgs{}); err != nil {
 		t.Fatal(err)
 	}
 	first, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"cursor/key"}, PageSize: 1})
@@ -297,7 +297,7 @@ func TestBoundedReadsObserveCallerTransaction(t *testing.T) {
 	}
 	defer tx.Rollback(ctx)
 	client := runtime.InTx(tx)
-	if _, err := command.With(client).Execute(ctx, "transaction/read", ingressArgs{}); err != nil {
+	if _, err := command.Enqueue(ctx, client, "transaction/read", ingressArgs{}); err != nil {
 		t.Fatal(err)
 	}
 	live, err := ListLiveWork(ctx, client, LiveWorkFilter{Keys: []string{"transaction/read"}})

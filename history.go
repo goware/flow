@@ -13,8 +13,8 @@ import (
 type HistoryKind string
 
 const (
-	HistoryExecutionStarted HistoryKind = "execution_started"
-	HistoryExecutionFailing HistoryKind = "execution_failing"
+	HistoryRunStarted       HistoryKind = "execution_started"
+	HistoryRunFailing       HistoryKind = "execution_failing"
 	HistoryCommandCreated   HistoryKind = "command_created"
 	HistoryAttemptStarted   HistoryKind = "attempt_started"
 	HistoryAttemptConcluded HistoryKind = "attempt_concluded"
@@ -22,7 +22,7 @@ const (
 )
 
 type HistoryEntry struct {
-	ExecutionID       ExecutionID
+	RunID             RunID
 	Position          JournalPosition
 	EntryID           JournalEntryID
 	Kind              HistoryKind
@@ -68,8 +68,8 @@ func HistoryLimit(limit int) HistoryOption {
 	})
 }
 
-func History(ctx context.Context, c Client, id ExecutionID, opts ...HistoryOption) ([]HistoryEntry, error) {
-	executionID, err := parseExecutionID(id)
+func History(ctx context.Context, c Client, id RunID, opts ...HistoryOption) ([]HistoryEntry, error) {
+	runID, err := parseRunID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -88,14 +88,14 @@ func History(ctx context.Context, c Client, id ExecutionID, opts ...HistoryOptio
 	if err := errors.Join(options.errs...); err != nil {
 		return nil, newError(ErrInvalid, "history", "options", "", err.Error())
 	}
-	rows, err := client.runtime.store.HistoryInTx(ctx, client.tx, executionID, uint64(options.after), options.limit)
+	rows, err := client.runtime.store.HistoryInTx(ctx, client.tx, runID, uint64(options.after), options.limit)
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 && options.after == 0 {
-		// Every valid execution has ExecutionStarted at position one. Distinguish
-		// a missing execution from an empty page without another query.
-		return nil, newError(ErrNotFound, "history", "execution", string(id), "execution does not exist")
+		// Every valid run has RunStarted at position one. Distinguish
+		// a missing run from an empty page without another query.
+		return nil, newError(ErrNotFound, "history", "run", string(id), "run does not exist")
 	}
 	return historyEntries(rows)
 }
@@ -104,7 +104,7 @@ func historyEntries(rows []store.JournalRow) ([]HistoryEntry, error) {
 	result := make([]HistoryEntry, len(rows))
 	for index, row := range rows {
 		entry := HistoryEntry{
-			ExecutionID: ExecutionID(row.ExecutionID.String()), Position: JournalPosition(row.Position),
+			RunID: RunID(row.RunID.String()), Position: JournalPosition(row.Position),
 			EntryID: JournalEntryID(row.EntryID.String()), Kind: HistoryKind(row.Kind), RecordedAt: row.RecordedAt,
 			Body: json.RawMessage(append([]byte(nil), row.Body...)), BodyHash: hex.EncodeToString(row.BodyHash[:]),
 		}

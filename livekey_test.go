@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/goware/flow/internal/testpg"
 )
 
@@ -14,14 +15,83 @@ type liveKeyArgs struct {
 	Value string `json:"value"`
 }
 
+func TestRenamedStoreGetContracts(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("store.get_contracts", 1)
+	event := DefineEvent[string]("store.get_contracts_event")
+	run, err := command.Enqueue(ctx, runtime, "entity/gets", None{}, WithLiveKey(), WithStartDelay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := parseRunID(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandID, err := parseCommandID(run.RootCommandID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, found, err := runtime.store.GetEvent(ctx, nil, runID, event.Name(), "ready"); err != nil || found {
+		t.Fatalf("GetEvent(absent) = found %v, %v", found, err)
+	}
+	owner, err := runtime.store.GetCommandRunID(ctx, nil, commandID)
+	if err != nil || owner != runID {
+		t.Fatalf("GetCommandRunID() = %s, %v; want %s", owner, err, runID)
+	}
+	if _, err := runtime.store.GetCommandRunID(ctx, nil, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetCommandRunID(missing) error = %v, want ErrNotFound", err)
+	}
+
+	row, found, err := runtime.store.GetCurrentRun(ctx, nil, command.Name(), "entity/gets")
+	if err != nil || !found || row.ID != runID {
+		t.Fatalf("GetCurrentRun(no tx) = %#v, %v, %v", row, found, err)
+	}
+	tx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	row, found, err = runtime.store.GetCurrentRun(ctx, tx, command.Name(), "entity/gets")
+	if err != nil || !found || row.ID != runID {
+		t.Fatalf("GetCurrentRun(tx) = %#v, %v, %v", row, found, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := event.Deliver(ctx, runtime, run.ID, "ready", "value"); err != nil {
+		t.Fatal(err)
+	}
+	record, found, err := runtime.store.GetEvent(ctx, nil, runID, event.Name(), "ready")
+	if err != nil || !found || record.ID == uuid.Nil || len(record.Body) == 0 {
+		t.Fatalf("GetEvent(present) = %#v, %v, %v", record, found, err)
+	}
+	if err := CancelRun(ctx, runtime, run.ID, "store get contract complete"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := runtime.store.GetCurrentRun(ctx, nil, command.Name(), "entity/gets"); err != nil || found {
+		t.Fatalf("GetCurrentRun(terminal) = found %v, %v", found, err)
+	}
+}
+
 type liveKeyResult struct {
 	Value string `json:"value"`
 }
 
-// A live-scoped key is held while its execution is non-terminal — repeated
-// starts rediscover the live execution with no identity comparison — and is
+// A live-scoped key is held while its run is non-terminal — repeated
+// starts rediscover the live run with no identity comparison — and is
 // released at settlement, so a later start with the same key creates a new
-// execution.
+// run.
 func TestLiveKeyReleasesOnSettlement(t *testing.T) {
 	t.Parallel()
 
@@ -54,44 +124,44 @@ func TestLiveKeyReleasesOnSettlement(t *testing.T) {
 	defer stop()
 	go runtime.Run(runCtx) //nolint:errcheck // returns nil on cancel
 
-	first, err := command.With(runtime).Execute(ctx, "entity/1", liveKeyArgs{Value: "a"}, WithLiveKey())
+	first, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "a"}, WithLiveKey())
 	if err != nil || !first.Created {
 		t.Fatalf("first live start = %#v, %v", first, err)
 	}
 
-	// While the first execution is live, an equivalent start and a start with
+	// While the first run is live, an equivalent start and a start with
 	// different arguments both rediscover it silently: live keys are a dedupe
 	// on the entity, not an identity assertion.
-	same, err := command.With(runtime).Execute(ctx, "entity/1", liveKeyArgs{Value: "a"}, WithLiveKey())
+	same, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "a"}, WithLiveKey())
 	if err != nil || same.Created || same.ID != first.ID {
 		t.Fatalf("equivalent live start = %#v, %v", same, err)
 	}
-	different, err := command.With(runtime).Execute(ctx, "entity/1", liveKeyArgs{Value: "different"}, WithLiveKey())
+	different, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "different"}, WithLiveKey())
 	if err != nil || different.Created || different.ID != first.ID {
 		t.Fatalf("differing live start = %#v, %v", different, err)
 	}
 
-	live, found, err := LookupLiveExecution(ctx, runtime, command.Name(), "entity/1")
+	live, found, err := GetCurrentRun(ctx, runtime, command.Name(), "entity/1")
 	if err != nil || !found || live.ID != first.ID {
-		t.Fatalf("LookupLiveExecution(live) = %#v, %v, %v", live, found, err)
+		t.Fatalf("GetCurrentRun(live) = %#v, %v, %v", live, found, err)
 	}
 
 	close(release)
-	if _, err := AwaitExecution(ctx, runtime, first.ID); err != nil {
-		t.Fatalf("AwaitExecution() error = %v", err)
+	if _, err := AwaitRun(ctx, runtime, first.ID); err != nil {
+		t.Fatalf("AwaitRun() error = %v", err)
 	}
 
-	if _, found, err := LookupLiveExecution(ctx, runtime, command.Name(), "entity/1"); err != nil || found {
-		t.Fatalf("LookupLiveExecution(settled) = %v, %v", found, err)
+	if _, found, err := GetCurrentRun(ctx, runtime, command.Name(), "entity/1"); err != nil || found {
+		t.Fatalf("GetCurrentRun(settled) = %v, %v", found, err)
 	}
 
-	// The settled execution released the key: the same key starts fresh work.
-	second, err := command.With(runtime).Execute(ctx, "entity/1", liveKeyArgs{Value: "b"}, WithLiveKey())
+	// The settled run released the key: the same key starts fresh work.
+	second, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "b"}, WithLiveKey())
 	if err != nil || !second.Created || second.ID == first.ID {
 		t.Fatalf("post-settlement live start = %#v, %v", second, err)
 	}
-	if _, err := AwaitExecution(ctx, runtime, second.ID); err != nil {
-		t.Fatalf("AwaitExecution(second) error = %v", err)
+	if _, err := AwaitRun(ctx, runtime, second.ID); err != nil {
+		t.Fatalf("AwaitRun(second) error = %v", err)
 	}
 	if got := invocations.Load(); got != 2 {
 		t.Fatalf("handler invocations = %d, want 2", got)
@@ -99,16 +169,16 @@ func TestLiveKeyReleasesOnSettlement(t *testing.T) {
 
 	// Permanent-scope semantics are untouched: the same key under the default
 	// scope is its own identity space and conflicts on differing input.
-	permanent, err := command.With(runtime).Execute(ctx, "entity/1", liveKeyArgs{Value: "perm"})
+	permanent, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "perm"})
 	if err != nil || !permanent.Created {
 		t.Fatalf("permanent start = %#v, %v", permanent, err)
 	}
-	if _, err := command.With(runtime).Execute(ctx, "entity/1", liveKeyArgs{Value: "other"}); !errors.Is(err, ErrConflict) {
+	if _, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "other"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("permanent conflicting start error = %v", err)
 	}
 }
 
-func TestLiveKeyRequiresExecutionKey(t *testing.T) {
+func TestLiveKeyRequiresRunKey(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -121,7 +191,7 @@ func TestLiveKeyRequiresExecutionKey(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	command := DefineCommand[liveKeyArgs, liveKeyResult]("livekey.unkeyed", 1)
-	if _, err := command.With(runtime).Execute(ctx, "", liveKeyArgs{}, WithLiveKey()); !errors.Is(err, ErrInvalid) {
+	if _, err := command.Enqueue(ctx, runtime, "", liveKeyArgs{}, WithLiveKey()); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unkeyed live start error = %v", err)
 	}
 }
@@ -151,7 +221,7 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 
 	const delay = 400 * time.Millisecond
 	startedAt := time.Now()
-	exec, err := command.With(runtime).Execute(ctx, "delayed/1", liveKeyArgs{Value: "later"}, WithLiveKey(), WithStartDelay(delay))
+	exec, err := command.Enqueue(ctx, runtime, "delayed/1", liveKeyArgs{Value: "later"}, WithLiveKey(), WithStartDelay(delay))
 	if err != nil || !exec.Created {
 		t.Fatalf("delayed start = %#v, %v", exec, err)
 	}
@@ -168,12 +238,12 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 	defer stop()
 	go runtime.Run(runCtx) //nolint:errcheck // returns nil on cancel
 
-	execution, err := AwaitExecution(ctx, runtime, exec.ID)
+	run, err := AwaitRun(ctx, runtime, exec.ID)
 	if err != nil {
-		t.Fatalf("AwaitExecution() error = %v", err)
+		t.Fatalf("AwaitRun() error = %v", err)
 	}
-	if execution.Status != "succeeded" {
-		t.Fatalf("delayed execution status = %s", execution.Status)
+	if run.Status != "succeeded" {
+		t.Fatalf("delayed run status = %s", run.Status)
 	}
 	if elapsed := time.Since(startedAt); elapsed < delay {
 		t.Fatalf("delayed root ran after %s, before its %s delay", elapsed, delay)
@@ -197,10 +267,10 @@ func TestGetQueueDepthCountsLane(t *testing.T) {
 	}
 
 	command := DefineCommand[liveKeyArgs, liveKeyResult]("livekey.depth", 1, WithQueue("livekey.depth.lane"))
-	if _, err := command.With(runtime).Execute(ctx, "depth/ready", liveKeyArgs{Value: "r"}); err != nil {
+	if _, err := command.Enqueue(ctx, runtime, "depth/ready", liveKeyArgs{Value: "r"}); err != nil {
 		t.Fatalf("ready start error = %v", err)
 	}
-	if _, err := command.With(runtime).Execute(ctx, "depth/delayed", liveKeyArgs{Value: "d"}, WithStartDelay(time.Hour)); err != nil {
+	if _, err := command.Enqueue(ctx, runtime, "depth/delayed", liveKeyArgs{Value: "d"}, WithStartDelay(time.Hour)); err != nil {
 		t.Fatalf("delayed start error = %v", err)
 	}
 

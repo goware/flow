@@ -61,6 +61,25 @@ func ExactMilliseconds(field string, value time.Duration) (int64, error) {
 	return int64(value / time.Millisecond), nil
 }
 
+// CeilMilliseconds normalizes a non-negative public duration upward to its
+// durable whole-millisecond representation. Feature-specific callers retain
+// ownership of zero semantics. Values whose ceiling cannot be represented as
+// a time.Duration are rejected instead of wrapping.
+func CeilMilliseconds(field string, value time.Duration) (time.Duration, int64, error) {
+	if value < 0 {
+		return 0, 0, fmt.Errorf("%w: %s must not be negative", flowerr.ErrInvalid, field)
+	}
+	milliseconds := int64(value / time.Millisecond)
+	if value%time.Millisecond != 0 {
+		if milliseconds >= math.MaxInt64/int64(time.Millisecond) {
+			return 0, 0, fmt.Errorf("%w: %s ceiling is outside Go duration range", flowerr.ErrInvalid, field)
+		}
+		milliseconds++
+	}
+	normalized := time.Duration(milliseconds) * time.Millisecond
+	return normalized, milliseconds, nil
+}
+
 // MillisecondsDuration converts a non-negative durable millisecond value to a
 // Go duration without overflowing the narrower nanosecond representation.
 func MillisecondsDuration(field string, value int64) (time.Duration, error) {

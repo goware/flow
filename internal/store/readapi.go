@@ -25,11 +25,11 @@ const (
 // LiveWorkCursor is the last immutable ordering tuple returned by a live-work
 // list. It is internal store state; the public API binds it to its key filter.
 type LiveWorkCursor struct {
-	ExecutionKey       string
-	DefinitionName     string
-	ExecutionCreatedAt time.Time
-	ExecutionID        uuid.UUID
-	CommandID          uuid.UUID
+	RunKey         string
+	DefinitionName string
+	RunCreatedAt   time.Time
+	RunID          uuid.UUID
+	CommandID      uuid.UUID
 }
 
 // LiveWorkListFilter selects a bounded keyset page of live work.
@@ -39,35 +39,35 @@ type LiveWorkListFilter struct {
 	Cursor *LiveWorkCursor
 }
 
-// LiveWorkRow is one queued (or leased) command of a non-terminal execution,
-// carrying the execution's identity for key-addressed batch reads.
+// LiveWorkRow is one queued (or leased) command of a non-terminal run,
+// carrying the run's identity for key-addressed batch reads.
 type LiveWorkRow struct {
-	ExecutionID        uuid.UUID
-	DefinitionName     string
-	ExecutionKey       string
-	KeyScope           string
-	ExecutionStatus    string
-	ExecutionCreatedAt time.Time
-	CommandID          uuid.UUID
-	CommandKey         string
-	CommandName        string
-	Queue              string
-	QueueState         string
-	NextRunAt          time.Time
-	LeaseOwner         *string
-	LeaseExpiresAt     *time.Time
-	AttemptOrdinal     int
-	CommandCreatedAt   time.Time
+	RunID            uuid.UUID
+	DefinitionName   string
+	RunKey           string
+	KeyScope         string
+	RunStatus        string
+	RunCreatedAt     time.Time
+	CommandID        uuid.UUID
+	CommandKey       string
+	CommandName      string
+	Queue            string
+	QueueState       string
+	NextRunAt        time.Time
+	LeaseOwner       *string
+	LeaseExpiresAt   *time.Time
+	AttemptOrdinal   int
+	CommandCreatedAt time.Time
 }
 
 // KeyedHistoryCursor is the last immutable ordering tuple returned by a
 // keyed-history list.
 type KeyedHistoryCursor struct {
-	ExecutionKey       string
-	DefinitionName     string
-	ExecutionCreatedAt time.Time
-	ExecutionID        uuid.UUID
-	Position           int64
+	RunKey         string
+	DefinitionName string
+	RunCreatedAt   time.Time
+	RunID          uuid.UUID
+	Position       int64
 }
 
 // KeyedHistoryListFilter selects a bounded keyset page of retained history.
@@ -77,14 +77,14 @@ type KeyedHistoryListFilter struct {
 	Cursor *KeyedHistoryCursor
 }
 
-// KeyedJournalRow is a journal entry carrying its execution's identity, for
-// key-addressed reads that span executions.
+// KeyedJournalRow is a journal entry carrying its run's identity, for
+// key-addressed reads that span runs.
 type KeyedJournalRow struct {
-	DefinitionName     string
-	ExecutionKey       string
-	KeyScope           string
-	ExecutionCreatedAt time.Time
-	Entry              JournalRow
+	DefinitionName string
+	RunKey         string
+	KeyScope       string
+	RunCreatedAt   time.Time
+	Entry          JournalRow
 }
 
 func validateReadKeys(keys []string) error {
@@ -106,16 +106,16 @@ func validateReadLimit(limit int) error {
 	return nil
 }
 
-func validateReadCursor(executionKey, definitionName string, createdAt time.Time, executionID uuid.UUID) error {
-	if executionKey == "" || len(executionKey) > maxReadKeyBytes || !utf8.ValidString(executionKey) ||
-		definitionName == "" || !utf8.ValidString(definitionName) || createdAt.IsZero() || executionID == uuid.Nil {
+func validateReadCursor(runKey, definitionName string, createdAt time.Time, runID uuid.UUID) error {
+	if runKey == "" || len(runKey) > maxReadKeyBytes || !utf8.ValidString(runKey) ||
+		definitionName == "" || !utf8.ValidString(definitionName) || createdAt.IsZero() || runID == uuid.Nil {
 		return fmt.Errorf("%w: invalid batch read cursor", flowerr.ErrInvalid)
 	}
 	return nil
 }
 
 // ListLiveWorkInTx returns one bounded keyset page of queued commands for
-// non-terminal executions, reading through tx when supplied.
+// non-terminal runs, reading through tx when supplied.
 func (s *Store) ListLiveWorkInTx(ctx context.Context, tx pgx.Tx, filter LiveWorkListFilter) ([]LiveWorkRow, error) {
 	if err := validateReadKeys(filter.Keys); err != nil {
 		return nil, err
@@ -124,7 +124,7 @@ func (s *Store) ListLiveWorkInTx(ctx context.Context, tx pgx.Tx, filter LiveWork
 		return nil, err
 	}
 	if filter.Cursor != nil {
-		if err := validateReadCursor(filter.Cursor.ExecutionKey, filter.Cursor.DefinitionName, filter.Cursor.ExecutionCreatedAt, filter.Cursor.ExecutionID); err != nil {
+		if err := validateReadCursor(filter.Cursor.RunKey, filter.Cursor.DefinitionName, filter.Cursor.RunCreatedAt, filter.Cursor.RunID); err != nil {
 			return nil, err
 		}
 		if filter.Cursor.CommandID == uuid.Nil {
@@ -146,8 +146,8 @@ func (s *Store) ListLiveWorkInTx(ctx context.Context, tx pgx.Tx, filter LiveWork
 	for rows.Next() {
 		var row LiveWorkRow
 		if err := rows.Scan(
-			&row.ExecutionID, &row.DefinitionName, &row.ExecutionKey, &row.KeyScope, &row.ExecutionStatus,
-			&row.ExecutionCreatedAt, &row.CommandID, &row.CommandKey, &row.CommandName, &row.Queue,
+			&row.RunID, &row.DefinitionName, &row.RunKey, &row.KeyScope, &row.RunStatus,
+			&row.RunCreatedAt, &row.CommandID, &row.CommandKey, &row.CommandName, &row.Queue,
 			&row.QueueState, &row.NextRunAt, &row.LeaseOwner, &row.LeaseExpiresAt,
 			&row.AttemptOrdinal, &row.CommandCreatedAt,
 		); err != nil {
@@ -162,30 +162,30 @@ func (s *Store) ListLiveWorkInTx(ctx context.Context, tx pgx.Tx, filter LiveWork
 }
 
 func (s *Store) listLiveWorkQuery(filter LiveWorkListFilter) (string, []any) {
-	query := `SELECT fe.execution_id, fe.definition_name, fe.execution_key, fe.key_scope, fe.status, fe.created_at,
+	query := `SELECT fe.run_id, fe.definition_name, fe.run_key, fe.key_scope, fe.status, fe.created_at,
 			c.command_id, c.command_key, cq.name, cq.queue, cq.state, cq.next_run_at,
 			cq.lease_owner, cq.lease_expires_at, c.attempt_ordinal, c.created_at
-		FROM ` + pgschema.Table(s.schema, "flow_executions") + ` fe
-		JOIN ` + pgschema.Table(s.schema, "flow_command_queue") + ` cq ON cq.execution_id = fe.execution_id
+		FROM ` + pgschema.Table(s.schema, "flow_runs") + ` fe
+		JOIN ` + pgschema.Table(s.schema, "flow_command_queue") + ` cq ON cq.run_id = fe.run_id
 		JOIN ` + pgschema.Table(s.schema, "flow_commands") + ` c
-			ON c.execution_id = cq.execution_id AND c.command_id = cq.command_id
-		WHERE fe.execution_key COLLATE "C" = ANY($1::text[])
+			ON c.run_id = cq.run_id AND c.command_id = cq.command_id
+		WHERE fe.run_key COLLATE "C" = ANY($1::text[])
 			AND fe.status IN ('running', 'failing')`
 	args := []any{filter.Keys}
 	if filter.Cursor != nil {
-		query += ` AND (fe.execution_key COLLATE "C", fe.definition_name, fe.created_at, fe.execution_id, c.command_id)
+		query += ` AND (fe.run_key COLLATE "C", fe.definition_name, fe.created_at, fe.run_id, c.command_id)
 			> ($2::text COLLATE "C", $3::text, $4::timestamptz, $5::uuid, $6::uuid)`
-		args = append(args, filter.Cursor.ExecutionKey, filter.Cursor.DefinitionName,
-			filter.Cursor.ExecutionCreatedAt, filter.Cursor.ExecutionID, filter.Cursor.CommandID)
+		args = append(args, filter.Cursor.RunKey, filter.Cursor.DefinitionName,
+			filter.Cursor.RunCreatedAt, filter.Cursor.RunID, filter.Cursor.CommandID)
 	}
 	args = append(args, filter.Limit)
-	query += fmt.Sprintf(` ORDER BY fe.execution_key COLLATE "C", fe.definition_name, fe.created_at, fe.execution_id, c.command_id
+	query += fmt.Sprintf(` ORDER BY fe.run_key COLLATE "C", fe.definition_name, fe.created_at, fe.run_id, c.command_id
 		LIMIT $%d`, len(args))
 	return query, args
 }
 
 // ListJournalByKeysInTx returns one bounded keyset page of retained journal
-// entries for executions that ever held one of the keys, reading through tx
+// entries for runs that ever held one of the keys, reading through tx
 // when supplied.
 func (s *Store) ListJournalByKeysInTx(ctx context.Context, tx pgx.Tx, filter KeyedHistoryListFilter) ([]KeyedJournalRow, error) {
 	if err := validateReadKeys(filter.Keys); err != nil {
@@ -195,7 +195,7 @@ func (s *Store) ListJournalByKeysInTx(ctx context.Context, tx pgx.Tx, filter Key
 		return nil, err
 	}
 	if filter.Cursor != nil {
-		if err := validateReadCursor(filter.Cursor.ExecutionKey, filter.Cursor.DefinitionName, filter.Cursor.ExecutionCreatedAt, filter.Cursor.ExecutionID); err != nil {
+		if err := validateReadCursor(filter.Cursor.RunKey, filter.Cursor.DefinitionName, filter.Cursor.RunCreatedAt, filter.Cursor.RunID); err != nil {
 			return nil, err
 		}
 		if filter.Cursor.Position < 1 {
@@ -219,8 +219,8 @@ func (s *Store) ListJournalByKeysInTx(ctx context.Context, tx pgx.Tx, filter Key
 		var kind string
 		var bodyHash []byte
 		if err := rows.Scan(
-			&row.DefinitionName, &row.ExecutionKey, &row.KeyScope, &row.ExecutionCreatedAt,
-			&row.Entry.ExecutionID, &row.Entry.Position, &row.Entry.EntryID, &kind, &row.Entry.RecordedAt,
+			&row.DefinitionName, &row.RunKey, &row.KeyScope, &row.RunCreatedAt,
+			&row.Entry.RunID, &row.Entry.Position, &row.Entry.EntryID, &kind, &row.Entry.RecordedAt,
 			&row.Entry.CausationPosition, &row.Entry.CommandID, &row.Entry.AttemptID,
 			&row.Entry.EventID, &row.Entry.EventNamespace, &row.Entry.EventName, &row.Entry.EventKey,
 			&row.Entry.EventClass, &row.Entry.TerminalStatus, &row.Entry.Body, &bodyHash,
@@ -241,23 +241,23 @@ func (s *Store) ListJournalByKeysInTx(ctx context.Context, tx pgx.Tx, filter Key
 }
 
 func (s *Store) listJournalByKeysQuery(filter KeyedHistoryListFilter) (string, []any) {
-	query := `SELECT fe.definition_name, fe.execution_key, fe.key_scope, fe.created_at,
-			j.execution_id, j.position, j.entry_id, j.entry_kind, j.recorded_at, j.causation_position,
+	query := `SELECT fe.definition_name, fe.run_key, fe.key_scope, fe.created_at,
+			j.run_id, j.position, j.entry_id, j.entry_kind, j.recorded_at, j.causation_position,
 			j.command_id, j.attempt_id,
 			j.event_id, j.event_namespace, j.event_name, j.event_key, j.event_class, j.terminal_status,
 			j.body, j.body_hash
-		FROM ` + pgschema.Table(s.schema, "flow_executions") + ` fe
-		JOIN ` + pgschema.Table(s.schema, "flow_journal") + ` j ON j.execution_id = fe.execution_id
-		WHERE fe.execution_key COLLATE "C" = ANY($1::text[])`
+		FROM ` + pgschema.Table(s.schema, "flow_runs") + ` fe
+		JOIN ` + pgschema.Table(s.schema, "flow_journal") + ` j ON j.run_id = fe.run_id
+		WHERE fe.run_key COLLATE "C" = ANY($1::text[])`
 	args := []any{filter.Keys}
 	if filter.Cursor != nil {
-		query += ` AND (fe.execution_key COLLATE "C", fe.definition_name, fe.created_at, fe.execution_id, j.position)
+		query += ` AND (fe.run_key COLLATE "C", fe.definition_name, fe.created_at, fe.run_id, j.position)
 			> ($2::text COLLATE "C", $3::text, $4::timestamptz, $5::uuid, $6::bigint)`
-		args = append(args, filter.Cursor.ExecutionKey, filter.Cursor.DefinitionName,
-			filter.Cursor.ExecutionCreatedAt, filter.Cursor.ExecutionID, filter.Cursor.Position)
+		args = append(args, filter.Cursor.RunKey, filter.Cursor.DefinitionName,
+			filter.Cursor.RunCreatedAt, filter.Cursor.RunID, filter.Cursor.Position)
 	}
 	args = append(args, filter.Limit)
-	query += fmt.Sprintf(` ORDER BY fe.execution_key COLLATE "C", fe.definition_name, fe.created_at, fe.execution_id, j.position
+	query += fmt.Sprintf(` ORDER BY fe.run_key COLLATE "C", fe.definition_name, fe.created_at, fe.run_id, j.position
 		LIMIT $%d`, len(args))
 	return query, args
 }

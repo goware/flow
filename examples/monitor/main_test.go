@@ -48,16 +48,16 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 	}
 	var factRows, queueRows, satisfiedWaits int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE execution_id=$1 AND event_namespace='application' AND event_name=$2`,
+		WHERE run_id=$1 AND event_namespace='application' AND event_name=$2`,
 		exec.ID, bridgeDeliveredName).Scan(&factRows); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_event_waits")+`
-		WHERE execution_id=$1 AND satisfied_position IS NOT NULL`, exec.ID).Scan(&satisfiedWaits); err != nil {
+		WHERE run_id=$1 AND satisfied_position IS NOT NULL`, exec.ID).Scan(&satisfiedWaits); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE execution_id=$1`, exec.ID).Scan(&queueRows); err != nil {
+		WHERE run_id=$1`, exec.ID).Scan(&queueRows); err != nil {
 		t.Fatal(err)
 	}
 	if factRows != 1 || satisfiedWaits != 1 || queueRows != 0 {

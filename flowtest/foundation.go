@@ -59,13 +59,13 @@ const (
 )
 
 type RetryInput struct {
-	DBNow             time.Time
-	BudgetStartedAt   time.Time
-	ConsumedAttempts  int
-	AttemptID         flow.AttemptID
-	Class             RetryClass
-	ExplicitDelay     time.Duration
-	ExecutionDeadline *time.Time
+	DBNow            time.Time
+	BudgetStartedAt  time.Time
+	ConsumedAttempts int
+	AttemptID        flow.AttemptID
+	Class            RetryClass
+	ExplicitDelay    time.Duration
+	RunDeadline      *time.Time
 }
 
 type RetryDecision struct {
@@ -84,13 +84,13 @@ func DecideRetry(policy flow.RetryPolicy, input RetryInput) (RetryDecision, erro
 		explicit = &delay
 	}
 	decision, err := retrypolicy.DecidePublic(policy, retrypolicy.Input{
-		DBNow:             input.DBNow,
-		BudgetStartedAt:   input.BudgetStartedAt,
-		ConsumedAttempts:  input.ConsumedAttempts,
-		AttemptID:         string(input.AttemptID),
-		Classification:    class,
-		ExplicitDelay:     explicit,
-		ExecutionDeadline: input.ExecutionDeadline,
+		DBNow:            input.DBNow,
+		BudgetStartedAt:  input.BudgetStartedAt,
+		ConsumedAttempts: input.ConsumedAttempts,
+		AttemptID:        string(input.AttemptID),
+		Classification:   class,
+		ExplicitDelay:    explicit,
+		RunDeadline:      input.RunDeadline,
 	})
 	if err != nil {
 		return RetryDecision{}, fmt.Errorf("decide retry: %w", err)

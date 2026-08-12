@@ -17,13 +17,13 @@ import (
 )
 
 const (
-	benchmarkPollInterval              = 5 * time.Millisecond
-	benchmarkLifecycleBatchSize        = 64
-	benchmarkExternalExecutionDeadline = 30 * time.Minute
-	benchmarkExternalHoldKey           = "benchmark/hold"
+	benchmarkPollInterval        = 5 * time.Millisecond
+	benchmarkLifecycleBatchSize  = 64
+	benchmarkExternalRunDeadline = 30 * time.Minute
+	benchmarkExternalHoldKey     = "benchmark/hold"
 )
 
-func BenchmarkExecutionIngressNotification(b *testing.B) {
+func BenchmarkRunIngressNotification(b *testing.B) {
 	for _, notifications := range []bool{false, true} {
 		name := map[bool]string{false: "poll_only", true: "notify"}[notifications]
 		b.Run(name, func(b *testing.B) {
@@ -39,7 +39,7 @@ func BenchmarkExecutionIngressNotification(b *testing.B) {
 			command := DefineCommand[None, None]("benchmark.notification", 1)
 			b.ResetTimer()
 			for index := range b.N {
-				if _, err := command.With(runtime).Execute(ctx, fmt.Sprintf("ingress/%d", index), None{}, WithoutExecutionDeadline()); err != nil {
+				if _, err := command.Enqueue(ctx, runtime, fmt.Sprintf("ingress/%d", index), None{}, WithoutRunDeadline()); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -79,22 +79,22 @@ func BenchmarkIndependentCommandLifecycle(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := range b.N {
-				executions := make([]Execution, benchmarkLifecycleBatchSize)
+				runs := make([]Run, benchmarkLifecycleBatchSize)
 				err := runBenchmarkProducers(producers, benchmarkLifecycleBatchSize, func(index int) error {
 					var executeErr error
-					executions[index], executeErr = command.With(runtime).Execute(ctx,
-						fmt.Sprintf("lifecycle/%d/%d", iteration, index), None{}, WithoutExecutionDeadline())
+					runs[index], executeErr = command.Enqueue(ctx, runtime,
+						fmt.Sprintf("lifecycle/%d/%d", iteration, index), None{}, WithoutRunDeadline())
 					return executeErr
 				})
 				if err != nil {
 					b.Fatal(err)
 				}
 				waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				for _, execution := range executions {
-					settled, awaitErr := AwaitExecution(waitCtx, runtime, execution.ID)
-					if awaitErr != nil || settled.Status != ExecutionStatusSucceeded || settled.CommandCount != 1 {
+				for _, run := range runs {
+					settled, awaitErr := AwaitRun(waitCtx, runtime, run.ID)
+					if awaitErr != nil || settled.Status != RunStatusSucceeded || settled.CommandCount != 1 {
 						cancel()
-						b.Fatalf("AwaitExecution() = status %q commands %d, err %v",
+						b.Fatalf("AwaitRun() = status %q commands %d, err %v",
 							settled.Status, settled.CommandCount, awaitErr)
 					}
 				}
@@ -106,30 +106,30 @@ func BenchmarkIndependentCommandLifecycle(b *testing.B) {
 	}
 }
 
-// BenchmarkSameExecutionFanout measures a complete fan-out execution. The
+// BenchmarkSameRunFanout measures a complete fan-out run. The
 // size is the total command count, including the root command. Notifications
 // are disabled so the workload uses deterministic local polling.
-func BenchmarkSameExecutionFanout(b *testing.B) {
+func BenchmarkSameRunFanout(b *testing.B) {
 	for _, commandCount := range []int{10, 100} {
 		b.Run(fmt.Sprintf("commands_%d", commandCount), func(b *testing.B) {
-			benchmarkSameExecutionFanout(b, commandCount)
+			benchmarkSameRunFanout(b, commandCount)
 		})
 	}
 }
 
-// BenchmarkSameExecutionFanoutStress1000 is deliberately opt-in and one-shot.
+// BenchmarkSameRunFanoutStress1000 is deliberately opt-in and one-shot.
 // Run it with FLOW_BENCHMARK_STRESS=1 and -benchtime=1x.
-func BenchmarkSameExecutionFanoutStress1000(b *testing.B) {
+func BenchmarkSameRunFanoutStress1000(b *testing.B) {
 	if os.Getenv("FLOW_BENCHMARK_STRESS") != "1" {
 		b.Skip("set FLOW_BENCHMARK_STRESS=1 and use -benchtime=1x for the 1,000-command stress workload")
 	}
 	if b.N != 1 {
 		b.Fatalf("1,000-command stress workload requires -benchtime=1x (b.N=%d)", b.N)
 	}
-	benchmarkSameExecutionFanout(b, 1000)
+	benchmarkSameRunFanout(b, 1000)
 }
 
-func benchmarkSameExecutionFanout(b *testing.B, commandCount int) {
+func benchmarkSameRunFanout(b *testing.B, commandCount int) {
 	b.Helper()
 	database := testpg.Open(b)
 	ctx := context.Background()
@@ -139,14 +139,14 @@ func benchmarkSameExecutionFanout(b *testing.B, commandCount int) {
 	child := DefineCommand[None, None]("benchmark.fanout.child", 1)
 	root := DefineCommand[None, None]("benchmark.fanout.root", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
-		WithMaxCommandsPerExecution(0), WithWorkerConcurrency(16), WithPollInterval(benchmarkPollInterval))
+		WithMaxCommandsPerRun(0), WithWorkerConcurrency(16), WithPollInterval(benchmarkPollInterval))
 	if err != nil {
 		b.Fatal(err)
 	}
 	if err := runtime.Register(
 		Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
 			for index := 1; index < commandCount; index++ {
-				Execute(work, fmt.Sprintf("work/%04d", index), child, None{})
+				Enqueue(work, fmt.Sprintf("work/%04d", index), child, None{})
 			}
 			return None{}, nil
 		}),
@@ -163,16 +163,16 @@ func benchmarkSameExecutionFanout(b *testing.B, commandCount int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for iteration := range b.N {
-		execution, executeErr := root.With(runtime).Execute(ctx,
-			fmt.Sprintf("fanout/%d/%d", commandCount, iteration), None{}, WithoutExecutionDeadline())
+		run, executeErr := root.Enqueue(ctx, runtime,
+			fmt.Sprintf("fanout/%d/%d", commandCount, iteration), None{}, WithoutRunDeadline())
 		if executeErr != nil {
 			b.Fatal(executeErr)
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		settled, awaitErr := AwaitExecution(waitCtx, runtime, execution.ID)
+		settled, awaitErr := AwaitRun(waitCtx, runtime, run.ID)
 		cancel()
-		if awaitErr != nil || settled.Status != ExecutionStatusSucceeded || settled.CommandCount != commandCount {
-			b.Fatalf("AwaitExecution() = status %q commands %d, err %v",
+		if awaitErr != nil || settled.Status != RunStatusSucceeded || settled.CommandCount != commandCount {
+			b.Fatalf("AwaitRun() = status %q commands %d, err %v",
 				settled.Status, settled.CommandCount, awaitErr)
 		}
 	}
@@ -181,10 +181,10 @@ func benchmarkSameExecutionFanout(b *testing.B, commandCount int) {
 	reportBenchmarkRate(b, float64(b.N*commandCount), "commands")
 }
 
-// BenchmarkSameExecutionClaimBatch measures one ordinary multi-command claim
-// transaction for ready siblings in the same execution. Fixture creation,
+// BenchmarkSameRunClaimBatch measures one ordinary multi-command claim
+// transaction for ready siblings in the same run. Fixture creation,
 // candidate probing, and projection reset are excluded from the timed region.
-func BenchmarkSameExecutionClaimBatch(b *testing.B) {
+func BenchmarkSameRunClaimBatch(b *testing.B) {
 	const commandCount = 16
 
 	database := testpg.Open(b)
@@ -195,20 +195,20 @@ func BenchmarkSameExecutionClaimBatch(b *testing.B) {
 	parent := DefineCommand[None, None]("benchmark.claim_batch.parent", 1)
 	child := DefineCommand[None, None]("benchmark.claim_batch.child", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
-		WithMaxCommandsPerExecution(0), WithWorkerConcurrency(1), WithPollInterval(benchmarkPollInterval))
+		WithMaxCommandsPerRun(0), WithWorkerConcurrency(1), WithPollInterval(benchmarkPollInterval))
 	if err != nil {
 		b.Fatal(err)
 	}
 	if err := runtime.Register(Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
 		for index := range commandCount {
-			Execute(work, fmt.Sprintf("child/%02d", index), child, None{})
+			Enqueue(work, fmt.Sprintf("child/%02d", index), child, None{})
 		}
 		return None{}, nil
 	})); err != nil {
 		b.Fatal(err)
 	}
 	stop := startBenchmarkRuntime(b, runtime)
-	execution, err := parent.With(runtime).Execute(ctx, "claim-batch", None{}, WithoutExecutionDeadline())
+	run, err := parent.Enqueue(ctx, runtime, "claim-batch", None{}, WithoutRunDeadline())
 	if err != nil {
 		stop()
 		b.Fatal(err)
@@ -218,10 +218,10 @@ func BenchmarkSameExecutionClaimBatch(b *testing.B) {
 		var persistedCommands int
 		var parentState string
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT e.command_count,c.state
-			FROM `+pgschema.Table(database.Schema, "flow_executions")+` e
+			FROM `+pgschema.Table(database.Schema, "flow_runs")+` e
 			JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c
-			  ON c.execution_id=e.execution_id AND c.command_id=e.root_command_id
-			WHERE e.execution_id=$1`, execution.ID).Scan(&persistedCommands, &parentState); err != nil {
+			  ON c.run_id=e.run_id AND c.command_id=e.root_command_id
+			WHERE e.run_id=$1`, run.ID).Scan(&persistedCommands, &parentState); err != nil {
 			stop()
 			b.Fatal(err)
 		}
@@ -263,11 +263,11 @@ func resetBenchmarkClaimBatch(b *testing.B, ctx context.Context, runtime *Runtim
 	commandIDs := make([]uuid.UUID, len(claims))
 	attemptIDs := make([]uuid.UUID, len(claims))
 	firstPosition := claims[0].AttemptStartedPosition
-	executionID := claims[0].ExecutionID
+	runID := claims[0].RunID
 	for index, claim := range claims {
-		if claim.ExecutionID != executionID || claim.AttemptStartedPosition != firstPosition+int64(index) {
-			b.Fatalf("claim[%d] execution=%s position=%d, want %s/%d", index,
-				claim.ExecutionID, claim.AttemptStartedPosition, executionID, firstPosition+int64(index))
+		if claim.RunID != runID || claim.AttemptStartedPosition != firstPosition+int64(index) {
+			b.Fatalf("claim[%d] run=%s position=%d, want %s/%d", index,
+				claim.RunID, claim.AttemptStartedPosition, runID, firstPosition+int64(index))
 		}
 		commandIDs[index], attemptIDs[index] = claim.CommandID, claim.AttemptID
 	}
@@ -277,8 +277,8 @@ func resetBenchmarkClaimBatch(b *testing.B, ctx context.Context, runtime *Runtim
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	removed, err := tx.Exec(ctx, `DELETE FROM `+pgschema.Table(runtime.schema, "flow_journal")+`
-		WHERE execution_id=$1 AND attempt_id=ANY($2::uuid[]) AND entry_kind='attempt_started'`,
-		executionID, attemptIDs)
+		WHERE run_id=$1 AND attempt_id=ANY($2::uuid[]) AND entry_kind='attempt_started'`,
+		runID, attemptIDs)
 	if err != nil || removed.RowsAffected() != int64(len(claims)) {
 		b.Fatalf("reset claim journal rows=%d, err=%v", removed.RowsAffected(), err)
 	}
@@ -289,23 +289,23 @@ func resetBenchmarkClaimBatch(b *testing.B, ctx context.Context, runtime *Runtim
 	SET state='ready',active_attempt_id=NULL,lease_token=NULL,lease_owner=NULL,
 	    lease_started_at=NULL,lease_expires_at=NULL
 	FROM reset
-	WHERE q.command_id=reset.command_id AND q.execution_id=$3 AND q.active_attempt_id=reset.attempt_id`,
-		commandIDs, attemptIDs, executionID)
+	WHERE q.command_id=reset.command_id AND q.run_id=$3 AND q.active_attempt_id=reset.attempt_id`,
+		commandIDs, attemptIDs, runID)
 	if err != nil || resetQueue.RowsAffected() != int64(len(claims)) {
 		b.Fatalf("reset claim queue rows=%d, err=%v", resetQueue.RowsAffected(), err)
 	}
 	resetCommand, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_commands")+`
 		SET state='ready',attempt_ordinal=attempt_ordinal-1
-		WHERE execution_id=$1 AND command_id=ANY($2::uuid[]) AND state='running' AND attempt_ordinal>0`,
-		executionID, commandIDs)
+		WHERE run_id=$1 AND command_id=ANY($2::uuid[]) AND state='running' AND attempt_ordinal>0`,
+		runID, commandIDs)
 	if err != nil || resetCommand.RowsAffected() != int64(len(claims)) {
 		b.Fatalf("reset claim command rows=%d, err=%v", resetCommand.RowsAffected(), err)
 	}
-	resetExecution, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_executions")+`
+	resetRun, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_runs")+`
 		SET next_journal_position=$2
-		WHERE execution_id=$1 AND next_journal_position=$2::bigint+$3::bigint`, executionID, firstPosition, len(claims))
-	if err != nil || resetExecution.RowsAffected() != 1 {
-		b.Fatalf("reset claim execution rows=%d, err=%v", resetExecution.RowsAffected(), err)
+		WHERE run_id=$1 AND next_journal_position=$2::bigint+$3::bigint`, runID, firstPosition, len(claims))
+	if err != nil || resetRun.RowsAffected() != 1 {
+		b.Fatalf("reset claim run rows=%d, err=%v", resetRun.RowsAffected(), err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		b.Fatal(err)
@@ -313,7 +313,7 @@ func resetBenchmarkClaimBatch(b *testing.B, ctx context.Context, runtime *Runtim
 }
 
 // BenchmarkStagedDecisionBatch isolates the successful settlement transaction
-// from execution ingress, claiming, handler work, and later child execution.
+// from run ingress, claiming, handler work, and later child run.
 // Child shapes rotate through no waits, one wait, and three waits.
 func BenchmarkStagedDecisionBatch(b *testing.B) {
 	for _, childCount := range []int{1, 10, 100} {
@@ -326,7 +326,7 @@ func BenchmarkStagedDecisionBatch(b *testing.B) {
 					b.Fatal(err)
 				}
 				runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
-					WithMaxCommandsPerExecution(0))
+					WithMaxCommandsPerRun(0))
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -364,27 +364,27 @@ func BenchmarkExternalEventIngress(b *testing.B) {
 		runtime, root, event := setupExternalEventBenchmark(b)
 		targets := make([]benchmarkEventTarget, b.N)
 		for index := range b.N {
-			execution, err := root.With(runtime).Execute(context.Background(),
+			run, err := root.Enqueue(context.Background(), runtime,
 				fmt.Sprintf("external/distinct/%d", index), None{},
-				WithExecutionDeadline(benchmarkExternalExecutionDeadline), WaitFor(event, benchmarkExternalHoldKey))
+				WithRunDeadline(benchmarkExternalRunDeadline), WaitFor(event, benchmarkExternalHoldKey))
 			if err != nil {
 				b.Fatal(err)
 			}
-			targets[index] = benchmarkEventTarget{executionID: execution.ID, key: fmt.Sprintf("event/%d", index)}
+			targets[index] = benchmarkEventTarget{runID: run.ID, key: fmt.Sprintf("event/%d", index)}
 		}
 		benchmarkEventTargets(b, runtime, event, targets)
 	})
 
 	b.Run("hot_live/no_match", func(b *testing.B) {
 		runtime, root, event := setupExternalEventBenchmark(b)
-		execution, err := root.With(runtime).Execute(context.Background(), "external/hot", None{},
-			WithExecutionDeadline(benchmarkExternalExecutionDeadline), WaitFor(event, benchmarkExternalHoldKey))
+		run, err := root.Enqueue(context.Background(), runtime, "external/hot", None{},
+			WithRunDeadline(benchmarkExternalRunDeadline), WaitFor(event, benchmarkExternalHoldKey))
 		if err != nil {
 			b.Fatal(err)
 		}
 		targets := make([]benchmarkEventTarget, b.N)
 		for index := range b.N {
-			targets[index] = benchmarkEventTarget{executionID: execution.ID, key: fmt.Sprintf("event/%d", index)}
+			targets[index] = benchmarkEventTarget{runID: run.ID, key: fmt.Sprintf("event/%d", index)}
 		}
 		benchmarkEventTargets(b, runtime, event, targets)
 	})
@@ -392,11 +392,11 @@ func BenchmarkExternalEventIngress(b *testing.B) {
 	b.Run("retained_100/no_match", func(b *testing.B) {
 		runtime, root, event := setupExternalEventBenchmark(b)
 		child := DefineCommand[None, None]("benchmark.external.child", 1)
-		executionID, _ := createRetainedWaitExecution(b, runtime, root, child, event,
+		runID, _ := createRetainedWaitRun(b, runtime, root, child, event,
 			"external/retained/no-match", func(index int) string { return fmt.Sprintf("wait/%03d", index) })
 		targets := make([]benchmarkEventTarget, b.N)
 		for index := range b.N {
-			targets[index] = benchmarkEventTarget{executionID: executionID, key: fmt.Sprintf("unmatched/%d", index)}
+			targets[index] = benchmarkEventTarget{runID: runID, key: fmt.Sprintf("unmatched/%d", index)}
 		}
 		benchmarkEventTargets(b, runtime, event, targets)
 	})
@@ -406,11 +406,11 @@ func BenchmarkExternalEventIngress(b *testing.B) {
 		child := DefineCommand[None, None]("benchmark.external.child", 1)
 		targets := make([]benchmarkEventTarget, 0, b.N*99)
 		for iteration := range b.N {
-			executionID, keys := createRetainedWaitExecution(b, runtime, root, child, event,
+			runID, keys := createRetainedWaitRun(b, runtime, root, child, event,
 				fmt.Sprintf("external/retained/match-one/%d", iteration),
 				func(index int) string { return fmt.Sprintf("wait/%03d", index) })
 			for _, key := range keys {
-				targets = append(targets, benchmarkEventTarget{executionID: executionID, key: key})
+				targets = append(targets, benchmarkEventTarget{runID: runID, key: key})
 			}
 		}
 		benchmarkEventTargets(b, runtime, event, targets)
@@ -421,11 +421,11 @@ func BenchmarkExternalEventIngress(b *testing.B) {
 		child := DefineCommand[None, None]("benchmark.external.child", 1)
 		targets := make([]benchmarkEventTarget, 0, b.N*11)
 		for iteration := range b.N {
-			executionID, keys := createRetainedWaitExecution(b, runtime, root, child, event,
+			runID, keys := createRetainedWaitRun(b, runtime, root, child, event,
 				fmt.Sprintf("external/retained/match-several/%d", iteration),
 				func(index int) string { return fmt.Sprintf("group/%02d", index/9) })
 			for _, key := range keys {
-				targets = append(targets, benchmarkEventTarget{executionID: executionID, key: key})
+				targets = append(targets, benchmarkEventTarget{runID: runID, key: key})
 			}
 		}
 		benchmarkEventTargets(b, runtime, event, targets)
@@ -433,8 +433,8 @@ func BenchmarkExternalEventIngress(b *testing.B) {
 }
 
 type benchmarkEventTarget struct {
-	executionID ExecutionID
-	key         string
+	runID RunID
+	key   string
 }
 
 func setupExternalEventBenchmark(b *testing.B) (*Runtime, Command[None, None], Event[None]) {
@@ -445,7 +445,7 @@ func setupExternalEventBenchmark(b *testing.B) (*Runtime, Command[None, None], E
 		b.Fatal(err)
 	}
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
-		WithMaxCommandsPerExecution(0))
+		WithMaxCommandsPerRun(0))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -460,7 +460,7 @@ func benchmarkEventTargets(b *testing.B, runtime *Runtime, event Event[None], ta
 	b.ReportAllocs()
 	b.ResetTimer()
 	for _, target := range targets {
-		if err := event.Emit(ctx, runtime, target.executionID, target.key, None{}); err != nil {
+		if err := event.Deliver(ctx, runtime, target.runID, target.key, None{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -478,54 +478,54 @@ func assertBenchmarkTargetsHeld(
 	targets []benchmarkEventTarget,
 ) {
 	b.Helper()
-	seen := make(map[ExecutionID]struct{}, len(targets))
+	seen := make(map[RunID]struct{}, len(targets))
 	for _, target := range targets {
-		if _, checked := seen[target.executionID]; checked {
+		if _, checked := seen[target.runID]; checked {
 			continue
 		}
-		seen[target.executionID] = struct{}{}
-		execution, err := GetExecution(ctx, runtime, target.executionID)
-		if err != nil || execution.Status != ExecutionStatusRunning || execution.DeadlineAt == nil {
+		seen[target.runID] = struct{}{}
+		run, err := GetRun(ctx, runtime, target.runID)
+		if err != nil || run.Status != RunStatusRunning || run.DeadlineAt == nil {
 			b.Fatalf("external target %s status=%q deadline=%v, err=%v",
-				target.executionID, execution.Status, execution.DeadlineAt, err)
+				target.runID, run.Status, run.DeadlineAt, err)
 		}
 		var unresolvedHold int
 		if err := runtime.db.Conn.QueryRow(ctx, `SELECT count(*) FROM `+
 			pgschema.Table(runtime.schema, "flow_command_event_waits")+`
-			WHERE execution_id=$1 AND event_name=$2 AND event_key=$3 AND satisfied_position IS NULL`,
-			target.executionID, event.Name(), benchmarkExternalHoldKey).Scan(&unresolvedHold); err != nil {
+			WHERE run_id=$1 AND event_name=$2 AND event_key=$3 AND satisfied_position IS NULL`,
+			target.runID, event.Name(), benchmarkExternalHoldKey).Scan(&unresolvedHold); err != nil {
 			b.Fatal(err)
 		}
 		if unresolvedHold != 1 {
-			b.Fatalf("external target %s unresolved hold waits=%d, want 1", target.executionID, unresolvedHold)
+			b.Fatalf("external target %s unresolved hold waits=%d, want 1", target.runID, unresolvedHold)
 		}
 	}
 }
 
-// createRetainedWaitExecution settles one root with 99 waiting children. The
-// resulting finite execution contains exactly 100 retained commands. One
+// createRetainedWaitRun settles one root with 99 waiting children. The
+// resulting finite run contains exactly 100 retained commands. One
 // child has an additional hold wait that is never included in the returned
 // event keys, so every measured shape remains deliberately live.
-func createRetainedWaitExecution(
+func createRetainedWaitRun(
 	b *testing.B,
 	runtime *Runtime,
 	root Command[None, None],
 	child Command[None, None],
 	event Event[None],
-	executionKey string,
+	runKey string,
 	waitKey func(int) string,
-) (ExecutionID, []string) {
+) (RunID, []string) {
 	b.Helper()
 	ctx := context.Background()
-	claim := claimBenchmarkRoot(b, ctx, runtime, root, executionKey,
-		WithExecutionDeadline(benchmarkExternalExecutionDeadline))
+	claim := claimBenchmarkRoot(b, ctx, runtime, root, runKey,
+		WithRunDeadline(benchmarkExternalRunDeadline))
 	scope := &workScope{args: None{}}
 	work := &Work[None]{Args: None{}, scope: &scope.state}
 	keys := make([]string, 0, 99)
 	seen := make(map[string]struct{}, 99)
 	for index := range 99 {
 		key := waitKey(index)
-		node := Execute(work, fmt.Sprintf("waiting/%03d", index), child, None{}).WaitFor(event, key)
+		node := Enqueue(work, fmt.Sprintf("waiting/%03d", index), child, None{}).WaitFor(event, key)
 		if index == 0 {
 			node.WaitFor(event, benchmarkExternalHoldKey)
 		}
@@ -549,15 +549,15 @@ func createRetainedWaitExecution(
 	}
 	var commandCount, waitCount int
 	if err := runtime.db.Conn.QueryRow(ctx, `SELECT
-		(SELECT count(*) FROM `+pgschema.Table(runtime.schema, "flow_commands")+` WHERE execution_id=$1),
-		(SELECT count(*) FROM `+pgschema.Table(runtime.schema, "flow_command_event_waits")+` WHERE execution_id=$1)`,
-		claim.ExecutionID).Scan(&commandCount, &waitCount); err != nil {
+		(SELECT count(*) FROM `+pgschema.Table(runtime.schema, "flow_commands")+` WHERE run_id=$1),
+		(SELECT count(*) FROM `+pgschema.Table(runtime.schema, "flow_command_event_waits")+` WHERE run_id=$1)`,
+		claim.RunID).Scan(&commandCount, &waitCount); err != nil {
 		b.Fatal(err)
 	}
 	if commandCount != 100 || waitCount != 100 {
 		b.Fatalf("retained fixture has commands=%d waits=%d, want 100 and 100", commandCount, waitCount)
 	}
-	return ExecutionID(claim.ExecutionID.String()), keys
+	return RunID(claim.RunID.String()), keys
 }
 
 func claimBenchmarkRoot(
@@ -565,27 +565,27 @@ func claimBenchmarkRoot(
 	ctx context.Context,
 	runtime *Runtime,
 	root Command[None, None],
-	executionKey string,
-	opts ...ExecutionOption,
+	runKey string,
+	opts ...RunOption,
 ) store.ClaimedCommand {
 	b.Helper()
 	if len(opts) == 0 {
-		opts = []ExecutionOption{WithoutExecutionDeadline()}
+		opts = []RunOption{WithoutRunDeadline()}
 	}
-	execution, err := root.With(runtime).Execute(ctx, executionKey, None{}, opts...)
+	run, err := root.Enqueue(ctx, runtime, runKey, None{}, opts...)
 	if err != nil {
 		b.Fatal(err)
 	}
-	commandID, err := uuid.Parse(string(execution.RootCommandID))
+	commandID, err := uuid.Parse(string(run.RootCommandID))
 	if err != nil {
 		b.Fatal(err)
 	}
-	executionID, err := uuid.Parse(string(execution.ID))
+	runID, err := uuid.Parse(string(run.ID))
 	if err != nil {
 		b.Fatal(err)
 	}
 	claimed, err := runtime.store.ClaimCommand(ctx, store.CommandCandidate{
-		CommandID: commandID, ExecutionID: executionID, Queue: defaultQueue,
+		CommandID: commandID, RunID: runID, Queue: defaultQueue,
 		Name: root.Name(), Version: root.Version(),
 	}, time.Minute, "benchmark", nil)
 	if err != nil || claimed.Command == nil {
@@ -611,7 +611,7 @@ func prepareBenchmarkDecision(
 		}
 	}
 	for index := range childCount {
-		node := Execute(work, fmt.Sprintf("child/%03d", index), child, None{})
+		node := Enqueue(work, fmt.Sprintf("child/%03d", index), child, None{})
 		waitCount := index % 3
 		if waitCount == 2 {
 			waitCount = 3
@@ -709,9 +709,9 @@ func BenchmarkGetEventValueLookup256(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		value, err := GetEventValue(work, event, "input/255")
-		if err != nil || value != 255 {
-			b.Fatalf("GetEventValue() = %d, %v", value, err)
+		value, found, err := GetEventValue(work, event, "input/255")
+		if err != nil || !found || value != 255 {
+			b.Fatalf("GetEventValue() = %d, %v, %v", value, found, err)
 		}
 	}
 }
@@ -737,7 +737,7 @@ func BenchmarkEventSnapshotMaterialization(b *testing.B) {
 
 // BenchmarkEventSnapshotMaterialization256 measures a command claim that
 // batches 256 maximum-size event payloads into one immutable worker input
-// snapshot. Migration, execution ingress, event ingress, and candidate setup
+// snapshot. Migration, run ingress, event ingress, and candidate setup
 // are excluded from the timed region.
 func BenchmarkEventSnapshotMaterialization256(b *testing.B) {
 	benchmarkEventSnapshotMaterialization(b, maxCommandEventWaits, maxApplicationEventBytes)
@@ -757,18 +757,18 @@ func benchmarkEventSnapshotMaterialization(b *testing.B, inputCount int, payload
 	event := DefineEvent[string]("benchmark.snapshot_event")
 	command := DefineCommand[None, None]("benchmark.snapshot_command", 1)
 	payload := strings.Repeat("x", payloadBytes-2)
-	opts := make([]ExecutionOption, 0, inputCount+1)
-	opts = append(opts, WithoutExecutionDeadline())
+	opts := make([]RunOption, 0, inputCount+1)
+	opts = append(opts, WithoutRunDeadline())
 	for wait := range inputCount {
 		opts = append(opts, WaitFor(event, fmt.Sprintf("input/%03d", wait)))
 	}
-	exec, err := command.With(runtime).Execute(ctx,
+	exec, err := command.Enqueue(ctx, runtime,
 		fmt.Sprintf("snapshot/%d/%d", inputCount, payloadBytes), None{}, opts...)
 	if err != nil {
 		b.Fatal(err)
 	}
 	for wait := range inputCount {
-		if err := event.Emit(ctx, runtime, exec.ID, fmt.Sprintf("input/%03d", wait), payload); err != nil {
+		if err := event.Deliver(ctx, runtime, exec.ID, fmt.Sprintf("input/%03d", wait), payload); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -776,11 +776,11 @@ func benchmarkEventSnapshotMaterialization(b *testing.B, inputCount int, payload
 	if err != nil {
 		b.Fatal(err)
 	}
-	executionID, err := uuid.Parse(string(exec.ID))
+	runID, err := uuid.Parse(string(exec.ID))
 	if err != nil {
 		b.Fatal(err)
 	}
-	candidate := store.CommandCandidate{CommandID: commandID, ExecutionID: executionID,
+	candidate := store.CommandCandidate{CommandID: commandID, RunID: runID,
 		Queue: defaultQueue, Name: command.Name(), Version: command.Version()}
 
 	b.ReportAllocs()
@@ -815,32 +815,32 @@ func resetBenchmarkClaim(b *testing.B, ctx context.Context, runtime *Runtime, cl
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	removed, err := tx.Exec(ctx, `DELETE FROM `+pgschema.Table(runtime.schema, "flow_journal")+`
-		WHERE execution_id=$1 AND position=$2 AND attempt_id=$3 AND entry_kind='attempt_started'`,
-		claim.ExecutionID, claim.AttemptStartedPosition, claim.AttemptID)
+		WHERE run_id=$1 AND position=$2 AND attempt_id=$3 AND entry_kind='attempt_started'`,
+		claim.RunID, claim.AttemptStartedPosition, claim.AttemptID)
 	if err != nil || removed.RowsAffected() != 1 {
 		b.Fatalf("reset claim journal rows=%d, err=%v", removed.RowsAffected(), err)
 	}
 	resetQueue, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_command_queue")+`
 		SET state='ready',active_attempt_id=NULL,lease_token=NULL,lease_owner=NULL,
 		    lease_started_at=NULL,lease_expires_at=NULL
-		WHERE command_id=$1 AND execution_id=$2 AND active_attempt_id=$3`,
-		claim.CommandID, claim.ExecutionID, claim.AttemptID)
+		WHERE command_id=$1 AND run_id=$2 AND active_attempt_id=$3`,
+		claim.CommandID, claim.RunID, claim.AttemptID)
 	if err != nil || resetQueue.RowsAffected() != 1 {
 		b.Fatalf("reset claim queue rows=%d, err=%v", resetQueue.RowsAffected(), err)
 	}
 	resetCommand, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_commands")+`
 		SET state='ready',attempt_ordinal=attempt_ordinal-1
-		WHERE command_id=$1 AND execution_id=$2 AND state='running' AND attempt_ordinal>0`,
-		claim.CommandID, claim.ExecutionID)
+		WHERE command_id=$1 AND run_id=$2 AND state='running' AND attempt_ordinal>0`,
+		claim.CommandID, claim.RunID)
 	if err != nil || resetCommand.RowsAffected() != 1 {
 		b.Fatalf("reset claim command rows=%d, err=%v", resetCommand.RowsAffected(), err)
 	}
-	resetExecution, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_executions")+`
+	resetRun, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(runtime.schema, "flow_runs")+`
 		SET next_journal_position=$2
-		WHERE execution_id=$1 AND next_journal_position=$2+1`,
-		claim.ExecutionID, claim.AttemptStartedPosition)
-	if err != nil || resetExecution.RowsAffected() != 1 {
-		b.Fatalf("reset claim execution rows=%d, err=%v", resetExecution.RowsAffected(), err)
+		WHERE run_id=$1 AND next_journal_position=$2+1`,
+		claim.RunID, claim.AttemptStartedPosition)
+	if err != nil || resetRun.RowsAffected() != 1 {
+		b.Fatalf("reset claim run rows=%d, err=%v", resetRun.RowsAffected(), err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		b.Fatal(err)
@@ -855,7 +855,7 @@ func BenchmarkInspection100Commands(b *testing.B) {
 			if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 				b.Fatal(err)
 			}
-			runtime, exec, stop := startHundredCommandExecution(b, database, ctx, "inspection")
+			runtime, exec, stop := startHundredCommandRun(b, database, ctx, "inspection")
 			defer stop()
 			b.ResetTimer()
 			for range b.N {
@@ -883,12 +883,12 @@ func TestJournalGrowthMeasurement100Commands(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	_, exec, stop := startHundredCommandExecution(t, database, ctx, "journal-growth")
+	_, exec, stop := startHundredCommandRun(t, database, ctx, "journal-growth")
 	defer stop()
 	var rows int
 	var tupleBytes, bodyBytes int64
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*),COALESCE(sum(pg_column_size(j)),0),COALESCE(sum(octet_length(body)),0)
-		FROM `+pgschema.Table(database.Schema, "flow_journal")+` j WHERE execution_id=$1`, exec.ID).
+		FROM `+pgschema.Table(database.Schema, "flow_journal")+` j WHERE run_id=$1`, exec.ID).
 		Scan(&rows, &tupleBytes, &bodyBytes); err != nil {
 		t.Fatal(err)
 	}
@@ -904,19 +904,19 @@ type benchmarkTB interface {
 	Fatal(...any)
 }
 
-func startHundredCommandExecution(tb benchmarkTB, database testpg.Database, ctx context.Context, key string) (*Runtime, Execution, func()) {
+func startHundredCommandRun(tb benchmarkTB, database testpg.Database, ctx context.Context, key string) (*Runtime, Run, func()) {
 	tb.Helper()
 	child := DefineCommand[None, None]("benchmark.inspection.child", 1)
 	root := DefineCommand[None, None]("benchmark.inspection.root", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
-		WithMaxCommandsPerExecution(0), WithWorkerConcurrency(16), WithPollInterval(5*time.Millisecond))
+		WithMaxCommandsPerRun(0), WithWorkerConcurrency(16), WithPollInterval(5*time.Millisecond))
 	if err != nil {
 		tb.Fatal(err)
 	}
 	if err := runtime.Register(
 		Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
 			for index := range 99 {
-				Execute(work, fmt.Sprintf("work/%03d", index), child, None{})
+				Enqueue(work, fmt.Sprintf("work/%03d", index), child, None{})
 			}
 			return None{}, nil
 		}),
@@ -927,18 +927,18 @@ func startHundredCommandExecution(tb benchmarkTB, database testpg.Database, ctx 
 	runCtx, cancel := context.WithCancel(ctx)
 	runResult := make(chan error, 1)
 	go func() { runResult <- runtime.Run(runCtx) }()
-	exec, err := root.With(runtime).Execute(ctx, key, None{}, WithoutExecutionDeadline())
+	exec, err := root.Enqueue(ctx, runtime, key, None{}, WithoutRunDeadline())
 	if err != nil {
 		cancel()
 		tb.Fatal(err)
 	}
 	deadlineCtx, deadlineCancel := context.WithTimeout(ctx, 10*time.Second)
-	settled, err := AwaitExecution(deadlineCtx, runtime, exec.ID)
+	settled, err := AwaitRun(deadlineCtx, runtime, exec.ID)
 	deadlineCancel()
 	if err != nil || settled.Status != "succeeded" || settled.CommandCount != 100 {
 		cancel()
 		<-runResult
-		tb.Fatal("hundred-command execution failed", err, settled)
+		tb.Fatal("hundred-command run failed", err, settled)
 	}
 	return runtime, exec, func() {
 		cancel()

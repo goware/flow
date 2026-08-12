@@ -38,26 +38,26 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 			}
 			return nil
 		})
-		if _, err := command.With(runtime).Execute(ctx, "fault/"+string(point), ingressArgs{}); !errors.Is(err, fault.ErrInjected) {
-			t.Fatalf("Execute(%s) error = %v", point, err)
+		if _, err := command.Enqueue(ctx, runtime, "fault/"+string(point), ingressArgs{}); !errors.Is(err, fault.ErrInjected) {
+			t.Fatalf("Enqueue(%s) error = %v", point, err)
 		}
 		var count int
-		if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_executions")+`
-			WHERE execution_key=$1`, "fault/"+string(point)).Scan(&count); err != nil {
-			t.Fatalf("count fault execution: %v", err)
+		if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_runs")+`
+			WHERE run_key=$1`, "fault/"+string(point)).Scan(&count); err != nil {
+			t.Fatalf("count fault run: %v", err)
 		}
 		if count != 0 {
-			t.Fatalf("fault %s left %d executions", point, count)
+			t.Fatalf("fault %s left %d runs", point, count)
 		}
 	}
 
 	runtime.faults = fault.None{}
-	exec, err := command.With(runtime).Execute(ctx, "observed", ingressArgs{})
+	exec, err := command.Enqueue(ctx, runtime, "observed", ingressArgs{})
 	if err != nil {
-		t.Fatalf("Execute(observed) error = %v", err)
+		t.Fatalf("Enqueue(observed) error = %v", err)
 	}
 	observations := waitForObservations(t, observer, 1)
-	if len(observations) != 1 || observations[0].ExecutionID != exec.ID || observations[0].Operation != "start" {
+	if len(observations) != 1 || observations[0].RunID != exec.ID || observations[0].Operation != "start" {
 		t.Fatalf("observations = %#v", observations)
 	}
 
@@ -67,18 +67,18 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 		}
 		return nil
 	})
-	if _, err := command.With(runtime).Execute(ctx, "ambiguous", ingressArgs{}); !errors.Is(err, fault.ErrInjected) {
-		t.Fatalf("Execute(ambiguous) error = %v", err)
+	if _, err := command.Enqueue(ctx, runtime, "ambiguous", ingressArgs{}); !errors.Is(err, fault.ErrInjected) {
+		t.Fatalf("Enqueue(ambiguous) error = %v", err)
 	}
 	runtime.faults = fault.None{}
-	recovered, err := command.With(runtime).Execute(ctx, "ambiguous", ingressArgs{})
+	recovered, err := command.Enqueue(ctx, runtime, "ambiguous", ingressArgs{})
 	if err != nil || recovered.Created {
-		t.Fatalf("Execute(ambiguous retry) = %#v, %v", recovered, err)
+		t.Fatalf("Enqueue(ambiguous retry) = %#v, %v", recovered, err)
 	}
 
 	observer.panic = true
-	if err := CancelExecution(ctx, runtime, exec.ID, "safe observer panic"); err != nil {
-		t.Fatalf("CancelExecution() with panicking observer error = %v", err)
+	if err := CancelRun(ctx, runtime, exec.ID, "safe observer panic"); err != nil {
+		t.Fatalf("CancelRun() with panicking observer error = %v", err)
 	}
 }
 

@@ -18,7 +18,7 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 	t.Parallel()
 
 	for _, point := range []fault.Point{
-		fault.ClaimExecutionLock,
+		fault.ClaimRunLock,
 		fault.ClaimBeforeJournal,
 		fault.ClaimBeforeCommit,
 		fault.ClaimCommitAmbiguous,
@@ -57,7 +57,7 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 				if err := Emit(work, event, "accepted", runtimeResult{Value: "ok"}); err != nil {
 					return runtimeResult{}, err
 				}
-				Execute(work, "child", child, None{})
+				Enqueue(work, "child", child, None{})
 				return runtimeResult{Value: "ok"}, nil
 			}, WithCommit(func(ctx context.Context, tx Tx, commit Commit[runtimeArgs, runtimeResult]) error {
 				_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "fault_commit")+` (command_id) VALUES ($1)`, commit.Info.CommandID)
@@ -77,11 +77,11 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 				return nil
 			})
 			cancelRun, runResult := startRuntime(t, runtime)
-			exec, err := command.With(runtime).Execute(ctx, "fault", runtimeArgs{})
+			exec, err := command.Enqueue(ctx, runtime, "fault", runtimeArgs{})
 			if err != nil {
-				t.Fatalf("Execute() error = %v", err)
+				t.Fatalf("Enqueue() error = %v", err)
 			}
-			waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 			stopRuntime(t, cancelRun, runResult)
 			if calls.Load() != 1 {
 				t.Fatalf("worker calls = %d", calls.Load())
@@ -92,7 +92,7 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 				count(*) FILTER (WHERE entry_kind='attempt_concluded'),
 				count(*) FILTER (WHERE entry_kind='event_recorded' AND event_class='command_terminal'),
 				count(*) FILTER (WHERE entry_kind='event_recorded' AND event_class='application')
-				FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE execution_id=$1`, exec.ID).
+				FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1`, exec.ID).
 				Scan(&starts, &conclusions, &terminalEvents, &applicationEvents); err != nil {
 				t.Fatalf("count history: %v", err)
 			}
@@ -130,7 +130,7 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 		if err := Emit(work, event, "settled", runtimeResult{Value: "unsettled"}); err != nil {
 			return runtimeResult{}, err
 		}
-		Execute(work, "discarded-child", child, runtimeArgs{Value: "unsettled"})
+		Enqueue(work, "discarded-child", child, runtimeArgs{Value: "unsettled"})
 		return runtimeResult{Value: "unsettled"}, nil
 	})); err != nil {
 		t.Fatalf("Register(first) error = %v", err)
@@ -142,9 +142,9 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 		return nil
 	})
 	cancelFirst, firstResult := startRuntime(t, first)
-	exec, err := command.With(first).Execute(ctx, "settlement-outage", runtimeArgs{})
+	exec, err := command.Enqueue(ctx, first, "settlement-outage", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatalf("Enqueue() error = %v", err)
 	}
 	select {
 	case <-firstReturned:
@@ -169,7 +169,7 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 		t.Fatalf("Register(second) error = %v", err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	trace, traceErr := Trace(ctx, second, exec.ID)
 	stopRuntime(t, cancelSecond, secondResult)
 	if traceErr != nil {
@@ -196,7 +196,7 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 	}
 	var childCount int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-		WHERE execution_id=$1 AND parent_command_id IS NOT NULL`, exec.ID).Scan(&childCount); err != nil {
+		WHERE run_id=$1 AND parent_command_id IS NOT NULL`, exec.ID).Scan(&childCount); err != nil {
 		t.Fatal(err)
 	}
 	if childCount != 0 {
@@ -234,10 +234,10 @@ func TestExhaustedSettlementLoopsAreObserved(t *testing.T) {
 	})
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	if _, err := succeeds.With(runtime).Execute(ctx, "settle/error", None{}); err != nil {
+	if _, err := succeeds.Enqueue(ctx, runtime, "settle/error", None{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fails.With(runtime).Execute(ctx, "conclude/error", None{}); err != nil {
+	if _, err := fails.Enqueue(ctx, runtime, "conclude/error", None{}); err != nil {
 		t.Fatal(err)
 	}
 	waitForObservation(t, observer, "settle", "error", 1, 2*time.Second)

@@ -14,8 +14,8 @@ func KeyedHistoryListQueryForTest(s *Store, filter KeyedHistoryListFilter) (stri
 	return s.listJournalByKeysQuery(filter)
 }
 
-func ExecutionListQueryForTest(s *Store, filter ExecutionListFilter) (string, []any) {
-	return s.listExecutionsQuery(filter)
+func RunListQueryForTest(s *Store, filter RunListFilter) (string, []any) {
+	return s.listRunsQuery(filter)
 }
 
 func QueueDepthQueryForTest(s *Store) string { return s.queueDepthQuery() }

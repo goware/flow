@@ -15,31 +15,31 @@ import (
 	"github.com/goware/pgkit/v2"
 )
 
-// AssertMatchesLive checks that folding an execution's journal produces
-// the same execution and command state as the live projections.
-func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.ExecutionID) {
+// AssertMatchesLive checks that folding a run's journal produces
+// the same run and command state as the live projections.
+func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.RunID) {
 	t.Helper()
 	ctx := context.Background()
 	runtime, err := flow.New(db, flow.WithSchema(schema))
 	if err != nil {
 		t.Fatalf("New() for replay conformance error = %v", err)
 	}
-	live, err := flow.GetExecution(ctx, runtime, id)
+	live, err := flow.GetRun(ctx, runtime, id)
 	if err != nil {
-		t.Fatalf("GetExecution() for replay conformance error = %v", err)
+		t.Fatalf("GetRun() for replay conformance error = %v", err)
 	}
 	repository, err := store.New(db, schema, false)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
-	executionID, err := uuid.Parse(string(id))
+	runID, err := uuid.Parse(string(id))
 	if err != nil {
-		t.Fatalf("parse execution ID: %v", err)
+		t.Fatalf("parse run ID: %v", err)
 	}
 	var rows []store.JournalRow
 	var after uint64
 	for {
-		page, err := repository.History(ctx, executionID, after, store.MaxHistoryLimit)
+		page, err := repository.History(ctx, runID, after, store.MaxHistoryLimit)
 		if err != nil {
 			t.Fatalf("History() replay rows error = %v", err)
 		}
@@ -54,13 +54,13 @@ func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.Execut
 		t.Fatalf("replay.Fold() error = %v", err)
 	}
 	if projected.ID.String() != string(live.ID) || projected.DefinitionName != live.Type || projected.DefinitionVersion != live.Version ||
-		projected.ExecutionKey != live.Key || projected.Status != string(live.Status) || projected.CommandCount != live.CommandCount ||
+		projected.RunKey != live.Key || projected.Status != string(live.Status) || projected.CommandCount != live.CommandCount ||
 		projected.OpenCommands != live.OpenCommands || !equalFailure(projected.Failure, live.Failure) {
-		t.Fatalf("replay/live execution mismatch:\nreplay=%#v\nlive=%#v", projected, live)
+		t.Fatalf("replay/live run mismatch:\nreplay=%#v\nlive=%#v", projected, live)
 	}
 
 	commandRows, err := db.Conn.Query(ctx, `SELECT command_id,state,result,terminal_position,retry_policy,declaration_fingerprint FROM `+
-		pgschema.Table(schema, "flow_commands")+` WHERE execution_id=$1`, executionID)
+		pgschema.Table(schema, "flow_commands")+` WHERE run_id=$1`, runID)
 	if err != nil {
 		t.Fatalf("query live commands: %v", err)
 	}

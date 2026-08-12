@@ -71,7 +71,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("execution %s completed with %d journal entries\n", exec.ID, len(trace.History))
+	fmt.Printf("run %s completed with %d journal entries\n", exec.ID, len(trace.History))
 }
 
 func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
@@ -124,50 +124,53 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 
 // runExampleCommand creates a direct command gated on an independently
 // published event and returns its terminal trace.
-func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *externalMonitor) (flow.Execution, flow.ExecutionTrace, error) {
-	exec, err := confirmBridge.With(runtime).Execute(ctx, "bridge/example", flow.None{},
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *externalMonitor) (flow.Run, flow.RunTrace, error) {
+	exec, err := confirmBridge.Enqueue(ctx, runtime, "bridge/example", flow.None{},
 		flow.WaitFor(bridgeDelivered, "delivery/example"),
 		flow.Within(2*time.Second),
 	)
 	if err != nil {
-		return flow.Execution{}, flow.ExecutionTrace{}, err
+		return flow.Run{}, flow.RunTrace{}, err
 	}
 	monitorResult := make(chan error, 1)
 	go func() { monitorResult <- monitor.observeBridgeDelivery(ctx, exec.ID) }()
 
 	trace, err := waitForTerminal(ctx, runtime, exec.ID, 8*time.Second)
 	if err != nil {
-		return flow.Execution{}, flow.ExecutionTrace{}, err
+		return flow.Run{}, flow.RunTrace{}, err
 	}
 	if err := <-monitorResult; err != nil {
-		return flow.Execution{}, flow.ExecutionTrace{}, err
+		return flow.Run{}, flow.RunTrace{}, err
 	}
 	return exec, trace, nil
 }
 
 // confirmBridge is the worker handler.
 func (example *monitorExample) confirmBridge(_ context.Context, work *flow.Work[flow.None]) (confirmBridgeResult, error) {
-	delivery, err := flow.GetEventValue(work, bridgeDelivered, "delivery/example")
-	if err != nil {
+	delivery, found, err := flow.GetEventValue(work, bridgeDelivered, "delivery/example")
+	if err != nil || !found {
+		if err == nil {
+			err = fmt.Errorf("required bridge delivery is absent")
+		}
 		return confirmBridgeResult{}, err
 	}
 	fmt.Fprintf(example.output, "bridge delivery %s confirmed\n", delivery.TransactionHash)
 	return confirmBridgeResult{Confirmed: true}, nil
 }
 
-func (monitor *externalMonitor) observeBridgeDelivery(ctx context.Context, executionID flow.ExecutionID) error {
+func (monitor *externalMonitor) observeBridgeDelivery(ctx context.Context, runID flow.RunID) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(50 * time.Millisecond):
 	}
 	fmt.Fprintln(monitor.output, "external monitor observed bridge delivery")
-	return bridgeDelivered.Emit(ctx, monitor.publisher, executionID, "delivery/example", bridgeDelivery{
+	return bridgeDelivered.Deliver(ctx, monitor.publisher, runID, "delivery/example", bridgeDelivery{
 		TransactionHash: "0xexample",
 	})
 }
 
-func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.ExecutionID, timeout time.Duration) (flow.ExecutionTrace, error) {
+func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.RunID, timeout time.Duration) (flow.RunTrace, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -175,19 +178,19 @@ func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.Executi
 	for {
 		trace, err := flow.Trace(ctx, runtime, id)
 		if err != nil {
-			return flow.ExecutionTrace{}, err
+			return flow.RunTrace{}, err
 		}
-		switch trace.Execution.Status {
+		switch trace.Run.Status {
 		case "succeeded":
 			return trace, nil
 		case "failed", "cancelled", "expired":
-			return flow.ExecutionTrace{}, fmt.Errorf("example execution ended %s", trace.Execution.Status)
+			return flow.RunTrace{}, fmt.Errorf("example run ended %s", trace.Run.Status)
 		}
 		select {
 		case <-ctx.Done():
-			return flow.ExecutionTrace{}, ctx.Err()
+			return flow.RunTrace{}, ctx.Err()
 		case <-timer.C:
-			return flow.ExecutionTrace{}, fmt.Errorf("example execution timed out")
+			return flow.RunTrace{}, fmt.Errorf("example run timed out")
 		case <-ticker.C:
 		}
 	}

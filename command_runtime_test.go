@@ -49,7 +49,7 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 	lifecycleEvent := DefineEvent[runtimeResult]("runtime.lifecycle_event")
 	stageLifecycleOutput := func(work *Work[runtimeArgs], value string) {
 		_ = Emit(work, lifecycleEvent, "output", runtimeResult{Value: value})
-		Execute(work, "child", lifecycleChild, runtimeArgs{Value: value})
+		Enqueue(work, "child", lifecycleChild, runtimeArgs{Value: value})
 	}
 
 	var retryCalls atomic.Int32
@@ -98,7 +98,7 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 		}),
 		Handle(retryAfter, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
 			if retryAfterCalls.Add(1) == 1 {
-				return runtimeResult{}, RetryAfter(15*time.Millisecond, errors.New("rate limited"))
+				return runtimeResult{}, RetryAfter(15*time.Millisecond+time.Nanosecond, errors.New("rate limited"))
 			}
 			return runtimeResult{Value: "after-delay"}, nil
 		}),
@@ -116,24 +116,24 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 	cancelRun, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancelRun, runResult)
 
-	retryHandle, _ := retrying.With(runtime).Execute(ctx, "retry", runtimeArgs{})
-	permanentHandle, _ := permanent.With(runtime).Execute(ctx, "permanent", runtimeArgs{})
-	timeoutHandle, _ := timed.With(runtime).Execute(ctx, "timeout", runtimeArgs{})
-	commitHandle, _ := committed.With(runtime).Execute(ctx, "commit", runtimeArgs{})
-	commitFailedHandle, _ := commitFailed.With(runtime).Execute(ctx, "commit-failed", runtimeArgs{})
-	exhaustedHandle, _ := exhausted.With(runtime).Execute(ctx, "exhausted", runtimeArgs{})
-	panicHandle, _ := panicked.With(runtime).Execute(ctx, "panic", runtimeArgs{})
-	retryAfterHandle, _ := retryAfter.With(runtime).Execute(ctx, "retry-after", runtimeArgs{})
-	oversizedHandle, _ := oversized.With(runtime).Execute(ctx, "oversized", runtimeArgs{})
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, retryHandle.ID, "succeeded", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, permanentHandle.ID, "failed", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, timeoutHandle.ID, "failed", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, commitHandle.ID, "succeeded", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, commitFailedHandle.ID, "failed", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exhaustedHandle.ID, "failed", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, panicHandle.ID, "failed", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, retryAfterHandle.ID, "succeeded", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, oversizedHandle.ID, "failed", 5*time.Second)
+	retryHandle, _ := retrying.Enqueue(ctx, runtime, "retry", runtimeArgs{})
+	permanentHandle, _ := permanent.Enqueue(ctx, runtime, "permanent", runtimeArgs{})
+	timeoutHandle, _ := timed.Enqueue(ctx, runtime, "timeout", runtimeArgs{})
+	commitHandle, _ := committed.Enqueue(ctx, runtime, "commit", runtimeArgs{})
+	commitFailedHandle, _ := commitFailed.Enqueue(ctx, runtime, "commit-failed", runtimeArgs{})
+	exhaustedHandle, _ := exhausted.Enqueue(ctx, runtime, "exhausted", runtimeArgs{})
+	panicHandle, _ := panicked.Enqueue(ctx, runtime, "panic", runtimeArgs{})
+	retryAfterHandle, _ := retryAfter.Enqueue(ctx, runtime, "retry-after", runtimeArgs{})
+	oversizedHandle, _ := oversized.Enqueue(ctx, runtime, "oversized", runtimeArgs{})
+	waitForRunStatus(t, database.Schema, database.DB.Conn, retryHandle.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, permanentHandle.ID, "failed", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, timeoutHandle.ID, "failed", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, commitHandle.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, commitFailedHandle.ID, "failed", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exhaustedHandle.ID, "failed", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, panicHandle.ID, "failed", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, retryAfterHandle.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, oversizedHandle.ID, "failed", 5*time.Second)
 
 	if retryCalls.Load() != 3 {
 		t.Fatalf("retry worker calls = %d", retryCalls.Load())
@@ -172,13 +172,13 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 	if len(timeoutTrace.Commands[0].Attempts) != 1 || timeoutTrace.Commands[0].Attempts[0].Classification != "timeout" {
 		t.Fatalf("timeout Trace = %#v", timeoutTrace)
 	}
-	for name, exec := range map[string]Execution{"timeout": timeoutHandle, "panic": panicHandle} {
+	for name, exec := range map[string]Run{"timeout": timeoutHandle, "panic": panicHandle} {
 		var eventCount, childCount int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-			 WHERE execution_id=$1 AND event_class='application'),
+			 WHERE run_id=$1 AND event_class='application'),
 			(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-			 WHERE execution_id=$1 AND parent_command_id IS NOT NULL)`, exec.ID).Scan(&eventCount, &childCount); err != nil {
+			 WHERE run_id=$1 AND parent_command_id IS NOT NULL)`, exec.ID).Scan(&eventCount, &childCount); err != nil {
 			t.Fatalf("%s staged output query: %v", name, err)
 		}
 		if eventCount != 0 || childCount != 0 {
@@ -213,6 +213,12 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 		oversizedTrace.Commands[0].Failure == nil || oversizedTrace.Commands[0].Failure.Code != "result_encode" {
 		t.Fatalf("edge traces exhausted=%#v panic=%#v retry-after=%#v oversized=%#v",
 			exhaustedTrace, panicTrace, retryAfterTrace, oversizedTrace)
+	}
+	firstRetryAfter := retryAfterTrace.Commands[0].Attempts[0]
+	if firstRetryAfter.FinishedAt == nil || firstRetryAfter.NextAttemptAt == nil ||
+		firstRetryAfter.NextAttemptAt.Sub(*firstRetryAfter.FinishedAt) < 16*time.Millisecond {
+		t.Fatalf("fractional retry-after scheduled early: finished=%v next=%v",
+			firstRetryAfter.FinishedAt, firstRetryAfter.NextAttemptAt)
 	}
 }
 
@@ -251,16 +257,16 @@ func TestRuntimeRecoversCommitPanicAndRollsBackItsWrites(t *testing.T) {
 	}
 	cancel, result := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, result)
-	failed, err := panicking.With(runtime).Execute(ctx, "commit-panic", None{})
+	failed, err := panicking.Enqueue(ctx, runtime, "commit-panic", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	succeeded, err := sibling.With(runtime).Execute(ctx, "commit-panic-sibling", None{})
+	succeeded, err := sibling.Enqueue(ctx, runtime, "commit-panic-sibling", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, failed.ID, "failed", 5*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, succeeded.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, failed.ID, "failed", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, succeeded.ID, "succeeded", 5*time.Second)
 
 	var writes int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "commit_panic_writes")).Scan(&writes); err != nil {
@@ -300,20 +306,20 @@ func TestDeterministicEarlyFailuresUseDetachedConclusionContext(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	malformedExecution, err := malformed.With(runtime).Execute(ctx, "detached/argument", None{}, WithoutExecutionDeadline())
+	malformedRun, err := malformed.Enqueue(ctx, runtime, "detached/argument", None{}, WithoutRunDeadline())
 	if err != nil {
 		t.Fatal(err)
 	}
-	duplicateExecution, err := duplicate.With(runtime).Execute(ctx, "detached/event", None{}, WithoutExecutionDeadline())
+	duplicateRun, err := duplicate.Enqueue(ctx, runtime, "detached/event", None{}, WithoutRunDeadline())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_commands")+`
-		SET args=convert_to('not-json','UTF8') WHERE command_id=$1`, malformedExecution.RootCommandID); err != nil {
+		SET args=convert_to('not-json','UTF8') WHERE command_id=$1`, malformedRun.RootCommandID); err != nil {
 		t.Fatal(err)
 	}
 
-	claims := make(map[ExecutionID]store.ClaimedCommand, 2)
+	claims := make(map[RunID]store.ClaimedCommand, 2)
 	for _, definition := range []struct {
 		name    string
 		version int
@@ -331,40 +337,40 @@ func TestDeterministicEarlyFailuresUseDetachedConclusionContext(t *testing.T) {
 		}
 		claim := claimed.Commands[0]
 		past := time.Now().Add(-time.Second)
-		claim.ExecutionDeadline = &past
-		claims[ExecutionID(claim.ExecutionID.String())] = claim
+		claim.RunDeadline = &past
+		claims[RunID(claim.RunID.String())] = claim
 	}
-	duplicateClaim := claims[duplicateExecution.ID]
+	duplicateClaim := claims[duplicateRun.ID]
 	duplicateClaim.EventInputs = []store.ClaimedEventInput{
 		{Name: "duplicate", Key: "same", Position: 1, Payload: []byte(`{}`)},
 		{Name: "duplicate", Key: "same", Position: 1, Payload: []byte(`{}`)},
 	}
-	claims[duplicateExecution.ID] = duplicateClaim
+	claims[duplicateRun.ID] = duplicateClaim
 
 	for _, test := range []struct {
-		execution Execution
-		command   Command[None, None]
-		code      string
+		run     Run
+		command Command[None, None]
+		code    string
 	}{
-		{execution: malformedExecution, command: malformed, code: "argument_decode"},
-		{execution: duplicateExecution, command: duplicate, code: "event_input_decode"},
+		{run: malformedRun, command: malformed, code: "argument_decode"},
+		{run: duplicateRun, command: duplicate, code: "event_input_decode"},
 	} {
 		worker, ok := runtime.registry.worker(test.command.Name(), test.command.Version())
 		if !ok {
 			t.Fatalf("worker %s missing", test.command.Name())
 		}
-		claim := claims[test.execution.ID]
+		claim := claims[test.run.ID]
 		slots := newCommandSlots(1, nil)
 		if reserved, _ := slots.reserve(claim.Queue); !reserved {
 			t.Fatal("failed to reserve direct test slot")
 		}
 		runtime.workerGroup.Add(1)
 		runtime.executeClaim(worker, claim, slots)
-		trace, err := Trace(ctx, runtime, test.execution.ID)
+		trace, err := Trace(ctx, runtime, test.run.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if trace.Execution.Status != ExecutionStatusFailed || len(trace.Commands) != 1 || trace.Commands[0].Failure == nil ||
+		if trace.Run.Status != RunStatusFailed || len(trace.Commands) != 1 || trace.Commands[0].Failure == nil ||
 			trace.Commands[0].Failure.Code != test.code {
 			t.Fatalf("detached %s trace = %#v", test.code, trace)
 		}
@@ -396,7 +402,7 @@ func TestDeadlineDiscardedDecisionEmitsOnlyExpiredSettlement(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	execution, err := command.With(runtime).Execute(ctx, "deadline/discard", None{}, WithoutExecutionDeadline())
+	run, err := command.Enqueue(ctx, runtime, "deadline/discard", None{}, WithoutRunDeadline())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,9 +416,9 @@ func TestDeadlineDiscardedDecisionEmitsOnlyExpiredSettlement(t *testing.T) {
 		t.Fatalf("ClaimCommands() commands=%d error=%v", len(claimed.Commands), err)
 	}
 	claim := claimed.Commands[0]
-	claim.ExecutionDeadline = nil
-	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_executions")+`
-		SET deadline_at=clock_timestamp()-interval '1 second' WHERE execution_id=$1`, execution.ID); err != nil {
+	claim.RunDeadline = nil
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_runs")+`
+		SET deadline_at=clock_timestamp()-interval '1 second' WHERE run_id=$1`, run.ID); err != nil {
 		t.Fatal(err)
 	}
 	worker, ok := runtime.registry.worker(command.Name(), command.Version())
@@ -427,7 +433,7 @@ func TestDeadlineDiscardedDecisionEmitsOnlyExpiredSettlement(t *testing.T) {
 	runtime.executeClaim(worker, claim, slots)
 	waitForObservation(t, observer, "settle", "expired", 1, time.Second)
 	for _, observation := range observer.snapshot() {
-		if observation.ExecutionID != execution.ID {
+		if observation.RunID != run.ID {
 			continue
 		}
 		if (observation.Kind == ObservationEvent && observation.Operation == "settle" && observation.Outcome == "accepted") ||
@@ -439,8 +445,8 @@ func TestDeadlineDiscardedDecisionEmitsOnlyExpiredSettlement(t *testing.T) {
 	var applicationEvents int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT status,
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		 WHERE execution_id=e.execution_id AND event_class='application')
-		FROM `+pgschema.Table(database.Schema, "flow_executions")+` e WHERE execution_id=$1`, execution.ID).
+		 WHERE run_id=e.run_id AND event_class='application')
+		FROM `+pgschema.Table(database.Schema, "flow_runs")+` e WHERE run_id=$1`, run.ID).
 		Scan(&status, &applicationEvents); err != nil {
 		t.Fatal(err)
 	}
@@ -471,14 +477,20 @@ func TestRuntimeStagesDelayedChildrenAtomically(t *testing.T) {
 	}
 	if err := runtime.Register(
 		Handle(root, func(_ context.Context, work *Work[None]) (rootResult, error) {
-			Execute(work, "child/required", child, childArgs{Value: "required"})
-			Execute(work, "child/delayed", child, childArgs{Value: "delayed"}).Optional().Delay(80 * time.Millisecond)
+			if work.Info().RunKey != "graph-tree" {
+				return rootResult{}, fmt.Errorf("root RunKey = %q", work.Info().RunKey)
+			}
+			Enqueue(work, "child/required", child, childArgs{Value: "required"})
+			Enqueue(work, "child/delayed", child, childArgs{Value: "delayed"}).Optional().Delay(80 * time.Millisecond)
 			if rootCalls.Add(1) == 1 {
 				return rootResult{}, errors.New("retry after staging")
 			}
 			return rootResult{Children: 2}, nil
 		}),
 		Handle(child, func(_ context.Context, work *Work[childArgs]) (childResult, error) {
+			if work.Info().RunKey != "graph-tree" {
+				return childResult{}, fmt.Errorf("child RunKey = %q", work.Info().RunKey)
+			}
 			if work.Args.Value == "delayed" {
 				childStartedAt.Store(time.Now().UnixNano())
 			}
@@ -490,11 +502,11 @@ func TestRuntimeStagesDelayedChildrenAtomically(t *testing.T) {
 	cancelRun, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancelRun, runResult)
 	started := time.Now()
-	exec, err := root.With(runtime).Execute(ctx, "graph-tree", None{})
+	exec, err := root.Enqueue(ctx, runtime, "graph-tree", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	if got := time.Unix(0, childStartedAt.Load()).Sub(started); got < 60*time.Millisecond {
 		t.Fatalf("delayed child started after %s", got)
 	}
@@ -502,8 +514,8 @@ func TestRuntimeStagesDelayedChildrenAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(trace.Commands) != 3 || trace.Execution.CommandCount != 3 || trace.Execution.OpenCommands != 0 {
-		t.Fatalf("Trace topology = commands %d, count %d, open %d", len(trace.Commands), trace.Execution.CommandCount, trace.Execution.OpenCommands)
+	if len(trace.Commands) != 3 || trace.Run.CommandCount != 3 || trace.Run.OpenCommands != 0 {
+		t.Fatalf("Trace topology = commands %d, count %d, open %d", len(trace.Commands), trace.Run.CommandCount, trace.Run.OpenCommands)
 	}
 	if rootCalls.Load() != 2 {
 		t.Fatalf("root calls = %d, want 2", rootCalls.Load())
@@ -519,13 +531,52 @@ func TestRuntimeStagesDelayedChildrenAtomically(t *testing.T) {
 	}
 	var linked int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-		WHERE execution_id=$1 AND parent_command_id=$2`, exec.ID, parentID).Scan(&linked); err != nil {
+		WHERE run_id=$1 AND parent_command_id=$2`, exec.ID, parentID).Scan(&linked); err != nil {
 		t.Fatal(err)
 	}
 	if linked != 2 {
 		t.Fatalf("linked children = %d, want 2", linked)
 	}
 	assertReplayMatches(t, runtime, exec.ID)
+}
+
+func TestRuntimeCommandInfoRunKeyIsEmptyForUnkeyedRun(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	root := DefineCommand[None, None]("runtime.unkeyed_run_key_root", 1)
+	child := DefineCommand[None, None]("runtime.unkeyed_run_key_child", 1)
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
+			if work.Info().RunKey != "" {
+				return None{}, fmt.Errorf("unkeyed root RunKey = %q", work.Info().RunKey)
+			}
+			Enqueue(work, "child", child, None{})
+			return None{}, nil
+		}),
+		Handle(child, func(_ context.Context, work *Work[None]) (None, error) {
+			if work.Info().RunKey != "" {
+				return None{}, fmt.Errorf("unkeyed child RunKey = %q", work.Info().RunKey)
+			}
+			return None{}, nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancel, result := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, result)
+	run, err := root.Enqueue(ctx, runtime, "", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunStatus(t, database.Schema, database.DB.Conn, run.ID, "succeeded", 5*time.Second)
 }
 
 func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
@@ -555,8 +606,8 @@ func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
 			}
 			if err := runtime.Register(
 				Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
-					Execute(work, "a-failure", child, args{Kind: "fail"})
-					Execute(work, "z-sibling", child, args{Kind: "sibling"}).Delay(60 * time.Millisecond)
+					Enqueue(work, "a-failure", child, args{Kind: "fail"})
+					Enqueue(work, "z-sibling", child, args{Kind: "sibling"}).Delay(60 * time.Millisecond)
 					return None{}, nil
 				}),
 				Handle(child, func(_ context.Context, work *Work[args]) (None, error) {
@@ -571,11 +622,11 @@ func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
 			}
 			cancelRun, runResult := startRuntime(t, runtime)
 			defer stopRuntime(t, cancelRun, runResult)
-			exec, err := root.With(runtime).Execute(ctx, "failfast/"+test.name, None{}, WithFailFast(test.failFast))
+			exec, err := root.Enqueue(ctx, runtime, "failfast/"+test.name, None{}, WithFailFast(test.failFast))
 			if err != nil {
 				t.Fatal(err)
 			}
-			waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
+			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
 			trace, err := Trace(ctx, runtime, exec.ID)
 			if err != nil {
 				t.Fatal(err)
@@ -634,8 +685,8 @@ func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testi
 			}
 			if err := runtime.Register(
 				Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
-					Execute(work, "a-failure", parallel, args{Kind: "failure"})
-					Execute(work, "b-survivor", parallel, args{Kind: "survivor"})
+					Enqueue(work, "a-failure", parallel, args{Kind: "failure"})
+					Enqueue(work, "b-survivor", parallel, args{Kind: "survivor"})
 					return None{}, nil
 				}),
 				Handle(parallel, func(_ context.Context, work *Work[args]) (None, error) {
@@ -653,7 +704,7 @@ func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testi
 						return None{}, err
 					}
 					for index := range stagedChildren {
-						Execute(work, fmt.Sprintf("late-child/%02d", index), late, None{})
+						Enqueue(work, fmt.Sprintf("late-child/%02d", index), late, None{})
 					}
 					return None{}, nil
 				}),
@@ -666,13 +717,13 @@ func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testi
 			}
 			cancelRun, runResult := startRuntime(t, runtime)
 			defer stopRuntime(t, cancelRun, runResult)
-			exec, err := root.With(runtime).Execute(ctx, "settling/"+test.name, None{}, WithFailFast(test.failFast))
+			exec, err := root.Enqueue(ctx, runtime, "settling/"+test.name, None{}, WithFailFast(test.failFast))
 			if err != nil {
 				t.Fatal(err)
 			}
-			waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "failing", 5*time.Second)
+			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "failing", 5*time.Second)
 			close(releaseSurvivor)
-			waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
+			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
 			trace, err := Trace(ctx, runtime, exec.ID)
 			if err != nil {
 				t.Fatal(err)
@@ -691,7 +742,7 @@ func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testi
 			}
 			var events int
 			if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-				WHERE execution_id=$1 AND event_class='application' AND event_name=$2 AND event_key='committed'`,
+				WHERE run_id=$1 AND event_class='application' AND event_name=$2 AND event_key='committed'`,
 				exec.ID, fact.Name()).Scan(&events); err != nil || events != 1 {
 				t.Fatalf("survivor event count=%d err=%v", events, err)
 			}
@@ -732,11 +783,11 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 	cancelRun, runResult := startRuntime(t, runtime)
-	execs := make([]Execution, 5)
+	execs := make([]Run, 5)
 	for index := range execs {
-		execs[index], err = command.With(runtime).Execute(ctx, fmt.Sprintf("capacity/%d", index), runtimeArgs{})
+		execs[index], err = command.Enqueue(ctx, runtime, fmt.Sprintf("capacity/%d", index), runtimeArgs{})
 		if err != nil {
-			t.Fatalf("Execute(%d) error = %v", index, err)
+			t.Fatalf("Enqueue(%d) error = %v", index, err)
 		}
 	}
 	waitForCount(t, &started, 2, 3*time.Second)
@@ -746,7 +797,7 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	}
 	close(blocking)
 	for _, exec := range execs {
-		waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+		waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	}
 	stopRuntime(t, cancelRun, runResult)
 
@@ -761,8 +812,14 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 		t.Fatalf("New(first) error = %v", err)
 	}
 	if err := first.Register(Handle(takeover, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
-		input, err := GetEventValue(work, takeoverInput, "input")
-		if err != nil {
+		if work.Info().RunKey != "takeover" {
+			return runtimeResult{}, fmt.Errorf("first takeover RunKey = %q", work.Info().RunKey)
+		}
+		input, found, err := GetEventValue(work, takeoverInput, "input")
+		if err != nil || !found {
+			if err == nil {
+				err = errors.New("required takeover input is absent")
+			}
 			return runtimeResult{}, err
 		}
 		firstInput.Store(input.Value)
@@ -773,11 +830,11 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 		t.Fatalf("Register(first) error = %v", err)
 	}
 	cancelFirst, firstResult := startRuntime(t, first)
-	exec, err := takeover.With(first).Execute(ctx, "takeover", runtimeArgs{}, WaitFor(takeoverInput, "input"))
+	exec, err := takeover.Enqueue(ctx, first, "takeover", runtimeArgs{}, WaitFor(takeoverInput, "input"))
 	if err != nil {
-		t.Fatalf("Execute(takeover) error = %v", err)
+		t.Fatalf("Enqueue(takeover) error = %v", err)
 	}
-	if err := takeoverInput.Emit(ctx, first, exec.ID, "input", runtimeArgs{Value: "stable"}); err != nil {
+	if err := takeoverInput.Deliver(ctx, first, exec.ID, "input", runtimeArgs{Value: "stable"}); err != nil {
 		t.Fatalf("Emit(takeover input) error = %v", err)
 	}
 	select {
@@ -801,8 +858,14 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 		t.Fatalf("New(second) error = %v", err)
 	}
 	if err := second.Register(Handle(takeover, func(_ context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
-		input, err := GetEventValue(work, takeoverInput, "input")
-		if err != nil {
+		if work.Info().RunKey != "takeover" {
+			return runtimeResult{}, fmt.Errorf("second takeover RunKey = %q", work.Info().RunKey)
+		}
+		input, found, err := GetEventValue(work, takeoverInput, "input")
+		if err != nil || !found {
+			if err == nil {
+				err = errors.New("required takeover input is absent")
+			}
 			return runtimeResult{}, err
 		}
 		secondInput.Store(input.Value)
@@ -811,7 +874,7 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 		t.Fatalf("Register(second) error = %v", err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	close(releaseFirst)
 	stopRuntime(t, cancelSecond, secondResult)
 	trace, err := Trace(ctx, second, exec.ID)
@@ -861,11 +924,11 @@ func TestRuntimeReleasesDatabaseConnectionBeforeWorker(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 	cancelRun, runResult := startRuntime(t, runtime)
-	exec, err := command.With(runtime).Execute(ctx, "connection-release", runtimeArgs{})
+	exec, err := command.Enqueue(ctx, runtime, "connection-release", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatalf("Enqueue() error = %v", err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	stopRuntime(t, cancelRun, runResult)
 }
 
@@ -917,36 +980,36 @@ func TestRuntimeQueueConcurrencyAndFairSelection(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 	cancelRun, runResult := startRuntime(t, runtime)
-	bulkHandles := make([]Execution, 0, commandProbeFactor+1)
-	firstBulk, err := bulk.With(runtime).Execute(ctx, "queue/bulk/active", runtimeArgs{})
+	bulkHandles := make([]Run, 0, commandProbeFactor+1)
+	firstBulk, err := bulk.Enqueue(ctx, runtime, "queue/bulk/active", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("bulk Execute(active) error = %v", err)
+		t.Fatalf("bulk Enqueue(active) error = %v", err)
 	}
 	bulkHandles = append(bulkHandles, firstBulk)
 	waitForCount(t, &bulkStarted, 1, 3*time.Second)
 	for index := range commandProbeFactor {
-		execution, executeErr := bulk.With(runtime).Execute(ctx, fmt.Sprintf("queue/bulk/backlog/%d", index), runtimeArgs{})
+		run, executeErr := bulk.Enqueue(ctx, runtime, fmt.Sprintf("queue/bulk/backlog/%d", index), runtimeArgs{})
 		if executeErr != nil {
-			t.Fatalf("bulk Execute(%d) error = %v", index, executeErr)
+			t.Fatalf("bulk Enqueue(%d) error = %v", index, executeErr)
 		}
-		bulkHandles = append(bulkHandles, execution)
+		bulkHandles = append(bulkHandles, run)
 	}
-	latencyHandle, err := latency.With(runtime).Execute(ctx, "queue/latency", runtimeArgs{})
+	latencyHandle, err := latency.Enqueue(ctx, runtime, "queue/latency", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("latency Execute() error = %v", err)
+		t.Fatalf("latency Enqueue() error = %v", err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, latencyHandle.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, latencyHandle.ID, "succeeded", 5*time.Second)
 	if bulkStarted.Load() != 1 {
 		t.Fatalf("bulk workers started while lane blocked = %d, want 1", bulkStarted.Load())
 	}
 	close(bulkRelease)
 	for _, exec := range bulkHandles {
-		waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+		waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	}
 	stopRuntime(t, cancelRun, runResult)
 }
 
-func TestRuntimeClaimsIndependentExecutionsConcurrently(t *testing.T) {
+func TestRuntimeClaimsIndependentRunsConcurrently(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -965,14 +1028,14 @@ func TestRuntimeClaimsIndependentExecutionsConcurrently(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	executions := make([]Execution, 4)
-	for index := range executions {
-		executions[index], err = command.With(runtime).Execute(ctx, fmt.Sprintf("concurrent-claim/%d", index), None{})
+	runs := make([]Run, 4)
+	for index := range runs {
+		runs[index], err = command.Enqueue(ctx, runtime, fmt.Sprintf("concurrent-claim/%d", index), None{})
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	entered := make(chan struct{}, len(executions))
+	entered := make(chan struct{}, len(runs))
 	release := make(chan struct{})
 	runtime.faults = fault.Func(func(ctx context.Context, point fault.Point) error {
 		if point != fault.ClaimBeforeJournal {
@@ -1007,8 +1070,8 @@ func TestRuntimeClaimsIndependentExecutionsConcurrently(t *testing.T) {
 		}
 	}
 	close(release)
-	for _, execution := range executions {
-		waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	for _, run := range runs {
+		waitForRunStatus(t, database.Schema, database.DB.Conn, run.ID, "succeeded", 5*time.Second)
 	}
 }
 
@@ -1025,14 +1088,14 @@ func TestRuntimeClaimsOnlyAvailableSiblingSlots(t *testing.T) {
 	release := make(chan struct{})
 	var started atomic.Int32
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(3),
-		WithMaxCommandsPerExecution(0), WithPollInterval(5*time.Millisecond), WithNotifications(false))
+		WithMaxCommandsPerRun(0), WithPollInterval(5*time.Millisecond), WithNotifications(false))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.Register(
 		Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
 			for index := range 8 {
-				Execute(work, fmt.Sprintf("child/%d", index), child, None{})
+				Enqueue(work, fmt.Sprintf("child/%d", index), child, None{})
 			}
 			return None{}, nil
 		}),
@@ -1053,7 +1116,7 @@ func TestRuntimeClaimsOnlyAvailableSiblingSlots(t *testing.T) {
 		}
 		stopRuntime(t, cancel, runResult)
 	}()
-	execution, err := parent.With(runtime).Execute(ctx, "sibling/capacity", None{})
+	run, err := parent.Enqueue(ctx, runtime, "sibling/capacity", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1062,9 +1125,9 @@ func TestRuntimeClaimsOnlyAvailableSiblingSlots(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT
 		count(*) FILTER (WHERE c.state='running'),
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+` j
-		 WHERE j.execution_id=$1 AND j.entry_kind='attempt_started' AND j.command_id<>$2)
+		 WHERE j.run_id=$1 AND j.entry_kind='attempt_started' AND j.command_id<>$2)
 	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
-	WHERE c.execution_id=$1 AND c.parent_command_id=$2`, execution.ID, execution.RootCommandID).
+	WHERE c.run_id=$1 AND c.parent_command_id=$2`, run.ID, run.RootCommandID).
 		Scan(&running, &starts); err != nil {
 		t.Fatal(err)
 	}
@@ -1072,10 +1135,10 @@ func TestRuntimeClaimsOnlyAvailableSiblingSlots(t *testing.T) {
 		t.Fatalf("sibling capacity started=%d running=%d starts=%d, want 3", started.Load(), running, starts)
 	}
 	close(release)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, run.ID, "succeeded", 5*time.Second)
 }
 
-func TestRuntimeLockedExecutionReleasesSlotForLaterCandidate(t *testing.T) {
+func TestRuntimeLockedRunReleasesSlotForLaterCandidate(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -1086,7 +1149,7 @@ func TestRuntimeLockedExecutionReleasesSlotForLaterCandidate(t *testing.T) {
 	lockedChild := DefineCommand[None, None]("runtime.locked_claim_fairness_child", 1)
 	_, locked := stageClaimFixture(t, database, "locked_claim_fairness", commandProbeFactor, func(work *Work[None]) {
 		for index := range commandProbeFactor {
-			Execute(work, fmt.Sprintf("child/%d", index), lockedChild, None{})
+			Enqueue(work, fmt.Sprintf("child/%d", index), lockedChild, None{})
 		}
 	})
 	availableCommand := DefineCommand[None, None]("runtime.locked_claim_fairness_available", 1)
@@ -1101,7 +1164,7 @@ func TestRuntimeLockedExecutionReleasesSlotForLaterCandidate(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	available, err := availableCommand.With(runtime).Execute(ctx, "locked-claim/available", None{})
+	available, err := availableCommand.Enqueue(ctx, runtime, "locked-claim/available", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1110,16 +1173,16 @@ func TestRuntimeLockedExecutionReleasesSlotForLaterCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = lockTx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := lockTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
-		WHERE execution_id=$1 FOR UPDATE`, locked.ID); err != nil {
+	if _, err := lockTx.Exec(ctx, `SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_runs")+`
+		WHERE run_id=$1 FOR UPDATE`, locked.ID); err != nil {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, available.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, available.ID, "succeeded", 5*time.Second)
 	stopRuntime(t, cancel, runResult)
 	var attempts int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT COALESCE(sum(attempt_ordinal),0) FROM `+
-		pgschema.Table(database.Schema, "flow_commands")+` WHERE execution_id=$1 AND parent_command_id=$2`,
+		pgschema.Table(database.Schema, "flow_commands")+` WHERE run_id=$1 AND parent_command_id=$2`,
 		locked.ID, locked.RootCommandID).Scan(&attempts); err != nil {
 		t.Fatal(err)
 	}
@@ -1149,16 +1212,16 @@ func TestRuntimeProbeContinuationPassesExclusionCap(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	blockedExecutionIDs := make([]uuid.UUID, maxCommandProbe)
+	blockedRunIDs := make([]uuid.UUID, maxCommandProbe)
 	for index := range maxCommandProbe {
-		execution, executeErr := blockedCommand.With(runtime).Execute(ctx,
+		run, executeErr := blockedCommand.Enqueue(ctx, runtime,
 			fmt.Sprintf("probe-continuation/blocked/%03d", index), None{})
 		if executeErr != nil {
 			t.Fatal(executeErr)
 		}
-		blockedExecutionIDs[index] = uuid.MustParse(string(execution.ID))
+		blockedRunIDs[index] = uuid.MustParse(string(run.ID))
 	}
-	available, err := availableCommand.With(runtime).Execute(ctx, "probe-continuation/available", None{})
+	available, err := availableCommand.Enqueue(ctx, runtime, "probe-continuation/available", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1167,16 +1230,16 @@ func TestRuntimeProbeContinuationPassesExclusionCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = lockTx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := lockTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
-		WHERE execution_id=ANY($1::uuid[]) FOR UPDATE`, blockedExecutionIDs); err != nil {
+	if _, err := lockTx.Exec(ctx, `SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_runs")+`
+		WHERE run_id=ANY($1::uuid[]) FOR UPDATE`, blockedRunIDs); err != nil {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, available.ID, "succeeded", 10*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, available.ID, "succeeded", 10*time.Second)
 	stopRuntime(t, cancel, runResult)
 	var attempts int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT COALESCE(sum(attempt_ordinal),0) FROM `+
-		pgschema.Table(database.Schema, "flow_commands")+` WHERE execution_id=ANY($1::uuid[])`, blockedExecutionIDs).
+		pgschema.Table(database.Schema, "flow_commands")+` WHERE run_id=ANY($1::uuid[])`, blockedRunIDs).
 		Scan(&attempts); err != nil {
 		t.Fatal(err)
 	}
@@ -1204,26 +1267,26 @@ func TestRuntimeProbeContinuationRevisitsHeadBetweenBoundedTurns(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	head, err := command.With(runtime).Execute(ctx, "probe-revisit/head", None{})
+	head, err := command.Enqueue(ctx, runtime, "probe-revisit/head", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	headID := uuid.MustParse(string(head.ID))
 	tailIDs := make([]uuid.UUID, maxCommandProbe)
 	for index := range maxCommandProbe {
-		execution, executeErr := command.With(runtime).Execute(ctx, fmt.Sprintf("probe-revisit/tail/%03d", index), None{})
+		run, executeErr := command.Enqueue(ctx, runtime, fmt.Sprintf("probe-revisit/tail/%03d", index), None{})
 		if executeErr != nil {
 			t.Fatal(executeErr)
 		}
-		tailIDs[index] = uuid.MustParse(string(execution.ID))
+		tailIDs[index] = uuid.MustParse(string(run.ID))
 	}
 	headTx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = headTx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := headTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
-		WHERE execution_id=$1 FOR UPDATE`, headID); err != nil {
+	if _, err := headTx.Exec(ctx, `SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_runs")+`
+		WHERE run_id=$1 FOR UPDATE`, headID); err != nil {
 		t.Fatal(err)
 	}
 	tailTx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
@@ -1231,8 +1294,8 @@ func TestRuntimeProbeContinuationRevisitsHeadBetweenBoundedTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tailTx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := tailTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
-		WHERE execution_id=ANY($1::uuid[]) FOR UPDATE`, tailIDs); err != nil {
+	if _, err := tailTx.Exec(ctx, `SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_runs")+`
+		WHERE run_id=ANY($1::uuid[]) FOR UPDATE`, tailIDs); err != nil {
 		t.Fatal(err)
 	}
 	continuing := make(chan struct{})
@@ -1251,14 +1314,14 @@ func TestRuntimeProbeContinuationRevisitsHeadBetweenBoundedTurns(t *testing.T) {
 		}
 		if probe > int32(maxCommandRoundsPerTurn) && keepArriving.Load() && hookCtx.Err() == nil {
 			index := arrivalSequence.Add(1)
-			execution, executeErr := command.With(runtime).Execute(hookCtx,
+			run, executeErr := command.Enqueue(hookCtx, runtime,
 				fmt.Sprintf("probe-revisit/arrival/%d", index), None{})
 			if executeErr != nil {
 				return executeErr
 			}
-			_, lockErr := tailTx.Exec(hookCtx, `SELECT execution_id FROM `+
-				pgschema.Table(database.Schema, "flow_executions")+` WHERE execution_id=$1 FOR UPDATE`,
-				uuid.MustParse(string(execution.ID)))
+			_, lockErr := tailTx.Exec(hookCtx, `SELECT run_id FROM `+
+				pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1 FOR UPDATE`,
+				uuid.MustParse(string(run.ID)))
 			return lockErr
 		}
 		return nil
@@ -1278,12 +1341,12 @@ func TestRuntimeProbeContinuationRevisitsHeadBetweenBoundedTurns(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("scheduler did not reach its bounded continuation turn")
 	}
-	firstArrival, err := command.With(runtime).Execute(ctx, "probe-revisit/arrival/0", None{})
+	firstArrival, err := command.Enqueue(ctx, runtime, "probe-revisit/arrival/0", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tailTx.Exec(ctx, `SELECT execution_id FROM `+pgschema.Table(database.Schema, "flow_executions")+`
-		WHERE execution_id=$1 FOR UPDATE`, uuid.MustParse(string(firstArrival.ID))); err != nil {
+	if _, err := tailTx.Exec(ctx, `SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_runs")+`
+		WHERE run_id=$1 FOR UPDATE`, uuid.MustParse(string(firstArrival.ID))); err != nil {
 		t.Fatal(err)
 	}
 	keepArriving.Store(true)
@@ -1291,7 +1354,7 @@ func TestRuntimeProbeContinuationRevisitsHeadBetweenBoundedTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	close(releaseProbe)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, head.ID, "succeeded", 10*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, head.ID, "succeeded", 10*time.Second)
 }
 
 func TestRuntimeShutdownDrainsInflightClaimBeforeWorkerAccounting(t *testing.T) {
@@ -1315,7 +1378,7 @@ func TestRuntimeShutdownDrainsInflightClaimBeforeWorkerAccounting(t *testing.T) 
 	})); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := command.With(runtime).Execute(ctx, "shutdown/inflight-claim", None{}); err != nil {
+	if _, err := command.Enqueue(ctx, runtime, "shutdown/inflight-claim", None{}); err != nil {
 		t.Fatal(err)
 	}
 	entered := make(chan struct{}, 1)
@@ -1377,7 +1440,7 @@ func TestRuntimeShutdownTransfersPostCommitClaimToWorkerAccounting(t *testing.T)
 	})); err != nil {
 		t.Fatal(err)
 	}
-	execution, err := command.With(runtime).Execute(ctx, "shutdown/postcommit-claim", None{})
+	run, err := command.Enqueue(ctx, runtime, "shutdown/postcommit-claim", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1385,7 +1448,7 @@ func TestRuntimeShutdownTransfersPostCommitClaimToWorkerAccounting(t *testing.T)
 	release := make(chan struct{})
 	var once sync.Once
 	var renewableDuringShutdown atomic.Bool
-	commandID := uuid.MustParse(string(execution.RootCommandID))
+	commandID := uuid.MustParse(string(run.RootCommandID))
 	runtime.faults = fault.Func(func(_ context.Context, point fault.Point) error {
 		switch point {
 		case fault.ClaimCommitAmbiguous:
@@ -1434,7 +1497,7 @@ func TestRuntimeShutdownTransfersPostCommitClaimToWorkerAccounting(t *testing.T)
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.state,
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` q
 		 WHERE q.command_id=c.command_id AND (q.active_attempt_id IS NOT NULL OR q.lease_token IS NOT NULL))
-	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c WHERE c.command_id=$1`, execution.RootCommandID).
+	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c WHERE c.command_id=$1`, run.RootCommandID).
 		Scan(&state, &activeFences); err != nil {
 		t.Fatal(err)
 	}
@@ -1468,7 +1531,7 @@ func TestRuntimeAmbiguousClaimResolverFailureTransfersFence(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	execution, err := command.With(runtime).Execute(ctx, "ambiguous/resolver-failure", None{})
+	run, err := command.Enqueue(ctx, runtime, "ambiguous/resolver-failure", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1526,7 +1589,7 @@ func TestRuntimeAmbiguousClaimResolverFailureTransfersFence(t *testing.T) {
 	}
 	held = nil
 	close(handlerRelease)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, run.ID, "succeeded", 5*time.Second)
 	if handlers.Load() != 1 {
 		t.Fatalf("ambiguous resolver-failure handlers=%d, want 1", handlers.Load())
 	}
@@ -1558,7 +1621,7 @@ func TestRuntimeFalseAmbiguityReleasesPhantomBeforeRealClaim(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	execution, err := command.With(first).Execute(ctx, "false-ambiguity/claim", None{})
+	run, err := command.Enqueue(ctx, first, "false-ambiguity/claim", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1696,13 +1759,13 @@ func TestRuntimeFalseAmbiguityReleasesPhantomBeforeRealClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, run.ID, "succeeded", 5*time.Second)
 	stopRuntime(t, cancelSecond, secondResult)
 	var attemptOrdinal, attemptStarts int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.attempt_ordinal,
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+` j
-		 WHERE j.execution_id=c.execution_id AND j.command_id=c.command_id AND j.entry_kind='attempt_started')
-	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c WHERE c.command_id=$1`, execution.RootCommandID).
+		 WHERE j.run_id=c.run_id AND j.command_id=c.command_id AND j.entry_kind='attempt_started')
+	FROM `+pgschema.Table(database.Schema, "flow_commands")+` c WHERE c.command_id=$1`, run.RootCommandID).
 		Scan(&attemptOrdinal, &attemptStarts); err != nil {
 		t.Fatal(err)
 	}
@@ -1732,12 +1795,12 @@ func TestRuntimeTwoConnectionPoolRetainsMaintenanceHeadroomDuringClaim(t *testin
 	})); err != nil {
 		t.Fatal(err)
 	}
-	claimExecution, err := claimable.With(runtime).Execute(ctx, "small-pool/claim", None{})
+	claimRun, err := claimable.Enqueue(ctx, runtime, "small-pool/claim", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadlineExecution, err := unhandled.With(runtime).Execute(ctx, "small-pool/deadline", None{},
-		WithExecutionDeadline(25*time.Millisecond))
+	deadlineRun, err := unhandled.Enqueue(ctx, runtime, "small-pool/deadline", None{},
+		WithRunDeadline(25*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1765,9 +1828,9 @@ func TestRuntimeTwoConnectionPoolRetainsMaintenanceHeadroomDuringClaim(t *testin
 	case <-time.After(3 * time.Second):
 		t.Fatal("claim did not hold its bounded pool connection")
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, deadlineExecution.ID, "expired", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, deadlineRun.ID, "expired", 5*time.Second)
 	close(release)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, claimExecution.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, claimRun.ID, "succeeded", 5*time.Second)
 }
 
 func TestClaimConcurrencyLimitLeavesMaintenanceHeadroom(t *testing.T) {
@@ -1806,9 +1869,9 @@ func TestRuntimeRollingVersionLeavesUnknownWorkUnclaimed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(api) error = %v", err)
 	}
-	exec, err := v2.With(api).Execute(ctx, "rolling/v2", runtimeArgs{})
+	exec, err := v2.Enqueue(ctx, api, "rolling/v2", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("v2 Execute() error = %v", err)
+		t.Fatalf("v2 Enqueue() error = %v", err)
 	}
 	oldReplica, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
 		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(time.Second))
@@ -1845,7 +1908,7 @@ func TestRuntimeRollingVersionLeavesUnknownWorkUnclaimed(t *testing.T) {
 		t.Fatalf("Register(new replica) error = %v", err)
 	}
 	cancelNew, newResult := startRuntime(t, newReplica)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	stopRuntime(t, cancelNew, newResult)
 }
 
@@ -1873,7 +1936,7 @@ func TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt(t *testing.T) {
 	if err := runtime.Register(Handle(command, func(ctx context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
 		if work.Args.Value == "cancel" {
 			_ = Emit(work, event, "cancelled", runtimeResult{Value: "must-not-commit"})
-			Execute(work, "child", child, runtimeArgs{Value: "must-not-commit"})
+			Enqueue(work, "child", child, runtimeArgs{Value: "must-not-commit"})
 			cancelStarted <- struct{}{}
 			<-ctx.Done()
 			cancelObserved <- struct{}{}
@@ -1893,13 +1956,13 @@ func TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 	cancelRun, runResult := startRuntime(t, runtime)
-	cancelHandle, err := command.With(runtime).Execute(ctx, "cancel/active", runtimeArgs{Value: "cancel"})
+	cancelHandle, err := command.Enqueue(ctx, runtime, "cancel/active", runtimeArgs{Value: "cancel"})
 	if err != nil {
-		t.Fatalf("Execute(cancel) error = %v", err)
+		t.Fatalf("Enqueue(cancel) error = %v", err)
 	}
-	otherHandle, err := command.With(runtime).Execute(ctx, "cancel/other", runtimeArgs{Value: "other"})
+	otherHandle, err := command.Enqueue(ctx, runtime, "cancel/other", runtimeArgs{Value: "other"})
 	if err != nil {
-		t.Fatalf("Execute(other) error = %v", err)
+		t.Fatalf("Enqueue(other) error = %v", err)
 	}
 	for name, signal := range map[string]<-chan struct{}{"cancel": cancelStarted, "other": otherStarted} {
 		select {
@@ -1922,13 +1985,13 @@ func TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(releaseOther)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, otherHandle.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, otherHandle.ID, "succeeded", 5*time.Second)
 	trace, err := Trace(ctx, runtime, cancelHandle.ID)
 	if err != nil {
 		t.Fatalf("Trace(cancelled) error = %v", err)
 	}
 	stopRuntime(t, cancelRun, runResult)
-	if trace.Execution.Status != "failed" || len(trace.Commands) != 1 || trace.Commands[0].State != "cancelled" ||
+	if trace.Run.Status != "failed" || len(trace.Commands) != 1 || trace.Commands[0].State != "cancelled" ||
 		len(trace.Commands[0].Attempts) != 1 || trace.Commands[0].Attempts[0].Classification != "cancelled" ||
 		trace.Commands[0].Attempts[0].FinishedAt == nil || trace.Commands[0].Attempts[0].ConsumedBudget {
 		t.Fatalf("cancelled Trace = %#v", trace)
@@ -1936,9 +1999,9 @@ func TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt(t *testing.T) {
 	var eventCount, childCount int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		 WHERE execution_id=$1 AND event_class='application'),
+		 WHERE run_id=$1 AND event_class='application'),
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-		 WHERE execution_id=$1 AND parent_command_id IS NOT NULL)`, cancelHandle.ID).Scan(&eventCount, &childCount); err != nil {
+		 WHERE run_id=$1 AND parent_command_id IS NOT NULL)`, cancelHandle.ID).Scan(&eventCount, &childCount); err != nil {
 		t.Fatal(err)
 	}
 	if eventCount != 0 || childCount != 0 {
@@ -1969,9 +2032,9 @@ func TestRuntimeCooperativeShutdownIsRetryableAndBudgetNeutral(t *testing.T) {
 		t.Fatalf("Register(first) error = %v", err)
 	}
 	cancelFirst, firstResult := startRuntime(t, first)
-	exec, err := command.With(first).Execute(ctx, "shutdown", runtimeArgs{})
+	exec, err := command.Enqueue(ctx, first, "shutdown", runtimeArgs{})
 	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatalf("Enqueue() error = %v", err)
 	}
 	select {
 	case <-started:
@@ -1991,7 +2054,7 @@ func TestRuntimeCooperativeShutdownIsRetryableAndBudgetNeutral(t *testing.T) {
 		t.Fatalf("Register(second) error = %v", err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	trace, err := Trace(ctx, second, exec.ID)
 	if err != nil {
 		t.Fatalf("Trace() error = %v", err)
@@ -2046,17 +2109,17 @@ func TestRuntimeDeadlineAndRegistrationLifecycle(t *testing.T) {
 	if err := runtime.Register(worker); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("Register(after Run) error = %v", err)
 	}
-	exec, err := unhandled.With(runtime).Execute(ctx, "deadline", runtimeArgs{}, WithExecutionDeadline(40*time.Millisecond))
+	exec, err := unhandled.Enqueue(ctx, runtime, "deadline", runtimeArgs{}, WithRunDeadline(40*time.Millisecond))
 	if err != nil {
-		t.Fatalf("Execute(deadline) error = %v", err)
+		t.Fatalf("Enqueue(deadline) error = %v", err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "expired", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "expired", 5*time.Second)
 	stopRuntime(t, cancelRun, runResult)
 	if err := runtime.Run(ctx); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("Run(second) error = %v", err)
 	}
-	if _, err := unhandled.With(runtime).Execute(ctx, "closed", runtimeArgs{}); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Execute(stopped runtime) error = %v", err)
+	if _, err := unhandled.Enqueue(ctx, runtime, "closed", runtimeArgs{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Enqueue(stopped runtime) error = %v", err)
 	}
 }
 
@@ -2117,7 +2180,7 @@ type runtimeResult struct {
 	Value string `json:"value"`
 }
 
-func TestRuntimeExecutesDirectCommand(t *testing.T) {
+func TestRuntimeEnqueuesDirectCommand(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -2144,17 +2207,17 @@ func TestRuntimeExecutesDirectCommand(t *testing.T) {
 	runResult := make(chan error, 1)
 	go func() { runResult <- runtime.Run(runCtx) }()
 
-	exec, err := command.With(runtime).Execute(ctx, "direct", runtimeArgs{Value: "work"})
+	exec, err := command.Enqueue(ctx, runtime, "direct", runtimeArgs{Value: "work"})
 	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatalf("Enqueue() error = %v", err)
 	}
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
 	if calls.Load() != 1 {
 		t.Fatalf("worker calls = %d", calls.Load())
 	}
 	select {
 	case info := <-seenInfo:
-		if info.ExecutionID != exec.ID || info.CommandID != exec.RootCommandID || info.Attempt != 1 ||
+		if info.RunID != exec.ID || info.RunKey != "direct" || info.CommandID != exec.RootCommandID || info.Attempt != 1 ||
 			info.BudgetStartedAt.IsZero() || info.AttemptStartedAt.IsZero() {
 			t.Fatalf("CommandInfo = %#v", info)
 		}
@@ -2169,7 +2232,7 @@ func TestRuntimeExecutesDirectCommand(t *testing.T) {
 		t.Fatalf("read command projection: %v", err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE execution_id=$1`, exec.ID).Scan(&queueCount); err != nil {
+		WHERE run_id=$1`, exec.ID).Scan(&queueCount); err != nil {
 		t.Fatalf("count command queue: %v", err)
 	}
 	if commandState != "succeeded" || string(result) != `{"value":"done:work"}` || queueCount != 0 {
@@ -2187,7 +2250,7 @@ func TestRuntimeExecutesDirectCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Trace() error = %v", err)
 	}
-	if trace.Execution.Status != "succeeded" || len(trace.Commands) != 1 || trace.Commands[0].State != "succeeded" ||
+	if trace.Run.Status != "succeeded" || len(trace.Commands) != 1 || trace.Commands[0].State != "succeeded" ||
 		len(trace.Commands[0].Attempts) != 1 || trace.Commands[0].Attempts[0].Classification != "succeeded" ||
 		string(trace.Commands[0].Result) != `{"value":"done:work"}` {
 		t.Fatalf("Trace() = %#v", trace)
@@ -2204,14 +2267,14 @@ func TestRuntimeExecutesDirectCommand(t *testing.T) {
 	}
 }
 
-func waitForExecutionStatus(t *testing.T, schema string, db queryRower, id ExecutionID, want string, timeout time.Duration) {
+func waitForRunStatus(t *testing.T, schema string, db queryRower, id RunID, want string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	last := "<unreadable>"
 	for time.Now().Before(deadline) {
 		var status string
-		if err := db.QueryRow(context.Background(), `SELECT status FROM `+pgschema.Table(schema, "flow_executions")+`
-			WHERE execution_id=$1`, id).Scan(&status); err == nil {
+		if err := db.QueryRow(context.Background(), `SELECT status FROM `+pgschema.Table(schema, "flow_runs")+`
+			WHERE run_id=$1`, id).Scan(&status); err == nil {
 			last = status
 			if status == want {
 				return
@@ -2219,5 +2282,5 @@ func waitForExecutionStatus(t *testing.T, schema string, db queryRower, id Execu
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("execution %s did not reach %s (last status %s)", id, want, last)
+	t.Fatalf("run %s did not reach %s (last status %s)", id, want, last)
 }

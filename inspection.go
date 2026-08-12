@@ -15,16 +15,16 @@ import (
 )
 
 const (
-	defaultExecutionPageSize = 50
-	maxExecutionPageSize     = 200
+	defaultRunPageSize = 50
+	maxRunPageSize     = 200
 )
 
-// ExecutionFilter is the bounded, indexed filter supported by
-// ListExecutions. CreatedBefore is exclusive and CreatedAfter is inclusive.
-type ExecutionFilter struct {
+// RunFilter is the bounded, indexed filter supported by
+// ListRuns. CreatedBefore is exclusive and CreatedAfter is inclusive.
+type RunFilter struct {
 	Type          string
 	KeyPrefix     string
-	Statuses      []ExecutionStatus
+	Statuses      []RunStatus
 	CreatedAfter  *time.Time
 	CreatedBefore *time.Time
 	Metadata      map[string]string
@@ -32,138 +32,138 @@ type ExecutionFilter struct {
 	Cursor        string
 }
 
-type ExecutionPage struct {
-	Executions []Execution
+type RunPage struct {
+	Runs       []Run
 	NextCursor string
 }
 
-type executionCursor struct {
+type runCursor struct {
 	CreatedAt time.Time `json:"created_at"`
 	ID        string    `json:"id"`
 }
 
-func GetExecution(ctx context.Context, c Client, id ExecutionID) (Execution, error) {
-	executionID, err := parseExecutionID(id)
+func GetRun(ctx context.Context, c Client, id RunID) (Run, error) {
+	runID, err := parseRunID(id)
 	if err != nil {
-		return Execution{}, err
+		return Run{}, err
 	}
 	client, err := resolveClient(c)
 	if err != nil {
-		return Execution{}, err
+		return Run{}, err
 	}
-	row, err := client.runtime.store.GetExecutionInTx(ctx, client.tx, executionID)
+	row, err := client.runtime.store.GetRunInTx(ctx, client.tx, runID)
 	if err != nil {
-		return Execution{}, err
+		return Run{}, err
 	}
-	return executionFromStore(row)
+	return runFromStore(row)
 }
 
-// LookupLiveExecution finds the one non-terminal execution currently holding
+// GetCurrentRun finds the one non-terminal run currently holding
 // a live-scoped key for the definition, if any. Live keys admit many settled
-// executions per key over time but at most one live holder; this is the
+// runs per key over time but at most one live holder; this is the
 // lookup that matches that invariant. found=false means no live holder —
-// settled executions with the key may still exist.
-func LookupLiveExecution(ctx context.Context, c Client, typ, key string) (Execution, bool, error) {
+// settled runs with the key may still exist.
+func GetCurrentRun(ctx context.Context, c Client, typ, key string) (Run, bool, error) {
 	if err := definition.ValidateName(typ); err != nil {
-		return Execution{}, false, newError(ErrInvalid, "lookup", "execution type", typ, "invalid definition name")
+		return Run{}, false, newError(ErrInvalid, "lookup", "run type", typ, "invalid definition name")
 	}
-	if key == "" || len(key) > maxExecutionKeyBytes || !utf8.ValidString(key) {
-		return Execution{}, false, newError(ErrInvalid, "lookup", "execution key", "", "key is empty, malformed, or too long")
+	if key == "" || len(key) > maxRunKeyBytes || !utf8.ValidString(key) {
+		return Run{}, false, newError(ErrInvalid, "lookup", "run key", "", "key is empty, malformed, or too long")
 	}
 	client, err := resolveClient(c)
 	if err != nil {
-		return Execution{}, false, err
+		return Run{}, false, err
 	}
-	row, found, err := client.runtime.store.LookupLiveExecutionInTx(ctx, client.tx, typ, key)
+	row, found, err := client.runtime.store.GetCurrentRun(ctx, client.tx, typ, key)
 	if err != nil || !found {
-		return Execution{}, false, err
+		return Run{}, false, err
 	}
-	execution, err := executionFromStore(row)
-	return execution, err == nil, err
+	run, err := runFromStore(row)
+	return run, err == nil, err
 }
 
-func ListExecutions(ctx context.Context, c Client, filter ExecutionFilter) (ExecutionPage, error) {
+func ListRuns(ctx context.Context, c Client, filter RunFilter) (RunPage, error) {
 	client, err := resolveClient(c)
 	if err != nil {
-		return ExecutionPage{}, err
+		return RunPage{}, err
 	}
 	if filter.Type != "" {
 		if err := definition.ValidateName(filter.Type); err != nil {
-			return ExecutionPage{}, newError(ErrInvalid, "list", "execution type", filter.Type, "invalid definition name")
+			return RunPage{}, newError(ErrInvalid, "list", "run type", filter.Type, "invalid definition name")
 		}
 	}
-	if len(filter.KeyPrefix) > maxExecutionKeyBytes || !utf8.ValidString(filter.KeyPrefix) {
-		return ExecutionPage{}, newError(ErrInvalid, "list", "key prefix", "", "key prefix is malformed or too long")
+	if len(filter.KeyPrefix) > maxRunKeyBytes || !utf8.ValidString(filter.KeyPrefix) {
+		return RunPage{}, newError(ErrInvalid, "list", "key prefix", "", "key prefix is malformed or too long")
 	}
 	pageSize := filter.PageSize
 	if pageSize == 0 {
-		pageSize = defaultExecutionPageSize
+		pageSize = defaultRunPageSize
 	}
-	if pageSize < 1 || pageSize > maxExecutionPageSize {
-		return ExecutionPage{}, newError(ErrInvalid, "list", "page size", "", "page size must be between 1 and 200")
+	if pageSize < 1 || pageSize > maxRunPageSize {
+		return RunPage{}, newError(ErrInvalid, "list", "page size", "", "page size must be between 1 and 200")
 	}
-	statuses, err := validateExecutionStatuses(filter.Statuses)
+	statuses, err := validateRunStatuses(filter.Statuses)
 	if err != nil {
-		return ExecutionPage{}, err
+		return RunPage{}, err
 	}
 	if filter.CreatedAfter != nil && filter.CreatedBefore != nil && !filter.CreatedAfter.Before(*filter.CreatedBefore) {
-		return ExecutionPage{}, newError(ErrInvalid, "list", "time range", "", "created-after must precede created-before")
+		return RunPage{}, newError(ErrInvalid, "list", "time range", "", "created-after must precede created-before")
 	}
 	if err := validateMetadata(filter.Metadata); err != nil {
-		return ExecutionPage{}, err
+		return RunPage{}, err
 	}
 	var metadataBytes []byte
 	if len(filter.Metadata) != 0 {
-		metadata, err := canonical.Marshal(filter.Metadata, maxExecutionMetadataBytes)
+		metadata, err := canonical.Marshal(filter.Metadata, maxRunMetadataBytes)
 		if err != nil {
-			return ExecutionPage{}, mapCanonicalError("list", "metadata", err)
+			return RunPage{}, mapCanonicalError("list", "metadata", err)
 		}
 		metadataBytes = metadata.BytesCopy()
 	}
 	var cursorTime *time.Time
 	var cursorID *uuid.UUID
 	if filter.Cursor != "" {
-		decoded, err := decodeExecutionCursor(filter.Cursor)
+		decoded, err := decodeRunCursor(filter.Cursor)
 		if err != nil {
-			return ExecutionPage{}, err
+			return RunPage{}, err
 		}
 		cursorTime, cursorID = &decoded.CreatedAt, &decoded.ID
 	}
-	rows, err := client.runtime.store.ListExecutionsInTx(ctx, client.tx, store.ExecutionListFilter{
+	rows, err := client.runtime.store.ListRunsInTx(ctx, client.tx, store.RunListFilter{
 		DefinitionName: filter.Type, KeyPrefix: filter.KeyPrefix, Statuses: statuses,
 		CreatedAfter: cloneTimePointer(filter.CreatedAfter), CreatedBefore: cloneTimePointer(filter.CreatedBefore),
 		Metadata: metadataBytes, CursorCreated: cursorTime, CursorID: cursorID, Limit: pageSize + 1,
 	})
 	if err != nil {
-		return ExecutionPage{}, err
+		return RunPage{}, err
 	}
-	page := ExecutionPage{Executions: make([]Execution, min(len(rows), pageSize))}
-	for i := range page.Executions {
-		page.Executions[i], err = executionFromStore(rows[i])
+	page := RunPage{Runs: make([]Run, min(len(rows), pageSize))}
+	for i := range page.Runs {
+		page.Runs[i], err = runFromStore(rows[i])
 		if err != nil {
-			return ExecutionPage{}, err
+			return RunPage{}, err
 		}
 	}
 	if len(rows) > pageSize {
 		last := rows[pageSize-1]
-		page.NextCursor, err = encodeExecutionCursor(last.CreatedAt, last.ID)
+		page.NextCursor, err = encodeRunCursor(last.CreatedAt, last.ID)
 		if err != nil {
-			return ExecutionPage{}, err
+			return RunPage{}, err
 		}
 	}
 	return page, nil
 }
 
-// AwaitExecution polls the durable execution row until it reaches a terminal
+// AwaitRun polls the durable run row until it reaches a terminal
 // state or ctx ends. It consumes no command worker, connection while waiting,
 // or durable lease.
-func AwaitExecution(ctx context.Context, c Client, id ExecutionID) (Execution, error) {
+func AwaitRun(ctx context.Context, c Client, id RunID) (Run, error) {
 	client, err := resolveClient(c)
 	if err != nil {
-		return Execution{}, err
+		return Run{}, err
 	}
 	if client.tx != nil {
-		return Execution{}, newError(ErrInvalid, "await", "transaction client", string(id), "await cannot observe commits while a caller transaction remains open")
+		return Run{}, newError(ErrInvalid, "await", "transaction client", string(id), "await cannot observe commits while a caller transaction remains open")
 	}
 	interval := min(client.runtime.pollInterval, 250*time.Millisecond)
 	if interval <= 0 {
@@ -174,30 +174,30 @@ func AwaitExecution(ctx context.Context, c Client, id ExecutionID) (Execution, e
 	for {
 		select {
 		case <-ctx.Done():
-			return Execution{}, ctx.Err()
+			return Run{}, ctx.Err()
 		case <-timer.C:
 		}
-		execution, err := GetExecution(ctx, c, id)
+		run, err := GetRun(ctx, c, id)
 		if err != nil {
-			return Execution{}, err
+			return Run{}, err
 		}
-		if isTerminalExecutionStatus(execution.Status) {
-			return execution, nil
+		if isTerminalRunStatus(run.Status) {
+			return run, nil
 		}
 		timer.Reset(interval)
 	}
 }
 
-func executionFromStore(row store.ExecutionRow) (Execution, error) {
-	status, err := executionStatusFromString(row.Status)
+func runFromStore(row store.RunRow) (Run, error) {
+	status, err := runStatusFromString(row.Status)
 	if err != nil {
-		return Execution{}, newError(ErrInvalidState, "decode", "execution status", row.Status, "stored status is unknown")
+		return Run{}, newError(ErrInvalidState, "decode", "run status", row.Status, "stored status is unknown")
 	}
 	if row.RootCommandID == nil {
-		return Execution{}, newError(ErrInvalidState, "decode", "root command", row.ID.String(), "stored root command is missing")
+		return Run{}, newError(ErrInvalidState, "decode", "root command", row.ID.String(), "stored root command is missing")
 	}
-	exec := Execution{
-		ID: ExecutionID(row.ID.String()), Type: row.DefinitionName, Version: row.DefinitionVersion,
+	run := Run{
+		ID: RunID(row.ID.String()), Type: row.DefinitionName, Version: row.DefinitionVersion,
 		Key: row.Key, Status: status, FailFast: row.FailFast, MaxCommands: row.MaxCommands,
 		RootCommandID: CommandID(row.RootCommandID.String()),
 		CommandCount:  row.CommandCount, OpenCommands: row.OpenCommands,
@@ -205,15 +205,15 @@ func executionFromStore(row store.ExecutionRow) (Execution, error) {
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StatusAt: row.StatusAt,
 		FinishedAt: cloneTimePointer(row.FinishedAt), Metadata: json.RawMessage(append([]byte(nil), row.Metadata...)),
 	}
-	return exec, nil
+	return run, nil
 }
 
-func validateExecutionStatuses(values []ExecutionStatus) ([]string, error) {
+func validateRunStatuses(values []RunStatus) ([]string, error) {
 	seen := make(map[string]struct{}, len(values))
 	result := make([]string, 0, len(values))
 	for _, value := range values {
-		if _, err := executionStatusFromString(string(value)); err != nil {
-			return nil, newError(ErrInvalid, "list", "status", string(value), "unknown execution status")
+		if _, err := runStatusFromString(string(value)); err != nil {
+			return nil, newError(ErrInvalid, "list", "status", string(value), "unknown run status")
 		}
 		encoded := string(value)
 		if _, ok := seen[encoded]; ok {
@@ -225,24 +225,24 @@ func validateExecutionStatuses(values []ExecutionStatus) ([]string, error) {
 	return result, nil
 }
 
-func isTerminalExecutionStatus(status ExecutionStatus) bool {
+func isTerminalRunStatus(status RunStatus) bool {
 	switch status {
-	case ExecutionStatusSucceeded, ExecutionStatusFailed, ExecutionStatusCancelled, ExecutionStatusExpired:
+	case RunStatusSucceeded, RunStatusFailed, RunStatusCancelled, RunStatusExpired:
 		return true
 	default:
 		return false
 	}
 }
 
-func encodeExecutionCursor(createdAt time.Time, id uuid.UUID) (string, error) {
-	encoded, err := json.Marshal(executionCursor{CreatedAt: createdAt, ID: id.String()})
+func encodeRunCursor(createdAt time.Time, id uuid.UUID) (string, error) {
+	encoded, err := json.Marshal(runCursor{CreatedAt: createdAt, ID: id.String()})
 	if err != nil {
 		return "", newError(ErrInvalidState, "list", "cursor", "", "cannot encode cursor")
 	}
 	return base64.RawURLEncoding.EncodeToString(encoded), nil
 }
 
-func decodeExecutionCursor(value string) (struct {
+func decodeRunCursor(value string) (struct {
 	CreatedAt time.Time
 	ID        uuid.UUID
 }, error) {
@@ -257,7 +257,7 @@ func decodeExecutionCursor(value string) (struct {
 	if err != nil {
 		return result, newError(ErrInvalid, "list", "cursor", "", "cursor is malformed")
 	}
-	var cursor executionCursor
+	var cursor runCursor
 	if err := json.Unmarshal(data, &cursor); err != nil || cursor.CreatedAt.IsZero() {
 		return result, newError(ErrInvalid, "list", "cursor", "", "cursor is malformed")
 	}

@@ -22,21 +22,21 @@ import (
 )
 
 const (
-	maxCommandArgumentBytes   = 256 << 10
-	maxApplicationEventBytes  = journalcodec.MaxApplicationEventPayloadBytes
-	maxCommandEventWaits      = 256
-	maxExecutionMetadataBytes = 16 << 10
-	maxExecutionKeyBytes      = 1024
-	maxCommandKeyBytes        = 1024
-	defaultExecutionDeadline  = 30 * 24 * time.Hour
+	maxCommandArgumentBytes  = 256 << 10
+	maxApplicationEventBytes = journalcodec.MaxApplicationEventPayloadBytes
+	maxCommandEventWaits     = 256
+	maxRunMetadataBytes      = 16 << 10
+	maxRunKeyBytes           = 1024
+	maxCommandKeyBytes       = 1024
+	defaultRunDeadline       = 30 * 24 * time.Hour
 )
 
-// ExecutionOption is a sealed command execution option.
-type ExecutionOption interface {
-	applyExecution(*executionOptions)
+// RunOption is a sealed command run option.
+type RunOption interface {
+	applyRun(*runOptions)
 }
 
-type executionOptions struct {
+type runOptions struct {
 	deadline      store.DeadlineSpec
 	deadlineSet   bool
 	failFast      bool
@@ -53,33 +53,34 @@ type executionOptions struct {
 	errs          []error
 }
 
-type executionOptionFunc func(*executionOptions)
+type runOptionFunc func(*runOptions)
 
-func (f executionOptionFunc) applyExecution(options *executionOptions) { f(options) }
+func (f runOptionFunc) applyRun(options *runOptions) { f(options) }
 
-func WithExecutionDeadline(deadline time.Duration) ExecutionOption {
-	return executionOptionFunc(func(options *executionOptions) {
+func WithRunDeadline(deadline time.Duration) RunOption {
+	return runOptionFunc(func(options *runOptions) {
 		if options.deadlineSet {
-			options.errs = append(options.errs, errors.New("execution deadline configured more than once"))
+			options.errs = append(options.errs, errors.New("run deadline configured more than once"))
 			return
 		}
 		options.deadlineSet = true
 		if deadline <= 0 {
-			options.errs = append(options.errs, errors.New("execution deadline must be positive"))
+			options.errs = append(options.errs, errors.New("run deadline must be positive"))
 			return
 		}
-		if _, err := durable.ExactMilliseconds("execution deadline", deadline); err != nil {
+		normalized, _, err := durable.CeilMilliseconds("run deadline", deadline)
+		if err != nil {
 			options.errs = append(options.errs, err)
 			return
 		}
-		options.deadline = store.DeadlineSpec{Mode: "duration", Duration: deadline}
+		options.deadline = store.DeadlineSpec{Mode: "duration", Duration: normalized}
 	})
 }
 
-func WithoutExecutionDeadline() ExecutionOption {
-	return executionOptionFunc(func(options *executionOptions) {
+func WithoutRunDeadline() RunOption {
+	return runOptionFunc(func(options *runOptions) {
 		if options.deadlineSet {
-			options.errs = append(options.errs, errors.New("execution deadline configured more than once"))
+			options.errs = append(options.errs, errors.New("run deadline configured more than once"))
 			return
 		}
 		options.deadlineSet = true
@@ -87,8 +88,8 @@ func WithoutExecutionDeadline() ExecutionOption {
 	})
 }
 
-func WithMetadata(metadata map[string]string) ExecutionOption {
-	return executionOptionFunc(func(options *executionOptions) {
+func WithMetadata(metadata map[string]string) RunOption {
+	return runOptionFunc(func(options *runOptions) {
 		if options.metadataSet {
 			options.errs = append(options.errs, errors.New("metadata configured more than once"))
 			return
@@ -98,8 +99,8 @@ func WithMetadata(metadata map[string]string) ExecutionOption {
 	})
 }
 
-func WithFailFast(enabled bool) ExecutionOption {
-	return executionOptionFunc(func(options *executionOptions) {
+func WithFailFast(enabled bool) RunOption {
+	return runOptionFunc(func(options *runOptions) {
 		if options.failFastSet {
 			options.errs = append(options.errs, errors.New("fail-fast configured more than once"))
 			return
@@ -109,14 +110,14 @@ func WithFailFast(enabled bool) ExecutionOption {
 	})
 }
 
-// WithLiveKey scopes the execution key to live executions: while a running or
-// failing execution holds the key, Execute rediscovers it without comparing
+// WithLiveKey scopes the run key to live runs: while a running or
+// failing run holds the key, Enqueue rediscovers it without comparing
 // start identity — a silent, queue-style dedupe no-op — and once that
-// execution reaches a terminal status the key is released for a new start.
-// Live-keyed starts therefore give at-most-one live execution per key, not
-// at-most-one execution ever. Requires a non-empty key.
-func WithLiveKey() ExecutionOption {
-	return executionOptionFunc(func(options *executionOptions) {
+// run reaches a terminal status the key is released for a new start.
+// Live-keyed starts therefore give at-most-one live run per key, not
+// at-most-one run ever. Requires a non-empty key.
+func WithLiveKey() RunOption {
+	return runOptionFunc(func(options *runOptions) {
 		if options.keyScopeSet {
 			options.errs = append(options.errs, errors.New("key scope configured more than once"))
 			return
@@ -126,32 +127,33 @@ func WithLiveKey() ExecutionOption {
 	})
 }
 
-// WithStartDelay schedules an execution's root command to become deliverable
+// WithStartDelay schedules a run's root command to become deliverable
 // after the delay instead of immediately, mirroring Delay for sub-commands.
-func WithStartDelay(delay time.Duration) ExecutionOption {
-	return executionOptionFunc(func(options *executionOptions) {
+func WithStartDelay(delay time.Duration) RunOption {
+	return runOptionFunc(func(options *runOptions) {
 		if options.startDelaySet {
 			options.errs = append(options.errs, errors.New("start delay configured more than once"))
 			return
 		}
 		options.startDelaySet = true
-		if delay < time.Millisecond {
-			options.errs = append(options.errs, errors.New("start delay must be at least one millisecond"))
+		if delay <= 0 {
+			options.errs = append(options.errs, errors.New("start delay must be positive"))
 			return
 		}
-		if _, err := durable.ExactMilliseconds("start delay", delay); err != nil {
+		normalized, _, err := durable.CeilMilliseconds("start delay", delay)
+		if err != nil {
 			options.errs = append(options.errs, err)
 			return
 		}
-		options.startDelay = delay
+		options.startDelay = normalized
 	})
 }
 
 // WaitFor gates a root command on one exact application event inside the
-// execution it creates. Multiple waits are AND conditions. Worker decisions
+// run it creates. Multiple waits are AND conditions. Worker decisions
 // use the matching Node.WaitFor method.
-func WaitFor(event EventRef, key string) ExecutionOption {
-	return executionOptionFunc(func(options *executionOptions) {
+func WaitFor(event EventRef, key string) RunOption {
+	return runOptionFunc(func(options *runOptions) {
 		wait, err := makeCommandEventWait(event, key)
 		if err != nil {
 			options.errs = append(options.errs, err)
@@ -163,50 +165,67 @@ func WaitFor(event EventRef, key string) ExecutionOption {
 
 // Within bounds how long a direct root command waits for its exact events.
 // It is valid only when the same start declares at least one WaitFor option.
-func Within(duration time.Duration) ExecutionOption {
-	return executionOptionFunc(func(options *executionOptions) {
-		if duration < time.Millisecond {
-			options.errs = append(options.errs, errors.New("within must be at least one millisecond"))
+func Within(duration time.Duration) RunOption {
+	return runOptionFunc(func(options *runOptions) {
+		if duration <= 0 {
+			options.errs = append(options.errs, errors.New("within must be positive"))
 			return
 		}
-		if _, err := durable.ExactMilliseconds("within", duration); err != nil {
+		normalized, _, err := durable.CeilMilliseconds("within", duration)
+		if err != nil {
 			options.errs = append(options.errs, err)
 			return
 		}
-		if options.withinSet && options.within == duration {
+		if options.withinSet && options.within == normalized {
 			return
 		}
 		if options.withinSet {
 			options.errs = append(options.errs, errors.New("within configured with different values"))
 			return
 		}
-		options.withinSet, options.within = true, duration
+		options.withinSet, options.within = true, normalized
 	})
 }
 
-func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts ...ExecutionOption) (Execution, error) {
+func (cmd Command[A, R]) Enqueue(ctx context.Context, client Client, key string, args A, opts ...RunOption) (Run, error) {
 	var definitionError error
 	if cmd.def == nil {
 		definitionError = errors.New("zero definition")
 	}
-	if err := errors.Join(cmd.err, definitionError, validateBoundClient(cmd.client)); err != nil {
-		return Execution{}, newError(ErrInvalid, "execute", "command", cmd.Name(), err.Error())
+	if err := errors.Join(cmd.err, definitionError); err != nil {
+		return Run{}, newError(ErrInvalid, "enqueue", "command", cmd.Name(), err.Error())
 	}
 	input, err := encodeDefinitionValue(cmd.def.Args, args, maxCommandArgumentBytes, "command arguments")
 	if err != nil {
-		return Execution{}, err
+		return Run{}, err
 	}
-	client, err := resolveClient(cmd.client)
+	resolved, err := resolveClient(client)
 	if err != nil {
-		return Execution{}, err
+		return Run{}, err
 	}
+	if err := resolved.beforeFlowWrite(); err != nil {
+		return Run{}, err
+	}
+	request, err := cmd.prepareStartRequest(key, input, resolved.runtime.maxCommands, opts...)
+	if err != nil {
+		return Run{}, err
+	}
+	return enqueueStart(ctx, resolved, request)
+}
+
+func (cmd Command[A, R]) prepareStartRequest(
+	key string,
+	input canonical.Value,
+	maxCommands int,
+	opts ...RunOption,
+) (store.StartRequest, error) {
 	options, metadata, fingerprint, err := prepareStartOptions(cmd.Name(), cmd.Version(), key, input, opts...)
 	if err != nil {
-		return Execution{}, err
+		return store.StartRequest{}, err
 	}
 	root, err := prepareCommand(uuid.New(), "root", cmd.def, cmd.defaults, input)
 	if err != nil {
-		return Execution{}, err
+		return store.StartRequest{}, err
 	}
 	if options.startDelay > 0 {
 		root.InitialDelay = options.startDelay
@@ -217,17 +236,94 @@ func (cmd Command[A, R]) Execute(ctx context.Context, key string, args A, opts .
 	root.Within = options.within
 	root.DeclarationFingerprint, err = commandDeclarationFingerprint(root)
 	if err != nil {
-		return Execution{}, err
+		return store.StartRequest{}, err
 	}
-	request := store.StartRequest{
+	return store.StartRequest{
 		ID: uuid.New(), DefinitionName: cmd.Name(), DefinitionVersion: cmd.Version(), Key: key,
 		KeyScope: options.keyScope, StartFingerprint: fingerprint, Input: input, Metadata: metadata,
-		FailFast: options.failFast, Deadline: options.deadline, MaxCommands: client.runtime.maxCommands, Root: &root,
-	}
-	return executeStart(ctx, client, request)
+		FailFast: options.failFast, Deadline: options.deadline, MaxCommands: maxCommands, Root: &root,
+	}, nil
 }
 
-func executeStart(ctx context.Context, client resolvedClient, request store.StartRequest) (Execution, error) {
+// ReplaceCurrentRun atomically cancels expected and creates a distinct
+// live-key successor. If expected is stale, an equivalent already-committed
+// successor is returned with Replaced=false; a different current declaration
+// conflicts and no state is changed.
+func (cmd Command[A, R]) ReplaceCurrentRun(
+	ctx context.Context,
+	client Client,
+	expected RunID,
+	key string,
+	args A,
+	reason string,
+	opts ...RunOption,
+) (ReplaceRunResult, error) {
+	var definitionError error
+	if cmd.def == nil {
+		definitionError = errors.New("zero definition")
+	}
+	if err := errors.Join(cmd.err, definitionError); err != nil {
+		return ReplaceRunResult{}, newError(ErrInvalid, "replace", "command", cmd.Name(), err.Error())
+	}
+	expectedID, err := parseRunID(expected)
+	if err != nil {
+		return ReplaceRunResult{}, err
+	}
+	if err := validateCancellationReason(reason); err != nil {
+		return ReplaceRunResult{}, err
+	}
+	input, err := encodeDefinitionValue(cmd.def.Args, args, maxCommandArgumentBytes, "command arguments")
+	if err != nil {
+		return ReplaceRunResult{}, err
+	}
+	resolved, err := resolveClient(client)
+	if err != nil {
+		return ReplaceRunResult{}, err
+	}
+	if err := resolved.beforeFlowWrite(); err != nil {
+		return ReplaceRunResult{}, err
+	}
+	start, err := cmd.prepareStartRequest(key, input, resolved.runtime.maxCommands, opts...)
+	if err != nil {
+		return ReplaceRunResult{}, err
+	}
+	if key == "" || start.KeyScope != store.KeyScopeLive {
+		return ReplaceRunResult{}, newError(ErrInvalid, "replace", "run", key, "replacement requires a non-empty live key and WithLiveKey")
+	}
+
+	var result store.ReplaceRunResult
+	err = resolved.inTransaction(ctx, func(tx pgx.Tx) error {
+		if err := resolved.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
+			return err
+		}
+		var err error
+		result, err = resolved.runtime.store.ReplaceCurrentRunInTx(ctx, tx, store.ReplaceRunRequest{
+			Expected: expectedID, Start: start, Reason: reason,
+		}, resolved.order)
+		return err
+	})
+	if err != nil {
+		return ReplaceRunResult{}, err
+	}
+	run, err := runFromStore(result.Start.Row)
+	if err != nil {
+		return ReplaceRunResult{}, err
+	}
+	run.Created = result.Start.Created
+	if resolved.tx == nil && result.Replaced {
+		resolved.runtime.wakeCommands()
+		resolved.runtime.observe(ctx, Observation{
+			Kind: ObservationRun, Operation: "cancel", Outcome: "cancelled", RunID: expected,
+		})
+		resolved.runtime.observe(ctx, Observation{
+			Kind: ObservationRun, Operation: "start", Outcome: "created", RunID: run.ID,
+			Name: start.DefinitionName, Version: start.DefinitionVersion,
+		})
+	}
+	return ReplaceRunResult{Run: run, Replaced: result.Replaced}, nil
+}
+
+func enqueueStart(ctx context.Context, client resolvedClient, request store.StartRequest) (Run, error) {
 	var result store.StartResult
 	err := client.inTransaction(ctx, func(tx pgx.Tx) error {
 		if err := client.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
@@ -238,47 +334,38 @@ func executeStart(ctx context.Context, client resolvedClient, request store.Star
 		return err
 	})
 	if err != nil {
-		return Execution{}, err
+		return Run{}, err
 	}
-	exec, err := executionFromStore(result.Row)
+	run, err := runFromStore(result.Row)
 	if err != nil {
-		return Execution{}, err
+		return Run{}, err
 	}
-	exec.Created = result.Created
+	run.Created = result.Created
 	if client.tx == nil && result.Created {
 		client.runtime.wakeCommands()
 		client.runtime.observe(ctx, Observation{
-			Kind: ObservationExecution, Operation: "start", Outcome: "created",
-			ExecutionID: exec.ID, Name: request.DefinitionName, Version: request.DefinitionVersion,
+			Kind: ObservationRun, Operation: "start", Outcome: "created",
+			RunID: run.ID, Name: request.DefinitionName, Version: request.DefinitionVersion,
 		})
 	}
-	return exec, nil
+	return run, nil
 }
 
-func (event Event[T]) Emit(ctx context.Context, c Client, id ExecutionID, key string, payload T) error {
-	if state := attemptScope(ctx); state != nil {
-		err := newError(ErrInvalidState, "emit", "event", key, "external event ingress is unavailable inside an attempt")
-		state.poison(err)
-		return err
-	}
-	return event.emitExternal(ctx, c, id, key, payload)
-}
-
-// Deliver records an event in a known execution, including from inside an
+// Deliver records an event in a known run, including from inside an
 // active worker attempt. Delivery is detached from that attempt: pass a
 // Runtime.InTx client to join a caller-owned transaction. Once committed, the
 // event is not retracted if the source attempt fails or retries; equivalent
 // repeats retain ordinary event idempotency. Use Emit(work, ...) for
-// same-execution events that must settle atomically with the worker decision.
-func (event Event[T]) Deliver(ctx context.Context, client Client, target ExecutionID, key string, payload T) error {
-	return event.emitExternal(ctx, client, target, key, payload)
+// same-run events that must settle atomically with the worker decision.
+func (event Event[T]) Deliver(ctx context.Context, client Client, target RunID, key string, payload T) error {
+	return event.deliverExternal(ctx, client, target, key, payload)
 }
 
-func (event Event[T]) emitExternal(ctx context.Context, c Client, id ExecutionID, key string, payload T) error {
+func (event Event[T]) deliverExternal(ctx context.Context, c Client, id RunID, key string, payload T) error {
 	if event.err != nil || event.def == nil || event.def.Namespace != "application" {
-		return newError(ErrInvalid, "emit", "event", eventName(event.def), "invalid event definition")
+		return newError(ErrInvalid, "deliver", "event", eventName(event.def), "invalid event definition")
 	}
-	executionID, err := parseExecutionID(id)
+	runID, err := parseRunID(id)
 	if err != nil {
 		return err
 	}
@@ -293,24 +380,27 @@ func (event Event[T]) emitExternal(ctx context.Context, c Client, id ExecutionID
 		V: journalcodec.ApplicationEventBodyVersion, Payload: json.RawMessage(encoded.BytesCopy()),
 	}, 0)
 	if err != nil {
-		return newError(ErrInvalid, "emit", "event", event.def.Name, "payload cannot be journaled")
+		return newError(ErrInvalid, "deliver", "event", event.def.Name, "payload cannot be journaled")
 	}
 	client, err := resolveClient(c)
 	if err != nil {
 		return err
 	}
-	existing, err := client.runtime.store.LookupApplicationEvent(ctx, client.tx, executionID, event.def.Name, key)
+	if err := client.beforeFlowWrite(); err != nil {
+		return err
+	}
+	existing, found, err := client.runtime.store.GetEvent(ctx, client.tx, runID, event.def.Name, key)
 	if err != nil {
 		return err
 	}
-	if existing.Found {
+	if found {
 		if bytes.Equal(existing.Body, body.Bytes) {
 			return nil
 		}
-		return newError(ErrConflict, "emit", "event", key, "event identity differs")
+		return newError(ErrConflict, "deliver", "event", key, "event identity differs")
 	}
 	created := false
-	err = client.semantic(ctx, executionID, func(semantic *store.SemanticTx) error {
+	err = client.semantic(ctx, runID, func(semantic *store.SemanticTx) error {
 		if err := client.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
 			return err
 		}
@@ -325,7 +415,7 @@ func (event Event[T]) emitExternal(ctx context.Context, c Client, id ExecutionID
 	}
 	if client.tx == nil && created {
 		client.runtime.observe(ctx, Observation{
-			Kind: ObservationEvent, Operation: "emit", Outcome: "created", ExecutionID: id,
+			Kind: ObservationEvent, Operation: "deliver", Outcome: "created", RunID: id,
 			Name: event.def.Name,
 		})
 	}
@@ -344,12 +434,15 @@ func CancelCommand(ctx context.Context, c Client, id CommandID, reason string) e
 	if err != nil {
 		return err
 	}
-	executionID, err := client.runtime.store.LookupCommandExecution(ctx, client.tx, commandID)
+	if err := client.beforeFlowWrite(); err != nil {
+		return err
+	}
+	runID, err := client.runtime.store.GetCommandRunID(ctx, client.tx, commandID)
 	if err != nil {
 		return err
 	}
 	var result store.CancelResult
-	err = client.semantic(ctx, executionID, func(semantic *store.SemanticTx) error {
+	err = client.semantic(ctx, runID, func(semantic *store.SemanticTx) error {
 		if err := client.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
 			return err
 		}
@@ -363,17 +456,17 @@ func CancelCommand(ctx context.Context, c Client, id CommandID, reason string) e
 	if client.tx == nil && result.Created {
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationCommand, Operation: "cancel", Outcome: "cancelled",
-			ExecutionID: ExecutionID(executionID.String()), CommandID: id,
+			RunID: RunID(runID.String()), CommandID: id,
 		})
 	}
 	return nil
 }
 
-func CancelExecution(ctx context.Context, c Client, id ExecutionID, reason string) error {
+func CancelRun(ctx context.Context, c Client, id RunID, reason string) error {
 	if err := validateCancellationReason(reason); err != nil {
 		return err
 	}
-	executionID, err := parseExecutionID(id)
+	runID, err := parseRunID(id)
 	if err != nil {
 		return err
 	}
@@ -381,13 +474,16 @@ func CancelExecution(ctx context.Context, c Client, id ExecutionID, reason strin
 	if err != nil {
 		return err
 	}
+	if err := client.beforeFlowWrite(); err != nil {
+		return err
+	}
 	var result store.CancelResult
-	err = client.semantic(ctx, executionID, func(semantic *store.SemanticTx) error {
+	err = client.semantic(ctx, runID, func(semantic *store.SemanticTx) error {
 		if err := client.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
 			return err
 		}
 		var err error
-		result, err = client.runtime.store.CancelExecutionLocked(ctx, semantic, reason)
+		result, err = client.runtime.store.CancelRunLocked(ctx, semantic, reason)
 		return err
 	})
 	if err != nil {
@@ -395,68 +491,68 @@ func CancelExecution(ctx context.Context, c Client, id ExecutionID, reason strin
 	}
 	if client.tx == nil && result.Created {
 		client.runtime.observe(ctx, Observation{
-			Kind: ObservationExecution, Operation: "cancel", Outcome: "cancelled", ExecutionID: id,
+			Kind: ObservationRun, Operation: "cancel", Outcome: "cancelled", RunID: id,
 		})
 	}
 	return nil
 }
 
-func prepareStartOptions(name string, version int, key string, input canonical.Value, supplied ...ExecutionOption) (executionOptions, canonical.Value, [32]byte, error) {
+func prepareStartOptions(name string, version int, key string, input canonical.Value, supplied ...RunOption) (runOptions, canonical.Value, [32]byte, error) {
 	if err := durable.PostgresInteger("definition version", version, 1, durable.PostgresIntegerMax); err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "version", "", err.Error())
+		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "version", "", err.Error())
 	}
-	if len(key) > maxExecutionKeyBytes || !utf8.ValidString(key) {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "key", "", "execution key is invalid or too long")
+	if len(key) > maxRunKeyBytes || !utf8.ValidString(key) {
+		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "key", "", "run key is invalid or too long")
 	}
-	options := executionOptions{
-		deadline: store.DeadlineSpec{Mode: "duration", Duration: defaultExecutionDeadline},
+	options := runOptions{
+		deadline: store.DeadlineSpec{Mode: "duration", Duration: defaultRunDeadline},
 		failFast: true, metadata: map[string]string{},
 	}
 	for _, option := range supplied {
 		if option == nil {
-			options.errs = append(options.errs, errors.New("nil execution option"))
+			options.errs = append(options.errs, errors.New("nil run option"))
 			continue
 		}
-		option.applyExecution(&options)
+		option.applyRun(&options)
 	}
 	if err := errors.Join(options.errs...); err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "options", "", err.Error())
+		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "options", "", err.Error())
 	}
 	if options.keyScope == store.KeyScopeLive && key == "" {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "key", "", "live key scope requires a non-empty execution key")
+		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "key", "", "live key scope requires a non-empty run key")
 	}
 	if options.withinSet && len(options.waits) == 0 {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "within", "", "Within requires WaitFor")
+		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "within", "", "Within requires WaitFor")
 	}
 	if len(options.waits) > maxCommandEventWaits {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "wait", "", "command exceeds the 256 event-wait limit")
+		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "wait", "", "command exceeds the 256 event-wait limit")
 	}
 	if err := validateMetadata(options.metadata); err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, err
+		return runOptions{}, canonical.Value{}, [32]byte{}, err
 	}
-	metadata, err := canonical.Marshal(options.metadata, maxExecutionMetadataBytes)
+	metadata, err := canonical.Marshal(options.metadata, maxRunMetadataBytes)
 	if err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, mapCanonicalError("execute", "metadata", err)
+		return runOptions{}, canonical.Value{}, [32]byte{}, mapCanonicalError("enqueue", "metadata", err)
 	}
 	// key_scope and start_delay_ms are omitted when zero so fingerprints of
 	// starts that predate these options remain rediscoverable.
-	deadlineMilliseconds, err := durable.ExactMilliseconds("execution deadline", options.deadline.Duration)
+	deadlineMilliseconds, err := durable.ExactMilliseconds("run deadline", options.deadline.Duration)
 	if err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, err
+		return runOptions{}, canonical.Value{}, [32]byte{}, err
 	}
 	startDelayMilliseconds, err := durable.ExactMilliseconds("start delay", options.startDelay)
 	if err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, err
+		return runOptions{}, canonical.Value{}, [32]byte{}, err
 	}
 	withinMilliseconds, err := durable.ExactMilliseconds("within", options.within)
 	if err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, err
+		return runOptions{}, canonical.Value{}, [32]byte{}, err
 	}
 	fingerprintRecord := struct {
 		V                 int                      `json:"v"`
 		DefinitionName    string                   `json:"definition_name"`
 		DefinitionVersion int                      `json:"definition_version"`
-		ExecutionKey      string                   `json:"execution_key"`
+		RunKey            string                   `json:"execution_key"`
 		KeyScope          string                   `json:"key_scope,omitempty"`
 		Input             json.RawMessage          `json:"input"`
 		DeadlineMode      string                   `json:"deadline_mode"`
@@ -468,7 +564,7 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 		Metadata          json.RawMessage          `json:"metadata"`
 	}{
 		V: 1, DefinitionName: name, DefinitionVersion: version,
-		ExecutionKey: key, KeyScope: options.keyScope, Input: json.RawMessage(input.BytesCopy()),
+		RunKey: key, KeyScope: options.keyScope, Input: json.RawMessage(input.BytesCopy()),
 		DeadlineMode: options.deadline.Mode, DeadlineDuration: deadlineMilliseconds,
 		FailFast: options.failFast, StartDelayMS: startDelayMilliseconds,
 		Waits: commandWaitFingerprints(options.waits), WithinMS: withinMilliseconds,
@@ -476,7 +572,7 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 	}
 	fingerprint, err := canonical.Marshal(fingerprintRecord, 0)
 	if err != nil {
-		return executionOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "execute", "identity", "", "cannot canonicalize start identity")
+		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "identity", "", "cannot canonicalize start identity")
 	}
 	return options, metadata, fingerprint.Digest, nil
 }
@@ -538,14 +634,14 @@ func commandWaitFingerprints(waits []commandEventWait) []commandWaitFingerprint 
 
 func makeCommandEventWait(event EventRef, key string) (commandEventWait, error) {
 	if event == nil {
-		return commandEventWait{}, newError(ErrInvalid, "execute", "wait", key, "nil event selector")
+		return commandEventWait{}, newError(ErrInvalid, "enqueue", "wait", key, "nil event selector")
 	}
 	if err := validateStableKey(key, maxCommandKeyBytes, "event"); err != nil {
 		return commandEventWait{}, err
 	}
 	selector := event.flowEventRef()
 	if selector.name == "" || selector.namespace != "application" {
-		return commandEventWait{}, newError(ErrInvalid, "execute", "wait", key, "invalid event selector")
+		return commandEventWait{}, newError(ErrInvalid, "enqueue", "wait", key, "invalid event selector")
 	}
 	return commandEventWait{eventReference: selector, key: key}, nil
 }
@@ -630,7 +726,7 @@ func validateStableKey(key string, maxBytes int, resource string) error {
 func validateMetadata(metadata map[string]string) error {
 	for key, value := range metadata {
 		if key == "" || len(key) > 128 || len(value) > 1024 || !utf8.ValidString(key) || !utf8.ValidString(value) {
-			return newError(ErrInvalid, "execute", "metadata", "", "metadata key or value is invalid")
+			return newError(ErrInvalid, "enqueue", "metadata", "", "metadata key or value is invalid")
 		}
 	}
 	return nil
@@ -639,13 +735,6 @@ func validateMetadata(metadata map[string]string) error {
 func validateCancellationReason(reason string) error {
 	if reason == "" || strings.TrimSpace(reason) != reason || len(reason) > 1024 || !utf8.ValidString(reason) {
 		return newError(ErrInvalid, "cancel", "reason", "", "reason is empty, malformed, or too long")
-	}
-	return nil
-}
-
-func validateBoundClient(client Client) error {
-	if client == nil {
-		return errors.New("definition is not bound to a client")
 	}
 	return nil
 }

@@ -14,7 +14,6 @@ const defaultQueue = "default"
 type Command[A, R any] struct {
 	def      *definition.Command
 	defaults commandDefaults
-	client   Client
 	err      error
 }
 
@@ -97,12 +96,6 @@ func (c Command[A, R]) Version() int {
 	return c.def.Version
 }
 
-func (c Command[A, R]) With(client Client) Command[A, R] {
-	copy := c
-	copy.client = client
-	return copy
-}
-
 func (e Event[T]) flowEventRef() eventReference {
 	if e.def == nil {
 		return eventReference{}
@@ -136,15 +129,16 @@ func WithTimeout(timeout time.Duration) CommandOption {
 			return
 		}
 		state.timeoutSet = true
-		if timeout < time.Millisecond {
-			state.errs = append(state.errs, errors.New("attempt timeout must be at least one millisecond"))
+		if timeout <= 0 {
+			state.errs = append(state.errs, errors.New("attempt timeout must be positive"))
 			return
 		}
-		if _, err := durable.ExactMilliseconds("attempt timeout", timeout); err != nil {
+		normalized, _, err := durable.CeilMilliseconds("attempt timeout", timeout)
+		if err != nil {
 			state.errs = append(state.errs, err)
 			return
 		}
-		state.defaults.attemptTimeout = timeout
+		state.defaults.attemptTimeout = normalized
 	})
 }
 

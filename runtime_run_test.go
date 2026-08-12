@@ -190,7 +190,7 @@ func TestLeaseRenewalErrorIsObservedWithoutFalseSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
-	if _, err := command.With(runtime).Execute(ctx, "renewal/observation", None{}); err != nil {
+	if _, err := command.Enqueue(ctx, runtime, "renewal/observation", None{}); err != nil {
 		cancel()
 		t.Fatal(err)
 	}
@@ -274,11 +274,11 @@ func TestLockedSettlementIsUncertainWhileUnrelatedLeaseRenews(t *testing.T) {
 		}
 		stopRuntime(t, cancel, runResult)
 	}()
-	settlingExecution, err := settling.With(runtime).Execute(ctx, "renewal/locked-settlement", None{})
+	settlingRun, err := settling.Enqueue(ctx, runtime, "renewal/locked-settlement", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	unrelatedExecution, err := unrelated.With(runtime).Execute(ctx, "renewal/unrelated", None{})
+	unrelatedRun, err := unrelated.Enqueue(ctx, runtime, "renewal/unrelated", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,12 +301,12 @@ func TestLockedSettlementIsUncertainWhileUnrelatedLeaseRenews(t *testing.T) {
 	}
 	close(releaseCommit)
 	close(releaseUnrelated)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, settlingExecution.ID, "succeeded", 3*time.Second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, unrelatedExecution.ID, "succeeded", 3*time.Second)
-	for _, executionID := range []ExecutionID{settlingExecution.ID, unrelatedExecution.ID} {
-		trace, err := Trace(ctx, runtime, executionID)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, settlingRun.ID, "succeeded", 3*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, unrelatedRun.ID, "succeeded", 3*time.Second)
+	for _, runID := range []RunID{settlingRun.ID, unrelatedRun.ID} {
+		trace, err := Trace(ctx, runtime, runID)
 		if err != nil || len(trace.Commands) != 1 || len(trace.Commands[0].Attempts) != 1 {
-			t.Fatalf("trace %s = %#v, %v", executionID, trace, err)
+			t.Fatalf("trace %s = %#v, %v", runID, trace, err)
 		}
 	}
 }
@@ -336,7 +336,7 @@ func TestLeaseWatchdogCancelsAfterPoolStarvationAndAllowsTakeover(t *testing.T) 
 		t.Fatal(err)
 	}
 	cancelFirst, firstResult := startRuntime(t, first)
-	execution, err := command.With(first).Execute(ctx, "renewal/pool-starvation", None{})
+	run, err := command.Enqueue(ctx, first, "renewal/pool-starvation", None{})
 	if err != nil {
 		cancelFirst()
 		t.Fatal(err)
@@ -391,9 +391,9 @@ func TestLeaseWatchdogCancelsAfterPoolStarvationAndAllowsTakeover(t *testing.T) 
 		t.Fatal(err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForExecutionStatus(t, database.Schema, database.DB.Conn, execution.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, run.ID, "succeeded", 5*time.Second)
 	stopRuntime(t, cancelSecond, secondResult)
-	trace, err := Trace(ctx, mustReader(t, database), execution.ID)
+	trace, err := Trace(ctx, mustReader(t, database), run.ID)
 	if err != nil || len(trace.Commands) != 1 || len(trace.Commands[0].Attempts) != 2 ||
 		trace.Commands[0].Attempts[1].Classification != "succeeded" {
 		t.Fatalf("pool-starvation trace = %#v, %v", trace, err)

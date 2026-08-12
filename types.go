@@ -10,26 +10,26 @@ import (
 
 type None = struct{}
 
-type ExecutionID string
+type RunID string
 type CommandID string
 type EventID string
 type AttemptID string
 type JournalEntryID string
 type JournalPosition uint64
 
-type ExecutionStatus string
+type RunStatus string
 type CommandStatus string
 type QueueState string
 type KeyScope string
 type TerminalStatus string
 
 const (
-	ExecutionStatusRunning   ExecutionStatus = "running"
-	ExecutionStatusFailing   ExecutionStatus = "failing"
-	ExecutionStatusSucceeded ExecutionStatus = "succeeded"
-	ExecutionStatusFailed    ExecutionStatus = "failed"
-	ExecutionStatusCancelled ExecutionStatus = "cancelled"
-	ExecutionStatusExpired   ExecutionStatus = "expired"
+	RunStatusRunning   RunStatus = "running"
+	RunStatusFailing   RunStatus = "failing"
+	RunStatusSucceeded RunStatus = "succeeded"
+	RunStatusFailed    RunStatus = "failed"
+	RunStatusCancelled RunStatus = "cancelled"
+	RunStatusExpired   RunStatus = "expired"
 
 	CommandStatusPending   CommandStatus = "pending"
 	CommandStatusReady     CommandStatus = "ready"
@@ -62,15 +62,23 @@ const (
 type Failure = failure.Value
 type CommandFailure = Failure
 
+// ReplaceRunResult reports the current run after an atomic live-key
+// replacement attempt. Replaced is true only for the call that cancelled the
+// expected predecessor and created Run.
+type ReplaceRunResult struct {
+	Run      Run
+	Replaced bool
+}
+
 func cloneFailure(value *Failure) *Failure { return failure.Clone(value) }
 
-func executionStatusFromString(value string) (ExecutionStatus, error) {
-	switch ExecutionStatus(value) {
-	case ExecutionStatusRunning, ExecutionStatusFailing, ExecutionStatusSucceeded,
-		ExecutionStatusFailed, ExecutionStatusCancelled, ExecutionStatusExpired:
-		return ExecutionStatus(value), nil
+func runStatusFromString(value string) (RunStatus, error) {
+	switch RunStatus(value) {
+	case RunStatusRunning, RunStatusFailing, RunStatusSucceeded,
+		RunStatusFailed, RunStatusCancelled, RunStatusExpired:
+		return RunStatus(value), nil
 	default:
-		return "", fmt.Errorf("%w: unknown execution status %q", flowerr.ErrInvalidState, value)
+		return "", fmt.Errorf("%w: unknown run status %q", flowerr.ErrInvalidState, value)
 	}
 }
 
@@ -112,11 +120,12 @@ func terminalStatusFromString(value string) (TerminalStatus, error) {
 }
 
 type CommandInfo struct {
-	ExecutionID ExecutionID
-	CommandID   CommandID
-	CommandKey  string
-	Name        string
-	Version     int
+	RunID      RunID
+	RunKey     string
+	CommandID  CommandID
+	CommandKey string
+	Name       string
+	Version    int
 
 	CreatedAt        time.Time
 	BudgetStartedAt  time.Time

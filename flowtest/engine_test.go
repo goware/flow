@@ -80,12 +80,18 @@ func TestRunWorkerReadsDeclaredEventInputs(t *testing.T) {
 	event := flow.DefineEvent[testFact]("flowtest.worker_input")
 	command := flow.DefineCommand[testArgs, testResult]("flowtest.input_worker", 1)
 	registration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		first, err := flow.GetEventValue(work, event, "input/1")
-		if err != nil {
+		first, found, err := flow.GetEventValue(work, event, "input/1")
+		if err != nil || !found {
+			if err == nil {
+				err = errors.New("required worker input is absent")
+			}
 			return testResult{}, err
 		}
-		second, err := flow.GetEventValue(work, event, "input/1")
-		if err != nil {
+		second, found, err := flow.GetEventValue(work, event, "input/1")
+		if err != nil || !found {
+			if err == nil {
+				err = errors.New("required worker input is absent")
+			}
 			return testResult{}, err
 		}
 		return testResult{Value: first.Value + "/" + second.Value}, nil
@@ -96,13 +102,27 @@ func TestRunWorkerReadsDeclaredEventInputs(t *testing.T) {
 		t.Fatalf("declared event decision=%+v err=%v", decision, err)
 	}
 	missing, err := flowtest.RunWorker[testArgs, testResult](context.Background(), registration, testArgs{})
-	if err != nil || !errors.Is(missing.Err, flow.ErrInvalidState) {
+	if err != nil || missing.Err == nil {
 		t.Fatalf("missing event decision=%+v err=%v", missing, err)
+	}
+	optionalRegistration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		value, found, err := flow.GetEventValue(work, event, "input/1")
+		if err != nil {
+			return testResult{}, err
+		}
+		if !found {
+			return testResult{Value: "absent"}, nil
+		}
+		return testResult{Value: value.Value}, nil
+	})
+	optional, err := flowtest.RunWorker[testArgs, testResult](context.Background(), optionalRegistration, testArgs{})
+	if err != nil || optional.Err != nil || optional.Result.Value != "absent" {
+		t.Fatalf("optional absent event decision=%+v err=%v", optional, err)
 	}
 
 	wrongType := flow.DefineEvent[int]("flowtest.worker_input")
 	wrongRegistration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		_, err := flow.GetEventValue(work, wrongType, "input/1")
+		_, _, err := flow.GetEventValue(work, wrongType, "input/1")
 		return testResult{}, err
 	})
 	wrong, err := flowtest.RunWorker[testArgs, testResult](context.Background(), wrongRegistration, testArgs{},
@@ -111,33 +131,16 @@ func TestRunWorkerReadsDeclaredEventInputs(t *testing.T) {
 		t.Fatalf("wrong event type decision=%+v err=%v", wrong, err)
 	}
 }
-func TestExternalEventIngressIsRejectedInsideAttempt(t *testing.T) {
-	event := flow.DefineEvent[testFact]("flowtest.external_in_attempt")
-	command := flow.DefineCommand[testArgs, testResult]("flowtest.external_in_attempt_worker", 1)
-	registration := flow.Handle(command, func(ctx context.Context, _ *flow.Work[testArgs]) (testResult, error) {
-		_ = event.Emit(ctx, nil, flow.ExecutionID("not-used"), "bad", testFact{})
-		return testResult{}, nil
-	})
-	decision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), registration, testArgs{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !errors.Is(decision.Err, flow.ErrInvalidState) {
-		t.Fatalf("decision error=%v", decision.Err)
-	}
-}
 
-func TestCommitCannotIgnoreExternalEventIngressDefect(t *testing.T) {
-	event := flow.DefineEvent[testFact]("flowtest.external_in_commit")
-	command := flow.DefineCommand[testArgs, testResult]("flowtest.external_in_commit_worker", 1)
-	registration := flow.Handle(command,
-		func(context.Context, *flow.Work[testArgs]) (testResult, error) { return testResult{}, nil },
-		flow.WithCommit(func(ctx context.Context, _ flow.Tx, _ flow.Commit[testArgs, testResult]) error {
-			_ = event.Emit(ctx, nil, flow.ExecutionID("not-used"), "bad", testFact{})
-			return nil
-		}))
-	if err := flowtest.RunCommit(context.Background(), registration, &recordingTx{}, testArgs{}, testResult{}, flow.CommandInfo{}); !errors.Is(err, flow.ErrInvalidState) {
-		t.Fatalf("RunCommit error=%v", err)
+func TestRunWorkerCarriesRunKey(t *testing.T) {
+	command := flow.DefineCommand[testArgs, testResult]("flowtest.run_key", 1)
+	registration := flow.Handle(command, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
+		return testResult{Value: work.Info().RunKey}, nil
+	})
+	result, err := flowtest.RunWorker[testArgs, testResult](context.Background(), registration, testArgs{},
+		flowtest.WithCommandInfo(flow.CommandInfo{RunID: "run-id", RunKey: "intent/42", CommandKey: "child"}))
+	if err != nil || result.Err != nil || result.Result.Value != "intent/42" {
+		t.Fatalf("RunWorker RunKey result = %#v, %v", result, err)
 	}
 }
 
@@ -160,7 +163,7 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	gate := flow.DefineEvent[testFact]("flowtest.child_gate")
 
 	parentRegistration := flow.Handle(parent, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		flow.Execute(work, "child/next", child, testArgs{Value: work.Args.Value}).
+		flow.Enqueue(work, "child/next", child, testArgs{Value: work.Args.Value}).
 			Optional().Delay(time.Second).WaitFor(gate, "ready").Within(2 * time.Second)
 		return testResult{Value: "ready/" + work.Args.Value}, nil
 	}, flow.WithCommit(func(ctx context.Context, tx flow.Tx, commit flow.Commit[testArgs, testResult]) error {
@@ -188,12 +191,14 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	root := flow.DefineCommand[testArgs, testResult]("flowtest.root", 1)
 	rootRegistration := flow.Handle(root, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
 		_ = flow.Emit(work, directEvent, "shared", testFact{Value: "same"})
-		flow.Execute(work, "leaf", child, testArgs{Value: "leaf"}).WaitFor(directEvent, "shared")
+		flow.Enqueue(work, "leaf", child, testArgs{Value: "leaf"}).WaitFor(directEvent, "shared")
 		return testResult{Value: "root"}, nil
 	})
 	childRegistration := flow.Handle(child, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
-		if _, err := flow.GetEventValue(work, directEvent, "shared"); err != nil {
+		if _, found, err := flow.GetEventValue(work, directEvent, "shared"); err != nil {
 			return testResult{}, err
+		} else if !found {
+			return testResult{}, errors.New("required direct event is absent")
 		}
 		_ = flow.Emit(work, directEvent, "shared", testFact{Value: "same"})
 		return testResult{Value: work.Args.Value + "/done"}, nil
@@ -223,7 +228,7 @@ func TestRunDirectRejectsNegativeCommandCeilingBeforeApplicationCode(t *testing.
 		registration := flow.Handle(root, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
 			calls++
 			if withChild {
-				flow.Execute(work, "child", child, testArgs{})
+				flow.Enqueue(work, "child", child, testArgs{})
 			}
 			return testResult{}, nil
 		})

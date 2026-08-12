@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/flowerr"
 )
@@ -76,4 +77,13 @@ func Permanent(err error) error { return failure.Permanent(err) }
 
 // RetryAfter classifies an error as retryable after a requested delay. The
 // command's immutable retry bounds still apply.
-func RetryAfter(delay time.Duration, err error) error { return failure.RetryAfter(delay, err) }
+func RetryAfter(delay time.Duration, err error) error {
+	if delay > 0 {
+		normalized, _, normalizeErr := durable.CeilMilliseconds("retry-after delay", delay)
+		if normalizeErr != nil {
+			return failure.Permanent(normalizeErr)
+		}
+		delay = normalized
+	}
+	return failure.RetryAfter(delay, err)
+}

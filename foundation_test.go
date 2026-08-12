@@ -14,11 +14,11 @@ import (
 func TestSafeErrorsAndObservations(t *testing.T) {
 	t.Parallel()
 
-	err := newError(ErrConflict, "start", "execution", "exec-1", "identity differs")
+	err := newError(ErrConflict, "start", "run", "exec-1", "identity differs")
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("errors.Is(%v, ErrConflict) = false", err)
 	}
-	for _, part := range []string{"start", "execution", "exec-1", "identity differs"} {
+	for _, part := range []string{"start", "run", "exec-1", "identity differs"} {
 		if !strings.Contains(err.Error(), part) {
 			t.Fatalf("error %q omits %q", err, part)
 		}

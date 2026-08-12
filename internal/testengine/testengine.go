@@ -18,7 +18,8 @@ const (
 )
 
 type Info struct {
-	ExecutionID      string
+	RunID            string
+	RunKey           string
 	CommandID        string
 	CommandKey       string
 	Name             string

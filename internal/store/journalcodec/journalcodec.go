@@ -12,14 +12,14 @@ import (
 	"github.com/goware/flow/internal/canonical"
 )
 
-// ExecutionStartedBody is the versioned logical start record retained by the
+// RunStartedBody is the versioned logical start record retained by the
 // journal. Raw JSON fields already contain canonical application values.
-type ExecutionStartedBody struct {
+type RunStartedBody struct {
 	V                 int             `json:"v"`
-	ExecutionID       string          `json:"execution_id"`
+	RunID             string          `json:"execution_id"`
 	DefinitionName    string          `json:"definition_name"`
 	DefinitionVersion int             `json:"definition_version"`
-	ExecutionKey      string          `json:"execution_key"`
+	RunKey            string          `json:"execution_key"`
 	KeyScope          string          `json:"key_scope,omitempty"`
 	Input             json.RawMessage `json:"input"`
 	FailFast          bool            `json:"fail_fast"`

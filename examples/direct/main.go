@@ -58,7 +58,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("execution %s completed with %d journal entries\n", exec.ID, len(trace.History))
+	fmt.Printf("run %s completed with %d journal entries\n", exec.ID, len(trace.History))
 }
 
 func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
@@ -94,13 +94,13 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 }
 
 // runExampleCommand submits one command and waits for its terminal trace.
-func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Execution, flow.ExecutionTrace, error) {
-	exec, err := sendReceipt.With(runtime).Execute(ctx, "receipt/example-order", receiptArgs{
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Run, flow.RunTrace, error) {
+	exec, err := sendReceipt.Enqueue(ctx, runtime, "receipt/example-order", receiptArgs{
 		OrderID: "example-order",
 		Email:   "person@example.com",
 	})
 	if err != nil {
-		return flow.Execution{}, flow.ExecutionTrace{}, err
+		return flow.Run{}, flow.RunTrace{}, err
 	}
 	trace, err := waitForTerminal(ctx, runtime, exec.ID, 5*time.Second)
 	return exec, trace, err
@@ -120,7 +120,7 @@ func (example *directExample) sendReceipt(ctx context.Context, work *flow.Work[r
 	return result, nil
 }
 
-func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.ExecutionID, timeout time.Duration) (flow.ExecutionTrace, error) {
+func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.RunID, timeout time.Duration) (flow.RunTrace, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -128,19 +128,19 @@ func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.Executi
 	for {
 		trace, err := flow.Trace(ctx, runtime, id)
 		if err != nil {
-			return flow.ExecutionTrace{}, err
+			return flow.RunTrace{}, err
 		}
-		switch trace.Execution.Status {
+		switch trace.Run.Status {
 		case "succeeded":
 			return trace, nil
 		case "failed", "cancelled", "expired":
-			return flow.ExecutionTrace{}, fmt.Errorf("example execution ended %s", trace.Execution.Status)
+			return flow.RunTrace{}, fmt.Errorf("example run ended %s", trace.Run.Status)
 		}
 		select {
 		case <-ctx.Done():
-			return flow.ExecutionTrace{}, ctx.Err()
+			return flow.RunTrace{}, ctx.Err()
 		case <-timer.C:
-			return flow.ExecutionTrace{}, fmt.Errorf("example execution timed out")
+			return flow.RunTrace{}, fmt.Errorf("example run timed out")
 		case <-ticker.C:
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/goware/flow/internal/testpg"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -33,7 +34,7 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 		t.Fatalf("CheckSchema() error = %v", err)
 	}
 	if !status.Compatible || status.Schema != database.Schema || status.CurrentVersion != currentSchemaVersion ||
-		status.MinReaderVersion != 1 || status.MinWriterVersion != 1 || status.AppliedAt.IsZero() {
+		status.MinReaderVersion != 2 || status.MinWriterVersion != 2 || status.AppliedAt.IsZero() {
 		t.Fatalf("CheckSchema() = %#v", status)
 	}
 
@@ -69,12 +70,32 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MigrationFS() error = %v", err)
 	}
-	rendered, err := fs.ReadFile(migrationFS, "migrations/001_initial.sql")
+	initial, err := fs.ReadFile(migrationFS, "migrations/001_initial.sql")
 	if err != nil {
-		t.Fatalf("read rendered migration: %v", err)
+		t.Fatalf("read rendered initial migration: %v", err)
 	}
-	if bytes.Contains(rendered, []byte(migrationToken)) || !bytes.Contains(rendered, []byte(quoteIdentifier(database.Schema)+`.flow_executions`)) {
+	if bytes.Contains(initial, []byte(migrationToken)) || !bytes.Contains(initial, []byte(quoteIdentifier(database.Schema)+`.flow_executions`)) {
+		t.Fatal("MigrationFS changed the immutable initial migration")
+	}
+	runVocabulary, err := fs.ReadFile(migrationFS, "migrations/004_run_vocabulary.sql")
+	if err != nil {
+		t.Fatalf("read rendered run-vocabulary migration: %v", err)
+	}
+	if bytes.Contains(runVocabulary, []byte(migrationToken)) || !bytes.Contains(runVocabulary, []byte(quoteIdentifier(database.Schema)+`.flow_runs`)) {
 		t.Fatal("MigrationFS did not safely render the configured schema")
+	}
+}
+
+func TestRunVocabularyMigrationRequiresVersionTwoReaderAndWriter(t *testing.T) {
+	t.Parallel()
+	if schemaVersionsCompatible(4, 2, 2, 4, 1, 1) {
+		t.Fatal("v0.2 reader/writer unexpectedly accepts the run-vocabulary catalog")
+	}
+	if schemaVersionsCompatible(4, 2, 2, 4, 2, 1) || schemaVersionsCompatible(4, 2, 2, 4, 1, 2) {
+		t.Fatal("partial reader/writer upgrade unexpectedly accepted")
+	}
+	if !schemaVersionsCompatible(4, 2, 2, 4, 2, 2) {
+		t.Fatal("v0.3 reader/writer rejected its catalog")
 	}
 }
 
@@ -97,8 +118,8 @@ func TestMigrationReleaseReadPaths(t *testing.T) {
 		contains  string
 	}
 	want := []indexShape{
-		{name: "flow_executions_key_lookup_idx", columns: []string{"execution_key", "definition_name", "created_at", "execution_id"}, collation: ptr("C"), opclass: ptr("text_ops")},
-		{name: "flow_executions_created_idx", columns: []string{"created_at", "execution_id"}, contains: "(created_at DESC, execution_id DESC)"},
+		{name: "flow_runs_key_lookup_idx", columns: []string{"run_key", "definition_name", "created_at", "run_id"}, collation: ptr("C"), opclass: ptr("text_ops")},
+		{name: "flow_runs_created_idx", columns: []string{"created_at", "run_id"}, contains: "(created_at DESC, run_id DESC)"},
 		{name: "flow_command_queue_depth_idx", columns: []string{"queue", "state", "next_run_at"}},
 	}
 	for _, expected := range want {
@@ -142,17 +163,17 @@ func TestMigrationReleaseReadPaths(t *testing.T) {
 
 	var prefixDefinition string
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT indexdef FROM pg_catalog.pg_indexes
-		WHERE schemaname=$1 AND indexname='flow_executions_key_prefix_idx'`, database.Schema).Scan(&prefixDefinition); err != nil {
+		WHERE schemaname=$1 AND indexname='flow_runs_key_prefix_idx'`, database.Schema).Scan(&prefixDefinition); err != nil {
 		t.Fatalf("inspect retained prefix index: %v", err)
 	}
-	if !strings.Contains(prefixDefinition, "(definition_name, execution_key text_pattern_ops)") {
+	if !strings.Contains(prefixDefinition, "(definition_name, run_key text_pattern_ops)") {
 		t.Fatalf("retained prefix index = %s", prefixDefinition)
 	}
 
 	var checkDefinition string
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT pg_get_constraintdef(oid)
 		FROM pg_catalog.pg_constraint
-		WHERE connamespace=$1::regnamespace AND conname='flow_executions_open_commands_ck'`, database.Schema).
+		WHERE connamespace=$1::regnamespace AND conname='flow_runs_open_commands_ck'`, database.Schema).
 		Scan(&checkDefinition); err != nil {
 		t.Fatalf("inspect open-command check: %v", err)
 	}
@@ -163,7 +184,7 @@ func TestMigrationReleaseReadPaths(t *testing.T) {
 
 func ptr[T any](value T) *T { return &value }
 
-func TestMigrationVersionTwoUpgradePreservesLedger(t *testing.T) {
+func TestMigrationVersionThreeRunVocabularyUpgradePreservesData(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -173,12 +194,52 @@ func TestMigrationVersionTwoUpgradePreservesLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, unit := range units[:2] {
+	for _, unit := range units[:3] {
 		if _, err := database.DB.Conn.Exec(ctx, string(externalMigration(database.Schema, unit))); err != nil {
 			t.Fatalf("apply historical migration %d: %v", unit.version, err)
 		}
 	}
-	before := make(map[int][]byte, 2)
+
+	runID, commandID, entryID := uuid.New(), uuid.New(), uuid.New()
+	body := []byte(`{"v":1,"fixture":"preserved"}`)
+	bodyHash := bytes.Repeat([]byte{0x5a}, 32)
+	schema := quoteIdentifier(database.Schema)
+	tx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.flow_executions
+		(execution_id,definition_name,definition_version,execution_key,start_fingerprint,input,
+		 metadata_canonical,max_commands,root_command_id,created_at,updated_at,status_at)
+		VALUES ($1,'migration.fixture',1,'fixture/key',$2,'{}',$3,100,$4,
+		 clock_timestamp(),clock_timestamp(),clock_timestamp())`,
+		runID, bytes.Repeat([]byte{0x11}, 32), []byte(`{}`), commandID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.flow_commands
+		(command_id,execution_id,command_key,name,version,args,declaration_fingerprint,state,
+		 queue,retry_policy,created_position,created_at,updated_at,status_at)
+		VALUES ($1,$2,'root','migration.fixture',1,'{}',$3,'ready','default','{}',1,
+		 clock_timestamp(),clock_timestamp(),clock_timestamp())`,
+		commandID, runID, bytes.Repeat([]byte{0x22}, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.flow_command_queue
+		(command_id,execution_id,queue,name,version,state,next_run_at)
+		VALUES ($1,$2,'default','migration.fixture',1,'ready',clock_timestamp())`, commandID, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.flow_journal
+		(execution_id,position,entry_id,entry_kind,recorded_at,body,body_hash)
+		VALUES ($1,1,$2,'execution_started',clock_timestamp(),$3,$4)`, runID, entryID, body, bodyHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	before := make(map[int][]byte, 3)
 	rows, err := database.DB.Conn.Query(ctx, `SELECT version,checksum FROM `+quoteIdentifier(database.Schema)+`.flow_schema_migrations ORDER BY version`)
 	if err != nil {
 		t.Fatal(err)
@@ -211,8 +272,38 @@ func TestMigrationVersionTwoUpgradePreservesLedger(t *testing.T) {
 		}
 	}
 	status, err := CheckSchema(ctx, database.DB, option)
-	if err != nil || status.CurrentVersion != 3 {
+	if err != nil || status.CurrentVersion != 4 || status.MinReaderVersion != 2 || status.MinWriterVersion != 2 {
 		t.Fatalf("CheckSchema() = %#v, %v", status, err)
+	}
+	var storedBody, storedHash []byte
+	var commandRunID, queueRunID uuid.UUID
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT body,body_hash FROM `+schema+`.flow_journal
+		WHERE run_id=$1 AND position=1`, runID).Scan(&storedBody, &storedHash); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedBody, body) || !bytes.Equal(storedHash, bodyHash) {
+		t.Fatalf("journal bytes changed: body=%x hash=%x", storedBody, storedHash)
+	}
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT run_id FROM `+schema+`.flow_commands WHERE command_id=$1`, commandID).Scan(&commandRunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT run_id FROM `+schema+`.flow_command_queue WHERE command_id=$1`, commandID).Scan(&queueRunID); err != nil {
+		t.Fatal(err)
+	}
+	if commandRunID != runID || queueRunID != runID {
+		t.Fatalf("renamed ownership changed: command=%s queue=%s want=%s", commandRunID, queueRunID, runID)
+	}
+	var oldCatalogNames int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM information_schema.columns WHERE table_schema=$1 AND column_name LIKE 'execution\_%' ESCAPE '\') +
+		(SELECT count(*) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_namespace n ON n.oid=c.connamespace
+		 WHERE n.nspname=$1 AND c.conname LIKE '%execution%') +
+		(SELECT count(*) FROM pg_catalog.pg_indexes WHERE schemaname=$1 AND indexname LIKE '%execution%')`,
+		database.Schema).Scan(&oldCatalogNames); err != nil {
+		t.Fatal(err)
+	}
+	if oldCatalogNames != 0 {
+		t.Fatalf("old execution-named live catalog identifiers = %d", oldCatalogNames)
 	}
 }
 
@@ -261,7 +352,7 @@ func TestMigrationRejectsLedgerGapBeforeApplyingPending(t *testing.T) {
 	}
 	var keyScopeColumns int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
-		WHERE table_schema=$1 AND table_name='flow_executions' AND column_name='key_scope'`, database.Schema).Scan(&keyScopeColumns); err != nil {
+		WHERE table_schema=$1 AND table_name='flow_runs' AND column_name='key_scope'`, database.Schema).Scan(&keyScopeColumns); err != nil {
 		t.Fatal(err)
 	}
 	if keyScopeColumns != 0 {
@@ -287,7 +378,7 @@ func TestVerifyAppliedMigrationsRequiresKnownPrefix(t *testing.T) {
 	}{
 		{name: "empty", applied: map[int]appliedMigration{}},
 		{name: "first", applied: map[int]appliedMigration{1: row(units[0])}},
-		{name: "complete", applied: map[int]appliedMigration{1: row(units[0]), 2: row(units[1]), 3: row(units[2])}},
+		{name: "complete", applied: map[int]appliedMigration{1: row(units[0]), 2: row(units[1]), 3: row(units[2]), 4: row(units[3])}},
 		{name: "missing first", applied: map[int]appliedMigration{2: row(units[1])}, wantErr: true},
 		{name: "missing middle", applied: map[int]appliedMigration{1: row(units[0]), 3: row(units[2])}, wantErr: true},
 		{name: "unknown future", applied: map[int]appliedMigration{1: row(units[0]), 4: {version: 4}}, wantErr: true},
@@ -315,7 +406,7 @@ func TestMigrationPrunesAndNarrowsIndexes(t *testing.T) {
 	}
 
 	removed := []string{
-		"flow_commands_execution_idx",
+		"flow_commands_run_idx",
 		"flow_commands_terminal_idx",
 		"flow_journal_entry_id_uq",
 		"flow_journal_event_id_uq",
@@ -339,8 +430,8 @@ func TestMigrationPrunesAndNarrowsIndexes(t *testing.T) {
 		unique     bool
 	}
 	want := []indexShape{
-		{name: "flow_executions_key_prefix_idx", keyColumns: 2, allColumns: 2},
-		{name: "flow_commands_execution_key_uq", keyColumns: 2, allColumns: 2, unique: true},
+		{name: "flow_runs_key_prefix_idx", keyColumns: 2, allColumns: 2},
+		{name: "flow_commands_run_key_uq", keyColumns: 2, allColumns: 2, unique: true},
 		{name: "flow_commands_parent_idx", keyColumns: 1, allColumns: 1},
 		{name: "flow_journal_attempt_kind_uq", keyColumns: 2, allColumns: 2, unique: true},
 		{name: "flow_journal_command_events_idx", keyColumns: 1, allColumns: 1},
@@ -369,12 +460,12 @@ func TestMigrationPrunesAndNarrowsIndexes(t *testing.T) {
 		FROM pg_catalog.pg_index i
 		JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-		WHERE n.nspname=$1 AND c.relname='flow_commands_execution_key_uq'`, database.Schema).
+		WHERE n.nspname=$1 AND c.relname='flow_commands_run_key_uq'`, database.Schema).
 		Scan(&commandKeyDefinition, &commandKeyColumns); err != nil {
 		t.Fatalf("inspect command-key index definition: %v", err)
 	}
-	if !strings.EqualFold(strings.Join(commandKeyColumns, ","), "execution_id,command_key") {
-		t.Fatalf("command-key index columns = %v, want [execution_id command_key]", commandKeyColumns)
+	if !strings.EqualFold(strings.Join(commandKeyColumns, ","), "run_id,command_key") {
+		t.Fatalf("command-key index columns = %v, want [run_id command_key]", commandKeyColumns)
 	}
 	if strings.Contains(strings.ToUpper(commandKeyDefinition), "INCLUDE") {
 		t.Fatalf("command-key index contains INCLUDE: %s", commandKeyDefinition)
@@ -391,7 +482,7 @@ func TestMigrationPrunesAndNarrowsIndexes(t *testing.T) {
 	SELECT count(*) FROM command_indexes i
 		WHERE ARRAY(SELECT pg_get_indexdef(i.indexrelid, position, true)
 			FROM generate_series(1, i.indnkeyatts) position ORDER BY position)
-			= ARRAY['execution_id','command_key']`, database.Schema).Scan(&duplicateCommandKeyIndexes); err != nil {
+			= ARRAY['run_id','command_key']`, database.Schema).Scan(&duplicateCommandKeyIndexes); err != nil {
 		t.Fatalf("count command-key indexes: %v", err)
 	}
 	if duplicateCommandKeyIndexes != 1 {
@@ -401,11 +492,11 @@ func TestMigrationPrunesAndNarrowsIndexes(t *testing.T) {
 	var ownershipDefinition string
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT pg_get_constraintdef(oid)
 		FROM pg_catalog.pg_constraint
-		WHERE connamespace=$1::regnamespace AND conname='flow_commands_execution_command_uq'
+		WHERE connamespace=$1::regnamespace AND conname='flow_commands_run_command_uq'
 		AND contype='u'`, database.Schema).Scan(&ownershipDefinition); err != nil {
 		t.Fatalf("inspect command ownership key: %v", err)
 	}
-	if !strings.EqualFold(ownershipDefinition, "UNIQUE (execution_id, command_id)") {
+	if !strings.EqualFold(ownershipDefinition, "UNIQUE (run_id, command_id)") {
 		t.Fatalf("command ownership key = %s", ownershipDefinition)
 	}
 }
@@ -418,7 +509,7 @@ func TestSchemaCommandKeyQueryPlans(t *testing.T) {
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		t.Fatal(err)
 	}
-	runtime, execution, stop := startHundredCommandExecution(t, database, ctx, "schema-command-key-plans")
+	runtime, run, stop := startHundredCommandRun(t, database, ctx, "schema-command-key-plans")
 	stopped := false
 	defer func() {
 		if !stopped {
@@ -427,7 +518,7 @@ func TestSchemaCommandKeyQueryPlans(t *testing.T) {
 	}()
 	filler := DefineCommand[None, None]("schema.command-key-plan.filler", 1)
 	for index := range 900 {
-		if _, err := filler.With(runtime).Execute(ctx, fmt.Sprintf("schema-command-key-filler/%03d", index), None{}, WithoutExecutionDeadline()); err != nil {
+		if _, err := filler.Enqueue(ctx, runtime, fmt.Sprintf("schema-command-key-filler/%03d", index), None{}, WithoutRunDeadline()); err != nil {
 			t.Fatalf("create unrelated command %d: %v", index, err)
 		}
 	}
@@ -444,17 +535,17 @@ func TestSchemaCommandKeyQueryPlans(t *testing.T) {
 		args  []any
 	}{
 		{
-			name: "execution_order",
+			name: "run_order",
 			query: `SELECT command_id,command_key,name,version,parent_command_id,required,state,
 				unsatisfied_waits,terminal_position FROM ` + schema + `.flow_commands
-				WHERE execution_id=$1 ORDER BY command_key`,
-			args: []any{execution.ID},
+				WHERE run_id=$1 ORDER BY command_key`,
+			args: []any{run.ID},
 		},
 		{
 			name: "child_key_conflict",
 			query: `SELECT count(*) FROM ` + schema + `.flow_commands
-				WHERE execution_id=$1 AND command_key=ANY($2)`,
-			args: []any{execution.ID, []string{"work/010", "work/050", "work/090"}},
+				WHERE run_id=$1 AND command_key=ANY($2)`,
+			args: []any{run.ID, []string{"work/010", "work/050", "work/090"}},
 		},
 		{
 			name: "trace_queue_join",
@@ -463,8 +554,8 @@ func TestSchemaCommandKeyQueryPlans(t *testing.T) {
 				c.created_at,c.updated_at,c.status_at,c.finished_at,q.state,q.lease_owner,q.lease_started_at,q.lease_expires_at
 				FROM ` + schema + `.flow_commands c
 				LEFT JOIN ` + schema + `.flow_command_queue q USING(command_id)
-				WHERE c.execution_id=$1 ORDER BY c.command_key`,
-			args: []any{execution.ID},
+				WHERE c.run_id=$1 ORDER BY c.command_key`,
+			args: []any{run.ID},
 		},
 	}
 	explainPlans := func(indexShape string) {
@@ -486,14 +577,14 @@ func TestSchemaCommandKeyQueryPlans(t *testing.T) {
 	}
 	var narrowBytes int64
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT pg_relation_size($1::regclass)`,
-		database.Schema+`.flow_commands_execution_key_uq`).Scan(&narrowBytes); err != nil {
+		database.Schema+`.flow_commands_run_key_uq`).Scan(&narrowBytes); err != nil {
 		t.Fatalf("measure narrow command-key index: %v", err)
 	}
 	explainPlans("narrow")
 
 	if _, err := database.DB.Conn.Exec(ctx, `ALTER TABLE `+schema+`.flow_commands
-		DROP CONSTRAINT flow_commands_execution_key_uq,
-		ADD CONSTRAINT flow_commands_execution_key_uq UNIQUE (execution_id,command_key)
+		DROP CONSTRAINT flow_commands_run_key_uq,
+		ADD CONSTRAINT flow_commands_run_key_uq UNIQUE (run_id,command_key)
 		INCLUDE (command_id,name,version,parent_command_id,required,state,unsatisfied_waits,terminal_position)`); err != nil {
 		t.Fatalf("install legacy command-key index shape: %v", err)
 	}
@@ -502,7 +593,7 @@ func TestSchemaCommandKeyQueryPlans(t *testing.T) {
 	}
 	var legacyBytes int64
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT pg_relation_size($1::regclass)`,
-		database.Schema+`.flow_commands_execution_key_uq`).Scan(&legacyBytes); err != nil {
+		database.Schema+`.flow_commands_run_key_uq`).Scan(&legacyBytes); err != nil {
 		t.Fatalf("measure legacy command-key index: %v", err)
 	}
 	explainPlans("legacy INCLUDE")
@@ -522,7 +613,7 @@ func TestMigrationPrunesOnlyUnusedProjectionColumns(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
 		FROM information_schema.columns
 		WHERE table_schema=$1 AND (
-			(table_name='flow_executions' AND column_name IN ('input_hash','metadata_hash'))
+			(table_name='flow_runs' AND column_name IN ('input_hash','metadata_hash'))
 			OR (table_name='flow_commands' AND column_name IN ('args_hash','retry_policy_hash','result_hash'))
 			OR (table_name='flow_command_queue' AND column_name='updated_at')
 		)`, database.Schema).Scan(&pruned); err != nil {
@@ -536,7 +627,7 @@ func TestMigrationPrunesOnlyUnusedProjectionColumns(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
 		FROM information_schema.columns
 		WHERE table_schema=$1 AND (
-			(table_name='flow_executions' AND column_name IN ('input','metadata_canonical'))
+			(table_name='flow_runs' AND column_name IN ('input','metadata_canonical'))
 			OR (table_name='flow_commands' AND column_name IN
 				('declaration_fingerprint','result','last_error','terminal_failure'))
 		)`, database.Schema).Scan(&retained); err != nil {
@@ -565,10 +656,10 @@ func TestMigrationDurableTypesAndStateVocabularies(t *testing.T) {
 	}
 
 	constraints := map[string][]string{
-		"flow_executions_status_ck":       {string(ExecutionStatusRunning), string(ExecutionStatusFailing), string(ExecutionStatusSucceeded), string(ExecutionStatusFailed), string(ExecutionStatusCancelled), string(ExecutionStatusExpired)},
+		"flow_runs_status_ck":             {string(RunStatusRunning), string(RunStatusFailing), string(RunStatusSucceeded), string(RunStatusFailed), string(RunStatusCancelled), string(RunStatusExpired)},
 		"flow_commands_state_ck":          {string(CommandStatusPending), string(CommandStatusReady), string(CommandStatusRunning), string(CommandStatusRetryWait), string(CommandStatusSucceeded), string(CommandStatusFailed), string(CommandStatusCancelled), string(CommandStatusExpired)},
 		"flow_command_queue_state_ck":     {string(QueueStateReady), string(QueueStateRetryWait), string(QueueStateRunning)},
-		"flow_executions_key_scope_ck":    {string(KeyScopePermanent), string(KeyScopeLive)},
+		"flow_runs_key_scope_ck":          {string(KeyScopePermanent), string(KeyScopeLive)},
 		"flow_journal_terminal_status_ck": {string(TerminalStatusSucceeded), string(TerminalStatusFailed), string(TerminalStatusCancelled), string(TerminalStatusExpired)},
 	}
 	for name, values := range constraints {
@@ -598,11 +689,11 @@ func TestMigrationOwnershipAndPositionConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := DefineCommand[None, None]("constraint.root", 1)
-	first, err := command.With(runtime).Execute(ctx, "first", None{})
+	first, err := command.Enqueue(ctx, runtime, "first", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := command.With(runtime).Execute(ctx, "second", None{})
+	second, err := command.Enqueue(ctx, runtime, "second", None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +723,7 @@ func TestMigrationOwnershipAndPositionConstraints(t *testing.T) {
 		FROM pg_attribute attribute
 		JOIN pg_class relation ON relation.oid=attribute.attrelid
 		JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
-		WHERE namespace.nspname=$1 AND relation.relname='flow_executions'
+		WHERE namespace.nspname=$1 AND relation.relname='flow_runs'
 		AND attribute.attname='root_command_id' AND NOT attribute.attisdropped`, database.Schema).Scan(&rootNotNull); err != nil {
 		t.Fatal(err)
 	}
@@ -643,44 +734,44 @@ func TestMigrationOwnershipAndPositionConstraints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.Exec(ctx, `UPDATE `+schema+`.flow_executions SET root_command_id=NULL WHERE execution_id=$1`, first.ID)
+	_, err = tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET root_command_id=NULL WHERE run_id=$1`, first.ID)
 	_ = tx.Rollback(ctx)
 	var notNullError *pgconn.PgError
 	if !errors.As(err, &notNullError) || notNullError.ColumnName != "root_command_id" {
 		t.Fatalf("root NOT NULL error = %v", err)
 	}
-	assertConstraint("flow_executions_root_command_fk", func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_executions SET root_command_id=$2 WHERE execution_id=$1`, first.ID, second.RootCommandID); err != nil {
+	assertConstraint("flow_runs_root_command_fk", func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET root_command_id=$2 WHERE run_id=$1`, first.ID, second.RootCommandID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `SET CONSTRAINTS `+schema+`.flow_executions_root_command_fk IMMEDIATE`)
+		_, err := tx.Exec(ctx, `SET CONSTRAINTS `+schema+`.flow_runs_root_command_fk IMMEDIATE`)
 		return err
 	})
-	assertConstraint("flow_commands_parent_execution_fk", func(tx pgx.Tx) error {
+	assertConstraint("flow_commands_parent_run_fk", func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_commands SET parent_command_id=$2 WHERE command_id=$1`, first.RootCommandID, second.RootCommandID)
 		return err
 	})
-	assertConstraint("flow_command_queue_command_execution_fk", func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_queue SET execution_id=$2 WHERE command_id=$1`, first.RootCommandID, second.ID)
+	assertConstraint("flow_command_queue_command_run_fk", func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_queue SET run_id=$2 WHERE command_id=$1`, first.RootCommandID, second.ID)
 		return err
 	})
 	if _, err := database.DB.Conn.Exec(ctx, `INSERT INTO `+schema+`.flow_command_event_waits
-		(command_id,execution_id,event_name,event_key) VALUES ($1,$2,'constraint.event','key')`, first.RootCommandID, first.ID); err != nil {
+		(command_id,run_id,event_name,event_key) VALUES ($1,$2,'constraint.event','key')`, first.RootCommandID, first.ID); err != nil {
 		t.Fatal(err)
 	}
-	assertConstraint("flow_command_event_waits_command_execution_fk", func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_event_waits SET execution_id=$2 WHERE command_id=$1`, first.RootCommandID, second.ID)
+	assertConstraint("flow_command_event_waits_command_run_fk", func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_event_waits SET run_id=$2 WHERE command_id=$1`, first.RootCommandID, second.ID)
 		return err
 	})
-	assertConstraint("flow_journal_command_execution_fk", func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET command_id=$3 WHERE execution_id=$1 AND position=$2`, first.ID, 1, second.RootCommandID); err != nil {
+	assertConstraint("flow_journal_command_run_fk", func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET command_id=$3 WHERE run_id=$1 AND position=$2`, first.ID, 1, second.RootCommandID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `SET CONSTRAINTS `+schema+`.flow_journal_command_execution_fk IMMEDIATE`)
+		_, err := tx.Exec(ctx, `SET CONSTRAINTS `+schema+`.flow_journal_command_run_fk IMMEDIATE`)
 		return err
 	})
-	assertInvalidPosition("flow_executions_next_journal_position_ck", func(tx pgx.Tx, value int64) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_executions SET next_journal_position=$2 WHERE execution_id=$1`, first.ID, value)
+	assertInvalidPosition("flow_runs_next_journal_position_ck", func(tx pgx.Tx, value int64) error {
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET next_journal_position=$2 WHERE run_id=$1`, first.ID, value)
 		return err
 	})
 	assertInvalidPosition("flow_commands_created_position_ck", func(tx pgx.Tx, value int64) error {
@@ -692,7 +783,7 @@ func TestMigrationOwnershipAndPositionConstraints(t *testing.T) {
 		return err
 	})
 	assertInvalidPosition("flow_journal_position_ck", func(tx pgx.Tx, value int64) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET position=$2 WHERE execution_id=$1 AND position=1`, first.ID, value)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET position=$2 WHERE run_id=$1 AND position=1`, first.ID, value)
 		return err
 	})
 	assertInvalidPosition("flow_commands_terminal_position_ck", func(tx pgx.Tx, value int64) error {
@@ -702,7 +793,7 @@ func TestMigrationOwnershipAndPositionConstraints(t *testing.T) {
 		return err
 	})
 	assertInvalidPosition("flow_journal_position_causation_ck", func(tx pgx.Tx, value int64) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET causation_position=$2 WHERE execution_id=$1 AND position=2`, first.ID, value)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET causation_position=$2 WHERE run_id=$1 AND position=2`, first.ID, value)
 		return err
 	})
 }
@@ -751,7 +842,7 @@ func TestMigrationCompatibilityMismatch(t *testing.T) {
 		t.Fatalf("drop compatibility constraint: %v", err)
 	}
 	if _, err := database.DB.Conn.Exec(ctx,
-		`UPDATE `+quoteIdentifier(database.Schema)+`.flow_schema_migrations SET min_writer_version=2 WHERE version=1`,
+		`UPDATE `+quoteIdentifier(database.Schema)+`.flow_schema_migrations SET min_writer_version=3 WHERE version=1`,
 	); err != nil {
 		t.Fatalf("alter compatibility: %v", err)
 	}

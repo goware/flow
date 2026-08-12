@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const defaultMaxCommandsPerExecution = 1000
+const defaultMaxCommandsPerRun = 1000
 
 // Option is a sealed runtime configuration option.
 type Option interface {
@@ -43,9 +43,9 @@ func (f runtimeOptionFunc) applyRuntime(options *runtimeOptions) { f(options) }
 
 func (o schemaOption) applyRuntime(options *runtimeOptions) { options.schema = o.schema }
 
-// WithMaxCommandsPerExecution sets the command ceiling copied into each newly
-// created execution. Zero explicitly disables the ceiling.
-func WithMaxCommandsPerExecution(max int) Option {
+// WithMaxCommandsPerRun sets the command ceiling copied into each newly
+// created run. Zero explicitly disables the ceiling.
+func WithMaxCommandsPerRun(max int) Option {
 	return runtimeOptionFunc(func(options *runtimeOptions) {
 		if max < 0 {
 			options.errs = append(options.errs, errors.New("maximum commands must not be negative"))
@@ -151,7 +151,7 @@ func WithShutdownGrace(grace time.Duration) Option {
 }
 
 // Runtime is a configured PostgreSQL-backed Flow client. New starts no
-// goroutines; execution operations are usable before background processing is
+// goroutines; run operations are usable before background processing is
 // started.
 type Runtime struct {
 	db                *pgkit.DB
@@ -184,7 +184,7 @@ type Runtime struct {
 // starting background work.
 func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	options := runtimeOptions{
-		schema: defaultSchema, maxCommands: defaultMaxCommandsPerExecution,
+		schema: defaultSchema, maxCommands: defaultMaxCommandsPerRun,
 		workerConcurrency: max(1, runtime.GOMAXPROCS(0)), commandLease: 60 * time.Second,
 		pollInterval: time.Second, shutdownGrace: 30 * time.Second,
 		notifications: true,
@@ -233,18 +233,38 @@ func cloneIntMap(source map[string]int) map[string]int {
 
 func (*Runtime) flowClient() {}
 
-type transactionClient struct {
+// TransactionClient joins Flow operations to one caller-owned PostgreSQL
+// transaction. Create it exactly once per pgx.Tx, use Flow operations before
+// application row locks/writes, and do not use it concurrently or after the
+// transaction ends. Flow never commits or rolls back the transaction.
+type TransactionClient struct {
 	runtime *Runtime
 	tx      pgx.Tx
 	order   store.LockOrder
 }
 
-func (*transactionClient) flowClient() {}
+func (*TransactionClient) flowClient() {}
 
-// InTx returns a client whose writes participate in the supplied caller-owned
-// transaction. Flow never commits or rolls back that transaction.
-func (r *Runtime) InTx(tx pgx.Tx) Client {
-	return &transactionClient{runtime: r, tx: tx}
+// InTx returns a transaction-scoped client. Call it once at the transaction
+// boundary and thread the returned value through every Flow operation in that
+// transaction; repeated calls for the same pgx.Tx create independent order
+// guards and are invalid usage.
+func (r *Runtime) InTx(tx pgx.Tx) *TransactionClient {
+	return &TransactionClient{runtime: r, tx: tx}
+}
+
+// BeginApplicationWrites marks the irreversible boundary after which this
+// client rejects every Flow write or run-locking operation before issuing SQL.
+// It does not execute SQL or prove that the caller has not already taken
+// application locks.
+func (c *TransactionClient) BeginApplicationWrites() error {
+	if c == nil || c.runtime == nil || c.tx == nil {
+		return newError(ErrInvalid, "begin", "application writes", "", "transaction client is incomplete")
+	}
+	if err := c.order.BeginApplicationPhase(); err != nil {
+		return newError(ErrInvalidState, "begin", "application writes", "", err.Error())
+	}
+	return nil
 }
 
 type resolvedClient struct {
@@ -266,7 +286,7 @@ func resolveClient(client Client) (resolvedClient, error) {
 			return resolvedClient{}, newError(ErrClosed, "use", "runtime", "", "runtime is closed")
 		}
 		return resolvedClient{runtime: value}, nil
-	case *transactionClient:
+	case *TransactionClient:
 		if value == nil || value.runtime == nil || value.tx == nil {
 			return resolvedClient{}, newError(ErrInvalid, "use", "client", "", "transaction client is incomplete")
 		}
@@ -280,6 +300,13 @@ func resolveClient(client Client) (resolvedClient, error) {
 	default:
 		return resolvedClient{}, newError(ErrInvalid, "use", "client", "", "unsupported or nil client")
 	}
+}
+
+func (c resolvedClient) beforeFlowWrite() error {
+	if c.order == nil {
+		return nil
+	}
+	return c.order.BeforeFlowOperation()
 }
 
 func (c resolvedClient) inTransaction(ctx context.Context, operation func(pgx.Tx) error) (resultErr error) {
@@ -312,7 +339,7 @@ func (c resolvedClient) inTransaction(ctx context.Context, operation func(pgx.Tx
 
 func (c resolvedClient) semantic(ctx context.Context, id uuid.UUID, operation func(*store.SemanticTx) error) error {
 	if c.order != nil {
-		if err := c.order.BeforeExecution(id); err != nil {
+		if err := c.order.BeforeRun(id); err != nil {
 			return err
 		}
 	}
@@ -333,10 +360,10 @@ func (r *Runtime) observe(ctx context.Context, observation Observation) {
 	r.observations.emit(observation)
 }
 
-func parseExecutionID(id ExecutionID) (uuid.UUID, error) {
+func parseRunID(id RunID) (uuid.UUID, error) {
 	parsed, err := uuid.Parse(string(id))
 	if err != nil {
-		return uuid.Nil, newError(ErrInvalid, "parse", "execution", string(id), "invalid identifier")
+		return uuid.Nil, newError(ErrInvalid, "parse", "run", string(id), "invalid identifier")
 	}
 	return parsed, nil
 }

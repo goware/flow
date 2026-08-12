@@ -7,10 +7,6 @@ import (
 	"time"
 )
 
-type dummyClient struct{ id int }
-
-func (*dummyClient) flowClient() {}
-
 type testArgs struct {
 	ID string `json:"id"`
 }
@@ -19,7 +15,7 @@ type testResult struct {
 	OK bool `json:"ok"`
 }
 
-func TestDefinitionIdentityAndBinding(t *testing.T) {
+func TestDefinitionIdentity(t *testing.T) {
 	t.Parallel()
 
 	cmd := DefineCommand[testArgs, testResult]("send_receipt", 2, WithQueue("mail"), WithTimeout(time.Minute))
@@ -29,16 +25,6 @@ func TestDefinitionIdentityAndBinding(t *testing.T) {
 	if cmd.Name() != "send_receipt" || cmd.Version() != 2 {
 		t.Fatalf("command identity = %s/%d", cmd.Name(), cmd.Version())
 	}
-	clientA, clientB := &dummyClient{id: 1}, &dummyClient{id: 2}
-	boundA := cmd.With(clientA)
-	boundB := boundA.With(clientB)
-	if cmd.client != nil || boundA.client != clientA || boundB.client != clientB {
-		t.Fatal("With mutated or failed to replace the client binding")
-	}
-	if cmd.def != boundA.def || boundA.def != boundB.def || boundB.Name() != cmd.Name() {
-		t.Fatal("With changed durable definition identity")
-	}
-
 	encoded, err := cmd.def.Args.Encode(testArgs{ID: "42"}, 0)
 	if err != nil {
 		t.Fatalf("args Encode() error = %v", err)

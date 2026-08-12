@@ -83,7 +83,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("agent execution %s completed with %d commands and %d journal entries\n",
+	fmt.Printf("agent run %s completed with %d commands and %d journal entries\n",
 		exec.ID, len(trace.Commands), len(trace.History))
 }
 
@@ -121,15 +121,15 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 
 // runExampleCommand starts a bounded command chain. The root is declared
 // before an external user message exists, so the exact gate keeps it live.
-func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Execution, flow.ExecutionTrace, error) {
-	exec, err := agentThink.With(runtime).Execute(ctx, "agent/example", thinkArgs{
+func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Run, flow.RunTrace, error) {
+	exec, err := agentThink.Enqueue(ctx, runtime, "agent/example", thinkArgs{
 		Turn: 1, UserMessageKey: "message/1",
 	}, flow.WaitFor(agentUserMessage, "message/1"), flow.Within(2*time.Second))
 	if err != nil {
-		return flow.Execution{}, flow.ExecutionTrace{}, err
+		return flow.Run{}, flow.RunTrace{}, err
 	}
-	if err = agentUserMessage.Emit(ctx, runtime, exec.ID, "message/1", agentMessage{Text: "focus on durability"}); err != nil {
-		return flow.Execution{}, flow.ExecutionTrace{}, err
+	if err = agentUserMessage.Deliver(ctx, runtime, exec.ID, "message/1", agentMessage{Text: "focus on durability"}); err != nil {
+		return flow.Run{}, flow.RunTrace{}, err
 	}
 	trace, err := waitForTerminal(ctx, runtime, exec.ID, 8*time.Second)
 	return exec, trace, err
@@ -145,8 +145,11 @@ func (example *agentExample) agentThink(ctx context.Context, work *flow.Work[thi
 	case <-time.After(15 * time.Millisecond):
 	}
 	if work.Args.Turn == 1 {
-		message, err := flow.GetEventValue(work, agentUserMessage, work.Args.UserMessageKey)
-		if err != nil {
+		message, found, err := flow.GetEventValue(work, agentUserMessage, work.Args.UserMessageKey)
+		if err != nil || !found {
+			if err == nil {
+				err = fmt.Errorf("required user message %q is absent", work.Args.UserMessageKey)
+			}
 			return thinkResult{}, err
 		}
 		fmt.Fprintf(example.output, "user asked: %s\n", message.Text)
@@ -155,17 +158,19 @@ func (example *agentExample) agentThink(ctx context.Context, work *flow.Work[thi
 		for index, name := range tools {
 			toolKeys[index] = "turn/1/tool/" + name
 		}
-		next := flow.Execute(work, "turn/2/think", agentThink, thinkArgs{Turn: 2, ToolKeys: toolKeys})
+		next := flow.Enqueue(work, "turn/2/think", agentThink, thinkArgs{Turn: 2, ToolKeys: toolKeys})
 		for index, name := range tools {
 			key := toolKeys[index]
-			flow.Execute(work, key, agentTool, toolArgs{Name: name})
+			flow.Enqueue(work, key, agentTool, toolArgs{Name: name})
 			next.WaitFor(toolCompleted, key)
 		}
 		return thinkResult{Tools: tools}, nil
 	}
 	for _, key := range work.Args.ToolKeys {
-		if _, err := flow.GetEventValue(work, toolCompleted, key); err != nil {
+		if _, found, err := flow.GetEventValue(work, toolCompleted, key); err != nil {
 			return thinkResult{}, err
+		} else if !found {
+			return thinkResult{}, fmt.Errorf("required tool result %q is absent", key)
 		}
 	}
 	result := thinkResult{FinalResultRef: "result/final-report"}
@@ -204,7 +209,7 @@ func synchronized(writer io.Writer) io.Writer {
 	return &synchronizedWriter{writer: writer}
 }
 
-func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.ExecutionID, timeout time.Duration) (flow.ExecutionTrace, error) {
+func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.RunID, timeout time.Duration) (flow.RunTrace, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -212,19 +217,19 @@ func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.Executi
 	for {
 		trace, err := flow.Trace(ctx, runtime, id)
 		if err != nil {
-			return flow.ExecutionTrace{}, err
+			return flow.RunTrace{}, err
 		}
-		switch trace.Execution.Status {
+		switch trace.Run.Status {
 		case "succeeded":
 			return trace, nil
 		case "failed", "cancelled", "expired":
-			return flow.ExecutionTrace{}, fmt.Errorf("example execution ended %s", trace.Execution.Status)
+			return flow.RunTrace{}, fmt.Errorf("example run ended %s", trace.Run.Status)
 		}
 		select {
 		case <-ctx.Done():
-			return flow.ExecutionTrace{}, ctx.Err()
+			return flow.RunTrace{}, ctx.Err()
 		case <-timer.C:
-			return flow.ExecutionTrace{}, fmt.Errorf("example execution timed out")
+			return flow.RunTrace{}, fmt.Errorf("example run timed out")
 		case <-ticker.C:
 		}
 	}

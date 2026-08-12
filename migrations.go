@@ -23,9 +23,9 @@ import (
 
 const (
 	defaultSchema         = "public"
-	currentSchemaVersion  = 3
-	currentReaderVersion  = 1
-	currentWriterVersion  = 1
+	currentSchemaVersion  = 4
+	currentReaderVersion  = 2
+	currentWriterVersion  = 2
 	migrationToken        = "{{schema}}"
 	migrationAdvisorySalt = "goware/flow/migrate/v1"
 )
@@ -83,10 +83,11 @@ var migrationFiles = []struct {
 	{version: 1, name: "initial", path: "migrations/001_initial.sql", minReader: 1, minWriter: 1},
 	{version: 2, name: "live_keys", path: "migrations/002_live_keys.sql", minReader: 1, minWriter: 1},
 	{version: 3, name: "release_read_paths", path: "migrations/003_release_read_paths.sql", minReader: 1, minWriter: 1},
+	{version: 4, name: "run_vocabulary", path: "migrations/004_run_vocabulary.sql", minReader: 2, minWriter: 2},
 }
 
 // Migrate applies every unapplied embedded Flow migration in its own
-// execution-serialized transaction and verifies all previously recorded
+// run-serialized transaction and verifies all previously recorded
 // checksums before writing.
 func Migrate(ctx context.Context, db *pgkit.DB, opts ...MigrateOption) error {
 	options, units, err := prepareMigrations(opts...)
@@ -198,8 +199,10 @@ func CheckSchema(ctx context.Context, db *pgkit.DB, opts ...MigrateOption) (Sche
 		MinReaderVersion: latest.minReader, MinWriterVersion: latest.minWriter,
 		AppliedAt: latest.appliedAt,
 	}
-	status.Compatible = latest.version == currentSchemaVersion &&
-		latest.minReader <= currentReaderVersion && latest.minWriter <= currentWriterVersion
+	status.Compatible = schemaVersionsCompatible(
+		latest.version, latest.minReader, latest.minWriter,
+		currentSchemaVersion, currentReaderVersion, currentWriterVersion,
+	)
 	if !status.Compatible {
 		return status, newError(ErrSchema, "check", "schema", options.schema, "reader or writer compatibility does not include this library")
 	}
@@ -207,6 +210,10 @@ func CheckSchema(ctx context.Context, db *pgkit.DB, opts ...MigrateOption) (Sche
 		return status, err
 	}
 	return status, nil
+}
+
+func schemaVersionsCompatible(schemaVersion, minReader, minWriter, librarySchema, reader, writer int) bool {
+	return schemaVersion == librarySchema && minReader <= reader && minWriter <= writer
 }
 
 // MigrationFS returns schema-rendered SQL files for an external transactional
@@ -357,7 +364,7 @@ func verifyAppliedMigrations(applied map[int]appliedMigration, units []migration
 
 func verifyFlowTables(ctx context.Context, db queryer, schema string) error {
 	expected := []string{
-		"flow_executions", "flow_commands", "flow_command_queue",
+		"flow_runs", "flow_commands", "flow_command_queue",
 		"flow_command_event_waits", "flow_journal", "flow_schema_migrations",
 	}
 	rows, err := db.Query(ctx, `

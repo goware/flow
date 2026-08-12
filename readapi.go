@@ -27,22 +27,22 @@ const (
 	// MaxReadPageSize is the largest public by-key read page.
 	MaxReadPageSize = 1000
 
-	keyedReadCursorVersion = 1
+	keyedReadCursorVersion = 2
 	maxReadCursorBytes     = 4096
 	readKindLiveWork       = "live_work"
 	readKindHistory        = "keyed_history"
 )
 
-// LiveWork is one queued (or leased) command of a non-terminal execution,
-// carrying the execution's identity. It is the batch, key-addressed read for
+// LiveWork is one queued (or leased) command of a non-terminal run,
+// carrying the run's identity. It is the batch, key-addressed read for
 // consumers that decorate their own domain rows with dispatch state, without
 // touching Flow's tables.
 type LiveWork struct {
-	ExecutionID      ExecutionID
+	RunID            RunID
 	DefinitionName   string
-	ExecutionKey     string
+	RunKey           string
 	KeyScope         KeyScope
-	ExecutionStatus  ExecutionStatus
+	RunStatus        RunStatus
 	CommandID        CommandID
 	CommandKey       string
 	CommandName      string
@@ -55,7 +55,7 @@ type LiveWork struct {
 	CommandCreatedAt time.Time
 }
 
-// LiveWorkFilter selects bounded queued work for exact execution keys. Cursor
+// LiveWorkFilter selects bounded queued work for exact run keys. Cursor
 // values are opaque and may be reused only with the same Keys filter.
 type LiveWorkFilter struct {
 	Keys     []string
@@ -71,8 +71,8 @@ type LiveWorkPage struct {
 }
 
 // ListLiveWork returns one bounded page of queued commands for non-terminal
-// executions whose execution key is in filter.Keys. Rows are ordered by key,
-// definition, execution creation, execution ID, and command ID. An ordinary
+// runs whose run key is in filter.Keys. Rows are ordered by key,
+// definition, run creation, run ID, and command ID. An ordinary
 // client does not provide a cross-page snapshot; a transaction-scoped client
 // uses the caller's transaction and observes its uncommitted writes.
 func ListLiveWork(ctx context.Context, c Client, filter LiveWorkFilter) (LiveWorkPage, error) {
@@ -90,10 +90,10 @@ func ListLiveWork(ctx context.Context, c Client, filter LiveWorkFilter) (LiveWor
 	storeFilter := store.LiveWorkListFilter{Keys: keys, Limit: pageSize + 1}
 	if cursor != nil {
 		storeFilter.Cursor = &store.LiveWorkCursor{
-			ExecutionKey: cursor.ExecutionKey, DefinitionName: cursor.DefinitionName,
-			ExecutionCreatedAt: cursor.ExecutionCreatedAt,
-			ExecutionID:        uuid.MustParse(cursor.ExecutionID),
-			CommandID:          uuid.MustParse(cursor.CommandID),
+			RunKey: cursor.RunKey, DefinitionName: cursor.DefinitionName,
+			RunCreatedAt: cursor.RunCreatedAt,
+			RunID:        uuid.MustParse(cursor.RunID),
+			CommandID:    uuid.MustParse(cursor.CommandID),
 		}
 	}
 	rows, err := client.runtime.store.ListLiveWorkInTx(ctx, client.tx, storeFilter)
@@ -111,9 +111,9 @@ func ListLiveWork(ctx context.Context, c Client, filter LiveWorkFilter) (LiveWor
 		last := rows[pageSize-1]
 		page.NextCursor, err = encodeKeyedReadCursor(keyedReadCursor{
 			Version: keyedReadCursorVersion, Kind: readKindLiveWork,
-			KeysHash: keyedReadKeysHash(keys), ExecutionKey: last.ExecutionKey,
-			DefinitionName: last.DefinitionName, ExecutionCreatedAt: last.ExecutionCreatedAt.UTC(),
-			ExecutionID: last.ExecutionID.String(), CommandID: last.CommandID.String(),
+			KeysHash: keyedReadKeysHash(keys), RunKey: last.RunKey,
+			DefinitionName: last.DefinitionName, RunCreatedAt: last.RunCreatedAt.UTC(),
+			RunID: last.RunID.String(), CommandID: last.CommandID.String(),
 		})
 		if err != nil {
 			return LiveWorkPage{}, err
@@ -122,15 +122,15 @@ func ListLiveWork(ctx context.Context, c Client, filter LiveWorkFilter) (LiveWor
 	return page, nil
 }
 
-// KeyedHistoryEntry is a history entry carrying its execution's identity.
+// KeyedHistoryEntry is a history entry carrying its run's identity.
 type KeyedHistoryEntry struct {
 	DefinitionName string
-	ExecutionKey   string
+	RunKey         string
 	KeyScope       KeyScope
 	HistoryEntry
 }
 
-// KeyedHistoryFilter selects bounded retained history for exact execution
+// KeyedHistoryFilter selects bounded retained history for exact run
 // keys. Cursor values are opaque and may be reused only with the same Keys
 // filter.
 type KeyedHistoryFilter struct {
@@ -147,9 +147,9 @@ type KeyedHistoryPage struct {
 }
 
 // ListHistoryByKeys returns one bounded retained-history page for every
-// execution that ever held one of filter.Keys. Rows are ordered by key,
-// definition, execution creation, execution ID, and journal position. Journal
-// order is preserved within each execution. Transaction-scoped clients use the
+// run that ever held one of filter.Keys. Rows are ordered by key,
+// definition, run creation, run ID, and journal position. Journal
+// order is preserved within each run. Transaction-scoped clients use the
 // caller's transaction and observe their uncommitted writes.
 func ListHistoryByKeys(ctx context.Context, c Client, filter KeyedHistoryFilter) (KeyedHistoryPage, error) {
 	client, err := resolveClient(c)
@@ -166,10 +166,10 @@ func ListHistoryByKeys(ctx context.Context, c Client, filter KeyedHistoryFilter)
 	storeFilter := store.KeyedHistoryListFilter{Keys: keys, Limit: pageSize + 1}
 	if cursor != nil {
 		storeFilter.Cursor = &store.KeyedHistoryCursor{
-			ExecutionKey: cursor.ExecutionKey, DefinitionName: cursor.DefinitionName,
-			ExecutionCreatedAt: cursor.ExecutionCreatedAt,
-			ExecutionID:        uuid.MustParse(cursor.ExecutionID),
-			Position:           cursor.Position,
+			RunKey: cursor.RunKey, DefinitionName: cursor.DefinitionName,
+			RunCreatedAt: cursor.RunCreatedAt,
+			RunID:        uuid.MustParse(cursor.RunID),
+			Position:     cursor.Position,
 		}
 	}
 	rows, err := client.runtime.store.ListJournalByKeysInTx(ctx, client.tx, storeFilter)
@@ -187,9 +187,9 @@ func ListHistoryByKeys(ctx context.Context, c Client, filter KeyedHistoryFilter)
 		last := rows[pageSize-1]
 		page.NextCursor, err = encodeKeyedReadCursor(keyedReadCursor{
 			Version: keyedReadCursorVersion, Kind: readKindHistory,
-			KeysHash: keyedReadKeysHash(keys), ExecutionKey: last.ExecutionKey,
-			DefinitionName: last.DefinitionName, ExecutionCreatedAt: last.ExecutionCreatedAt.UTC(),
-			ExecutionID: last.Entry.ExecutionID.String(), Position: last.Entry.Position,
+			KeysHash: keyedReadKeysHash(keys), RunKey: last.RunKey,
+			DefinitionName: last.DefinitionName, RunCreatedAt: last.RunCreatedAt.UTC(),
+			RunID: last.Entry.RunID.String(), Position: last.Entry.Position,
 		})
 		if err != nil {
 			return KeyedHistoryPage{}, err
@@ -203,17 +203,17 @@ func liveWorkFromStore(row store.LiveWorkRow) (LiveWork, error) {
 	if err != nil {
 		return LiveWork{}, newError(ErrInvalidState, "decode", "key scope", row.KeyScope, "stored key scope is unknown")
 	}
-	executionStatus, err := executionStatusFromString(row.ExecutionStatus)
+	runStatus, err := runStatusFromString(row.RunStatus)
 	if err != nil {
-		return LiveWork{}, newError(ErrInvalidState, "decode", "execution status", row.ExecutionStatus, "stored status is unknown")
+		return LiveWork{}, newError(ErrInvalidState, "decode", "run status", row.RunStatus, "stored status is unknown")
 	}
 	queueState, err := queueStateFromString(row.QueueState)
 	if err != nil {
 		return LiveWork{}, newError(ErrInvalidState, "decode", "queue state", row.QueueState, "stored state is unknown")
 	}
 	work := LiveWork{
-		ExecutionID: ExecutionID(row.ExecutionID.String()), DefinitionName: row.DefinitionName,
-		ExecutionKey: row.ExecutionKey, KeyScope: keyScope, ExecutionStatus: executionStatus,
+		RunID: RunID(row.RunID.String()), DefinitionName: row.DefinitionName,
+		RunKey: row.RunKey, KeyScope: keyScope, RunStatus: runStatus,
 		CommandID: CommandID(row.CommandID.String()), CommandKey: row.CommandKey,
 		CommandName: row.CommandName, Queue: row.Queue, QueueState: queueState,
 		NextRunAt: row.NextRunAt, AttemptOrdinal: row.AttemptOrdinal,
@@ -239,31 +239,31 @@ func keyedHistoryFromStore(row store.KeyedJournalRow) (KeyedHistoryEntry, error)
 		return KeyedHistoryEntry{}, err
 	}
 	return KeyedHistoryEntry{
-		DefinitionName: row.DefinitionName, ExecutionKey: row.ExecutionKey,
+		DefinitionName: row.DefinitionName, RunKey: row.RunKey,
 		KeyScope: keyScope, HistoryEntry: history[0],
 	}, nil
 }
 
 type keyedReadCursor struct {
-	Version            int       `json:"v"`
-	Kind               string    `json:"kind"`
-	KeysHash           string    `json:"keys_hash"`
-	ExecutionKey       string    `json:"execution_key"`
-	DefinitionName     string    `json:"definition_name"`
-	ExecutionCreatedAt time.Time `json:"execution_created_at"`
-	ExecutionID        string    `json:"execution_id"`
-	CommandID          string    `json:"command_id,omitempty"`
-	Position           int64     `json:"position,omitempty"`
+	Version        int       `json:"v"`
+	Kind           string    `json:"kind"`
+	KeysHash       string    `json:"keys_hash"`
+	RunKey         string    `json:"run_key"`
+	DefinitionName string    `json:"definition_name"`
+	RunCreatedAt   time.Time `json:"run_created_at"`
+	RunID          string    `json:"run_id"`
+	CommandID      string    `json:"command_id,omitempty"`
+	Position       int64     `json:"position,omitempty"`
 }
 
 func prepareKeyedRead(keys []string, pageSize int, encodedCursor, kind string) ([]string, int, *keyedReadCursor, error) {
 	if len(keys) > MaxReadKeys {
-		return nil, 0, nil, newError(ErrInvalid, "list", "execution keys", "", "too many keys")
+		return nil, 0, nil, newError(ErrInvalid, "list", "run keys", "", "too many keys")
 	}
 	normalized := append([]string(nil), keys...)
 	for _, key := range normalized {
-		if key == "" || len(key) > maxExecutionKeyBytes || !utf8.ValidString(key) {
-			return nil, 0, nil, newError(ErrInvalid, "list", "execution key", "", "key is empty, malformed, or too long")
+		if key == "" || len(key) > maxRunKeyBytes || !utf8.ValidString(key) {
+			return nil, 0, nil, newError(ErrInvalid, "list", "run key", "", "key is empty, malformed, or too long")
 		}
 	}
 	slices.Sort(normalized)
@@ -276,7 +276,7 @@ func prepareKeyedRead(keys []string, pageSize int, encodedCursor, kind string) (
 	}
 	if len(normalized) == 0 {
 		if encodedCursor != "" {
-			return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor requires execution keys")
+			return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor requires run keys")
 		}
 		return normalized, pageSize, nil, nil
 	}
@@ -290,12 +290,12 @@ func prepareKeyedRead(keys []string, pageSize int, encodedCursor, kind string) (
 	if cursor.Version != keyedReadCursorVersion || cursor.Kind != kind || cursor.KeysHash != keyedReadKeysHash(normalized) {
 		return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor does not match this read filter")
 	}
-	if cursor.ExecutionKey == "" || len(cursor.ExecutionKey) > maxExecutionKeyBytes || !utf8.ValidString(cursor.ExecutionKey) ||
-		definition.ValidateName(cursor.DefinitionName) != nil || cursor.ExecutionCreatedAt.IsZero() {
+	if cursor.RunKey == "" || len(cursor.RunKey) > maxRunKeyBytes || !utf8.ValidString(cursor.RunKey) ||
+		definition.ValidateName(cursor.DefinitionName) != nil || cursor.RunCreatedAt.IsZero() {
 		return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor ordering values are invalid")
 	}
-	if _, err := uuid.Parse(cursor.ExecutionID); err != nil {
-		return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor execution ID is invalid")
+	if _, err := uuid.Parse(cursor.RunID); err != nil {
+		return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor run ID is invalid")
 	}
 	switch kind {
 	case readKindLiveWork:

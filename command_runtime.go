@@ -52,7 +52,7 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 			continue
 		}
 		progress := false
-		excludedExecutions := make(map[uuid.UUID]struct{})
+		excludedRuns := make(map[uuid.UUID]struct{})
 		excludedQueues := make(map[string]struct{})
 		probeAfter := continuationAfter
 		headRevisit := revisitHead && continuationAfter != nil
@@ -65,10 +65,10 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 		for rounds := 0; rounds < maxCommandRoundsPerTurn && slots.free() > 0 && ctx.Err() == nil; rounds++ {
 			free = slots.free()
 			limit := min(maxCommandProbe, max(free, free*commandProbeFactor))
-			atExclusionCap := len(excludedExecutions)+len(excludedQueues) >= maxCommandProbe
+			atExclusionCap := len(excludedRuns)+len(excludedQueues) >= maxCommandProbe
 			started := time.Now()
 			candidates, err := r.store.ProbeCommandsExcluding(ctx, kinds, limit,
-				executionIDs(excludedExecutions), queueNames(excludedQueues), probeAfter)
+				runIDs(excludedRuns), queueNames(excludedQueues), probeAfter)
 			if err == nil {
 				err = r.faults.Hit(ctx, fault.ProbeReturn)
 			}
@@ -108,7 +108,7 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 				if len(excludedQueues) > queueExclusionsBeforeSelection {
 					if atExclusionCap {
 						probeAfter = commandProbeCursor(candidates[0])
-						clear(excludedExecutions)
+						clear(excludedRuns)
 						clear(excludedQueues)
 					}
 					continue
@@ -121,11 +121,11 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 				}
 				return
 			}
-			exclusionsBefore := len(excludedExecutions) + len(excludedQueues)
+			exclusionsBefore := len(excludedRuns) + len(excludedQueues)
 			roundProgress := false
 			roundCommands := 0
-			groups := groupCandidatesByExecution(selected)
-			for _, claimedGroup := range r.claimExecutionGroups(ctx, groups) {
+			groups := groupCandidatesByRun(selected)
+			for _, claimedGroup := range r.claimRunGroups(ctx, groups) {
 				group, result, claimErr := claimedGroup.candidates, claimedGroup.result, claimedGroup.err
 				claimedIDs := make(map[uuid.UUID]struct{}, len(result.Commands))
 				for _, command := range result.Commands {
@@ -143,7 +143,7 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 					}
 				}
 				if !result.Progressed && len(result.Commands) == 0 && len(group) > 0 {
-					excludedExecutions[group[0].ExecutionID] = struct{}{}
+					excludedRuns[group[0].RunID] = struct{}{}
 				}
 				if claimErr != nil || len(result.Commands) == 0 {
 					continue
@@ -163,12 +163,12 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 			if atExclusionCap {
 				if !roundProgress && roundCommands == 0 {
 					probeAfter = commandProbeCursor(candidates[0])
-					clear(excludedExecutions)
+					clear(excludedRuns)
 					clear(excludedQueues)
 				}
 				continue
 			}
-			if len(excludedExecutions)+len(excludedQueues) == exclusionsBefore {
+			if len(excludedRuns)+len(excludedQueues) == exclusionsBefore {
 				break
 			}
 		}
@@ -197,10 +197,10 @@ func commandProbeCursor(candidate store.CommandCandidate) *store.CommandProbeCur
 	}
 }
 
-func executionIDs(executions map[uuid.UUID]struct{}) []uuid.UUID {
-	result := make([]uuid.UUID, 0, len(executions))
-	for executionID := range executions {
-		result = append(result, executionID)
+func runIDs(runs map[uuid.UUID]struct{}) []uuid.UUID {
+	result := make([]uuid.UUID, 0, len(runs))
+	for runID := range runs {
+		result = append(result, runID)
 	}
 	return result
 }
@@ -219,11 +219,11 @@ type commandGroupClaim struct {
 	err        error
 }
 
-// claimExecutionGroups runs at most one transaction per execution and waits
+// claimRunGroups runs at most one transaction per run and waits
 // for the complete selected set before the scheduler probes again. Worker
 // accounting remains scheduler-owned after this function returns, so Run
 // cannot begin waiting while a claim goroutine might still call WaitGroup.Add.
-func (r *Runtime) claimExecutionGroups(ctx context.Context, groups [][]store.CommandCandidate) []commandGroupClaim {
+func (r *Runtime) claimRunGroups(ctx context.Context, groups [][]store.CommandCandidate) []commandGroupClaim {
 	results := make([]commandGroupClaim, len(groups))
 	if len(groups) == 0 {
 		return results
@@ -241,7 +241,7 @@ func (r *Runtime) claimExecutionGroups(ctx context.Context, groups [][]store.Com
 					results[index].err = ctx.Err()
 					continue
 				}
-				results[index].result, results[index].err = r.claimExecutionGroup(ctx, groups[index])
+				results[index].result, results[index].err = r.claimRunGroup(ctx, groups[index])
 			}
 		}()
 	}
@@ -253,7 +253,7 @@ func (r *Runtime) claimExecutionGroups(ctx context.Context, groups [][]store.Com
 	return results
 }
 
-func (r *Runtime) claimExecutionGroup(
+func (r *Runtime) claimRunGroup(
 	ctx context.Context,
 	group []store.CommandCandidate,
 ) (store.ClaimBatchResult, error) {
@@ -283,7 +283,7 @@ func (r *Runtime) claimExecutionGroup(
 	}
 	r.observe(ctx, Observation{
 		Kind: ObservationClaim, Operation: "claim", Outcome: outcomeForError(err),
-		ExecutionID: ExecutionID(group[0].ExecutionID.String()), Count: int64(len(result.Commands)),
+		RunID: RunID(group[0].RunID.String()), Count: int64(len(result.Commands)),
 		Duration: time.Since(started), Worker: r.replicaName(),
 	})
 	return result, err
@@ -373,14 +373,14 @@ func fairQueueCandidates(candidates []store.CommandCandidate, turn *int) []store
 	return ordered
 }
 
-func groupCandidatesByExecution(candidates []store.CommandCandidate) [][]store.CommandCandidate {
+func groupCandidatesByRun(candidates []store.CommandCandidate) [][]store.CommandCandidate {
 	groups := make([][]store.CommandCandidate, 0, len(candidates))
 	indexes := make(map[uuid.UUID]int, len(candidates))
 	for _, candidate := range candidates {
-		index, exists := indexes[candidate.ExecutionID]
+		index, exists := indexes[candidate.RunID]
 		if !exists {
 			index = len(groups)
-			indexes[candidate.ExecutionID] = index
+			indexes[candidate.RunID] = index
 			groups = append(groups, nil)
 		}
 		groups[index] = append(groups[index], candidate)
@@ -428,7 +428,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		return
 	}
 	info := CommandInfo{
-		ExecutionID: ExecutionID(claim.ExecutionID.String()), CommandID: CommandID(claim.CommandID.String()),
+		RunID: RunID(claim.RunID.String()), RunKey: claim.RunKey, CommandID: CommandID(claim.CommandID.String()),
 		CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version,
 		CreatedAt: claim.CreatedAt, BudgetStartedAt: claim.BudgetStartedAt,
 		Attempt: claim.Attempt, AttemptStartedAt: claim.DBNow,
@@ -444,7 +444,6 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 			return
 		}
 	}
-	workerCtx = withAttemptScope(workerCtx, &scope.state)
 	if err := r.faults.Hit(workerCtx, fault.HandlerStart); err != nil {
 		r.concludeClaim(workerCtx, claim, classifiedConclusion{class: retrypolicy.ClassInterrupted, code: "handler_start_interrupted", message: "handler start was interrupted"})
 		return
@@ -456,7 +455,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 	r.observe(context.Background(), Observation{
 		Kind: ObservationAttempt, Operation: "handler", Outcome: outcomeForError(workerErr),
-		ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+		RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
 		Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Duration: time.Since(started),
 	})
 	if cause := context.Cause(workerCtx); cause != nil {
@@ -511,20 +510,20 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 				for _, event := range events {
 					r.observe(context.Background(), Observation{
 						Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
-						ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+						RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
 						Name: event.Name, Worker: r.replicaName(),
 					})
 				}
 				r.observe(context.Background(), Observation{
 					Kind: ObservationAttempt, Operation: "settle", Outcome: "succeeded",
-					ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+					RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
 					Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
 				})
 				return
 			case "expired":
 				r.observe(context.Background(), Observation{
 					Kind: ObservationAttempt, Operation: "settle", Outcome: "expired",
-					ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+					RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
 					Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
 				})
 				return
@@ -568,7 +567,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 	r.observe(context.Background(), Observation{
 		Kind: ObservationAttempt, Operation: "settle", Outcome: "error",
-		ExecutionID: info.ExecutionID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+		RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
 		Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
 	})
 }
@@ -691,7 +690,7 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 			}
 			r.observe(context.Background(), Observation{
 				Kind: ObservationAttempt, Operation: "conclude", Outcome: result.Status,
-				ExecutionID: ExecutionID(claim.ExecutionID.String()), CommandID: CommandID(claim.CommandID.String()),
+				RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
 				CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
 			})
 			return
@@ -709,7 +708,7 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 	}
 	r.observe(context.Background(), Observation{
 		Kind: ObservationAttempt, Operation: "conclude", Outcome: "error",
-		ExecutionID: ExecutionID(claim.ExecutionID.String()), CommandID: CommandID(claim.CommandID.String()),
+		RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
 		CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
 	})
 }
@@ -725,8 +724,8 @@ func commandAttemptRemaining(claim store.ClaimedCommand) (time.Duration, bool) {
 			deadline = candidate
 		}
 	}
-	if claim.ExecutionDeadline != nil && (deadline.IsZero() || claim.ExecutionDeadline.Before(deadline)) {
-		deadline = *claim.ExecutionDeadline
+	if claim.RunDeadline != nil && (deadline.IsZero() || claim.RunDeadline.Before(deadline)) {
+		deadline = *claim.RunDeadline
 	}
 	if deadline.IsZero() {
 		return 0, false
