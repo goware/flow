@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
 )
 
@@ -425,5 +426,45 @@ func TestGetQueueStatsBatchesValidatesAndObservesTransactions(t *testing.T) {
 	txStats, err := GetQueueStats(ctx, txClient, "stats.transaction.lane")
 	if err != nil || txStats["stats.transaction.lane"].Ready != 1 || len(recorder.snapshot()) != 1 {
 		t.Fatalf("transaction queue statistics = %#v, %v; queries=%#v", txStats, err, recorder.snapshot())
+	}
+}
+
+func TestGetQueueStatsDoesNotLockClaimableRows(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("stats.nonlocking", 1, WithQueue("stats.nonlocking.lane"))
+	if _, err := command.Enqueue(ctx, runtime, "stats/nonlocking", None{}, WithoutRunDeadline()); err != nil {
+		t.Fatal(err)
+	}
+
+	readTx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readTx.Rollback(ctx)
+	stats, err := GetQueueStats(ctx, runtime.InTx(readTx), command.Queue())
+	if err != nil || stats[command.Queue()].Ready != 1 {
+		t.Fatalf("transaction queue statistics = %#v, %v", stats, err)
+	}
+
+	claimCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	candidates, err := runtime.store.ProbeCommands(claimCtx,
+		[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("ProbeCommands() candidates=%d, err=%v", len(candidates), err)
+	}
+	claimed, err := runtime.store.ClaimCommands(claimCtx, candidates, time.Minute, "stats-nonlocking", nil)
+	if err != nil || len(claimed.Commands) != 1 {
+		t.Fatalf("ClaimCommands() commands=%d, err=%v", len(claimed.Commands), err)
 	}
 }

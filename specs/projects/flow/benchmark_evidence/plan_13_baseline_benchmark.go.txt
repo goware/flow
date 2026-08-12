@@ -1,0 +1,67 @@
+package flow
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/goware/flow/internal/testpg"
+)
+
+func BenchmarkPlan13BaselinePermanentKeyRediscovery(b *testing.B) {
+	database := testpg.Open(b)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		b.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		b.Fatal(err)
+	}
+	command := DefineCommand[None, None]("benchmark.rediscovery", 1)
+	original, err := command.Enqueue(ctx, runtime, "stable", None{}, WithoutRunDeadline())
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		result, rediscoverErr := command.Enqueue(ctx, runtime, "stable", None{}, WithoutRunDeadline())
+		if rediscoverErr != nil || result.Created || result.ID != original.ID {
+			b.Fatalf("rediscovery = %#v, %v; want existing %s", result, rediscoverErr, original.ID)
+		}
+	}
+}
+
+func BenchmarkPlan13BaselineQueueDepth16(b *testing.B) {
+	database := testpg.Open(b)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		b.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		b.Fatal(err)
+	}
+	queues := make([]string, 16)
+	for index := range queues {
+		queues[index] = fmt.Sprintf("benchmark.stats.%02d", index)
+		command := DefineCommand[None, None](fmt.Sprintf("benchmark.stats.command.%02d", index), 1,
+			WithQueue(queues[index]))
+		if _, err := command.Enqueue(ctx, runtime, fmt.Sprintf("queue/%02d", index), None{}, WithoutRunDeadline()); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ReportMetric(float64(len(queues)), "round_trips/op")
+	for range b.N {
+		for _, queue := range queues {
+			depth, err := GetQueueDepth(ctx, runtime, queue)
+			if err != nil || depth.Ready != 1 {
+				b.Fatalf("GetQueueDepth(%s) = %#v, %v", queue, depth, err)
+			}
+		}
+	}
+}
