@@ -108,7 +108,6 @@ type SemanticTx struct {
 type InitialLockedSnapshot struct {
 	Head     RunHead
 	Deadline *time.Time
-	RunKey   string
 }
 
 func (s *Store) BeginSemantic(ctx context.Context, id uuid.UUID, mode LockMode) (*SemanticTx, error) {
@@ -145,18 +144,19 @@ func (s *Store) AttachSemantic(ctx context.Context, tx pgx.Tx, id uuid.UUID, mod
 		return nil, fmt.Errorf("%w: unknown lock mode", flowerr.ErrInvalid)
 	}
 	lockSQL := `WITH locked AS MATERIALIZED (
-		SELECT run_id,status,deadline_at,run_key,max_commands,command_count,open_commands
+		SELECT run_id,status,deadline_at,run_key,definition_name,max_commands,command_count,open_commands
 		FROM ` + pgschema.Table(s.schema, "flow_runs") + ` WHERE run_id=$1 FOR UPDATE`
 	if mode == LockSkipLocked {
 		lockSQL += ` SKIP LOCKED`
 	}
 	lockSQL += `
-	) SELECT run_id,status,deadline_at,run_key,max_commands,command_count,open_commands,clock_timestamp()
+	) SELECT run_id,status,deadline_at,run_key,definition_name,max_commands,command_count,open_commands,clock_timestamp()
 	  FROM locked`
 	var snapshot InitialLockedSnapshot
 	var snapshotTime time.Time
 	if err := tx.QueryRow(ctx, lockSQL, id).Scan(
-		&snapshot.Head.ID, &snapshot.Head.Status, &snapshot.Deadline, &snapshot.RunKey,
+		&snapshot.Head.ID, &snapshot.Head.Status, &snapshot.Deadline,
+		&snapshot.Head.RunKey, &snapshot.Head.Definition,
 		&snapshot.Head.MaxCommands, &snapshot.Head.CommandCount, &snapshot.Head.OpenCommands,
 		&snapshotTime,
 	); err != nil {

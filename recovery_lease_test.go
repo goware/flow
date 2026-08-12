@@ -263,8 +263,8 @@ func TestShortRecoveryLeaseBecomesRecoverableBeforeDefault(t *testing.T) {
 	if expired[0].CommandID != shortID {
 		t.Fatalf("expired command=%s, want short %s", expired[0].CommandID, shortID)
 	}
-	if changed, err := runtime.store.RecoverExpiredCommandLease(ctx, expired[0]); err != nil || !changed {
-		t.Fatalf("RecoverExpiredCommandLease()=%t, %v", changed, err)
+	if recovery, err := runtime.store.RecoverExpiredCommandLease(ctx, expired[0]); err != nil || !recovery.Changed {
+		t.Fatalf("RecoverExpiredCommandLease()=%t, %v", recovery.Changed, err)
 	}
 	var shortState, standardState string
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT

@@ -135,9 +135,11 @@ func TestClaimCommandsLoadsRunKeyInExistingHeadQuery(t *testing.T) {
 	if err != nil || len(result.Commands) != 1 {
 		t.Fatalf("ClaimCommands() = %#v, %v", result, err)
 	}
-	if result.Commands[0].RunID != uuid.MustParse(string(run.RunID)) || result.Commands[0].RunKey != "intent/42" {
-		t.Fatalf("claimed run identity = %s/%q, want %s/%q",
-			result.Commands[0].RunID, result.Commands[0].RunKey, run.RunID, "intent/42")
+	if result.Commands[0].RunID != uuid.MustParse(string(run.RunID)) || result.Commands[0].RunKey != "intent/42" ||
+		result.Commands[0].DefinitionName != command.Name() {
+		t.Fatalf("claimed run identity = %s/%q/%q, want %s/%q/%q",
+			result.Commands[0].RunID, result.Commands[0].RunKey, result.Commands[0].DefinitionName,
+			run.RunID, "intent/42", command.Name())
 	}
 
 	var runKeyQueries []string
@@ -147,6 +149,7 @@ func TestClaimCommandsLoadsRunKeyInExistingHeadQuery(t *testing.T) {
 		}
 	}
 	if len(runKeyQueries) != 1 || !strings.Contains(runKeyQueries[0], "WITH locked AS MATERIALIZED") ||
+		!strings.Contains(runKeyQueries[0], "run_key,definition_name") ||
 		!strings.Contains(runKeyQueries[0], "clock_timestamp() FROM locked") {
 		t.Fatalf("claim run-key queries = %q, want one lock/time/initial-projection statement", runKeyQueries)
 	}
@@ -631,11 +634,11 @@ func TestClaimEventInputSnapshotStableAcrossRetryAndLeaseTakeover(t *testing.T) 
 		SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, retry.CommandID); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := runtime.store.RecoverExpiredCommandLease(ctx, store.ExpiredLeaseCandidate{
+	recovery, err := runtime.store.RecoverExpiredCommandLease(ctx, store.ExpiredLeaseCandidate{
 		CommandID: retry.CommandID, RunID: retry.RunID,
 	})
-	if err != nil || !changed {
-		t.Fatalf("RecoverExpiredCommandLease() = %t, %v", changed, err)
+	if err != nil || !recovery.Changed {
+		t.Fatalf("RecoverExpiredCommandLease() = %t, %v", recovery.Changed, err)
 	}
 
 	takeover := claimNext()
