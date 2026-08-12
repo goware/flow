@@ -1,10 +1,10 @@
-# Migrating Flow v0.2 applications to the Plans 9–10 API
+# Migrating Flow applications from v0.2 to v0.3
 
 This guide covers the combined breaking-development window implemented by
-Plans 9 and 10. Plan 9 is an intermediate implementation checkpoint, not a
-separate tagged release; the reviewed release after Plan 10 is the next public
-baseline. There is no compatibility shim: update the Go API and apply migration
-004 before starting the new runtime.
+Plans 9 and 10 and released as v0.3.0. Plan 9 was an intermediate
+implementation checkpoint, not a separate tagged release. There is no
+compatibility shim: update the Go API and apply migration 004 before starting
+the v0.3 runtime.
 
 ## 1. Apply migration 004 before deploying the runtime
 

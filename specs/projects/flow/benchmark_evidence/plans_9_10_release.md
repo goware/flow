@@ -1,15 +1,16 @@
 ---
-status: implementation-verified
+status: released
 recorded_at: 2026-08-11
+released_at: 2026-08-11
 ---
 
 # Plans 9–10 implementation evidence
 
-This record covers the combined v0.3 candidate implemented from `d977533` in
-commit `9cbef5eac70a4fadb5230d9737f0ced351ab5ffc` on branch `plan-9-10`.
-Plan 9 was reviewed as the logical intermediate API/schema checkpoint inside
-that combined implementation and was not tagged separately. Publication and
-the v0.3 tag remain human decisions after review of the pull request.
+This record covers the combined Plans 9–10 implementation developed from
+`d977533` in commit `9cbef5eac70a4fadb5230d9737f0ced351ab5ffc` on branch
+`plan-9-10`, then merged and tagged v0.3.0 at
+`0ad8f4064425ba535b848853149b3f453992a850`. Plan 9 was reviewed as the
+logical intermediate API/schema checkpoint and was not tagged separately.
 
 ## Environment
 

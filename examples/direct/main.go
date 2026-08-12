@@ -54,11 +54,11 @@ func main() {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	exec, trace, err := runExampleCommand(ctx, runtime)
+	run, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("run %s completed with %d journal entries\n", exec.ID, len(trace.History))
+	fmt.Printf("run %s completed with %d journal entries\n", run.ID, len(trace.History))
 }
 
 func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
@@ -95,15 +95,15 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 
 // runExampleCommand submits one command and waits for its terminal trace.
 func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Run, flow.RunTrace, error) {
-	exec, err := sendReceipt.Enqueue(ctx, runtime, "receipt/example-order", receiptArgs{
+	run, err := sendReceipt.Enqueue(ctx, runtime, "receipt/example-order", receiptArgs{
 		OrderID: "example-order",
 		Email:   "person@example.com",
 	})
 	if err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
-	trace, err := waitForTerminal(ctx, runtime, exec.ID, 5*time.Second)
-	return exec, trace, err
+	trace, err := waitForTerminal(ctx, runtime, run.ID, 5*time.Second)
+	return run, trace, err
 }
 
 // sendReceipt is the worker handler
@@ -121,27 +121,14 @@ func (example *directExample) sendReceipt(ctx context.Context, work *flow.Work[r
 }
 
 func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.RunID, timeout time.Duration) (flow.RunTrace, error) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		trace, err := flow.Trace(ctx, runtime, id)
-		if err != nil {
-			return flow.RunTrace{}, err
-		}
-		switch trace.Run.Status {
-		case "succeeded":
-			return trace, nil
-		case "failed", "cancelled", "expired":
-			return flow.RunTrace{}, fmt.Errorf("example run ended %s", trace.Run.Status)
-		}
-		select {
-		case <-ctx.Done():
-			return flow.RunTrace{}, ctx.Err()
-		case <-timer.C:
-			return flow.RunTrace{}, fmt.Errorf("example run timed out")
-		case <-ticker.C:
-		}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	settled, err := flow.AwaitRun(waitCtx, runtime, id)
+	if err != nil {
+		return flow.RunTrace{}, err
 	}
+	if settled.Status != flow.RunStatusSucceeded {
+		return flow.RunTrace{}, fmt.Errorf("example run ended %s", settled.Status)
+	}
+	return flow.Trace(waitCtx, runtime, id)
 }

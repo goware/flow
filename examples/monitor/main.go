@@ -67,11 +67,11 @@ func main() {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	exec, trace, err := runExampleCommand(ctx, runtime, monitor)
+	run, trace, err := runExampleCommand(ctx, runtime, monitor)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("run %s completed with %d journal entries\n", exec.ID, len(trace.History))
+	fmt.Printf("run %s completed with %d journal entries\n", run.ID, len(trace.History))
 }
 
 func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
@@ -125,7 +125,7 @@ func runFlowRuntime(runtime *flow.Runtime) func() {
 // runExampleCommand creates a direct command gated on an independently
 // published event and returns its terminal trace.
 func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *externalMonitor) (flow.Run, flow.RunTrace, error) {
-	exec, err := confirmBridge.Enqueue(ctx, runtime, "bridge/example", flow.None{},
+	run, err := confirmBridge.Enqueue(ctx, runtime, "bridge/example", flow.None{},
 		flow.WaitFor(bridgeDelivered, "delivery/example"),
 		flow.Within(2*time.Second),
 	)
@@ -133,16 +133,16 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *exte
 		return flow.Run{}, flow.RunTrace{}, err
 	}
 	monitorResult := make(chan error, 1)
-	go func() { monitorResult <- monitor.observeBridgeDelivery(ctx, exec.ID) }()
+	go func() { monitorResult <- monitor.observeBridgeDelivery(ctx, run.ID) }()
 
-	trace, err := waitForTerminal(ctx, runtime, exec.ID, 8*time.Second)
+	trace, err := waitForTerminal(ctx, runtime, run.ID, 8*time.Second)
 	if err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
 	if err := <-monitorResult; err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
-	return exec, trace, nil
+	return run, trace, nil
 }
 
 // confirmBridge is the worker handler.
@@ -171,27 +171,14 @@ func (monitor *externalMonitor) observeBridgeDelivery(ctx context.Context, runID
 }
 
 func waitForTerminal(ctx context.Context, runtime *flow.Runtime, id flow.RunID, timeout time.Duration) (flow.RunTrace, error) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		trace, err := flow.Trace(ctx, runtime, id)
-		if err != nil {
-			return flow.RunTrace{}, err
-		}
-		switch trace.Run.Status {
-		case "succeeded":
-			return trace, nil
-		case "failed", "cancelled", "expired":
-			return flow.RunTrace{}, fmt.Errorf("example run ended %s", trace.Run.Status)
-		}
-		select {
-		case <-ctx.Done():
-			return flow.RunTrace{}, ctx.Err()
-		case <-timer.C:
-			return flow.RunTrace{}, fmt.Errorf("example run timed out")
-		case <-ticker.C:
-		}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	settled, err := flow.AwaitRun(waitCtx, runtime, id)
+	if err != nil {
+		return flow.RunTrace{}, err
 	}
+	if settled.Status != flow.RunStatusSucceeded {
+		return flow.RunTrace{}, fmt.Errorf("example run ended %s", settled.Status)
+	}
+	return flow.Trace(waitCtx, runtime, id)
 }

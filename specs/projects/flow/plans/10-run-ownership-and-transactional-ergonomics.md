@@ -1,10 +1,10 @@
 # Plan 10: Make run ownership and transactional use explicit
 
-Status: Implemented (combined v0.3 candidate; awaiting human approval)
+Status: Released in v0.3.0
 
 Planned at: `788c9b5` on 2026-08-11
 
-- **Target release:** combined v0.3.0 candidate after the untagged Plan 9
+- **Released:** in the combined v0.3.0 release after the untagged Plan 9
   checkpoint; Plan 11 remains separate
 - **Priority:** P1 for correctness and Trails integration simplicity
 - **Effort:** M-L
@@ -752,5 +752,6 @@ Stop and report evidence rather than improvising if:
   conditions.
 - [x] Repeat the Trails proof against the exact candidate implementation
   commit.
-- [ ] Obtain human approval and tag the combined Plans 9–10 v0.3.0 candidate;
-  do not combine Plan 11.
+- [x] Human approval obtained and the combined Plans 9–10 implementation was
+  tagged v0.3.0 at `0ad8f4064425ba535b848853149b3f453992a850`; Plan 11 was
+  not included.

@@ -7,7 +7,7 @@ completed_at: 2026-08-04
 
 ## Controlling amendments
 
-[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. [`plans/5-hot-path-efficiency.md`](plans/5-hot-path-efficiency.md) reduces hot-path work without changing the public command/event model or six-table durability boundary. Plan 6 was a discarded `hardening-2` planning draft and was never committed; [`plans/7-lease-and-maintenance-bug-fixes.md`](plans/7-lease-and-maintenance-bug-fixes.md) retained only its necessary bug-fix subset. [`plans/8-v0.1.0-release-hardening.md`](plans/8-v0.1.0-release-hardening.md) is the controlling v0.1 release-hardening amendment. [`plans/9-simpler-flow-developer-experience.md`](plans/9-simpler-flow-developer-experience.md) and [`plans/10-run-ownership-and-transactional-ergonomics.md`](plans/10-run-ownership-and-transactional-ergonomics.md) are implemented together for the v0.3 candidate; they retain the command-only architecture and six-table schema. [`plans/11-inline-command-calls.md`](plans/11-inline-command-calls.md) remains a separate, unimplemented proposal. The Go API may still change intentionally during v0.x with release notes, while published migrations remain immutable and forward-only after v0.1.0.
+[`plans/3-remove-coordinator.md`](plans/3-remove-coordinator.md) supersedes the earlier plan/coordinator designs. [`plans/4-cross-execution-delivery.md`](plans/4-cross-execution-delivery.md) extends that command-only model with deliberately detached event ingress to a known execution. [`plans/5-hot-path-efficiency.md`](plans/5-hot-path-efficiency.md) reduces hot-path work without changing the public command/event model or six-table durability boundary. Plan 6 was a discarded `hardening-2` planning draft and was never committed; [`plans/7-lease-and-maintenance-bug-fixes.md`](plans/7-lease-and-maintenance-bug-fixes.md) retained only its necessary bug-fix subset. [`plans/8-v0.1.0-release-hardening.md`](plans/8-v0.1.0-release-hardening.md) is the controlling v0.1 release-hardening amendment. [`plans/9-simpler-flow-developer-experience.md`](plans/9-simpler-flow-developer-experience.md) and [`plans/10-run-ownership-and-transactional-ergonomics.md`](plans/10-run-ownership-and-transactional-ergonomics.md) were released together in v0.3.0; they retain the command-only architecture and six-table schema. [`plans/11-inline-command-calls.md`](plans/11-inline-command-calls.md) remains a separate, unimplemented proposal. The Go API may still change intentionally during v0.x with release notes, while published migrations remain immutable and forward-only after v0.1.0.
 
 ## Implemented Plans 9–10 outcomes
 
@@ -19,7 +19,7 @@ completed_at: 2026-08-04
 - [x] Add expected-ID-first atomic replacement for live-key run generations.
 - [x] Prove the migration, concurrency, PostgreSQL 17/18, race, performance, and disposable Trails consumer gates.
 
-The verification record is in [Plans 9–10 implementation evidence](benchmark_evidence/plans_9_10_release.md). Human review, publication, and tagging remain separate release decisions.
+The verification record is in [Plans 9–10 release evidence](benchmark_evidence/plans_9_10_release.md). The reviewed implementation was released as v0.3.0 at `0ad8f4064425ba535b848853149b3f453992a850`.
 
 ## Completed Plan 5 outcomes
 

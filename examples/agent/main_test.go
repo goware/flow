@@ -27,7 +27,7 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	exec, trace, err := runExampleCommand(ctx, runtime)
+	run, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		t.Fatalf("runExampleCommand() error = %v", err)
 	}
@@ -56,14 +56,14 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 	}
 	var outcomes, applicationEvents, queueRows int
 	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FILTER (WHERE event_class='command_terminal'),
-		count(*) FILTER (WHERE event_class='application') FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1`, exec.ID).Scan(&outcomes, &applicationEvents); err != nil {
+		count(*) FILTER (WHERE event_class='application') FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1`, run.ID).Scan(&outcomes, &applicationEvents); err != nil {
 		t.Fatal(err)
 	}
-	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` WHERE run_id=$1`, exec.ID).Scan(&queueRows); err != nil {
+	if err = database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` WHERE run_id=$1`, run.ID).Scan(&queueRows); err != nil {
 		t.Fatal(err)
 	}
 	if outcomes != 4 || applicationEvents != 4 || queueRows != 0 {
 		t.Fatalf("outcomes=%d application_events=%d queue=%d", outcomes, applicationEvents, queueRows)
 	}
-	replaytest.AssertMatchesLive(t, database.DB, database.Schema, exec.ID)
+	replaytest.AssertMatchesLive(t, database.DB, database.Schema, run.ID)
 }

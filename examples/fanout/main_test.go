@@ -27,7 +27,7 @@ func TestFanOutExampleEndToEnd(t *testing.T) {
 	stopFlowRuntime := runFlowRuntime(runtime)
 	defer stopFlowRuntime()
 
-	exec, trace, err := runExampleCommand(ctx, runtime)
+	run, trace, err := runExampleCommand(ctx, runtime)
 	if err != nil {
 		t.Fatalf("runExampleCommand() error = %v", err)
 	}
@@ -43,17 +43,17 @@ func TestFanOutExampleEndToEnd(t *testing.T) {
 	}
 	var queueRows, createdRows, terminalRows int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE run_id=$1`, exec.ID).Scan(&queueRows); err != nil {
+		WHERE run_id=$1`, run.ID).Scan(&queueRows); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FILTER (WHERE entry_kind='command_created'),
 		count(*) FILTER (WHERE entry_kind='event_recorded' AND event_class='command_terminal')
-		FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1`, exec.ID).
+		FROM `+pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1`, run.ID).
 		Scan(&createdRows, &terminalRows); err != nil {
 		t.Fatal(err)
 	}
 	if queueRows != 0 || createdRows != 10 || terminalRows != 10 {
 		t.Fatalf("database rows queue=%d created=%d terminal=%d", queueRows, createdRows, terminalRows)
 	}
-	replaytest.AssertMatchesLive(t, database.DB, database.Schema, exec.ID)
+	replaytest.AssertMatchesLive(t, database.DB, database.Schema, run.ID)
 }

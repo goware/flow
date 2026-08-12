@@ -1,12 +1,12 @@
 # Plan 9: Simplify Flow's developer experience without weakening its model
 
-Status: Implemented (combined v0.3 candidate; awaiting human approval)
+Status: Released in v0.3.0
 
 Planned at: `788c9b5` on 2026-08-11; implementation baseline remains the
 tagged `v0.2.0` source at `3d2b29b`
 
-- **Target release:** intermediate milestone in the combined v0.3.0 candidate;
-  Plan 9 is implemented and reviewed before Plan 10, but is not tagged alone
+- **Released:** as the intermediate implementation milestone in the combined
+  v0.3.0 release; Plan 9 was reviewed before Plan 10 but was not tagged alone
 - **Priority:** P1 for the public API cleanup and Trails-facing ergonomics
 - **Effort:** L
 - **Risk:** MEDIUM-HIGH; the durable model remains unchanged, but this plan
