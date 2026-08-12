@@ -1,6 +1,31 @@
 # Plan 12: Fast lease recovery for idempotent commands
 
-Status: Proposed
+Status: Deferred pending Plan 13 and amendment
+
+> **Sequencing note (2026-08-12):** Implement Plan 13 first. Do not implement
+> this proposal against its current snapshot. Plan 13 intentionally changes the
+> command defaults, claim/store request shapes, public results, and retained
+> tests that this proposal would touch. After Plan 13 is reviewed, amend this
+> plan against its final commit and repeat its baseline measurements.
+>
+> The amendment must also correct three assumptions in the current text:
+>
+> 1. `DefineCommand` does not accept a handler; handlers remain separately
+>    registered with `Handle`.
+> 2. Production Flow has no public `WithCommandLease`; the 60-second runtime
+>    lease is fixed and only an unexported test seam changes it.
+> 3. `runLeaseManager` currently renews every active command on one global
+>    ticker and calls one batch renewal with one duration. Mixed per-command
+>    leases therefore require an explicit bounded scheduling and batching
+>    design; they cannot be implemented by merely threading a value through the
+>    existing batch.
+> 4. Plan 13 resets the development database to one consolidated baseline and
+>    removes retired declaration fields/fingerprints. Any schema, fingerprint,
+>    or migration step here must be redesigned against that accepted clean
+>    baseline; do not restore an old-field decoder or upgrade shim.
+>
+> Preserve the motivation and fence-safety requirements below, but treat the
+> implementation sections as historical input until that amendment lands.
 
 Planned at: `d0d873d` on 2026-08-12
 

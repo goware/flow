@@ -1,6 +1,15 @@
 # Plan 11: Durable subroutine calls — inline progress, one command vocabulary
 
-Status: Planned
+Status: Deferred by Plan 13
+
+> **Deferral note (2026-08-12):** Plan 13 deliberately simplifies the shipped
+> Flow core before another durable delivery mode is considered. Trails API does
+> not need `flow.Call`, and no current production consumer justifies the schema,
+> replay, fencing, and testing expansion in this proposal. Plan 13 consolidates
+> the development schema into one clean baseline, so this document's migration
+> 005 and old-history assumptions no longer apply. If durable inline calls
+> acquire a concrete consumer later, re-plan them from the then-current schema
+> and public API rather than executing this document as written.
 
 Planned at: `788c9b5` on 2026-08-11
 
