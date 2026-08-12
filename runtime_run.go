@@ -593,7 +593,11 @@ func renewalCallTimeout(commands []activeCommand, now time.Time) time.Duration {
 	if !retry {
 		return commandRenewalTimeout(shortestLease)
 	}
-	return max(time.Millisecond, min(shortestLease/3, shortestRemaining/2))
+	// A retry may use more than the ordinary cap while there is enough local
+	// lease window left, but one nearly expired member must not collapse the
+	// shared batch deadline below its normal bounded timeout. The store still
+	// classifies each fence independently in one set-oriented call.
+	return max(commandRenewalTimeout(shortestLease), min(shortestLease/3, shortestRemaining/2))
 }
 
 func (r *Runtime) runLeaseWatchdog(ctx context.Context) {

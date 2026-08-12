@@ -33,6 +33,7 @@ func TestWakeHubBroadcastsOneGenerationToEveryScheduler(t *testing.T) {
 
 func TestLeaseRenewalResultCannotChangeWorkOutsideItsSnapshot(t *testing.T) {
 	active := newActiveCommands()
+	now := time.Now()
 	oldID, newID, replacedID := uuid.New(), uuid.New(), uuid.New()
 	oldAttempt, newAttempt, replacedAttempt, replacementAttempt := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	oldCancelled := make(chan struct{}, 1)
@@ -41,17 +42,38 @@ func TestLeaseRenewalResultCannotChangeWorkOutsideItsSnapshot(t *testing.T) {
 	active.register(activeCommand{commandID: oldID, attemptID: oldAttempt, cancel: func(error) { oldCancelled <- struct{}{} }})
 	active.register(activeCommand{commandID: newID, attemptID: newAttempt, cancel: func(error) { newCancelled <- struct{}{} }})
 	// A newer retry of the same logical command may replace the snapshotted
-	// attempt while its renewal query is in flight.
-	active.register(activeCommand{commandID: replacedID, attemptID: replacementAttempt, cancel: func(error) { replacementCancelled <- struct{}{} }})
-	active.renewalSucceeded(activeCommand{
+	// attempt while its renewal query is in flight. Drive both attempts through
+	// takeDue so the stale result is rejected by identity rather than merely by
+	// the in-flight-state guard.
+	active.register(activeCommand{
 		commandID: replacedID, attemptID: replacedAttempt, leaseDuration: time.Hour,
-	}, time.Now())
+		localExpiry: now.Add(time.Hour), nextRenewAt: now.Add(-time.Millisecond),
+		cancel: func(error) {},
+	})
+	staleDue := active.takeDue(now)
+	if len(staleDue) != 1 || staleDue[0].attemptID != replacedAttempt {
+		t.Fatalf("stale due snapshot = %#v", staleDue)
+	}
+	replacementExpiry := now.Add(2 * time.Hour)
+	replacementRenewal := now.Add(-time.Millisecond)
+	active.register(activeCommand{
+		commandID: replacedID, attemptID: replacementAttempt, leaseDuration: 2 * time.Hour,
+		localExpiry: replacementExpiry, nextRenewAt: replacementRenewal,
+		cancel: func(error) { replacementCancelled <- struct{}{} },
+	})
+	replacementDue := active.takeDue(now)
+	if len(replacementDue) != 1 || replacementDue[0].attemptID != replacementAttempt {
+		t.Fatalf("replacement due snapshot = %#v", replacementDue)
+	}
+	if active.renewalSucceeded(staleDue[0], now) {
+		t.Fatal("a stale attempt renewal was applied to its replacement")
+	}
 	foundReplacement := false
 	for _, value := range active.snapshot() {
 		if value.commandID == replacedID {
 			foundReplacement = true
-			if !value.localExpiry.IsZero() {
-				t.Fatal("an older renewal changed a newer command attempt's local expiry")
+			if !value.localExpiry.Equal(replacementExpiry) || !value.nextRenewAt.Equal(replacementRenewal) || !value.renewing {
+				t.Fatalf("an older renewal changed a newer command attempt: %#v", value)
 			}
 		}
 	}
@@ -219,6 +241,28 @@ func TestActiveCommandsDoNotExpireRenewalInFlight(t *testing.T) {
 	retry.localExpiry = now.Add(time.Minute)
 	if timeout := renewalCallTimeout([]activeCommand{retry}, now); timeout <= 5*time.Second || timeout > 20*time.Second {
 		t.Fatalf("default retry timeout = %s, want >5s and <=20s", timeout)
+	}
+}
+
+func TestRenewalCallTimeoutDoesNotCollapseForWeakBatchMember(t *testing.T) {
+	now := time.Now()
+	commands := []activeCommand{
+		{
+			leaseDuration: time.Minute,
+			localExpiry:   now.Add(40 * time.Second),
+			retryRenewal:  true,
+		},
+		{
+			leaseDuration: time.Minute,
+			localExpiry:   now.Add(time.Millisecond),
+		},
+	}
+	if got, want := renewalCallTimeout(commands, now), commandRenewalTimeout(time.Minute); got != want {
+		t.Fatalf("mixed weak-member timeout = %s, want ordinary floor %s", got, want)
+	}
+	commands[1].localExpiry = now.Add(30 * time.Second)
+	if got, want := renewalCallTimeout(commands, now), 15*time.Second; got != want {
+		t.Fatalf("mixed retry timeout = %s, want adaptive %s", got, want)
 	}
 }
 
