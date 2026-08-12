@@ -300,7 +300,7 @@ func prepareKeyedRead(keys []string, pageSize int, encodedCursor, kind string) (
 	switch kind {
 	case readKindActiveCommands:
 		if cursor.Position != 0 {
-			return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "live-work cursor has history state")
+			return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "active-command cursor has history state")
 		}
 		if _, err := uuid.Parse(cursor.CommandID); err != nil {
 			return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor command ID is invalid")

@@ -1,5 +1,5 @@
 ---
-status: implemented_pending_independent_review
+status: independently_reviewed_pending_acceptance_record
 recorded_at: 2026-08-12
 ---
 
@@ -22,8 +22,9 @@ The phase commits are:
 - `bf218d8`: final current-only durable cleanup and replay validation.
 
 No release or tag was created. The target after acceptance is a breaking
-v0.4.0 candidate. Plan 11 remains deferred, and Plan 12 must be amended to the
-accepted Plan 13 commit before implementation begins.
+v0.4.0 candidate. Plan 11 remains deferred. The Plan 12 amendment is drafted
+against implementation-closure commit `e5f0a7a`; implementation remains
+blocked until the accepted Plan 13 commit is recorded and reconciled.
 
 ## Baseline and environment
 
@@ -323,13 +324,15 @@ All 17 implementation acceptance criteria are satisfied:
 10. a decision accepts at most 256 distinct staged events atomically;
 11. pruning is bounded and excludes permanent/nonterminal runs;
 12. the reset baseline is one Run-named migration and six tables;
-13. Plans 11 and 12 remain deferred;
+13. Plan 11 remains deferred, while Plan 12 is amended but remains blocked;
 14. the disposable Trails adaptation compiles and its focused race tests pass;
 15. PostgreSQL 17/18, race, module, migration, replay, and concurrency gates pass;
 16. every retained performance median is within the 10% gate; and
 17. the final hunk review found no unplanned API, schema, journal, lock, or
     consumer behavior.
 
-Plan 13 is implemented and ready for independent final review. It deliberately
-remains untagged and unreleased. The independent-review and final-accepted-
-commit punchlist items remain open, and Plan 12 has not been amended yet.
+Plan 13 is implemented and its independent final review found no production
+correctness, concurrency, schema, API, or performance defect. It deliberately
+remains untagged and unreleased. The exact accepted implementation commit must
+still be recorded and reconciled into the drafted Plan 12 amendment before
+Plan 12 implementation begins.

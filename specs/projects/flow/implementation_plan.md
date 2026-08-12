@@ -16,7 +16,8 @@ schema is one clean Run-named baseline rather than a compatibility chain.
 
 [`plans/11-inline-command-calls.md`](plans/11-inline-command-calls.md) remains
 deferred. [`plans/12-fast-lease-recovery-for-idempotent-commands.md`](plans/12-fast-lease-recovery-for-idempotent-commands.md)
-must be amended against the final Plan 13 commit before implementation.
+has been amended against Plan 13 commit `e5f0a7a`; implementation remains
+blocked until Plan 13's exact accepted commit is recorded and reconciled.
 
 ## Implemented Plans 9–10 outcomes
 

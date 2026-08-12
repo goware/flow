@@ -1,427 +1,841 @@
 # Plan 12: Fast lease recovery for idempotent commands
 
-Status: Deferred pending Plan 13 and amendment
+Status: Planned — amended against Plan 13; implement after Plan 13 is accepted
 
-> **Sequencing note (2026-08-12):** Implement Plan 13 first. Do not implement
-> this proposal against its current snapshot. Plan 13 intentionally changes the
-> command defaults, claim/store request shapes, public results, and retained
-> tests that this proposal would touch. After Plan 13 is reviewed, amend this
-> plan against its final commit and repeat its baseline measurements.
+Amended at: `e5f0a7a4b54d091fc2c55b8cadf41f0f4865c848` on 2026-08-12
+
+- **Priority:** P2 — reduce dead-worker recovery latency for commands whose
+  duplicate execution is safe
+- **Effort:** L, phased
+- **Risk:** MEDIUM-HIGH — the public option is small, but its durable value
+  crosses definition, command creation, replay, batched claim, renewal timing,
+  the local watchdog, and maintenance recovery
+- **Depends on:** Plan 13 being independently reviewed and accepted; Plan 7's
+  lease fencing, local watchdog, and maintenance fixes remain controlling
+- **Public API impact:** additive — one `CommandOption`,
+  `WithRecoveryLease(time.Duration)`
+- **Database impact:** development reset only — add one nullable declaration
+  column to the consolidated `001_initial.sql`; do not add a second migration
+  or support existing Flow data
+- **Durable history impact:** current format only — include the override in
+  `command_created`, declaration fingerprints, and replay; no compatibility
+  decoder is required
+- **Runtime impact:** keep the existing lease manager and watchdog services;
+  make their timing depend on active commands rather than add another service
+  or one goroutine per attempt
+- **Release impact:** implementation does not tag or publish a release
+
+> **Sequencing:** Plan 13 is implemented at the commit above but still awaits
+> independent final review. Do not begin this plan on an older branch or merge
+> it into an unaccepted Plan 13 result. After Plan 13 is accepted, start from
+> that exact accepted commit (or its descendant), repeat the initial drift
+> audit, and record the new implementation base here if it differs.
 >
-> The amendment must also correct three assumptions in the current text:
->
-> 1. `DefineCommand` does not accept a handler; handlers remain separately
->    registered with `Handle`.
-> 2. Production Flow has no public `WithCommandLease`; the 60-second runtime
->    lease is fixed and only an unexported test seam changes it.
-> 3. `runLeaseManager` currently renews every active command on one global
->    ticker and calls one batch renewal with one duration. Mixed per-command
->    leases therefore require an explicit bounded scheduling and batching
->    design; they cannot be implemented by merely threading a value through the
->    existing batch.
-> 4. Plan 13 resets the development database to one consolidated baseline and
->    removes retired declaration fields/fingerprints. Any schema, fingerprint,
->    or migration step here must be redesigned against that accepted clean
->    baseline; do not restore an old-field decoder or upgrade shim.
->
-> Preserve the motivation and fence-safety requirements below, but treat the
-> implementation sections as historical input until that amendment lands.
-
-Planned at: `d0d873d` on 2026-08-12
-
-- **Branch:** `feat/fast-lease-recovery`
-- **Priority:** P2 — recovery latency, not correctness
-- **Effort:** M
-- **Risk:** MEDIUM; the change is small but touches the claim path and the
-  lease field that fencing and maintenance recovery read, so it requires
-  careful PostgreSQL and race testing
-- **Depends on:** Plan 7 lease/maintenance fixes (already complete)
-- **Public API impact:** additive only — one new command definition option and
-  its documentation
-
-> **Executor instructions:** Read this plan completely before editing. This
-> plan changes *how long* a command's lease lasts, never *what a lease
-> protects*. The settlement fence (attempt ID plus lease token) and the
-> at-least-once contract must remain exactly as they are. If any step appears
-> to require changing the fence, the claim's owner identity, or the
-> at-most-one-durable-settlement guarantee, STOP and report rather than
-> proceeding.
+> **Executor rule:** This plan changes how long an attempt remains recoverable;
+> it does not change what owns an attempt. The attempt ID, lease token,
+> settlement fence, run lock, at-least-once execution contract, and
+> at-most-one-durable-settlement guarantee must remain intact. If implementation
+> appears to require weakening any of them, STOP and report.
 
 ## 1. Purpose
 
-When a worker process dies mid-attempt, the command it held stays leased until
-the lease expires; only then does the maintenance sweep recover it and let
-another worker (or the restarted process) re-claim it. Today the lease is a
-single runtime-global value that defaults to `60s`
-(`runtime.go` `commandLease`, set via `WithCommandLease`). Every interrupted
-command therefore costs up to a full lease window of recovery latency,
-regardless of how cheap it would be to simply re-run.
+Flow currently uses one fixed 60-second production command lease. A healthy
+runtime renews that lease, but a process that dies while handling a command
+cannot renew it. Another replica must wait for the stored `lease_expires_at`
+and the ordinary maintenance sweep before it can recover and re-claim the
+command.
 
-Observed in production integration testing: a process was killed while a
-transaction-monitoring command was polling for an on-chain receipt. The
-underlying transaction had already mined within seconds, but the owning
-execution did not progress for ~60 seconds — the exact lease window — because
-the dead process's lease had to expire before the work could be reclaimed. The
-recovery was correct; the latency was pure dead time.
+That conservative delay is sensible for a command whose worker may perform an
+expensive or non-idempotent external side effect. It is unnecessary for a
+read-only status poll, receipt lookup, or similar worker that can safely run
+again. In those cases a dead process introduces roughly a full minute of idle
+time even when another replica is ready and the external result already exists.
 
-The command in that case was a read-only poll: re-running it is idempotent and
-cheap. Nothing about it needs the conservative window that a non-idempotent,
-side-effect-producing command needs. This plan lets a command declare that it
-tolerates fast recovery, so idempotent work gets a short lease and recovers
-promptly while side-effecting work keeps the conservative default.
-
-```text
-DefineCommand(..., WithRecoveryLease(5*time.Second))  // idempotent poll
-DefineCommand(...)                                     // default 60s lease
-```
-
-## 2. Controlling decisions
-
-### 2.1 The lease bounds duplicate work, not durable settlement
-
-This is the decision the whole plan rests on, and it must be stated first
-because it is what makes a shorter lease safe.
-
-Flow already fences *durable settlement* with the attempt ID and lease token,
-independently of the lease window (`flow.go`: "settlement fencing … remains"
-after "the lease window expires"). A worker whose lease has expired cannot
-settle its command over a takeover: its settlement is rejected by the fence.
-Two workers may briefly run the same command concurrently after a short lease,
-but **at most one can durably settle it**, exactly as today.
-
-Therefore the lease length does not control correctness. It controls only how
-much *duplicate worker execution* can occur during the window where the
-original holder is unreachable but not yet known-dead. Shortening a lease can
-never cause double settlement; it can only cause a second worker to redo work
-whose result the fence will discard.
-
-The cost of that duplicate work is what differs per command:
-
-- an idempotent read (poll a receipt, re-check a status) costs one extra cheap
-  call and is otherwise invisible;
-- a non-idempotent external side effect (submit a payment, call a provider
-  that is not itself idempotent) costs a duplicated real-world action, which
-  the application may or may not absorb.
-
-So the lease window should be chosen per command by the cost of redoing that
-command's work, not by a single global default.
-
-### 2.2 Declare the recovery lease at command definition, not per execution
-
-A command's re-run cost is a property of its worker, which is fixed at
-definition time. It does not vary per execution or per call site. The
-declaration therefore belongs on `DefineCommand`, alongside the queue and other
-static command properties, not on `Execute`.
-
-Per-execution or per-call lease overrides are rejected (Section 11): they would
-let the same worker run under different windows in different code paths, making
-the duplicate-work bound unpredictable and the semantics harder to reason about.
-
-### 2.3 The declaration asserts idempotent recovery, not "unimportant"
-
-The option means: *this command's worker is safe to run again concurrently once
-a short idle window has passed.* It is an application assertion about the
-worker's re-run safety, not a priority or importance signal. Documentation must
-frame it this way so callers do not attach a short lease to a command whose
-duplicate execution has real external cost.
-
-### 2.4 The global default is unchanged and remains the safe fallback
-
-Any command that does not declare a recovery lease keeps the runtime default
-(`60s`, or whatever `WithCommandLease` sets). Undeclared commands behave exactly
-as they do today. The conservative default is correct for the unknown case; a
-short lease is strictly opt-in.
-
-### 2.5 Name the option `WithRecoveryLease`
-
-The option takes an explicit duration:
+Plan 12 adds one opt-in declaration:
 
 ```go
-func WithRecoveryLease(d time.Duration) CommandOption
-```
-
-`WithRecoveryLease` is preferred because it names what the value governs — how
-quickly the command is recovered after its holder goes silent. Rejected
-alternatives:
-
-- `WithLease` reads as the total lease budget and hides that it is a recovery
-  window, inviting misuse as a general timeout.
-- `WithIdempotent` / `WithConcurrentSafe` assert a property but hide that the
-  observable effect is a shorter recovery window and force a fixed hidden value.
-- `WithShortLease` describes the mechanism, not the intent, and bakes a
-  qualitative word into an API that takes a quantity.
-
-An explicit duration keeps the primitive small and lets the application choose
-a window matched to its own poll cadence and partition tolerance.
-
-### 2.6 The lease is applied at claim time from the command's declaration
-
-The claim already writes a per-row `lease_expires_at`. The only change is which
-duration produces it: the claimed command's declared recovery lease when set,
-otherwise the runtime default. No new lease storage, owner identity, or
-recovery loop is introduced — the existing `ProbeExpiredCommandLeases` /
-`RecoverExpiredCommandLease` maintenance path recovers a short-lease command
-sooner purely because its `lease_expires_at` is sooner.
-
-## 3. User model
-
-### 3.1 Declaring a fast-recovery command
-
-```go
-var pollReceipt = flow.DefineCommand[PollArgs, flow.None](
-	"txn.mine",
-	pollReceiptWorker,
+var pollReceipt = flow.DefineCommand[PollArgs, PollResult](
+	"txn.poll_receipt",
+	2,
 	flow.WithQueue("txn.mine"),
 	flow.WithRecoveryLease(5*time.Second),
 )
+
+func pollReceiptWorker(
+	ctx context.Context,
+	work *flow.Work[PollArgs],
+) (PollResult, error) {
+	return lookupReceipt(ctx, work.Args)
+}
+
+runtime.Register(flow.Handle(pollReceipt, pollReceiptWorker))
 ```
 
-`pollReceiptWorker` polls a chain receipt. Re-running it after a short idle
-window simply re-polls; the settlement fence guarantees only one attempt
-durably settles. If the holder dies, the command is recoverable ~5s later
-instead of ~60s later.
+The worker remains registered separately through `flow.Handle`; command
+definition does not accept a handler. An undeclared command still uses Flow's
+fixed 60-second production default.
 
-### 3.2 Leaving a command on the default
+The goal is deliberately narrow:
 
-```go
-var submitPayment = flow.DefineCommand[SubmitArgs, flow.None](
-	"txn.send",
-	submitPaymentWorker,
-	flow.WithQueue("txn.send"),
-)
+- recover a dead holder of an explicitly safe command in seconds rather than
+  roughly a minute;
+- keep healthy long-running handlers alive by renewing with their own declared
+  window;
+- retain set-oriented claim and renewal operations when one run contains mixed
+  lease durations; and
+- make the shorter timing safe under shutdown, slow PostgreSQL calls, renewal
+  races, and multiple replicas.
+
+## 2. Current baseline after Plan 13
+
+The original version of this plan predated Plan 13 and made assumptions that
+are no longer true. Implementation must use this baseline instead:
+
+1. `DefineCommand[A, R](name, version, opts...)` accepts only command options.
+   `flow.Handle` binds the worker later.
+2. Production callers cannot configure the runtime-global command lease.
+   `Runtime.commandLease` defaults to 60 seconds; only the unexported
+   `withCommandLeaseForTest` seam can change it.
+3. `commandDefaults` currently contains queue, retry policy, and attempt
+   timeout. These values are copied into each durable command declaration.
+4. `flow_commands` is part of one clean six-table `001_initial.sql`. Existing
+   development databases and retained history are disposable.
+5. Same-run claims are set-oriented. `ClaimCommands` locks a candidate batch,
+   appends all `attempt_started` entries, and updates the command/queue
+   projections in one transaction.
+6. Renewal is also set-oriented, but the current manager wakes on one global
+   ticker and supplies one scalar duration to one renewal statement. That shape
+   cannot correctly handle mixed per-command leases without amendment.
+7. The local lease watchdog currently wakes from the global lease duration.
+   A short command could expire before that watchdog's next tick.
+8. Maintenance already recovers rows according to their stored
+   `lease_expires_at`. It needs no new recovery category or ownership rule.
+
+## 3. Controlling semantics
+
+### 3.1 A lease bounds duplicate execution, not durable settlement
+
+When a lease expires, a second replica may recover and run the command while
+the original handler is still alive but partitioned. Flow's settlement fence
+allows only the current attempt ID and lease token to commit a durable result.
+The old attempt cannot settle over a takeover.
+
+A shorter lease therefore does **not** permit two durable settlements. It does
+permit duplicate application work sooner. This option is safe only when that
+duplicate work is acceptable.
+
+Good candidates include:
+
+- read-only receipt or status polling;
+- deterministic reconciliation against an authoritative external state;
+- an external request protected by its own stable idempotency key; and
+- cheap work whose duplicate result is harmless and whose stale attempt can be
+  discarded.
+
+Poor candidates include:
+
+- a payment or transaction submission without external idempotency;
+- sending an email or webhook that the receiver may process twice;
+- a worker with an unbounded application commit callback; and
+- any side effect whose safety depends on Flow preventing concurrent handler
+  execution. Flow never promises that; its guarantee is fenced settlement.
+
+### 3.2 The override belongs to the command declaration
+
+Recovery safety is a property of the command worker, not a property of one
+enqueue call. `WithRecoveryLease` therefore belongs next to `WithQueue`,
+`WithRetry`, and `WithTimeout` on `DefineCommand`.
+
+Do not add a run option, an enqueue override, a worker option, a queue-wide
+lease class, or a public runtime lease option. Those forms let the same command
+semantics vary by call site or deployment configuration and make duplicate-work
+bounds difficult to reason about.
+
+Changing a recovery lease changes the durable command declaration. Callers
+should bump the command version when changing it, just as they should for other
+worker-relevant durable settings.
+
+### 3.3 Unset keeps the conservative default
+
+An absent override means "use the runtime's command lease." In production that
+remains 60 seconds. The unexported runtime test seam continues to control the
+fallback in focused tests.
+
+Do not persist 60 seconds into every command merely because it is today's
+default. Persist only an explicit override. Each `attempt_started` row still
+records the actual resolved lease used for that attempt.
+
+### 3.4 The declaration is durable
+
+The runtime must not rediscover the lease only from its locally registered
+command definition at claim time. Different replicas can briefly run different
+builds, and a process restart must not reinterpret an existing command.
+
+Persist the override with the command. Claim and replay use the durable value;
+the registered worker supplies code and codecs, not a replacement lease policy.
+This keeps a command's recovery behavior stable across replicas and restarts.
+
+### 3.5 Duration rules
+
+`WithRecoveryLease(d)` must:
+
+- be accepted at most once per command definition;
+- reject zero and negative values;
+- round a positive fractional millisecond upward once at the public API
+  boundary, matching Plan 13's other public duration options;
+- reject a normalized value below 30 milliseconds, matching the engine's
+  existing technical lease floor; and
+- reject values that cannot be represented exactly as PostgreSQL
+  milliseconds.
+
+Thirty milliseconds is a technical testing floor, not an operational
+recommendation. Documentation and examples should recommend values measured in
+seconds. Very short leases create proportionally more renewal traffic and are
+more sensitive to scheduler pauses and database latency.
+
+### 3.6 Attempt timeout and recovery lease are different
+
+`WithTimeout` limits how long the handler attempt may run. `WithRecoveryLease`
+controls how quickly another replica may take over after lease renewal stops. A
+healthy long-running handler may run for many recovery windows because it keeps
+renewing. Neither option silently sets the other.
+
+## 4. Durable data model
+
+### 4.1 Consolidated schema reset
+
+Add this nullable column to `flow_commands` in `migrations/001_initial.sql`:
+
+```sql
+recovery_lease_ms bigint
+    CHECK (recovery_lease_ms IS NULL OR recovery_lease_ms >= 30)
 ```
 
-`submitPaymentWorker` performs a non-idempotent external submission. It declares
-no recovery lease and keeps the conservative default window, so a partition
-does not let a second worker resubmit until the full lease has elapsed.
+Place it with `queue`, `attempt_timeout_ms`, and `retry_policy`. It is a command
+declaration, not current queue ownership, so do not duplicate it into
+`flow_command_queue`.
 
-### 3.3 Choosing the window
+The repository is still in development and the user has explicitly declared
+old Flow data disposable. Rewrite the one baseline migration and update schema
+tests. Do not add `002`, data backfill, dual-read logic, an old journal decoder,
+or an upgrade path. The implementation notes must state that the Flow schema is
+dropped and recreated.
 
-The recovery lease should be at least a few multiples of the worker's own
-expected attempt duration plus its renewal cadence, so a healthy in-progress
-attempt is not treated as dead. It is a floor on recovery latency, not a
-deadline on the work: a live worker renews its lease and continues past the
-window. Applications should pick the smallest window that comfortably clears a
-normal healthy attempt.
+No seventh table or new index is needed. The claim query already joins and
+locks the command and queue projections.
 
-## 4. Semantics
+### 4.2 Command creation and declaration identity
 
-### 4.1 Claim
+Add the normalized optional duration throughout the existing declaration path:
 
-When a command is claimed, its `lease_expires_at` is `now()` plus the command's
-declared recovery lease if set, otherwise the runtime default lease. All other
-claim behavior — owner assignment, attempt creation, batch grouping — is
-unchanged.
+- `commandDefaults` and `commandOptionState`;
+- `equivalentCommandDefaults`, so duplicate staging under one command key only
+  coalesces equivalent declarations;
+- `store.CommandCreate` and its validation;
+- root and staged-child preparation;
+- `commandDeclarationFingerprint`;
+- `preparedCommandInsert` and the existing command `CopyFrom`; and
+- schema/catalog/read-path tests that enumerate command columns.
 
-### 4.2 Renewal
+Use a zero `time.Duration` internally to mean no override until the nullable
+database/journal representation is prepared. Do not add a public accessor only
+to expose this internal default.
 
-A live worker renews on the existing cadence. Renewal must extend by the same
-per-command lease used at claim, so a healthy short-lease worker stays owner
-across long work. The renewal interval logic already derives from the lease;
-it must derive from the command's lease, not the global, for a short-lease
-command (Section 5.3).
+### 4.3 Journal and replay
 
-### 4.3 Recovery
+Add optional `recovery_lease_ms` to `journalcodec.CommandCreatedBody`. An
+explicit override is present and positive; the default is omitted. Replay must
+retain and validate it in the replay command state.
 
-The maintenance sweep recovers any command whose `lease_expires_at` is in the
-past. A short-lease command becomes eligible sooner; the recovery transition,
-fence, and re-claim are otherwise identical. No new sweep or schedule is added.
+Add the field to the current declaration fingerprint. Because the database and
+history are reset, keep the clean current body/fingerprint version rather than
+introducing an old-format branch.
 
-### 4.4 Fence interaction (unchanged)
+`AttemptStartedBody.LeaseDurationMS` already exists. Populate it with the
+resolved duration for that individual claimed command, including the runtime
+fallback when the declaration has no override. This makes every attempt's
+actual ownership window auditable.
 
-A recovered command is re-claimed under a new attempt and lease token. If the
-original holder is still alive and later tries to settle, the fence rejects it
-because its attempt/lease token no longer matches. This is the existing
-behavior and is exactly what makes a short lease safe: earlier recovery widens
-only the concurrent-execution window, never the settlement window.
+Malformed direct-SQL values and non-positive journal durations must fail closed
+as invalid durable state where the existing validation layer can observe them.
+For an explicit override, replay can also require an `attempt_started` lease to
+match the command declaration. For an absent override it must accept any valid
+resolved duration because the unexported runtime test seam intentionally
+changes the fallback. Replay does not reconstruct live ownership, but it must
+still reject malformed command declarations and attempt lease values.
 
-### 4.5 Partition behavior
+## 5. Claim path: retain one mixed-duration batch
 
-During a network partition, a short-lease command may be re-claimed and run by
-a second worker while the first is still executing it. Both may perform the
-command's side effects (e.g. both poll the same receipt). Only one settles.
-Applications must only attach a recovery lease to workers whose side effects
-tolerate this concurrent duplication — which is the definition in 2.3.
+Do not split a same-run batch by recovery lease and do not issue one query per
+command.
 
-### 4.6 No change to waits, deadlines, or run lifecycle
+### 5.1 Resolve each locked command's duration
 
-The recovery lease governs command lease expiry only. Command event waits, run
-deadlines, retry backoff, and terminal-state rules are untouched.
+Extend the existing locked claim row with nullable `recovery_lease_ms`. For
+each claimable command:
 
-## 5. Minimal implementation
+1. validate and convert the stored override when present;
+2. otherwise use the `defaultLease` argument supplied by the runtime;
+3. calculate `lease_expires_at` from the semantic transaction's one database
+   timestamp plus that command's duration; and
+4. retain both the duration and expiry in the prepared claim row.
 
-### 5.1 Command definition option
+Keep `ClaimCommands(ctx, candidates, defaultLease, owner, hook)` as the store
+entry point. Rename its parameter from a generic `lease` to `defaultLease` so
+its fallback role is explicit.
 
-Add `WithRecoveryLease(d time.Duration) CommandOption` and store the value on
-the command definition next to its queue. A zero or unset value means "use the
-runtime default." Reject a negative duration at definition time.
+### 5.2 Persist all fences set-wise
 
-### 5.2 Thread the declared lease into the claim
+The existing claim update uses one expiry for the whole batch. Change its
+prepared arrays/`unnest` input to carry one expiry per command. The transaction
+must still perform:
 
-The claim currently applies `r.commandLease` to the batch. Change the claim so
-each claimed row's `lease_expires_at` is computed from that command's declared
-recovery lease, falling back to the runtime default when unset. The candidate
-the claim already carries is the natural place to surface the per-command
-value; the store computes expiry per row.
+- one run lock;
+- one ordered candidate lock/read;
+- one grouped event-input read;
+- one journal append for all `attempt_started` entries;
+- one bulk queue projection update; and
+- one bulk command projection update.
 
-### 5.3 Use the command lease for renewal and local deadline
+Every journal entry must map back to the exact command, attempt ID, token, and
+per-command lease duration. Preserve all row-count and identity checks.
 
-The renewal timeout and local-lease-deadline math must use the claimed
-command's lease, not the global, so a short-lease command renews often enough
-to stay owner while healthy. Reuse the Plan 7 local-deadline discipline (claim
-round-trip time is subtracted, not added) with the per-command value.
+### 5.3 Return the actual duration
 
-### 5.4 No storage, owner, or scheduler changes
+Add `LeaseDuration time.Duration` to internal `store.ClaimedCommand`. Populate
+it from the resolved durable value. Runtime local-expiry anchoring must use this
+duration and the returned database time; it must not look the value up again
+from worker registration.
 
-This plan requires:
+The value is internal engine state, not a new public `Work` or inspection
+field.
 
-- no schema migration (the `lease_expires_at` column already exists);
-- no change to lease ownership or `replicaName`;
-- no new maintenance probe, page, or loop;
-- no change to the settlement fence or attempt/lease-token identity;
-- no new goroutine.
+### 5.4 Ambiguous claim commits
 
-If the implementation appears to need any of these, stop and reassess against
-Section 2 before expanding scope.
+Keep the existing prepared-result and ownership-resolution behavior for an
+ambiguous claim commit. The prepared `ClaimedCommand` must already contain the
+correct duration and conservative local expiry so a possibly committed fence
+transferred to worker accounting behaves like an ordinary successful claim.
 
-## 6. Documentation updates
+Do not change attempt identity, ownership resolution, slot accounting, or the
+rule that only definitely lost/concluded attempts are dropped.
 
-- `doc.go` and the command definition API comments: document
-  `WithRecoveryLease`, its meaning (recovery window, not a work deadline), and
-  the sharp edge in 2.3 / 4.5 that a shorter lease permits concurrent duplicate
-  execution and must only be used for idempotent workers.
-- `README.md`: a short subsection under lease/recovery explaining that the
-  lease bounds duplicate work and not durable settlement, and that idempotent
-  commands may opt into faster recovery.
-- Architecture and runtime component specs: note the per-command recovery lease
-  and reaffirm that the settlement fence is independent of the lease window.
-- Cross-reference Plan 7; add a short note there only if its lease wording would
-  otherwise contradict a per-command lease.
+## 6. Renewal path: one statement, mixed durations
 
-## 7. Tests
+### 6.1 Carry duration per renewal
 
-### 7.1 Definition and default tests
+Extend internal `store.LeaseRenewal` with `Duration time.Duration` and remove
+the scalar duration argument from `RenewCommandLeases`.
 
-- `WithRecoveryLease` stores the duration on the definition.
-- An undeclared command claims with the runtime default lease.
-- A negative duration is rejected at definition time.
+Validate every request's identity and exact duration before SQL. The existing
+single statement should unnest aligned arrays of command IDs, attempt IDs,
+tokens, and duration milliseconds, then update each lockable row with:
 
-### 7.2 Claim and renewal tests (PostgreSQL)
+```sql
+lease_expires_at = db_now + requested.duration_ms * interval '1 millisecond'
+```
 
-- A claimed short-lease command has `lease_expires_at ≈ now + declared lease`.
-- A claimed default command has `lease_expires_at ≈ now + runtime lease`.
-- A healthy short-lease worker renews and retains ownership past its declared
-  window (proves renewal uses the per-command lease).
+Keep ordinality, exact result count/order checks, duplicate-command rejection,
+and the `renewed` / `lost` / `uncertain` classification. A mixed due set must
+remain one statement. Do not group by duration and do not introduce N+1 SQL.
 
-### 7.3 Recovery-latency tests (PostgreSQL)
+### 6.2 Track per-attempt timing locally
 
-- Simulate a dead holder (claim, then abandon without settling) for a
-  short-lease command and a default command in the same run; assert the
-  short-lease command is recovered and re-claimable materially sooner, bounded
-  by its declared window plus one maintenance interval.
-- Assert the default command is not recovered before its full window.
-
-### 7.4 Fence-safety tests (PostgreSQL, race)
-
-- After a short-lease command is recovered and re-claimed, a settle attempt
-  from the original (stale) holder is rejected by the fence.
-- At most one durable settlement occurs even when the original holder and the
-  recovering worker both run the worker to completion.
-- Repeat under `-race`.
-
-### 7.5 Regression suite
+Extend `activeCommand` with the minimum timing state needed by the existing
+services:
 
 ```text
-go test ./...
-go test -race ./...
-go vet ./...
+lease duration
+conservative local expiry
+next renewal time
+renewal in flight
+whether the next call is a retry
+cancelled
 ```
 
-Run database-backed tests against the local PostgreSQL instance, not in skip
-mode. Retain the Plan 7 lease/maintenance tests unchanged and confirm they
-still pass with a per-command lease in play.
+Registration uses the claim's returned `LeaseDuration` and conservative local
+expiry. A successful renewal anchors the new local expiry to the local renewal
+call start plus that command's duration; never add network time to the durable
+window.
 
-## 8. Acceptance criteria
+The active registry should expose one lightweight change notification shared
+by the manager and watchdog. Register, unregister, renewal completion, retry
+scheduling, and cancellation notify it so a newly registered short lease can
+reset a timer immediately. Reuse the repository's channel-generation pattern
+or an equivalently small primitive; do not create a goroutine or timer per
+command.
 
-This plan is complete when:
+### 6.3 Replace the global renewal ticker with an earliest-due timer
 
-1. `WithRecoveryLease(d)` exists as an additive command definition option.
-2. A command with a declared recovery lease claims, renews, and is recovered on
-   that window; an undeclared command is unchanged from today.
-3. The claim writes a per-command `lease_expires_at`; renewal and local
-   deadline use the same per-command lease.
-4. The settlement fence, attempt/lease-token identity, owner assignment, and
-   at-least-once contract are byte-for-byte unchanged.
-5. A recovered short-lease command still fences a stale settlement from its
-   original holder; at most one durable settlement occurs.
-6. No schema migration, new maintenance loop, or new goroutine is added.
-7. Documentation states that the lease bounds duplicate work rather than durable
-   settlement and that a recovery lease is only for idempotent workers.
-8. The full PostgreSQL-backed and race suites pass, including the retained
-   Plan 7 tests.
+Keep one `runLeaseManager` service, but make it schedule from active attempts:
 
-## 9. Non-goals
+1. wait until the earliest `nextRenewAt`, an active-registry change, or runtime
+   cancellation;
+2. atomically snapshot all due, non-cancelled, non-renewing attempts and mark
+   them renewing;
+3. renew that due set in one store call, even when durations differ;
+4. apply each classified result to the matching active attempt; and
+5. calculate the next timer from the remaining active set.
+
+The normal renewal target is approximately one third of each command's lease.
+Exact scheduling may be slightly later due to normal Go timer behavior, but it
+must leave substantial time for a retry before conservative local expiry.
+
+Default-only workloads should retain approximately today's cadence. A short
+lease must not cause every long-lease command to renew at the short cadence;
+only due attempts enter the batch.
+
+### 6.4 Bound slow calls and retry within the lease window
+
+Keep every renewal call bounded. For an ordinary renewal, derive its timeout
+from the shortest lease in the due set using the existing shape:
+
+```text
+max(10 milliseconds, min(5 seconds, shortest due lease / 6))
+```
+
+One timeout must not defer every affected command until its next ordinary
+one-third cadence. On a call error or `uncertain` result, clear the in-flight
+mark and schedule a bounded retry before that command's conservative local
+expiry. Use a small capped delay derived from its own lease/remaining window;
+do not spin and do not retry after the attempt is locally expired.
+
+The retry call must not blindly reuse the five-second cap. Give a retry a
+larger but still bounded budget, capped by both one third of the shortest due
+lease and half of the shortest remaining local window. This lets a default
+60-second command tolerate a slow round-trip longer than five seconds while
+still retaining time for cancellation or another retry. Runtime cancellation
+must cancel either budget immediately. Sustained database latency that consumes
+the ownership window can still lose the lease; the feature must not turn that
+case back into an unbounded wait.
+
+This preserves the reason for Plan 7's timeout—PostgreSQL cannot hang runtime
+shutdown forever—while removing both the one-shot-per-tick cliff and the hard
+five-second latency cliff for a default command.
+
+### 6.5 Close the known watchdog application race
+
+The watchdog must not cancel an attempt while its matching bounded renewal call
+is still in flight. The store may already have committed the extension while
+the Go result is waiting to be returned or applied.
+
+Mark the selected attempts renewing before the SQL call. Apply a successful
+result and clear that mark under the same active-registry lock. On a definite
+`lost`, cancel it. On error or `uncertain`, clear the mark and use the bounded
+retry behavior above.
+
+This closes the local race between a known in-flight renewal and watchdog
+cancellation. It cannot eliminate a genuinely ambiguous database/network
+failure; Flow remains at-least-once, and the durable fence remains the final
+authority.
+
+## 7. Watchdog and recovery
+
+### 7.1 Make watchdog timing active-command-aware
+
+The existing watchdog interval derives from the global 60-second lease and can
+sleep past a short command's local expiry. Keep one `runLeaseWatchdog` service,
+but replace its global ticker with a timer aimed at the earliest conservative
+local expiry.
+
+It waits on that timer, the same active-registry change notification, or
+runtime cancellation. When it wakes, it cancels all expired, non-cancelled
+attempts that are not currently renewing, emits the existing observation, and
+recomputes the next expiry.
+
+This adds no service and performs no SQL. Do not poll every few milliseconds
+when there are no short active attempts.
+
+### 7.2 Maintenance stays structurally unchanged
+
+`ProbeExpiredCommandLeases` and `RecoverExpiredCommandLease` already use the
+durable queue expiry. A short command naturally appears earlier. Preserve:
+
+- bounded maintenance pages and category-local drain pacing;
+- per-run locking and candidate revalidation;
+- current attempt/fence cleanup;
+- retry budget and fail-fast behavior; and
+- runnable-only notification behavior.
+
+Do not add a fast-recovery queue, a second maintenance loop, a heartbeat table,
+or a special takeover query.
+
+### 7.3 Shutdown remains bounded
+
+The lease manager and watchdog remain runtime-owned services that drain before
+`Run` returns. Their timers and in-flight calls must respond to runtime
+cancellation. Existing shutdown cancellation must continue removing an attempt
+from renewal snapshots so an aborting worker is not kept alive by fresh leases.
+
+## 8. Documentation and developer experience
+
+Update:
+
+- `flow.go`, the package entrypoint, with the distinction between attempt
+  timeout, recovery lease, duplicate execution, and fenced settlement;
+- `definitions.go` API comments for `WithRecoveryLease`;
+- `README.md` with one short safe/unsafe example and the 60-second fallback;
+- functional, architecture, schema, engine/runtime, and durability specs;
+- migration/schema inventory documentation; and
+- Plan 12 implementation evidence after the work is complete.
+
+Use plain wording:
+
+> A recovery lease controls how soon another worker may retry this command if
+> lease renewal stops. A shorter lease can cause concurrent duplicate handler
+> execution, so use it only when repeating the worker is safe. Attempt fencing
+> still permits only the current owner to durably settle.
+
+Do not advertise it as exactly-once execution, a work timeout, a priority, or a
+general performance switch.
+
+For Trails API, inspect the current workers before opting in. Only explicitly
+audited read-only/status-polling commands—or commands protected by their own
+stable external idempotency key—should add the option. Do not mechanically add
+it to every `txn.mine`, provider, or edge command merely because the name sounds
+like polling. Any changed command declaration should also bump its version.
+
+## 9. Implementation phases
+
+### Phase 0: Reconcile and measure
+
+1. Confirm Plan 13's accepted commit and clean worktree.
+2. Inventory the current claim, renewal, watchdog, maintenance, replay, schema,
+   and registration paths listed in this plan.
+3. Record default-only claim and renewal query counts/cadence, a mixed same-run
+   claim fixture, and dead-holder recovery timing using the current test seam.
+4. Confirm the six-table baseline and no public command-lease runtime option.
+
+### Phase 1: Durable declaration
+
+1. Add option validation and command-default equivalence.
+2. Add the nullable clean-baseline schema column and update command `CopyFrom`.
+3. Thread the value through `CommandCreate`, root/child preparation,
+   declaration fingerprint, `command_created`, validation, and replay.
+4. Prove default omission, explicit persistence, duplicate-option rejection,
+   duration normalization, rediscovery conflict, and malformed-history failure.
+5. Review the phase diff and run focused definition/migration/replay tests.
+
+### Phase 2: Mixed-duration batched claim
+
+1. Load and validate the durable override in the locked claim batch.
+2. Resolve per-command durations/expiries using the fixed runtime fallback.
+3. Update queue/command projections set-wise and journal exact per-command
+   `LeaseDurationMS` values.
+4. Return `LeaseDuration` on internal claims and anchor local expiry from it.
+5. Prove mixed short/default siblings claim in one transaction with exact
+   journal/fence mapping, rollback, and ambiguous-commit behavior.
+6. Review the phase diff and run focused PostgreSQL/race tests.
+
+### Phase 3: Mixed-duration renewal and local scheduling
+
+1. Move duration into each `LeaseRenewal` and preserve one statement.
+2. Add active-command due/expiry state and its change notification.
+3. Convert the existing manager to earliest-due scheduling with bounded
+   error/uncertain retries.
+4. Convert the existing watchdog to earliest-expiry scheduling and make it
+   skip in-flight renewals.
+5. Prove healthy short attempts renew through several windows, long attempts
+   are not renewed at short cadence, slow/error renewal retries remain bounded,
+   and shutdown still drains.
+6. Review the phase diff and run focused PostgreSQL/race tests.
+
+### Phase 4: Recovery, fencing, documentation, and release evidence
+
+1. Prove short dead-holder recovery and default-command non-recovery in the
+   same run and across competing replicas.
+2. Prove the original holder cannot settle after takeover and exactly one
+   durable settlement survives.
+3. Exercise the renewal-result/watchdog boundary with a deterministic fault
+   seam, including a committed renewal waiting for local application.
+4. Update documentation/specs and perform a disposable Trails compile/focused
+   test proof if a consumer candidate is used.
+5. Run full PostgreSQL 17/18 ordinary and race gates with zero named skips,
+   static analysis, schema/source scans, and bounded performance checks.
+6. Record evidence and mark the plan complete only after independent review.
+
+## 10. Required tests
+
+### 10.1 Definition, durability, and replay
+
+- unset, valid, duplicate, zero, negative, sub-floor, fractional-millisecond,
+  and overflow option values;
+- equivalent staged commands coalesce only when recovery leases match;
+- declaration fingerprints change when the override changes;
+- root and staged-child rows/journal bodies contain the exact nullable value;
+- replay reconstructs the value and rejects malformed values;
+- schema tests assert the nullable bigint/check constraint, six tables, and no
+  additional index or migration; and
+- fresh migration followed by ordinary runtime use succeeds on PostgreSQL 17
+  and 18.
+
+### 10.2 Claim
+
+- default command uses the runtime fallback;
+- explicit command uses its durable override;
+- short and default siblings in one run claim in one batch;
+- per-row queue expiry and `attempt_started.LeaseDurationMS` are exact;
+- returned `LeaseDuration`, DB expiry, and conservative local expiry agree;
+- mixed versions/queues/event inputs and locked siblings retain existing
+  behavior;
+- injected failures roll back every fence, projection, and journal row; and
+- ambiguous commits preserve duration while transferring possibly owned
+  attempts.
+
+### 10.3 Renewal and watchdog
+
+- one store call renews mixed durations with exact row ordering/results;
+- a short active attempt wakes a sleeping manager immediately;
+- a healthy short handler remains owned through at least three lease windows;
+- default commands do not renew at the shortest command's cadence;
+- one timeout/error retries before local expiry without a hot loop;
+- `lost` cancels exactly the matching attempt; `uncertain` does not falsely
+  extend it;
+- watchdog skips a matching in-flight renewal and applies the committed result
+  before reconsidering expiry;
+- a bounded hung renewal eventually stops shielding an actually expired
+  attempt;
+- shutdown removes aborting attempts from future renewal snapshots; and
+- the race detector reports no registry/timer/cancellation races.
+
+### 10.4 Recovery and fencing
+
+- an abandoned short command is recovered within its lease plus bounded
+  maintenance polling/scheduling variance;
+- a sibling on the default lease is not recovered early;
+- two replicas cannot both claim the same current fence;
+- the recovered attempt rejects settlement from the stale holder;
+- only one `attempt_started` per actual fence and one durable terminal result
+  survive adversarial recovery; and
+- retry budgets, attempt ordinals, queue slots, and run counters remain exact.
+
+### 10.5 Commands
+
+Run database-backed tests without skip mode:
+
+```text
+gofmt -w <changed Go files>
+git diff --check
+go build ./...
+go vet ./...
+go test -count=1 ./...
+make test
+```
+
+Also run the repository's named-test no-skip audit and the focused PostgreSQL
+17/18 suites used by the current release process.
+
+## 11. Performance and simplicity gates
+
+This feature is allowed to add one nullable command column and small local
+timing state. It is not allowed to turn claims or renewals into per-command
+database work.
+
+Measure five samples where timing is noisy and record environment/durability
+settings. Required gates:
+
+1. A mixed same-run claim remains one transaction and the same bounded number
+   of SQL statements as a uniform-duration claim.
+2. A mixed due renewal remains one SQL statement, not one per duration.
+3. A short command does not increase renewal SQL cadence for unrelated
+   long-lease commands.
+4. Default-only lifecycle and same-run claim medians do not regress more than
+   10% against a contemporaneous parent comparison without investigation.
+5. No timer/goroutine is allocated per command and idle runtimes do not wake at
+   short-lease frequency.
+6. Schema remains exactly six tables with no new index.
+
+Prefer the smallest code that satisfies these gates. Do not introduce a
+general timer wheel, priority heap, lease class registry, scheduler framework,
+or configurable retry subsystem. The number of active handlers is already
+bounded by worker concurrency, so a locked linear scan to find the earliest due
+time is simpler and adequate unless measurements prove otherwise.
+
+## 12. Acceptance criteria
+
+Plan 12 is complete only when all of the following are true:
+
+1. `WithRecoveryLease(d)` is a validated command definition option and
+   `DefineCommand` still accepts no handler.
+2. Unset commands retain the fixed 60-second production fallback.
+3. The explicit override is durable in the clean schema, command-created
+   journal, declaration fingerprint, and replay state.
+4. Existing Flow data is intentionally unsupported; only the consolidated
+   baseline is changed and reset instructions are clear.
+5. Mixed-duration commands claim together in one transaction with per-command
+   queue expiries and exact `attempt_started` lease durations.
+6. Mixed due attempts renew in one statement with their own durations.
+7. Renewal and watchdog timing react to the earliest active command without a
+   goroutine/timer per attempt.
+8. A healthy short-lease handler remains owned across repeated renewals.
+9. Renewal errors retry within the remaining local window without unbounded
+   PostgreSQL calls or a hot loop.
+10. The watchdog cannot cancel an attempt merely because a matching known
+    in-flight renewal committed before its result was locally applied.
+11. A dead short-lease holder is recovered materially sooner than a default
+    holder.
+12. A stale holder cannot settle after takeover, and at most one durable
+    terminal result exists.
+13. Attempt IDs, lease tokens, run locks, settlement fences, retry budgets,
+    queue slots, and run counters retain their existing semantics.
+14. Maintenance gains no category, table, or special recovery path.
+15. Default-only workloads retain their renewal cadence and stay within the
+    bounded performance gate.
+16. Documentation plainly warns that shorter leases permit duplicate handler
+    execution and are for idempotent/replay-safe workers.
+17. PostgreSQL 17/18 ordinary, race, build, vet, format, migration, replay,
+    no-skip, and source-audit gates pass.
+18. Independent final review finds no unresolved Critical or Moderate issue.
+
+## 13. Non-goals
 
 This plan does not:
 
-- change the settlement fence or make recovery faster for non-idempotent work;
-- add a liveness/heartbeat channel or platform death signal;
-- add per-execution or per-call lease overrides;
-- add startup self-reclamation by a stable runtime identity (Section 11.3);
-- change the global default lease or `WithCommandLease`;
-- add lease classes, priorities, or a scheduler;
-- alter waits, run deadlines, retry backoff, or replay.
+- promise exactly-once handler execution;
+- weaken or redesign the settlement fence;
+- change the default production lease;
+- add a public runtime lease option;
+- add per-run, per-enqueue, per-attempt, or queue-wide lease overrides;
+- infer idempotency from a command name or queue;
+- add stable runtime identity or startup self-reclamation;
+- add heartbeats, advisory ownership, a broker, a lease table, or a seventh
+  table;
+- alter command attempt timeouts, run deadlines, waits, retry policy, queue
+  concurrency, or retention;
+- implement Plan 11 inline calls;
+- modify Trails API automatically; or
+- preserve old schemas or history.
 
-## 10. Alternatives rejected
+## 14. Alternatives rejected
 
-### 10.1 Globally shorten the default lease
+### 14.1 Globally shorten the lease
 
-Rejected. It would speed recovery everywhere but also widen the concurrent
-duplicate-execution window for non-idempotent commands (e.g. external
-submissions), increasing wasted or externally-visible duplicate side effects.
-The safe global default must stay conservative; fast recovery is opt-in per
-command.
+Rejected. It would make every handler eligible for earlier duplicate execution,
+including external side effects that are not idempotent. Safe commands should
+opt in while unknown commands retain the conservative default.
 
-### 10.2 Per-execution or per-call lease
+### 14.2 Runtime registration-only lease
 
-Rejected (2.2). Re-run cost is a property of the worker, fixed at definition.
-Per-call windows make the duplicate-work bound depend on the call site and are
-harder to reason about, without adding capability.
+Rejected. A restart or rolling deployment could reinterpret an already durable
+command from whichever worker definition happened to claim it. The recovery
+window is a durable command declaration and must travel with the row/history.
 
-### 10.3 Startup self-reclamation by stable identity
+### 14.3 Per-call override
 
-Considered and deferred. If the runtime had an identity that survived restart,
-a booting process could immediately reclaim leases it previously held, giving
-instant recovery for same-node restarts. It does not generalize: a replaced
-process (new container, new identity) cannot recognize the prior holder's
-leases, and reclaiming by a shared identity across a partition would break the
-duplicate-work bound. The per-command recovery lease helps every recovery path
-(restart and peer takeover) without introducing identity coupling, so it is the
-better primitive to ship first. Startup reclamation may be revisited separately
-if same-node restart latency remains a concern.
+Rejected. The same command worker would have different duplicate-execution
+semantics depending on its caller. That is flexibility without a needed
+capability and makes audits harder.
 
-### 10.4 Liveness heartbeat to detect death faster
+### 14.4 Split claim or renewal batches by duration
 
-Rejected for this plan. A heartbeat that lets a peer detect a dead holder
-before the lease expires would speed recovery for all commands, but it adds a
-new durable signal, a new failure mode (heartbeat partition), and materially
-more machinery than the observed problem warrants. The per-command lease is the
-minimal change that fixes the observed latency safely.
+Rejected. PostgreSQL can update aligned per-row durations through `unnest` in
+one statement. Splitting reintroduces extra transactions/queries and weakens
+the set-oriented design without simplifying semantics.
 
-## 11. Implementation sequence
+### 14.5 One timer or renewal goroutine per attempt
 
-1. Add focused failing tests: the definition option and default; claim writing a
-   per-command `lease_expires_at`; a short-lease command recovering sooner than
-   a default command; a stale settlement from the original holder being fenced
-   after recovery.
-2. Add `WithRecoveryLease` and store it on the command definition.
-3. Thread the per-command lease through claim, renewal, and local-deadline math,
-   defaulting to the runtime lease when unset.
-4. Update `doc.go`, `README.md`, and the architecture/runtime specs.
-5. Run the full PostgreSQL-backed, race, and vet suites, including the retained
-   Plan 7 tests.
-6. Confirm the production diff contains no fence, owner-identity, schema,
-   scheduler, or new-goroutine changes.
+Rejected. Worker concurrency is bounded, but the existing runtime services can
+schedule the earliest due/expiry directly with less lifecycle and shutdown
+machinery.
 
-If any step begins changing what a lease protects rather than how long it lasts,
-return to Section 2.1 and stop.
+### 14.6 Stable-owner immediate reclamation
+
+Deferred. A runtime identity that survives restart can reclaim same-owner work
+quickly, but it does not help replacement containers or peer takeover and is
+dangerous across partitions. The opt-in lease works for every failure mode
+without introducing identity coupling.
+
+### 14.7 Heartbeats or external liveness
+
+Deferred. They can detect process death before a lease expires, but add durable
+signals, partition policy, and operational machinery disproportionate to the
+current need.
+
+## 15. Stop conditions
+
+Stop implementation and report if:
+
+1. Plan 13's accepted source differs materially from the baseline in Section 2
+   and this plan has not been reconciled;
+2. mixed durations appear to require per-command claim/renewal SQL rather than
+   aligned set-oriented input;
+3. any change weakens attempt/token settlement fencing or permits two durable
+   settlements;
+4. safe watchdog behavior appears to require an unbounded database call;
+5. a short lease causes unrelated default commands to renew at short cadence;
+6. the implementation adds a service/goroutine per attempt, a new table, or a
+   new maintenance category;
+7. schema work begins preserving old development data or introducing a
+   compatibility migration; or
+8. PostgreSQL/race testing exposes unresolved ownership, shutdown, timer, or
+   lock behavior.
+
+## 16. Punchlist
+
+### Reconcile and baseline
+
+- [ ] Record the independently accepted Plan 13 commit and confirm a clean
+  implementation branch.
+- [ ] Re-audit definition, durable creation, claim, renewal, watchdog,
+  maintenance, replay, and schema paths against that commit.
+- [ ] Record contemporaneous default/mixed claim, renewal-cadence, and recovery
+  baselines.
+
+### Durable declaration
+
+- [ ] Add and validate `WithRecoveryLease` with one-time upward millisecond
+  normalization and the 30-millisecond technical floor.
+- [ ] Add the override to command defaults, staging equivalence, durable create
+  validation, and declaration fingerprints.
+- [ ] Add nullable `flow_commands.recovery_lease_ms` to the consolidated
+  baseline and update CopyFrom/catalog tests without adding a migration/index.
+- [ ] Add the optional value to `command_created`, replay, and malformed-state
+  validation.
+
+### Claim
+
+- [ ] Resolve per-command lease durations from durable rows with runtime
+  fallback.
+- [ ] Preserve one mixed-duration claim transaction and set-oriented
+  journal/projection writes.
+- [ ] Return internal `LeaseDuration` and anchor conservative local expiry from
+  the exact claimed value.
+- [ ] Prove mixed, rollback, locked-sibling, and ambiguous-commit claim cases.
+
+### Renewal and watchdog
+
+- [ ] Move duration into each `LeaseRenewal` and retain one mixed renewal SQL
+  statement.
+- [ ] Track lease duration, next due time, local expiry, retry state, and
+  in-flight renewal in the bounded active-command registry.
+- [ ] Add the lightweight registry change notification used by both existing
+  services.
+- [ ] Convert the manager to earliest-due batching with bounded retries inside
+  the remaining local lease window.
+- [ ] Convert the watchdog to earliest-expiry timing and exclude matching
+  bounded in-flight renewals.
+- [ ] Preserve shutdown cancellation/drain and observation semantics.
+
+### Recovery and fencing
+
+- [ ] Prove healthy short handlers renew across repeated windows.
+- [ ] Prove dead short holders recover sooner while default siblings do not.
+- [ ] Prove competing replicas, takeover, stale settlement rejection, and one
+  durable terminal result.
+- [ ] Prove the committed-renewal/local-watchdog boundary with a deterministic
+  race test.
+
+### Documentation, performance, and closure
+
+- [ ] Update `flow.go`, README, API comments, and active functional,
+  architecture, schema, runtime, and durability specs.
+- [ ] Audit any Trails opt-in candidate rather than applying the option by
+  command/queue name.
+- [ ] Prove one mixed claim transaction, one mixed renewal statement,
+  default-only cadence isolation, idle efficiency, six tables, and no new
+  index.
+- [ ] Run PostgreSQL 17/18 ordinary/race/no-skip gates plus format, build, vet,
+  migration, replay, and source scans.
+- [ ] Record implementation/performance evidence and complete all 18 acceptance
+  criteria.
+- [ ] Obtain independent final review before marking this plan complete.

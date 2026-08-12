@@ -1,6 +1,6 @@
 # Plan 13: Simplify the shipped core, make reads definition-safe, and bound retention
 
-Status: Implemented — pending independent final review
+Status: Implemented — independently reviewed; accepted commit pending record
 
 Planned at: `7abfb8c` on 2026-08-12
 
@@ -16,8 +16,9 @@ Planned at: `7abfb8c` on 2026-08-12
   maintenance fixes retained; Plan 8 runtime/release verification guarantees
   retained except its migration-immutability policy, which this development-only
   reset deliberately supersedes
-- **Precedes:** Plan 12. Plan 12 must be amended against this plan's reviewed
-  final commit before implementation
+- **Precedes:** Plan 12. Its amendment is drafted against this plan's
+  implementation-closure commit; Plan 12 remains blocked until the accepted
+  Plan 13 commit is recorded and the amendment is reconciled with it
 - **Defers:** Plan 11 durable inline calls. Plan 11 is not implemented; its old
   migration-number proposal is discarded with the old schema history
 - **Primary consumer target:**
@@ -421,10 +422,11 @@ run delete count must equal the number selected; otherwise return
 ### 3.8 Plan ordering
 
 Implement Plan 13 before Plan 12. This plan removes state and rewrites the
-command/start/claim-adjacent public shapes on which Plan 12 is based. After Plan
-13 is reviewed, amend Plan 12 at the exact final commit. Its amendment must
-design mixed-lease renewal explicitly because the current runtime uses one
-global renewal ticker and one lease duration per batch.
+command/start/claim-adjacent public shapes on which Plan 12 is based. Plan 12's
+amendment is now drafted against implementation-closure commit `e5f0a7a` and
+explicitly designs mixed-lease renewal around the current global ticker and
+one-duration batch. Do not implement it until Plan 13 is independently reviewed
+and the amendment is reconciled with the exact accepted commit.
 
 Plan 11 remains deferred. If a concrete consumer later needs durable inline
 subroutines, write a new plan against the post-Plan-13 schema. Its old migration
@@ -1214,8 +1216,9 @@ Plan 13 is complete only when all of the following are true:
 12. The migration chain is one clean Run-named `001_initial.sql`, contains no
     002-005 files, retains exactly six tables, and does not contain an old-schema
     upgrade path; active docs require a reset.
-13. Plan 11 is deferred and not implemented; Plan 12 remains deferred until it
-    is amended against the final Plan 13 commit.
+13. Plan 11 is deferred and not implemented; Plan 12 is amended against the
+    implementation-closure commit but remains blocked until this plan's final
+    review and accepted commit.
 14. The disposable Trails adaptation compiles and its Flow-focused tests pass
     without locally recreating removed Flow features.
 15. PostgreSQL 17/18 ordinary and race suites, build, vet, formatting, module,
@@ -1241,8 +1244,8 @@ The required sequence is:
 9. performance/concurrency/final verification; and
 10. independent final review.
 
-Do not begin Plan 12 until step 10 is accepted and Plan 12 is amended at the
-exact accepted commit.
+Do not begin Plan 12 until step 10 is accepted and its drafted amendment is
+reconciled with the exact accepted commit.
 
 ## 15. Punchlist
 
@@ -1363,5 +1366,8 @@ exact accepted commit.
   enabled and zero named-test skips/failures.
 - [x] Pass build, vet, gofmt, diff, module verify/tidy, consolidated migration
   checksum/inventory, public surface, current journal/replay, and source scans.
-- [ ] Review every hunk against Plan 13 and obtain an independent final review.
-- [ ] Record the final accepted commit; only then amend Plan 12 against it.
+- [x] Draft the Plan 12 amendment against implementation-closure commit
+  `e5f0a7a` without beginning its implementation.
+- [x] Review every hunk against Plan 13 and obtain an independent final review.
+- [ ] Record the final accepted commit and reconcile Plan 12's drafted
+  amendment against it before implementation.

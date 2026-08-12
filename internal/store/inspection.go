@@ -117,7 +117,7 @@ func (s *Store) GetRunInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (RunRow
 // guarantees at most one match.
 func (s *Store) GetCurrentRun(ctx context.Context, tx pgx.Tx, definitionName, key string) (RunRow, bool, error) {
 	if definitionName == "" || key == "" {
-		return RunRow{}, false, fmt.Errorf("%w: lookup type and key are required", flowerr.ErrInvalid)
+		return RunRow{}, false, fmt.Errorf("%w: definition name and key are required", flowerr.ErrInvalid)
 	}
 	query := s.runSelect() + ` WHERE definition_name=$1 AND run_key=$2
 		AND key_scope='live' AND status IN ('running','failing') LIMIT 1`
