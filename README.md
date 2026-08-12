@@ -64,6 +64,11 @@ run, err := sendEmail.Enqueue(ctx, runtime, "email/order-42", emailArgs{
 })
 ```
 
+`Command.Name`, `Command.Version`, and `Command.Queue` inspect the immutable
+definition without accessing the database. `Queue` returns the configured
+delivery lane, or Flow's normalized `"default"` lane when `WithQueue` was not
+specified.
+
 `Work[A]` is the attempt-local scope for one claimed command. It is not the
 whole `Run` and it is not the immutable `Command[A, R]` definition. Each
 worker invocation receives a fresh `Work` containing typed arguments,

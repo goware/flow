@@ -96,6 +96,15 @@ func (c Command[A, R]) Version() int {
 	return c.def.Version
 }
 
+// Queue returns the command's normalized delivery queue. It returns an empty
+// string for a zero or invalid command definition.
+func (c Command[A, R]) Queue() string {
+	if c.def == nil || c.err != nil {
+		return ""
+	}
+	return c.defaults.queue
+}
+
 func (e Event[T]) flowEventRef() eventReference {
 	if e.def == nil {
 		return eventReference{}

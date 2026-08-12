@@ -25,6 +25,9 @@ func TestDefinitionIdentity(t *testing.T) {
 	if cmd.Name() != "send_receipt" || cmd.Version() != 2 {
 		t.Fatalf("command identity = %s/%d", cmd.Name(), cmd.Version())
 	}
+	if cmd.Queue() != "mail" {
+		t.Fatalf("command queue = %q, want mail", cmd.Queue())
+	}
 	encoded, err := cmd.def.Args.Encode(testArgs{ID: "42"}, 0)
 	if err != nil {
 		t.Fatalf("args Encode() error = %v", err)
@@ -32,6 +35,30 @@ func TestDefinitionIdentity(t *testing.T) {
 	decoded, err := cmd.def.Args.Decode(encoded.Bytes)
 	if err != nil || decoded != (testArgs{ID: "42"}) {
 		t.Fatalf("args Decode() = %#v, %v", decoded, err)
+	}
+}
+
+func TestCommandQueue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		command Command[testArgs, testResult]
+		want    string
+	}{
+		{name: "default", command: DefineCommand[testArgs, testResult]("queue.default", 1), want: defaultQueue},
+		{name: "configured", command: DefineCommand[testArgs, testResult]("queue.configured", 1, WithQueue("mail")), want: "mail"},
+		{name: "zero", command: Command[testArgs, testResult]{}, want: ""},
+		{name: "invalid name", command: DefineCommand[testArgs, testResult]("", 1), want: ""},
+		{name: "invalid queue", command: DefineCommand[testArgs, testResult]("queue.invalid", 1, WithQueue("bad queue")), want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := test.command.Queue(); got != test.want {
+				t.Fatalf("Queue() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
