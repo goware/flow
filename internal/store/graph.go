@@ -112,21 +112,28 @@ func (s *Store) ProbeExpiredCommandWaits(ctx context.Context, limit int) ([]Expi
 	return result, nil
 }
 
-func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCandidate) (bool, error) {
+// WaitExpiryResult reports whether the wait expiry committed and, when the
+// expiry also completed the run, the terminal run status it committed.
+type WaitExpiryResult struct {
+	Progressed        bool
+	RunTerminalStatus string
+}
+
+func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCandidate) (WaitExpiryResult, error) {
 	semantic, err := s.BeginSemantic(ctx, candidate.RunID, LockSkipLocked)
 	if errors.Is(err, ErrLockUnavailable) {
-		return false, nil
+		return WaitExpiryResult{}, nil
 	}
 	if err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
 	defer semantic.Rollback(context.WithoutCancel(ctx))
 	head, err := s.LoadRunHead(ctx, semantic)
 	if err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
 	if head.Status != "running" && head.Status != "failing" {
-		return false, nil
+		return WaitExpiryResult{}, nil
 	}
 	var key, state string
 	var required bool
@@ -138,12 +145,12 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		Scan(&key, &state, &required, &deadline, &createdPosition)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
+			return WaitExpiryResult{}, nil
 		}
-		return false, MapError("lock expired command wait", err)
+		return WaitExpiryResult{}, MapError("lock expired command wait", err)
 	}
 	if state != "pending" || semantic.DBNow().Before(deadline) {
-		return false, nil
+		return WaitExpiryResult{}, nil
 	}
 
 	// A fact committed on or before the persisted deadline wins, even when
@@ -158,7 +165,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		WHERE w.command_id=$1 AND w.run_id=$2 AND w.satisfied_position IS NULL FOR UPDATE`,
 		candidate.CommandID, candidate.RunID, deadline)
 	if err != nil {
-		return false, MapError("lock expiring event waits", err)
+		return WaitExpiryResult{}, MapError("lock expiring event waits", err)
 	}
 	type acceptedWait struct {
 		name     string
@@ -171,7 +178,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		var wait acceptedWait
 		if err := rows.Scan(&wait.name, &wait.key, &wait.position); err != nil {
 			rows.Close()
-			return false, MapError("scan expiring event wait", err)
+			return WaitExpiryResult{}, MapError("scan expiring event wait", err)
 		}
 		accepted = append(accepted, wait)
 		if wait.position == nil {
@@ -180,7 +187,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return false, MapError("read expiring event waits", err)
+		return WaitExpiryResult{}, MapError("read expiring event waits", err)
 	}
 	rows.Close()
 	if missing == 0 && len(accepted) > 0 {
@@ -191,17 +198,17 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		}
 		immediatelyRunnable, err := s.resolveEventReadinessLocked(ctx, semantic, events)
 		if err != nil {
-			return false, err
+			return WaitExpiryResult{}, err
 		}
 		if immediatelyRunnable {
 			if err := semantic.NotifyRunnableCommands(ctx); err != nil {
-				return false, err
+				return WaitExpiryResult{}, err
 			}
 		}
 		if err := semantic.Commit(ctx); err != nil {
-			return false, err
+			return WaitExpiryResult{}, err
 		}
-		return true, nil
+		return WaitExpiryResult{Progressed: true}, nil
 	}
 
 	failureEffects := failureResolution{}
@@ -209,12 +216,12 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, candidate.CommandID, "expired", head.FailFast)
 	}
 	if err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
 	expired, err := terminalEventWithCode(candidate.CommandID, key, "expired", "wait_expired",
 		"awaited event deadline expired", "flow.command_expired", "command_terminal")
 	if err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
 	expired.CausationPosition = clonePointer(&createdPosition)
 	entries := []JournalEntry{expired}
@@ -229,7 +236,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 			"fail_fast": head.FailFast, "survivors": survivors,
 		})
 		if err != nil {
-			return false, err
+			return WaitExpiryResult{}, err
 		}
 		zero := 0
 		failing.CausationBatchIndex = &zero
@@ -238,18 +245,18 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	cancelledOffset := len(entries)
 	cancelledEntries, err := failureEffects.cancellationEntries(0, "cancelled by fail-fast after required command expiry")
 	if err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
 	entries = append(entries, cancelledEntries...)
 	effectiveOpen, err := durable.AddPostgresInteger("run open commands", head.OpenCommands,
 		-1, 0, durable.PostgresIntegerMax)
 	if err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
 	effectiveOpen, err = durable.AddPostgresInteger("run open commands", effectiveOpen,
 		-len(failureEffects.cancelled), 0, durable.PostgresIntegerMax)
 	if err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
 	terminalRun := effectiveOpen == 0
 	if terminalRun {
@@ -259,7 +266,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		}
 		terminal, err := runTerminalEvent(status, reason, name)
 		if err != nil {
-			return false, err
+			return WaitExpiryResult{}, err
 		}
 		zero := 0
 		terminal.CausationBatchIndex = &zero
@@ -267,18 +274,18 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	}
 	journal, err := semantic.Apply(ctx, PersistedChangeSet{Journal: entries})
 	if err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
 	failure := terminalFailure{Code: "wait_expired", Message: "awaited event deadline expired"}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
 		SET state='expired',terminal_failure=$2::jsonb,terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
 		WHERE command_id=$1`, candidate.CommandID, jsonString(failure), journal.Journal[0].Position, semantic.DBNow()); err != nil {
-		return false, MapError("expire command wait", err)
+		return WaitExpiryResult{}, MapError("expire command wait", err)
 	}
 	if required {
 		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
 			"cancelled by fail-fast after required command expiry"); err != nil {
-			return false, err
+			return WaitExpiryResult{}, err
 		}
 	}
 	status := head.Status
@@ -297,12 +304,16 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 		updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END WHERE run_id=$1`,
 		head.ID, status, jsonString(failure), semantic.DBNow(), effectiveOpen, runFailed); err != nil {
-		return false, MapError("update run after wait expiry", err)
+		return WaitExpiryResult{}, MapError("update run after wait expiry", err)
 	}
 	if err := semantic.Commit(ctx); err != nil {
-		return false, err
+		return WaitExpiryResult{}, err
 	}
-	return true, nil
+	result := WaitExpiryResult{Progressed: true}
+	if terminalRun {
+		result.RunTerminalStatus = status
+	}
+	return result, nil
 }
 
 func (resolution failureResolution) cancellationEntries(causeBatchIndex int, reason string) ([]JournalEntry, error) {

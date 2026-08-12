@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goware/flow"
 	"github.com/goware/flow/flowtest/replaytest"
@@ -20,7 +21,7 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 		t.Fatalf("Migrate() error = %v", err)
 	}
 	var output bytes.Buffer
-	runtime, err := newFlowRuntime(database.DB, database.Schema, &output)
+	runtime, alerts, err := newFlowRuntime(database.DB, database.Schema, &output)
 	if err != nil {
 		t.Fatalf("newFlowRuntime() error = %v", err)
 	}
@@ -38,6 +39,15 @@ func TestExternalMonitorExampleEndToEnd(t *testing.T) {
 	if !strings.Contains(output.String(), "external monitor observed bridge delivery") ||
 		!strings.Contains(output.String(), "bridge delivery 0xexample confirmed") {
 		t.Fatalf("example output = %q", output.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	dutyCycle, pages := alerts.summary()
+	for dutyCycle == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		dutyCycle, pages = alerts.summary()
+	}
+	if dutyCycle == 0 || pages != 0 {
+		t.Fatalf("observer summary = %d duty-cycle facts, %d pages", dutyCycle, pages)
 	}
 	confirmed, err := flow.ResultOf(trace, "root", confirmBridge)
 	if err != nil || !confirmed.Confirmed {

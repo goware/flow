@@ -529,6 +529,82 @@ entries rather than returning an unbounded snapshot.
 
 While `Run` is active, observers receive bounded operational metadata asynchronously. Delivery and shutdown drain are best-effort: a full observer queue drops observations and later reports a drop count, and observer panics do not affect run. Observers must return promptly and should honor callback-context cancellation. A blocked observer may strand its one delivery goroutine, but cannot block runtime shutdown or durable work. Observations contain no arguments, results, event payloads, SQL, connection objects, or lease tokens.
 
+Every observation carries `RunID` plus, where the emitting path holds them,
+`RunKey` and `Definition` (the run's root definition name, which on
+attempt-path facts differs from `Name`, the command's own definition). Both are
+empty when the fact concerns no single run — runtime, notification-listener,
+and batched lease-renewal facts — and `RunKey` is also empty for a run started
+without a key. Ingress cancellation and maintenance-page facts carry the run
+ID alone, because naming the run there would cost a per-candidate read that the
+bounded pages must not take.
+
+### 14.1 Observation vocabulary
+
+The `(Kind, Operation, Outcome)` tuples below are the whole stream. Exported
+constants name every operation and outcome. Within a major version tuples are
+only added, never renamed or removed; consumers must ignore tuples they do not
+know. Each tuple belongs to one delivery class: **duty-cycle** facts are
+high-volume and individually valueless, while **terminal** facts are
+individually page-worthy and hold reserved queue capacity.
+
+| Kind | Operation | Outcomes | Class |
+|---|---|---|---|
+| `claim` | `probe` | `ok`, `error` | duty-cycle |
+| `claim` | `claim` | `ok`, `error` | duty-cycle |
+| `attempt` | `handler` | `ok`, `error` | duty-cycle |
+| `attempt` | `settle` | `succeeded`, `error` | duty-cycle |
+| `attempt` | `settle` | `expired` | terminal |
+| `attempt` | `conclude` | `retry_wait`, `error` | duty-cycle |
+| `attempt` | `conclude` | `failed`, `expired` | terminal |
+| `attempt` | `conclude_exhausted` | `failed` | terminal |
+| `event` | `settle` | `accepted` | duty-cycle |
+| `event` | `deliver` | `created` | duty-cycle |
+| `run` | `start` | `created` | duty-cycle |
+| `run` | `cancel` | `cancelled` | terminal |
+| `run` | `terminal` | `succeeded`, `failed`, `expired` | terminal |
+| `command` | `cancel` | `cancelled` | terminal |
+| `wait` | `expire` | `expired` | terminal |
+| `lease` | `renew` | `ok`, `partial`, `error` | duty-cycle |
+| `lease` | `renew_result` | `renewed`, `lost`, `uncertain` | duty-cycle |
+| `lease` | `local_cancel` | `lost`, `expired` | terminal |
+| `lease` | `recover` | `recovered` | terminal |
+| `runtime` | `run` | `started`, `stopped` | duty-cycle |
+| `runtime` | `notify_listener` | `connect_error`, `listening`, `reconnecting` | duty-cycle |
+| `runtime` | `notify_hint` | `received`, `broad_wake` | duty-cycle |
+| `runtime` | `deadline_probe`, `wait_expiry_probe`, `lease_recovery_probe` | `ok`, `error` | duty-cycle |
+| `runtime` | `deadline`, `wait_expiry`, `lease_recovery` | `ok`, `noop`, `partial`, `error` | duty-cycle |
+| `runtime` | `maintenance_pass` | `blocked`, `drain` | duty-cycle |
+| `runtime` | `observer` | `dropped`, `dropped_terminal` | terminal |
+
+`attempt/conclude_exhausted/failed` distinguishes a terminal command failure
+caused by the retry budget — attempt limit, elapsed limit, or a next attempt
+that would fall past a deadline — from `attempt/conclude/failed`, which is the
+failure's own classification. `run/terminal/*` is emitted once per durable run
+transition by the path that committed it: settlement, conclusion, command
+cancellation, wait-deadline failure, and the run-deadline maintenance page.
+`run/cancel/cancelled` is the run-terminal fact for explicit run cancellation
+and replacement, so `run/terminal` carries no cancelled outcome.
+
+Clients whose transaction Flow does not own emit nothing: a
+`TransactionClient` commits under caller control, and Flow does not observe
+what it did not commit.
+
+Duplicate emission is possible across crash and retry; the stream is
+at-least-zero and at-most-few. Consumers requiring exactly-once must correlate
+with the journal, and durable truth always remains the read APIs.
+
+### 14.2 Delivery classes and loss
+
+Terminal-class observations may use the whole 1024-slot queue, while
+duty-cycle observations are refused once the queue reaches the last 64 slots,
+so a duty-cycle flood cannot evict page-worthy lifecycle facts. The check is
+approximate under concurrent emitters, who may briefly overrun the reserve.
+Once even the reserve is full, terminal observations are dropped too. The
+drain reports `runtime/observer/dropped` with every dropped observation and,
+when any of them were terminal, `runtime/observer/dropped_terminal` with that
+subset. A nonzero terminal drop count means the application's alerting missed
+lifecycle edges and its polling reconciliation is the backstop.
+
 ## 15. Errors and data handling
 
 Public Flow errors support `errors.Is` with these categories:

@@ -360,6 +360,33 @@ func (r *Runtime) observe(ctx context.Context, observation Observation) {
 	r.observations.emit(observation)
 }
 
+// observeRunTerminal reports a run's terminal transition from the path that
+// committed it, so the fact is emitted exactly once per durable transition.
+// An empty or unknown status means the run stayed open and nothing is emitted.
+func (r *Runtime) observeRunTerminal(ctx context.Context, status string, id RunID, key, definition string) {
+	outcome := runTerminalOutcome(status)
+	if outcome == "" {
+		return
+	}
+	r.observe(ctx, Observation{
+		Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: outcome,
+		RunID: id, RunKey: key, Definition: definition, Worker: r.replicaName(),
+	})
+}
+
+func runTerminalOutcome(status string) string {
+	switch status {
+	case "succeeded":
+		return ObservationOutcomeSucceeded
+	case "failed":
+		return ObservationOutcomeFailed
+	case "expired":
+		return ObservationOutcomeExpired
+	default:
+		return ""
+	}
+}
+
 func parseRunID(id RunID) (uuid.UUID, error) {
 	parsed, err := uuid.Parse(string(id))
 	if err != nil {

@@ -101,8 +101,8 @@ func testCommit(worker erasedWorker, request testengine.Request) (testengine.Res
 }
 
 func testCommandInfo(value testengine.Info) CommandInfo {
-	return CommandInfo{RunID: RunID(value.RunID), RunKey: value.RunKey, CommandID: CommandID(value.CommandID),
-		CommandKey: value.CommandKey, Name: value.Name, Version: value.Version, CreatedAt: value.CreatedAt,
+	return CommandInfo{RunID: RunID(value.RunID), RunKey: value.RunKey, Definition: value.Definition,
+		CommandID: CommandID(value.CommandID), CommandKey: value.CommandKey, Name: value.Name, Version: value.Version, CreatedAt: value.CreatedAt,
 		BudgetStartedAt: value.BudgetStartedAt, Attempt: value.Attempt, AttemptStartedAt: value.AttemptStartedAt}
 }
 

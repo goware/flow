@@ -419,7 +419,7 @@ Embedded migrations are rendered for one validated schema while table names reta
 
 ## 17. Data safety, retention, and operational limits
 
-Canonical command arguments/results, event payloads, metadata, retry settings, and journal bodies are stored in PostgreSQL. Retained start/declaration fingerprints and journal body hashes support identity comparison and invariant checking; redundant write-only projection hashes are not stored. These values are not encryption. Applications must avoid putting secrets in keys, metadata, errors, or observer dimensions and should prefer stable references for sensitive/large values.
+Canonical command arguments/results, event payloads, metadata, retry settings, and journal bodies are stored in PostgreSQL. Retained start/declaration fingerprints and journal body hashes support identity comparison and invariant checking; redundant write-only projection hashes are not stored. These values are not encryption. Applications must avoid putting secrets in keys, metadata, errors, or observer dimensions and should prefer stable references for sensitive/large values. Observations carry the run key and the run's root definition name as `Observation.RunKey` and `Observation.Definition`, so a run key remains a non-secret application identifier wherever it appears.
 
 Parent-produced values should travel directly in child arguments, while exact
 events carry sibling, cross-branch, or external facts. Related events and

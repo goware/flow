@@ -1027,6 +1027,9 @@ func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event Appl
 
 type CancelResult struct {
 	Created bool
+	// RunTerminalStatus is the terminal run status this cancellation committed,
+	// empty when the run stayed open.
+	RunTerminalStatus string
 }
 
 type terminalFailure = failure.Value
@@ -1184,12 +1187,16 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	}
 	runFailed := required || head.Status == "failing"
 	terminalRun := effectiveOpen == 0
+	terminalStatus := "succeeded"
+	if runFailed {
+		terminalStatus = "failed"
+	}
 	if terminalRun {
-		status, eventName, terminalReason := "succeeded", "flow.execution_succeeded", ""
+		eventName, terminalReason := "flow.execution_succeeded", ""
 		if runFailed {
-			status, eventName, terminalReason = "failed", "flow.execution_failed", reason
+			eventName, terminalReason = "flow.execution_failed", reason
 		}
-		runEvent, err := runTerminalEvent(status, terminalReason, eventName)
+		runEvent, err := runTerminalEvent(terminalStatus, terminalReason, eventName)
 		if err != nil {
 			return CancelResult{}, err
 		}
@@ -1216,17 +1223,15 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		}
 	}
 
+	runTerminalStatus := ""
 	if terminalRun {
-		status := "succeeded"
-		if runFailed {
-			status = "failed"
-		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_runs")+`
 			SET status=$4,open_commands=0,failure=CASE WHEN $5 THEN $2::jsonb ELSE failure END,
 			    finished_at=$3,updated_at=$3,status_at=$3
-			WHERE run_id=$1`, head.ID, jsonString(terminalFailure{Code: "command_cancelled", Message: reason}), semantic.DBNow(), status, runFailed); err != nil {
+			WHERE run_id=$1`, head.ID, jsonString(terminalFailure{Code: "command_cancelled", Message: reason}), semantic.DBNow(), terminalStatus, runFailed); err != nil {
 			return CancelResult{}, MapError("fail run after command cancellation", err)
 		}
+		runTerminalStatus = terminalStatus
 	} else {
 		status := head.Status
 		if becameFailing {
@@ -1238,7 +1243,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 			return CancelResult{}, MapError("update run after command cancellation", err)
 		}
 	}
-	return CancelResult{Created: true}, nil
+	return CancelResult{Created: true, RunTerminalStatus: runTerminalStatus}, nil
 }
 
 func (s *Store) CancelRunLocked(ctx context.Context, semantic *SemanticTx, reason string) (CancelResult, error) {

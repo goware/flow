@@ -123,6 +123,16 @@
 // and should honor context cancellation; a blocked or failed observer never
 // changes durable run correctness or prevents runtime shutdown.
 //
+// Each [Observation] is a typed lifecycle fact: a (Kind, Operation, Outcome)
+// tuple named by exported constants, the run ID, and the run key and root
+// definition name wherever the emitting path holds them. Tuples are only added
+// within a major version, so consumers must ignore unknown ones. Terminal
+// facts — run and command terminal transitions, wait expiry, and lease
+// recovery — hold reserved queue capacity so a duty-cycle flood cannot evict
+// them, and the shutdown drain reports dropped terminal facts separately.
+// Alerting built on observations still needs a polling reconciliation over the
+// read APIs, which remain the only durable truth.
+//
 // The current v0.x line supports Go 1.26 and PostgreSQL 17 and 18. Published
 // migrations are immutable and upgrades are forward-only. During v0.x,
 // intentional Go API changes may be described in release notes.

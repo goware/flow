@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/goware/flow"
@@ -56,7 +57,7 @@ func main() {
 		panic(err)
 	}
 
-	runtime, err := newFlowRuntime(db, "public", os.Stdout)
+	runtime, alerts, err := newFlowRuntime(db, "public", os.Stdout)
 	if err != nil {
 		panic(err)
 	}
@@ -71,28 +72,81 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	dutyCycle, pages := alerts.summary()
 	fmt.Printf("run %s completed with %d journal entries\n", exec.ID, len(trace.History))
+	fmt.Printf("observer summary: %d duty-cycle facts, %d pages\n", dutyCycle, pages)
 }
 
-func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, error) {
+func newFlowRuntime(db *pgkit.DB, schema string, output io.Writer) (*flow.Runtime, *alertConsumer, error) {
 	if output == nil {
 		output = io.Discard
 	}
 	example := &monitorExample{output: output}
+	alerts := &alertConsumer{output: output}
 	runtime, err := flow.New(db,
 		flow.WithSchema(schema),
 		flow.WithWorkerConcurrency(2),
 		flow.WithPollInterval(20*time.Millisecond),
+		flow.WithObserver(alerts),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := runtime.Register(
 		flow.Handle(confirmBridge, example.confirmBridge),
 	); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return runtime, nil
+	return runtime, alerts, nil
+}
+
+// alertConsumer is the intended embedding shape for observations: count the
+// duty-cycle facts, page on the terminal ones, and ignore every tuple this
+// switch does not know so a later Flow release can add facts without breaking
+// it. Delivery is best-effort and process-local, so the Trace polling in
+// waitForTerminal, not this stream, remains the durable truth.
+type alertConsumer struct {
+	output    io.Writer
+	mu        sync.Mutex
+	dutyCycle int
+	pages     int
+}
+
+func (consumer *alertConsumer) Observe(_ context.Context, observation flow.Observation) {
+	consumer.mu.Lock()
+	defer consumer.mu.Unlock()
+	switch {
+	case observation.Kind == flow.ObservationRun && observation.Operation == flow.ObservationOpTerminal &&
+		observation.Outcome != flow.ObservationOutcomeSucceeded:
+		consumer.page(observation, "run ended "+observation.Outcome)
+	case observation.Kind == flow.ObservationAttempt &&
+		observation.Operation == flow.ObservationOpConcludeExhausted:
+		consumer.page(observation, "command exhausted its retry budget")
+	case observation.Kind == flow.ObservationAttempt &&
+		observation.Operation == flow.ObservationOpConclude &&
+		observation.Outcome == flow.ObservationOutcomeFailed:
+		consumer.page(observation, "command failed permanently")
+	case observation.Kind == flow.ObservationRuntime &&
+		observation.Operation == flow.ObservationOpObserver &&
+		observation.Outcome == flow.ObservationOutcomeDroppedTerminal:
+		// Lifecycle edges were lost. Reconcile from the read APIs.
+		consumer.page(observation, "terminal observations were dropped")
+	default:
+		consumer.dutyCycle++
+	}
+}
+
+func (consumer *alertConsumer) page(observation flow.Observation, reason string) {
+	consumer.pages++
+	fmt.Fprintf(consumer.output, "PAGE %s/%s/%s run=%s key=%q definition=%q: %s\n",
+		observation.Kind, observation.Operation, observation.Outcome,
+		observation.RunID, observation.RunKey, observation.Definition, reason)
+}
+
+func (consumer *alertConsumer) summary() (dutyCycle, pages int) {
+	consumer.mu.Lock()
+	defer consumer.mu.Unlock()
+	return consumer.dutyCycle, consumer.pages
 }
 
 // newExternalMonitor creates only the lightweight publisher surface. It

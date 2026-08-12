@@ -73,7 +73,7 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 				err = r.faults.Hit(ctx, fault.ProbeReturn)
 			}
 			r.observe(ctx, Observation{
-				Kind: ObservationClaim, Operation: "probe", Outcome: outcomeForError(err),
+				Kind: ObservationClaim, Operation: ObservationOpProbe, Outcome: outcomeForError(err),
 				Count: int64(len(candidates)), Duration: time.Since(started), Worker: r.replicaName(),
 			})
 			if err != nil || len(candidates) == 0 {
@@ -281,11 +281,15 @@ func (r *Runtime) claimRunGroup(
 			err = nil
 		}
 	}
-	r.observe(ctx, Observation{
-		Kind: ObservationClaim, Operation: "claim", Outcome: outcomeForError(err),
+	observation := Observation{
+		Kind: ObservationClaim, Operation: ObservationOpClaim, Outcome: outcomeForError(err),
 		RunID: RunID(group[0].RunID.String()), Count: int64(len(result.Commands)),
 		Duration: time.Since(started), Worker: r.replicaName(),
-	})
+	}
+	if len(result.Commands) > 0 {
+		observation.RunKey, observation.Definition = result.Commands[0].RunKey, result.Commands[0].DefinitionName
+	}
+	r.observe(ctx, observation)
 	return result, err
 }
 
@@ -428,8 +432,8 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		return
 	}
 	info := CommandInfo{
-		RunID: RunID(claim.RunID.String()), RunKey: claim.RunKey, CommandID: CommandID(claim.CommandID.String()),
-		CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version,
+		RunID: RunID(claim.RunID.String()), RunKey: claim.RunKey, Definition: claim.DefinitionName,
+		CommandID: CommandID(claim.CommandID.String()), CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version,
 		CreatedAt: claim.CreatedAt, BudgetStartedAt: claim.BudgetStartedAt,
 		Attempt: claim.Attempt, AttemptStartedAt: claim.DBNow,
 	}
@@ -454,8 +458,9 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		workerErr = hookErr
 	}
 	r.observe(context.Background(), Observation{
-		Kind: ObservationAttempt, Operation: "handler", Outcome: outcomeForError(workerErr),
-		RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+		Kind: ObservationAttempt, Operation: ObservationOpHandler, Outcome: outcomeForError(workerErr),
+		RunID: info.RunID, RunKey: info.RunKey, Definition: info.Definition,
+		CommandID: info.CommandID, CommandKey: info.CommandKey,
 		Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Duration: time.Since(started),
 	})
 	if cause := context.Cause(workerCtx); cause != nil {
@@ -509,23 +514,30 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 			case "succeeded":
 				for _, event := range events {
 					r.observe(context.Background(), Observation{
-						Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
-						RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+						Kind: ObservationEvent, Operation: ObservationOpSettle, Outcome: ObservationOutcomeAccepted,
+						RunID: info.RunID, RunKey: info.RunKey, Definition: info.Definition,
+						CommandID: info.CommandID, CommandKey: info.CommandKey,
 						Name: event.Name, Worker: r.replicaName(),
 					})
 				}
 				r.observe(context.Background(), Observation{
-					Kind: ObservationAttempt, Operation: "settle", Outcome: "succeeded",
-					RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+					Kind: ObservationAttempt, Operation: ObservationOpSettle, Outcome: ObservationOutcomeSucceeded,
+					RunID: info.RunID, RunKey: info.RunKey, Definition: info.Definition,
+					CommandID: info.CommandID, CommandKey: info.CommandKey,
 					Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
 				})
+				r.observeRunTerminal(context.Background(), settleResult.RunTerminalStatus,
+					info.RunID, info.RunKey, info.Definition)
 				return
 			case "expired":
 				r.observe(context.Background(), Observation{
-					Kind: ObservationAttempt, Operation: "settle", Outcome: "expired",
-					RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+					Kind: ObservationAttempt, Operation: ObservationOpSettle, Outcome: ObservationOutcomeExpired,
+					RunID: info.RunID, RunKey: info.RunKey, Definition: info.Definition,
+					CommandID: info.CommandID, CommandKey: info.CommandKey,
 					Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
 				})
+				r.observeRunTerminal(context.Background(), settleResult.RunTerminalStatus,
+					info.RunID, info.RunKey, info.Definition)
 				return
 			default:
 				settleErr = newError(ErrInvalidState, "settle", "status", settleResult.Status, "successful settlement returned an unknown status")
@@ -566,8 +578,9 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		}
 	}
 	r.observe(context.Background(), Observation{
-		Kind: ObservationAttempt, Operation: "settle", Outcome: "error",
-		RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+		Kind: ObservationAttempt, Operation: ObservationOpSettle, Outcome: ObservationOutcomeError,
+		RunID: info.RunID, RunKey: info.RunKey, Definition: info.Definition,
+		CommandID: info.CommandID, CommandKey: info.CommandKey,
 		Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
 	})
 }
@@ -688,11 +701,14 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 			if result.Retry {
 				r.wake.signal()
 			}
+			operation, outcome := concludedObservation(result)
 			r.observe(context.Background(), Observation{
-				Kind: ObservationAttempt, Operation: "conclude", Outcome: result.Status,
-				RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
-				CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
+				Kind: ObservationAttempt, Operation: operation, Outcome: outcome,
+				RunID: RunID(claim.RunID.String()), RunKey: claim.RunKey, Definition: claim.DefinitionName,
+				CommandID: CommandID(claim.CommandID.String()), CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
 			})
+			r.observeRunTerminal(context.Background(), result.RunTerminalStatus,
+				RunID(claim.RunID.String()), claim.RunKey, claim.DefinitionName)
 			return
 		}
 		ownership, resolveErr := r.store.ResolveCommandAttempt(context.Background(), claim.CommandID, claim.AttemptID, claim.LeaseToken)
@@ -707,10 +723,28 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 		}
 	}
 	r.observe(context.Background(), Observation{
-		Kind: ObservationAttempt, Operation: "conclude", Outcome: "error",
-		RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
-		CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
+		Kind: ObservationAttempt, Operation: ObservationOpConclude, Outcome: ObservationOutcomeError,
+		RunID: RunID(claim.RunID.String()), RunKey: claim.RunKey, Definition: claim.DefinitionName,
+		CommandID: CommandID(claim.CommandID.String()), CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
 	})
+}
+
+// concludedObservation maps the store's conclusion status onto the observation
+// vocabulary, separating retry scheduling from the terminal outcomes.
+func concludedObservation(result store.SettleResult) (operation, outcome string) {
+	switch result.Status {
+	case "retry_wait":
+		return ObservationOpConclude, ObservationOutcomeRetryWait
+	case "expired":
+		return ObservationOpConclude, ObservationOutcomeExpired
+	case "failed":
+		if result.Exhausted {
+			return ObservationOpConcludeExhausted, ObservationOutcomeFailed
+		}
+		return ObservationOpConclude, ObservationOutcomeFailed
+	default:
+		return ObservationOpConclude, ObservationOutcomeError
+	}
 }
 
 func commandAttemptRemaining(claim store.ClaimedCommand) (time.Duration, bool) {
@@ -746,9 +780,9 @@ func safeErrorMessage(err error) string {
 
 func outcomeForError(err error) string {
 	if err == nil {
-		return "ok"
+		return ObservationOutcomeOK
 	}
-	return "error"
+	return ObservationOutcomeError
 }
 
 func (r *Runtime) wakeCommands() { r.wake.signal() }

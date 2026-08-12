@@ -134,9 +134,11 @@ func TestClaimCommandsLoadsRunKeyInExistingHeadQuery(t *testing.T) {
 	if err != nil || len(result.Commands) != 1 {
 		t.Fatalf("ClaimCommands() = %#v, %v", result, err)
 	}
-	if result.Commands[0].RunID != uuid.MustParse(string(run.ID)) || result.Commands[0].RunKey != "intent/42" {
-		t.Fatalf("claimed run identity = %s/%q, want %s/%q",
-			result.Commands[0].RunID, result.Commands[0].RunKey, run.ID, "intent/42")
+	if result.Commands[0].RunID != uuid.MustParse(string(run.ID)) || result.Commands[0].RunKey != "intent/42" ||
+		result.Commands[0].DefinitionName != command.Name() {
+		t.Fatalf("claimed run identity = %s/%q/%q, want %s/%q/%q",
+			result.Commands[0].RunID, result.Commands[0].RunKey, result.Commands[0].DefinitionName,
+			run.ID, "intent/42", command.Name())
 	}
 
 	var runKeyQueries []string
@@ -145,7 +147,7 @@ func TestClaimCommandsLoadsRunKeyInExistingHeadQuery(t *testing.T) {
 			runKeyQueries = append(runKeyQueries, strings.Join(strings.Fields(query), " "))
 		}
 	}
-	if len(runKeyQueries) != 1 || !strings.Contains(runKeyQueries[0], "SELECT status,deadline_at,run_key FROM") {
+	if len(runKeyQueries) != 1 || !strings.Contains(runKeyQueries[0], "SELECT status,deadline_at,run_key,definition_name FROM") {
 		t.Fatalf("claim run-key queries = %q, want one existing run-head projection", runKeyQueries)
 	}
 }

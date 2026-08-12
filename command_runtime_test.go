@@ -491,6 +491,10 @@ func TestRuntimeStagesDelayedChildrenAtomically(t *testing.T) {
 			if work.Info().RunKey != "graph-tree" {
 				return childResult{}, fmt.Errorf("child RunKey = %q", work.Info().RunKey)
 			}
+			// The run root definition, not this child's own definition name.
+			if work.Info().Definition != root.Name() {
+				return childResult{}, fmt.Errorf("child Definition = %q", work.Info().Definition)
+			}
 			if work.Args.Value == "delayed" {
 				childStartedAt.Store(time.Now().UnixNano())
 			}
@@ -2217,7 +2221,8 @@ func TestRuntimeEnqueuesDirectCommand(t *testing.T) {
 	}
 	select {
 	case info := <-seenInfo:
-		if info.RunID != exec.ID || info.RunKey != "direct" || info.CommandID != exec.RootCommandID || info.Attempt != 1 ||
+		if info.RunID != exec.ID || info.RunKey != "direct" || info.Definition != command.Name() ||
+			info.CommandID != exec.RootCommandID || info.Attempt != 1 ||
 			info.BudgetStartedAt.IsZero() || info.AttemptStartedAt.IsZero() {
 			t.Fatalf("CommandInfo = %#v", info)
 		}

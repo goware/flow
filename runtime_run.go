@@ -239,7 +239,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 			r.runNotificationListener(serviceCtx)
 		}()
 	}
-	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: "run", Outcome: "started", Worker: r.replicaName()})
+	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: ObservationOpRun, Outcome: ObservationOutcomeStarted, Worker: r.replicaName()})
 	r.runCommandScheduler(runCtx)
 
 	r.mu.Lock()
@@ -266,7 +266,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	r.runCancel = nil
 	close(r.runDone)
 	r.mu.Unlock()
-	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: "run", Outcome: "stopped", Worker: r.replicaName()})
+	r.observe(context.Background(), Observation{Kind: ObservationRuntime, Operation: ObservationOpRun, Outcome: ObservationOutcomeStopped, Worker: r.replicaName()})
 	r.observations.close()
 	return nil
 }
@@ -284,7 +284,7 @@ func (r *Runtime) runNotificationListener(ctx context.Context) {
 	listenSQL := "LISTEN " + pgx.Identifier{channel}.Sanitize()
 	for ctx.Err() == nil {
 		if err := r.faults.Hit(ctx, fault.NotifyConnect); err != nil {
-			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "connect_error"})
+			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: ObservationOpNotifyListener, Outcome: ObservationOutcomeConnectError})
 			if !waitContext(ctx, backoff) {
 				return
 			}
@@ -304,7 +304,7 @@ func (r *Runtime) runNotificationListener(ctx context.Context) {
 			if conn != nil {
 				_ = conn.Close(context.WithoutCancel(ctx))
 			}
-			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "connect_error"})
+			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: ObservationOpNotifyListener, Outcome: ObservationOutcomeConnectError})
 			if !waitContext(ctx, backoff) {
 				return
 			}
@@ -316,7 +316,7 @@ func (r *Runtime) runNotificationListener(ctx context.Context) {
 		// LISTEN begins only after its statement commits. Wake immediately to
 		// close the commit-before-LISTEN and reconnect windows.
 		r.wake.signal()
-		r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "listening"})
+		r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: ObservationOpNotifyListener, Outcome: ObservationOutcomeListening})
 		for ctx.Err() == nil {
 			if err := r.faults.Hit(ctx, fault.NotifyBeforeWait); err != nil {
 				break
@@ -327,16 +327,16 @@ func (r *Runtime) runNotificationListener(ctx context.Context) {
 			}
 			r.wake.signal()
 			if _, valid := store.ParseNotificationHint(notification.Payload); valid {
-				r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_hint", Outcome: "received"})
+				r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: ObservationOpNotifyHint, Outcome: ObservationOutcomeReceived})
 			} else {
 				// Unknown versions and malformed hints are never interpreted as
 				// work. A bounded broad wake is forward-compatible and safe.
-				r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_hint", Outcome: "broad_wake"})
+				r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: ObservationOpNotifyHint, Outcome: ObservationOutcomeBroadWake})
 			}
 		}
 		_ = conn.Close(context.WithoutCancel(ctx))
 		if ctx.Err() == nil {
-			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "reconnecting"})
+			r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: ObservationOpNotifyListener, Outcome: ObservationOutcomeReconnecting})
 			if !waitContext(ctx, backoff) {
 				return
 			}
@@ -416,7 +416,7 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 		cancel()
 		duration := time.Since(started)
 		if err != nil {
-			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: "error",
+			r.observe(ctx, Observation{Kind: ObservationLease, Operation: ObservationOpRenew, Outcome: ObservationOutcomeError,
 				Count: int64(len(current)), Duration: duration, Worker: r.replicaName()})
 			continue
 		}
@@ -436,23 +436,34 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 			case store.LeaseUncertain:
 			}
 		}
-		outcome := "ok"
+		outcome := ObservationOutcomeOK
 		if counts[store.LeaseLost]+counts[store.LeaseUncertain] > 0 {
-			outcome = "partial"
+			outcome = ObservationOutcomePartial
 		}
-		r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: outcome,
+		r.observe(ctx, Observation{Kind: ObservationLease, Operation: ObservationOpRenew, Outcome: outcome,
 			Count: int64(len(current)), Duration: duration, Worker: r.replicaName()})
 		for _, resultOutcome := range []store.LeaseRenewalOutcome{store.LeaseRenewed, store.LeaseLost, store.LeaseUncertain} {
 			if counts[resultOutcome] == 0 {
 				continue
 			}
-			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew_result", Outcome: string(resultOutcome),
+			r.observe(ctx, Observation{Kind: ObservationLease, Operation: ObservationOpRenewResult, Outcome: leaseRenewalOutcome(resultOutcome),
 				Count: counts[resultOutcome], Worker: r.replicaName()})
 		}
 		if localLost > 0 {
-			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "local_cancel", Outcome: "lost",
+			r.observe(ctx, Observation{Kind: ObservationLease, Operation: ObservationOpLocalCancel, Outcome: ObservationOutcomeLost,
 				Count: localLost, Worker: r.replicaName()})
 		}
+	}
+}
+
+func leaseRenewalOutcome(outcome store.LeaseRenewalOutcome) string {
+	switch outcome {
+	case store.LeaseRenewed:
+		return ObservationOutcomeRenewed
+	case store.LeaseLost:
+		return ObservationOutcomeLost
+	default:
+		return ObservationOutcomeUncertain
 	}
 }
 
@@ -473,7 +484,7 @@ func (r *Runtime) runLeaseWatchdog(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if cancelled := r.active.cancelExpired(); cancelled > 0 {
-				r.observe(ctx, Observation{Kind: ObservationLease, Operation: "local_cancel", Outcome: "expired",
+				r.observe(ctx, Observation{Kind: ObservationLease, Operation: ObservationOpLocalCancel, Outcome: ObservationOutcomeExpired,
 					Count: int64(cancelled), Worker: r.replicaName()})
 			}
 		}
@@ -530,45 +541,45 @@ func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult 
 
 	started := time.Now()
 	runs, err := r.store.ProbeExpiredRuns(ctx, maintenanceRunPage)
-	r.observeMaintenanceProbe(ctx, "deadline_probe", len(runs), err, started)
+	r.observeMaintenanceProbe(ctx, ObservationOpDeadlineProbe, len(runs), err, started)
 	if err == nil {
 		transitionStarted := time.Now()
 		changed, transitionErr := r.runRunDeadlinePage(ctx, runs)
 		result.recordCategory(len(runs), maintenanceRunPage, changed)
 		if len(runs) > 0 {
-			r.observeMaintenanceTransition(ctx, "deadline", len(runs), changed, transitionErr, transitionStarted)
+			r.observeMaintenanceTransition(ctx, ObservationOpDeadline, len(runs), changed, transitionErr, transitionStarted)
 		}
 	}
 
 	started = time.Now()
 	waits, err := r.store.ProbeExpiredCommandWaits(ctx, maintenanceWaitPage)
-	r.observeMaintenanceProbe(ctx, "wait_expiry_probe", len(waits), err, started)
+	r.observeMaintenanceProbe(ctx, ObservationOpWaitExpiryProbe, len(waits), err, started)
 	if err == nil {
 		transitionStarted := time.Now()
 		changed, transitionErr := r.runWaitExpiryPage(ctx, waits)
 		result.recordCategory(len(waits), maintenanceWaitPage, changed)
 		if len(waits) > 0 {
-			r.observeMaintenanceTransition(ctx, "wait_expiry", len(waits), changed, transitionErr, transitionStarted)
+			r.observeMaintenanceTransition(ctx, ObservationOpWaitExpiry, len(waits), changed, transitionErr, transitionStarted)
 		}
 	}
 
 	started = time.Now()
 	leases, err := r.store.ProbeExpiredCommandLeases(ctx, maintenanceLeasePage)
-	r.observeMaintenanceProbe(ctx, "lease_recovery_probe", len(leases), err, started)
+	r.observeMaintenanceProbe(ctx, ObservationOpLeaseRecoveryProbe, len(leases), err, started)
 	if err == nil {
 		transitionStarted := time.Now()
 		changed, transitionErr := r.runLeaseRecoveryPage(ctx, leases)
 		result.recordCategory(len(leases), maintenanceLeasePage, changed)
 		if len(leases) > 0 {
-			r.observeMaintenanceTransition(ctx, "lease_recovery", len(leases), changed, transitionErr, transitionStarted)
+			r.observeMaintenanceTransition(ctx, ObservationOpLeaseRecovery, len(leases), changed, transitionErr, transitionStarted)
 		}
 	}
 	if result.saturated {
-		outcome := "blocked"
+		outcome := ObservationOutcomeBlocked
 		if result.drainable {
-			outcome = "drain"
+			outcome = ObservationOutcomeDrain
 		}
-		r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "maintenance_pass", Outcome: outcome,
+		r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: ObservationOpMaintenancePass, Outcome: outcome,
 			Count: 1, Worker: r.replicaName()})
 	}
 
@@ -590,6 +601,9 @@ func (r *Runtime) runRunDeadlinePage(ctx context.Context, candidates []uuid.UUID
 		}
 		if progressed {
 			changed++
+			// The page is bounded by maintenanceRunPage, and the probe returns
+			// identifiers only, so the run key and definition stay empty here.
+			r.observeRunTerminal(ctx, "expired", RunID(id.String()), "", "")
 		}
 	}
 	return changed, firstErr
@@ -604,12 +618,16 @@ func (r *Runtime) runWaitExpiryPage(ctx context.Context, candidates []store.Expi
 	changed := 0
 	var firstErr error
 	for _, candidate := range candidates {
-		progressed, err := r.store.ExpireCommandWait(ctx, candidate)
+		result, err := r.store.ExpireCommandWait(ctx, candidate)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
-		if progressed {
+		if result.Progressed {
 			changed++
+			r.observe(ctx, Observation{Kind: ObservationWait, Operation: ObservationOpExpire,
+				Outcome: ObservationOutcomeExpired, RunID: RunID(candidate.RunID.String()),
+				CommandID: CommandID(candidate.CommandID.String()), Worker: r.replicaName()})
+			r.observeRunTerminal(ctx, result.RunTerminalStatus, RunID(candidate.RunID.String()), "", "")
 		}
 	}
 	return changed, firstErr
@@ -630,6 +648,9 @@ func (r *Runtime) runLeaseRecoveryPage(ctx context.Context, candidates []store.E
 		}
 		if progressed {
 			changed++
+			r.observe(ctx, Observation{Kind: ObservationLease, Operation: ObservationOpRecover,
+				Outcome: ObservationOutcomeRecovered, RunID: RunID(candidate.RunID.String()),
+				CommandID: CommandID(candidate.CommandID.String()), Worker: r.replicaName()})
 		}
 	}
 	return changed, firstErr
@@ -651,15 +672,15 @@ func (r *Runtime) observeMaintenanceTransition(
 	err error,
 	started time.Time,
 ) {
-	outcome := "ok"
+	outcome := ObservationOutcomeOK
 	count := changed
 	if err != nil {
-		outcome = "error"
+		outcome = ObservationOutcomeError
 		if changed > 0 {
-			outcome = "partial"
+			outcome = ObservationOutcomePartial
 		}
 	} else if attempted > 0 && changed == 0 {
-		outcome = "noop"
+		outcome = ObservationOutcomeNoop
 		count = attempted
 	}
 	r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: operation, Outcome: outcome,

@@ -13,7 +13,7 @@ func TestObserverAdapterIsBoundedAndPanicIsolated(t *testing.T) {
 	observer := &blockingObserver{release: make(chan struct{})}
 	adapter := newObserverAdapter(observer)
 	adapter.run()
-	adapter.emit(Observation{Kind: ObservationRuntime, Operation: "first"})
+	adapter.emit(Observation{Kind: ObservationRuntime, Operation: ObservationOpRun, Outcome: ObservationOutcomeStarted})
 	deadline := time.Now().Add(time.Second)
 	for observer.started.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -23,7 +23,7 @@ func TestObserverAdapterIsBoundedAndPanicIsolated(t *testing.T) {
 	}
 	start := time.Now()
 	for index := 0; index < observerQueueSize+100; index++ {
-		adapter.emit(Observation{Kind: ObservationCommand, Operation: "queued"})
+		adapter.emit(Observation{Kind: ObservationClaim, Operation: ObservationOpProbe, Outcome: ObservationOutcomeOK})
 	}
 	if time.Since(start) > 100*time.Millisecond {
 		t.Fatal("bounded observer queue blocked run")
@@ -40,7 +40,7 @@ func TestObserverAdapterIsBoundedAndPanicIsolated(t *testing.T) {
 	}
 
 	panicking := newObserverAdapter(ObserverFunc(func(context.Context, Observation) { panic("adapter") }))
-	panicking.emit(Observation{Kind: ObservationRuntime})
+	panicking.emit(Observation{Kind: ObservationRuntime, Operation: ObservationOpRun, Outcome: ObservationOutcomeStarted})
 	panicking.close()
 	select {
 	case <-panicking.done:
@@ -68,7 +68,7 @@ func TestObserverCloseCancelsWithoutWaitingForBlockedCallback(t *testing.T) {
 			t.Error("observer delivery goroutine did not finish after release")
 		}
 	})
-	adapter.emit(Observation{Kind: ObservationRuntime, Operation: "blocked"})
+	adapter.emit(Observation{Kind: ObservationRuntime, Operation: ObservationOpRun, Outcome: ObservationOutcomeStarted})
 	adapter.run()
 
 	var callbackCtx context.Context
@@ -158,6 +158,56 @@ func TestBlockedObserverCannotBlockRuntimeStop(t *testing.T) {
 	case <-callbackCtx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("runtime observer context was not cancelled")
+	}
+}
+
+func TestObserverReservesCapacityForTerminalObservations(t *testing.T) {
+	dutyCycle := Observation{Kind: ObservationClaim, Operation: ObservationOpProbe, Outcome: ObservationOutcomeOK}
+	terminal := Observation{Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: ObservationOutcomeFailed}
+	observer := &recordingObserver{}
+	adapter := newObserverAdapter(observer)
+
+	// The delivery goroutine is deliberately not started yet, so the queue fills.
+	for range observerQueueSize {
+		adapter.emit(dutyCycle)
+	}
+	if dropped := adapter.dropped.Load(); dropped != observerTerminalReserve {
+		t.Fatalf("duty-cycle drops = %d, want %d", dropped, observerTerminalReserve)
+	}
+	for range observerTerminalReserve {
+		adapter.emit(terminal)
+	}
+	if dropped, terminalDrops := adapter.dropped.Load(), adapter.droppedTerminal.Load(); dropped != observerTerminalReserve || terminalDrops != 0 {
+		t.Fatalf("drops after filling the reserve = %d/%d, want %d/0", dropped, terminalDrops, observerTerminalReserve)
+	}
+	adapter.emit(terminal)
+	if dropped, terminalDrops := adapter.dropped.Load(), adapter.droppedTerminal.Load(); dropped != observerTerminalReserve+1 || terminalDrops != 1 {
+		t.Fatalf("drops after exhausting the reserve = %d/%d, want %d/1", dropped, terminalDrops, observerTerminalReserve+1)
+	}
+
+	adapter.close()
+	select {
+	case <-adapter.done:
+	case <-time.After(time.Second):
+		t.Fatal("observer adapter did not drain")
+	}
+	delivered := observer.snapshot()
+	counts := map[string]int{}
+	for _, observation := range delivered {
+		counts[string(observation.Kind)+"/"+observation.Operation+"/"+observation.Outcome]++
+	}
+	if counts["claim/probe/ok"] != observerQueueSize-observerTerminalReserve {
+		t.Fatalf("delivered duty-cycle observations = %d, want %d",
+			counts["claim/probe/ok"], observerQueueSize-observerTerminalReserve)
+	}
+	if counts["run/terminal/failed"] != observerTerminalReserve {
+		t.Fatalf("delivered terminal observations = %d, want %d",
+			counts["run/terminal/failed"], observerTerminalReserve)
+	}
+	report := delivered[len(delivered)-2:]
+	if report[0].Outcome != ObservationOutcomeDropped || report[0].Count != observerTerminalReserve+1 ||
+		report[1].Outcome != ObservationOutcomeDroppedTerminal || report[1].Count != 1 {
+		t.Fatalf("drain drop report = %#v", report)
 	}
 }
 

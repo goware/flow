@@ -173,7 +173,8 @@ Each example contains its complete, self-documenting logic:
 
 - `examples/direct`: one background command;
 - `examples/fanout`: two command-owned fan-out/join phases;
-- `examples/monitor`: a command gated by an externally published event;
+- `examples/monitor`: a command gated by an externally published event, with an
+  alert-style observer consumer beside its trace polling;
 - `examples/agent`: a bounded self-composing command loop.
 - `examples/pipeline`: multiple queues, atomic worker events, an external
   transaction, an all-of join, generation-fenced keys, and dynamic work.
@@ -240,6 +241,30 @@ default (maximum 1,000). Ordinary pages are not a cross-page snapshot; use a
 Repeatable Read or Serializable caller transaction when one coherent snapshot
 is required. The same rule applies to caller-owned `Trace`; Flow-owned `Trace`
 uses Repeatable Read automatically.
+
+### Alerting from observations
+
+Observations are typed lifecycle facts, not a metrics pipeline: Flow emits
+facts and the application owns policy. Each one carries a
+`(Kind, Operation, Outcome)` tuple, the run ID, and — wherever the emitting
+path holds them — the run key and the run's root definition name, so an alert
+consumer never needs a read per observation to learn which domain entity a
+fact concerns. Exported constants name every tuple, and the functional
+specification enumerates them with an additive-only compatibility policy:
+switch on the tuples you know and ignore the rest.
+
+Page on the terminal-class facts — `run/terminal/*`, `attempt/conclude/failed`,
+`attempt/conclude_exhausted/failed`, `command/cancel/cancelled`,
+`wait/expire/expired`, and `lease/recover/recovered` — and merely count the
+duty-cycle ones. Terminal facts hold reserved queue capacity so a duty-cycle
+flood cannot evict them, but the reserve is approximate under concurrent
+emitters and delivery stays best-effort and process-local:
+a `runtime/observer/dropped_terminal` fact means lifecycle edges were lost, and
+observations are never emitted at all for writes committed by a caller-owned
+transaction. Alerting that must survive a crash therefore needs a polling
+reconciliation over the read APIs as its backstop; durable truth lives there,
+never in the observer stream. `examples/monitor` shows the intended consumer
+shape.
 
 ## Tests
 
