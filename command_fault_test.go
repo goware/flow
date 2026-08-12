@@ -47,8 +47,12 @@ func TestCommandFaultBoundariesRecoverWithoutDuplicateProgress(t *testing.T) {
 			child := DefineCommand[None, None]("fault.child."+string(point), 1)
 			event := DefineEvent[runtimeResult]("fault.event." + string(point))
 			var calls atomic.Int32
+			// Every boundary here recovers in process, so the lease outlives the
+			// whole run: a lease that expired mid-recovery would hand the command
+			// to lease recovery and run the handler again, which is the separate
+			// behaviour TestSettlementOutageRecoversByLeaseExpiry covers.
 			runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-				WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(300*time.Millisecond))
+				WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(5*time.Second))
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
@@ -155,8 +159,10 @@ func TestSettlementOutageRecoversByLeaseExpiry(t *testing.T) {
 	time.Sleep(75 * time.Millisecond)
 	stopRuntime(t, cancelFirst, firstResult)
 
+	// Only the first lease has to expire. The recovering runtime holds its
+	// attempt for the rest of the run, so its lease outlives the whole run.
 	second, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(90*time.Millisecond))
+		WithPollInterval(5*time.Millisecond), withCommandLeaseForTest(5*time.Second))
 	if err != nil {
 		t.Fatalf("New(second) error = %v", err)
 	}
