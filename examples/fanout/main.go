@@ -169,7 +169,7 @@ func (example *fanoutExample) prepareReport(_ context.Context, work *flow.Work[p
 	join := flow.Enqueue(work, "analysis/join", joinAnalysis, joinAnalysisArgs{Parts: work.Args.Parts})
 	for _, part := range work.Args.Parts {
 		if _, duplicate := seen[part]; duplicate {
-			return prepareReportResult{}, flow.Permanent(fmt.Errorf("duplicate report part %d", part))
+			return prepareReportResult{}, flow.NoRetry(fmt.Errorf("duplicate report part %d", part))
 		}
 		seen[part] = struct{}{}
 		key := fmt.Sprintf("analysis/%d", part)

@@ -172,13 +172,13 @@ func TestResultOfEnforcesTraceSnapshot(t *testing.T) {
 	if err != nil || result.Value != "done" {
 		t.Fatalf("ResultOf = %#v, %v", result, err)
 	}
-	if _, err := ResultOf(source, "failure", command); !errors.Is(err, ErrInvalidState) || !failure.IsPermanent(err) {
+	if _, err := ResultOf(source, "failure", command); !errors.Is(err, ErrInvalidState) || !failure.IsNoRetry(err) {
 		t.Fatalf("failed ResultOf = %v", err)
 	}
-	if _, err := ResultOf(source, "missing", command); !errors.Is(err, ErrNotFound) || !failure.IsPermanent(err) {
+	if _, err := ResultOf(source, "missing", command); !errors.Is(err, ErrNotFound) || !failure.IsNoRetry(err) {
 		t.Fatalf("missing ResultOf = %v", err)
 	}
-	if _, err := ResultOf(source, "success", other); !errors.Is(err, ErrConflict) || !failure.IsPermanent(err) {
+	if _, err := ResultOf(source, "success", other); !errors.Is(err, ErrConflict) || !failure.IsNoRetry(err) {
 		t.Fatalf("mismatched ResultOf = %v", err)
 	}
 }

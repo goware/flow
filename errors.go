@@ -71,9 +71,9 @@ func newError(category error, op, resource, id, reason string) error {
 	return &Error{Category: category, Op: op, Resource: resource, ID: id, Reason: reason}
 }
 
-// Permanent classifies an application error as terminal for the current
-// command delivery.
-func Permanent(err error) error { return failure.Permanent(err) }
+// NoRetry classifies an application error as terminal for the current command
+// delivery, preventing it from being retried.
+func NoRetry(err error) error { return failure.NoRetry(err) }
 
 // RetryAfter classifies an error as retryable after a requested delay. The
 // command's immutable retry bounds still apply.
@@ -81,7 +81,7 @@ func RetryAfter(delay time.Duration, err error) error {
 	if delay > 0 {
 		normalized, _, normalizeErr := durable.CeilMilliseconds("retry-after delay", delay)
 		if normalizeErr != nil {
-			return failure.Permanent(normalizeErr)
+			return failure.NoRetry(normalizeErr)
 		}
 		delay = normalized
 	}

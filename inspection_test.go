@@ -44,7 +44,7 @@ func TestGetResultReadsTypedCommandProjection(t *testing.T) {
 			return inspectionResult{Value: "result/" + work.Args.Value}, nil
 		}),
 		Handle(failed, func(context.Context, *Work[inspectionArgs]) (inspectionResult, error) {
-			return inspectionResult{}, Permanent(errors.New("expected failure"))
+			return inspectionResult{}, NoRetry(errors.New("expected failure"))
 		}),
 	); err != nil {
 		t.Fatalf("Register() error = %v", err)

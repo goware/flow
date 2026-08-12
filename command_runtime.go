@@ -670,7 +670,7 @@ func classifyWorkerError(err error, panicked bool) classifiedConclusion {
 		return classifiedConclusion{class: retrypolicy.ClassInterrupted, code: "shutdown", message: "runtime shutdown interrupted the attempt"}
 	case errors.Is(err, errAttemptTimeout), errors.Is(err, context.DeadlineExceeded):
 		return classifiedConclusion{class: retrypolicy.ClassTimeout, code: "attempt_timeout", message: "command attempt timed out"}
-	case failure.IsPermanent(err):
+	case failure.IsNoRetry(err):
 		return classifiedConclusion{class: retrypolicy.ClassPermanent, code: "permanent", message: safeErrorMessage(err)}
 	}
 	if delay, ok := failure.RetryDelay(err); ok {

@@ -69,7 +69,7 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 			return runtimeResult{Value: "retried"}, nil
 		}),
 		Handle(permanent, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
-			return runtimeResult{}, Permanent(errors.New("not retryable"))
+			return runtimeResult{}, NoRetry(errors.New("not retryable"))
 		}),
 		Handle(timed, func(ctx context.Context, work *Work[runtimeArgs]) (runtimeResult, error) {
 			stageLifecycleOutput(work, "timeout")
@@ -86,7 +86,7 @@ func TestRuntimeRetriesPermanentTimeoutAndCommit(t *testing.T) {
 		Handle(commitFailed, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
 			return runtimeResult{Value: "must-rollback"}, nil
 		}, WithCommit(func(context.Context, Tx, Commit[runtimeArgs, runtimeResult]) error {
-			return Permanent(errors.New("commit rejected"))
+			return NoRetry(errors.New("commit rejected"))
 		})),
 		Handle(exhausted, func(context.Context, *Work[runtimeArgs]) (runtimeResult, error) {
 			exhaustedCalls.Add(1)
@@ -606,7 +606,7 @@ func TestRuntimeCommandFailureCancelsQueuedSiblings(t *testing.T) {
 		}),
 		Handle(child, func(_ context.Context, work *Work[args]) (None, error) {
 			if work.Args.Kind == "fail" {
-				return None{}, Permanent(errors.New("expected failure"))
+				return None{}, NoRetry(errors.New("expected failure"))
 			}
 			siblingCalls.Add(1)
 			return None{}, nil
@@ -669,9 +669,9 @@ func TestRunningAttemptSettlementAfterCommandFailureCancelsNewChildren(t *testin
 				select {
 				case <-survivorStarted:
 				case <-time.After(3 * time.Second):
-					return None{}, Permanent(errors.New("survivor did not start"))
+					return None{}, NoRetry(errors.New("survivor did not start"))
 				}
-				return None{}, Permanent(errors.New("required failure"))
+				return None{}, NoRetry(errors.New("required failure"))
 			}
 			close(survivorStarted)
 			<-releaseSurvivor

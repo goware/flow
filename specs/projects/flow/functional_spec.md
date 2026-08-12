@@ -291,7 +291,7 @@ Only the still-current attempt ID and lease token may settle. A lost or already 
 
 `WithCommit` runs inside this transaction after durable changes have been prepared but before commit. It receives typed arguments/result, `CommandInfo`, and a restricted SQL transaction interface. It may write application tables in the same PostgreSQL database.
 
-If the callback returns an error, the entire success transaction rolls back. `Permanent` and `RetryAfter` retain their normal classifications; invalid/conflict/state/payload Flow errors are permanent invalid decisions; other errors are retryable. The callback may run again on a later attempt, so it must not perform non-transactional effects as though they were exactly once.
+If the callback returns an error, the entire success transaction rolls back. `NoRetry` and `RetryAfter` retain their normal classifications; invalid/conflict/state/payload Flow errors are permanent invalid decisions; other errors are retryable. The callback may run again on a later attempt, so it must not perform non-transactional effects as though they were exactly once.
 
 The callback should contain only short same-database work. It must not perform
 remote calls, and unnecessarily long SQL holds the run lock and delays
@@ -318,7 +318,7 @@ Worker conclusions are classified as follows:
 |---|---:|---|
 | ordinary returned error | yes | policy backoff while bounds permit |
 | `RetryAfter(delay, err)` | yes | requested positive delay while bounds permit |
-| `Permanent(err)` | yes | no retry |
+| `NoRetry(err)` | yes | no retry |
 | panic | yes | policy backoff while bounds permit |
 | attempt timeout/deadline | yes | policy backoff while bounds permit |
 | cooperative shutdown interruption | no | eligible for retry |

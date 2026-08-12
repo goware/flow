@@ -25,9 +25,9 @@ func TestSafeErrorsAndObservations(t *testing.T) {
 	}
 
 	underlying := errors.New("upstream unavailable")
-	permanent := Permanent(underlying)
-	if !errors.Is(permanent, underlying) || !failure.IsPermanent(permanent) {
-		t.Fatalf("Permanent() = %v", permanent)
+	noRetry := NoRetry(underlying)
+	if !errors.Is(noRetry, underlying) || !failure.IsNoRetry(noRetry) {
+		t.Fatalf("NoRetry() = %v", noRetry)
 	}
 	delayed := RetryAfter(3*time.Second, underlying)
 	delay, ok := failure.RetryDelay(delayed)

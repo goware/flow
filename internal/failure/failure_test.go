@@ -6,19 +6,19 @@ import (
 	"time"
 )
 
-func TestPermanent(t *testing.T) {
+func TestNoRetry(t *testing.T) {
 	t.Parallel()
 
 	base := errors.New("broken")
-	wrapped := Permanent(base)
-	if wrapped.Error() != base.Error() || !errors.Is(wrapped, base) || !IsPermanent(wrapped) {
-		t.Fatalf("Permanent() = %v", wrapped)
+	wrapped := NoRetry(base)
+	if wrapped.Error() != base.Error() || !errors.Is(wrapped, base) || !IsNoRetry(wrapped) {
+		t.Fatalf("NoRetry() = %v", wrapped)
 	}
-	if Permanent(wrapped) != wrapped {
-		t.Fatal("Permanent() double wrapped an error")
+	if NoRetry(wrapped) != wrapped {
+		t.Fatal("NoRetry() double wrapped an error")
 	}
-	if Permanent(nil) != nil || IsPermanent(base) {
-		t.Fatal("Permanent nil/plain classification is wrong")
+	if NoRetry(nil) != nil || IsNoRetry(base) {
+		t.Fatal("NoRetry nil/plain classification is wrong")
 	}
 }
 

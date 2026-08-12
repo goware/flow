@@ -35,10 +35,10 @@ func Clone(value *Value) *Value {
 	return &copy
 }
 
-type permanent struct{ err error }
+type noRetry struct{ err error }
 
-func (e permanent) Error() string { return e.err.Error() }
-func (e permanent) Unwrap() error { return e.err }
+func (e noRetry) Error() string { return e.err.Error() }
+func (e noRetry) Unwrap() error { return e.err }
 
 type retryAfter struct {
 	delay time.Duration
@@ -48,19 +48,19 @@ type retryAfter struct {
 func (e retryAfter) Error() string { return e.err.Error() }
 func (e retryAfter) Unwrap() error { return e.err }
 
-func Permanent(err error) error {
+func NoRetry(err error) error {
 	if err == nil {
 		return nil
 	}
-	var existing permanent
+	var existing noRetry
 	if errors.As(err, &existing) {
 		return err
 	}
-	return permanent{err: err}
+	return noRetry{err: err}
 }
 
-func IsPermanent(err error) bool {
-	var target permanent
+func IsNoRetry(err error) bool {
+	var target noRetry
 	return errors.As(err, &target)
 }
 

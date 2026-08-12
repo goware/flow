@@ -556,7 +556,7 @@ var RunAgentWorker = flow.Handle(
                 return answer, nil
             }
         }
-        return AgentResult{}, flow.Permanent(errors.New("turn budget exceeded"))
+        return AgentResult{}, flow.NoRetry(errors.New("turn budget exceeded"))
     },
 )
 

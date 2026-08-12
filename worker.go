@@ -439,15 +439,15 @@ func ResultOf[A, R any](trace RunTrace, key string, cmd Command[A, R]) (R, error
 	var zero R
 	value, err := lookupTraceResult(trace, key, cmd.def)
 	if err != nil {
-		return zero, Permanent(err)
+		return zero, NoRetry(err)
 	}
 	decoded, err := cmd.def.Result.Decode(value.Result)
 	if err != nil {
-		return zero, Permanent(newError(ErrInvalidState, "result", "command", key, "stored result cannot be decoded"))
+		return zero, NoRetry(newError(ErrInvalidState, "result", "command", key, "stored result cannot be decoded"))
 	}
 	result, ok := decoded.(R)
 	if !ok {
-		return zero, Permanent(newError(ErrInvalidState, "result", "command", key, "stored result has an incompatible type"))
+		return zero, NoRetry(newError(ErrInvalidState, "result", "command", key, "stored result has an incompatible type"))
 	}
 	return result, nil
 }

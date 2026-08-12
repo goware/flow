@@ -268,13 +268,13 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 		})),
 		Handle(failure, func(_ context.Context, work *Work[None]) (None, error) {
 			stage(work)
-			return None{}, Permanent(errors.New("worker rejected"))
+			return None{}, NoRetry(errors.New("worker rejected"))
 		}),
 		Handle(commitFailure, func(_ context.Context, work *Work[None]) (None, error) {
 			stage(work)
 			return None{}, nil
 		}, WithCommit(func(context.Context, Tx, Commit[None, None]) error {
-			return Permanent(errors.New("commit rejected"))
+			return NoRetry(errors.New("commit rejected"))
 		})),
 	); err != nil {
 		t.Fatal(err)

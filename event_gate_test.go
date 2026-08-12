@@ -738,7 +738,7 @@ func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
 			return None{}, nil
 		}),
 		Handle(producer, func(context.Context, *Work[None]) (None, error) {
-			return None{}, Permanent(errors.New("analysis failed"))
+			return None{}, NoRetry(errors.New("analysis failed"))
 		}),
 		Handle(join, func(context.Context, *Work[None]) (None, error) {
 			joinCalls.Add(1)

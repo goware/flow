@@ -14,7 +14,7 @@ Establish the compile-time developer surface and database-free primitives on whi
 
 ## Steps
 
-1. Create the root package layout and foundational public values: typed IDs, statuses/outcomes, execution snapshots, command metadata, safe sentinel/structured errors, `Permanent`, and `RetryAfter`.
+1. Create the root package layout and foundational public values: typed IDs, statuses/outcomes, execution snapshots, command metadata, safe sentinel/structured errors, `NoRetry`, and `RetryAfter`.
 2. Implement RFC 8785 canonical JSON encoding, decoding, size/depth validation, SHA-256 values and equality helpers under `internal/canonical`, with independent conformance vectors.
 3. Implement immutable `Command[A,R]`, `Event[T]`, `PlanDef[A]`, and `Coordinator[S]` descriptors, same-type `With(Client)` binding, erased codecs/metadata, command options, handler registrations, commit-function registration, coordinator handler registration, and duplicate/overlap validation.
 4. Implement sealed immutable `RetryPolicy` data and builders plus the pure retry decision engine using supplied PostgreSQL-style timestamps, deterministic jitter, attempt/elapsed/deadline bounds, and non-consuming interruptions.

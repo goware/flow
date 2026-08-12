@@ -77,7 +77,7 @@ flow/
     ├── canonical/          bounded canonical JSON and hashes
     ├── definition/         erased codecs and stable definition validation
     ├── durable/            PostgreSQL integer and exact-duration boundaries
-    ├── failure/            shared failure value plus Permanent/RetryAfter wrappers
+    ├── failure/            shared failure value plus NoRetry/RetryAfter wrappers
     ├── replay/             pure semantic journal fold
     ├── retry/              persisted policy and deterministic decisions
     ├── pgschema/           validated schema/table rendering
@@ -339,7 +339,7 @@ limited to useful immediate wakes.
 
 Retry policies are canonicalized into every command declaration as opaque bytes with whole-millisecond elapsed/backoff fields. Decisions use PostgreSQL time, persisted budget start, consumed attempts, immutable policy, attempt identity, error classification, and run deadline. Jitter is deterministic and rounded to a durable whole millisecond, so failover replicas calculate the same next time.
 
-Ordinary errors, requested delays, panics, and timeouts consume budget. Shutdown interruption and lease loss do not. Permanent errors terminate immediately. Attempt and elapsed bounds plus the run deadline cap every retry.
+Ordinary errors, requested delays, panics, and timeouts consume budget. Shutdown interruption and lease loss do not. `NoRetry` errors terminate immediately. Attempt and elapsed bounds plus the run deadline cap every retry.
 
 When the first command becomes terminal unsuccessfully, the store records its
 terminal event and `run_failing`. It cancels open commands without active
