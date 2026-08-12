@@ -39,7 +39,10 @@ Flow supplies those properties while keeping orchestration inside ordinary typed
 
 ## Mental model
 
-Starting a command creates an asynchronous run. `Enqueue` never invokes a worker inline. It returns the `Run` snapshot as of durable acceptance, whose `Created` field tells the caller whether this call created the run or rediscovered it. `GetRun` and `AwaitRun` return the same `Run` type with the current or final durable state.
+Starting a command creates an asynchronous run. `Enqueue` never invokes a
+worker inline. It returns compact `EnqueueResult{RunID, Created}` operation
+data. `GetRun` and `AwaitRun` return the full current or final durable `Run`
+snapshot only when it is needed.
 
 Each run begins with one root command. A successful worker may stage children, and those children may stage more work. Every child has exactly one parent, so the resulting tree records ownership and provenance even when events synchronize work across branches.
 
@@ -82,6 +85,8 @@ large all-of inputs can be combined through hierarchical join commands.
 Related events and children should be staged in one decision when they form one
 atomic change. Large or sensitive documents remain in application storage and
 move through Flow as stable references in arguments or event payloads.
+One command may wait for at most 256 exact events, and one worker decision may
+stage at most 256 distinct application events.
 
 ## Event model
 
@@ -116,11 +121,18 @@ between them, in which case new ingress returns `ErrTerminal`.
 
 ## Identity and idempotency
 
-A non-empty run key is permanently idempotent by default. Repeating an equivalent start for the same command name and key returns the original run with `Created=false`. Reusing that identity with different start inputs or options returns a conflict. An empty permanent key creates a new run on every call.
+A non-empty run key is permanently idempotent by default. Repeating an
+equivalent start for the same command name and key returns the original
+`RunID` with `Created=false`. Reusing that identity with different start inputs
+or options returns a conflict. An empty permanent key creates a new run on
+every call.
 
 `WithLiveKey` changes the contract to queue-style deduplication. At most one non-terminal run for a command name/key may exist. While it is live, another start silently rediscovers it without comparing arguments or options; after it becomes terminal, the key is available for a new run.
 
-Command and event identities are similarly durable. Equivalent repeated declarations or publications are no-ops, while conflicting content is rejected. The first accepted declaration fixes its arguments, definition version, queue, retry policy, timeout, delay, waits, and optionality.
+Command and event identities are similarly durable. Equivalent repeated
+declarations or publications are no-ops, while conflicting content is
+rejected. The first accepted declaration fixes its arguments, definition
+version, queue, retry policy, timeout, delay, and waits.
 
 ## Durability guarantees
 
@@ -160,7 +172,9 @@ Positive public durations that become durable configuration are rounded upward
 once to the next whole millisecond before fingerprinting and persistence.
 Strict store and decode boundaries continue to require exact millisecond values.
 
-A required command that exhausts retry or is cancelled/expired makes the run fail. Reduced fail-fast is enabled by default: Flow cancels open work that has no active attempt while allowing already running attempts to settle through their fences. Optional command failure is observable but does not by itself fail the run; optional work still keeps the run open until it becomes terminal.
+Any command that exhausts retry or is cancelled/expired makes the run fail.
+Flow cancels open work that has no active attempt while allowing already
+running attempts to settle through their fences.
 
 ## Transactions and application state
 
@@ -203,22 +217,32 @@ Flow owns exactly six tables in a configurable PostgreSQL schema:
 | `flow_journal` | immutable ordered history and application-event bodies |
 | `flow_schema_migrations` | checksummed schema version and compatibility ledger |
 
-`Migrate` applies embedded migrations explicitly. `New` verifies schema compatibility and starts nothing. `Run` owns a bounded scheduler, lease renewal, wait/deadline/recovery maintenance, optional notification listening, observers, and graceful shutdown. Polling is always sufficient for correctness.
+`Migrate` installs the one clean baseline migration explicitly. An older
+multi-migration development schema is not upgraded; operators drop and
+recreate the Flow schema first. `New` verifies schema compatibility and starts
+nothing. `Run` owns a bounded scheduler, lease renewal,
+wait/deadline/recovery maintenance, optional notification listening, observers,
+and graceful shutdown. Polling is always sufficient for correctness.
+
+`PruneTerminalRuns` deletes one bounded batch of old terminal unkeyed or
+live-key aggregates in a Flow-owned transaction. Permanent non-empty keys and
+all application tables remain outside pruning. There is no automatic TTL or
+archival service.
 
 Worker registration matches exact command name/version pairs. Unhandled versions remain durable until a compatible replica is deployed, they are cancelled, or a deadline expires. A process may host every worker, a selected pool of workers, or only API publishers that never call `Run`.
 
 ## Inspection and testing
 
-`GetRun`, `GetCurrentRun`, `ListRuns`, `AwaitRun`, `GetResult`,
-`GetQueueDepth`, `History`, and `Trace` expose durable state without invoking
-application code. `GetResult` decodes one successful command result directly
+`GetRun`, both definition-bound and top-level `GetCurrentRun`, `ListRuns`,
+`AwaitRun`, both forms of `GetResult`, `GetQueueStats`, `History`, and `Trace`
+expose durable state without invoking application code. `GetResult` decodes one successful command result directly
 from its `(run ID, command key)` projection without replay. Trace includes
 command provenance, exact waits and satisfying positions, attempts,
 results/failures, events, operational lease state, and ordered history.
 `ResultOf` decodes a successful command result already held in a trace snapshot;
 workers use neither helper as implicit dataflow.
 
-`flowtest` exercises the production decision recorder, codecs, retry calculation, and commit callback without PostgreSQL. PostgreSQL integration tests cover migrations, claims, fencing, retries, exact event inputs, fail-fast, cancellation, replay conformance, transaction ownership, notification loss, multi-replica behavior, and all examples.
+`flowtest` exercises the production decision recorder, codecs, retry calculation, and commit callback without PostgreSQL. PostgreSQL integration tests cover migrations, claims, fencing, retries, exact event inputs, single failure propagation, cancellation, pruning, replay conformance, transaction ownership, notification loss, multi-replica behavior, and all examples.
 
 ## Fit and deliberate limits
 

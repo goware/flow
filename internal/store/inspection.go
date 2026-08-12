@@ -24,7 +24,6 @@ type RunRow struct {
 	Key               string
 	RootCommandID     *uuid.UUID
 	Status            string
-	FailFast          bool
 	MaxCommands       int
 	CommandCount      int
 	OpenCommands      int
@@ -34,7 +33,6 @@ type RunRow struct {
 	UpdatedAt         time.Time
 	StatusAt          time.Time
 	FinishedAt        *time.Time
-	Metadata          []byte
 }
 
 type RunListFilter struct {
@@ -43,7 +41,6 @@ type RunListFilter struct {
 	Statuses       []string
 	CreatedAfter   *time.Time
 	CreatedBefore  *time.Time
-	Metadata       []byte
 	CursorCreated  *time.Time
 	CursorID       *uuid.UUID
 	Limit          int
@@ -120,7 +117,7 @@ func (s *Store) GetRunInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (RunRow
 // guarantees at most one match.
 func (s *Store) GetCurrentRun(ctx context.Context, tx pgx.Tx, definitionName, key string) (RunRow, bool, error) {
 	if definitionName == "" || key == "" {
-		return RunRow{}, false, fmt.Errorf("%w: lookup type and key are required", flowerr.ErrInvalid)
+		return RunRow{}, false, fmt.Errorf("%w: definition name and key are required", flowerr.ErrInvalid)
 	}
 	query := s.runSelect() + ` WHERE definition_name=$1 AND run_key=$2
 		AND key_scope='live' AND status IN ('running','failing') LIMIT 1`
@@ -168,9 +165,6 @@ func (s *Store) listRunsQuery(filter RunListFilter) (string, []any) {
 	if filter.CreatedBefore != nil {
 		add(`created_at < $%d`, *filter.CreatedBefore)
 	}
-	if len(filter.Metadata) != 0 {
-		add(`metadata @> $%d::jsonb`, string(filter.Metadata))
-	}
 	if filter.CursorCreated != nil {
 		args = append(args, *filter.CursorCreated, *filter.CursorID)
 		clauses = append(clauses, fmt.Sprintf(`(created_at,run_id) < ($%d,$%d)`, len(args)-1, len(args)))
@@ -185,8 +179,8 @@ func (s *Store) listRunsQuery(filter RunListFilter) (string, []any) {
 }
 
 const runSelectColumns = `SELECT run_id,definition_name,definition_version,run_key,status,
-	fail_fast,max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
-	finished_at,metadata,root_command_id FROM `
+	max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
+	finished_at,root_command_id FROM `
 
 func (s *Store) runSelect() string {
 	return runSelectColumns + pgschema.Table(s.schema, "flow_runs")
@@ -220,11 +214,11 @@ func (s *Store) queryRuns(ctx context.Context, tx pgx.Tx, query string, args ...
 
 func scanRun(row pgx.Row) (RunRow, error) {
 	var value RunRow
-	var failureBytes, metadata []byte
+	var failureBytes []byte
 	if err := row.Scan(
 		&value.ID, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
-		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.DeadlineAt,
-		&failureBytes, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
+		&value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.DeadlineAt,
+		&failureBytes, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt,
 		&value.RootCommandID,
 	); err != nil {
 		return RunRow{}, MapError("scan run", err)
@@ -236,49 +230,71 @@ func scanRun(row pgx.Row) (RunRow, error) {
 		}
 		value.Failure = decoded
 	}
-	value.Metadata = append([]byte(nil), metadata...)
 	return value, nil
 }
 
-// QueueDepthRow is a point-in-time projection of one queue lane's operational
-// depth, derived from flow_command_queue.
-type QueueDepthRow struct {
+// QueueStatsRow is a point-in-time projection of one queue lane's operational
+// state, derived from flow_command_queue.
+type QueueStatsRow struct {
+	Queue          string
 	Ready          int64
 	Delayed        int64
 	Running        int64
 	OldestReadyFor time.Duration
 }
 
-// QueueDepthInTx counts the lane's deliverable, scheduled, and leased
-// commands. Ready commands are claimable now; Delayed commands wait out a
-// retry backoff or start delay; Running commands hold a lease.
-func (s *Store) QueueDepthInTx(ctx context.Context, tx pgx.Tx, queue string) (QueueDepthRow, error) {
-	if queue == "" {
-		return QueueDepthRow{}, fmt.Errorf("%w: queue name is required", flowerr.ErrInvalid)
+// QueueStatsInTx counts each requested lane's deliverable, scheduled, and
+// leased commands against one statement-stable timestamp.
+func (s *Store) QueueStatsInTx(ctx context.Context, tx pgx.Tx, queues []string) ([]QueueStatsRow, error) {
+	for _, queue := range queues {
+		if queue == "" {
+			return nil, fmt.Errorf("%w: queue name is required", flowerr.ErrInvalid)
+		}
 	}
-	query := s.queueDepthQuery()
-	var row QueueDepthRow
-	var oldestSeconds float64
-	var scan pgx.Row
+	query := s.queueStatsQuery()
+	var rows pgx.Rows
+	var err error
 	if tx != nil {
-		scan = tx.QueryRow(ctx, query, queue)
+		rows, err = tx.Query(ctx, query, queues)
 	} else {
-		scan = s.db.Conn.QueryRow(ctx, query, queue)
+		rows, err = s.db.Conn.Query(ctx, query, queues)
 	}
-	if err := scan.Scan(&row.Ready, &row.Delayed, &row.Running, &oldestSeconds); err != nil {
-		return QueueDepthRow{}, MapError("count queue depth", err)
+	if err != nil {
+		return nil, MapError("query queue statistics", err)
 	}
-	row.OldestReadyFor = time.Duration(oldestSeconds * float64(time.Second))
-	return row, nil
+	defer rows.Close()
+	result := make([]QueueStatsRow, 0, len(queues))
+	for rows.Next() {
+		var row QueueStatsRow
+		var oldestSeconds float64
+		if err := rows.Scan(&row.Queue, &row.Ready, &row.Delayed, &row.Running, &oldestSeconds); err != nil {
+			return nil, MapError("scan queue statistics", err)
+		}
+		row.OldestReadyFor = time.Duration(oldestSeconds * float64(time.Second))
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, MapError("read queue statistics", err)
+	}
+	return result, nil
 }
 
-func (s *Store) queueDepthQuery() string {
-	return `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now)
-	SELECT
-		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= observed.now),
-		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at > observed.now),
-		COUNT(*) FILTER (WHERE state = 'running'),
-		COALESCE(EXTRACT(EPOCH FROM MAX(observed.now) - MIN(next_run_at)
-			FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= observed.now)), 0)
-	FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` CROSS JOIN observed WHERE queue = $1`
+func (s *Store) queueStatsQuery() string {
+	return `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now),
+	requested(queue) AS (SELECT * FROM unnest($1::text[])),
+	stats AS (
+		SELECT q.queue,
+			COUNT(*) FILTER (WHERE q.state IN ('ready','retry_wait') AND q.next_run_at <= observed.now) AS ready,
+			COUNT(*) FILTER (WHERE q.state IN ('ready','retry_wait') AND q.next_run_at > observed.now) AS delayed,
+			COUNT(*) FILTER (WHERE q.state = 'running') AS running,
+			COALESCE(EXTRACT(EPOCH FROM observed.now - MIN(q.next_run_at)
+				FILTER (WHERE q.state IN ('ready','retry_wait') AND q.next_run_at <= observed.now)), 0) AS oldest_ready_seconds
+		FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` q CROSS JOIN observed
+		WHERE q.queue=ANY($1::text[])
+		GROUP BY q.queue,observed.now
+	)
+	SELECT requested.queue,COALESCE(stats.ready,0),COALESCE(stats.delayed,0),
+		COALESCE(stats.running,0),COALESCE(stats.oldest_ready_seconds,0)
+	FROM requested LEFT JOIN stats USING (queue)
+	ORDER BY requested.queue`
 }

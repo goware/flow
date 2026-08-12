@@ -3,11 +3,14 @@ package flow
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
 )
 
@@ -32,11 +35,12 @@ func TestRenamedStoreGetContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runID, err := parseRunID(run.ID)
+	runID, err := parseRunID(run.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	commandID, err := parseCommandID(run.RootCommandID)
+	runSnapshot := mustGetRun(t, runtime, run.RunID)
+	commandID, err := parseCommandID(runSnapshot.RootCommandID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,14 +73,14 @@ func TestRenamedStoreGetContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := event.Deliver(ctx, runtime, run.ID, "ready", "value"); err != nil {
+	if err := event.Deliver(ctx, runtime, run.RunID, "ready", "value"); err != nil {
 		t.Fatal(err)
 	}
 	record, found, err := runtime.store.GetEvent(ctx, nil, runID, event.Name(), "ready")
 	if err != nil || !found || record.ID == uuid.Nil || len(record.Body) == 0 {
 		t.Fatalf("GetEvent(present) = %#v, %v, %v", record, found, err)
 	}
-	if err := CancelRun(ctx, runtime, run.ID, "store get contract complete"); err != nil {
+	if err := CancelRun(ctx, runtime, run.RunID, "store get contract complete"); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := runtime.store.GetCurrentRun(ctx, nil, command.Name(), "entity/gets"); err != nil || found {
@@ -86,6 +90,61 @@ func TestRenamedStoreGetContracts(t *testing.T) {
 
 type liveKeyResult struct {
 	Value string `json:"value"`
+}
+
+func TestCommandGetCurrentRunUsesDefinitionNameAndCallerTransaction(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := DefineCommand[None, None]("current_run.command", 1, WithQueue("current_run.queue"))
+	v2 := DefineCommand[None, None](v1.Name(), 2, WithQueue("current_run.queue"))
+	started, err := v1.Enqueue(ctx, runtime, "current/visible", None{}, WithLiveKey(), WithStartDelay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromMethod, found, err := v1.GetCurrentRun(ctx, runtime, "current/visible")
+	if err != nil || !found || fromMethod.ID != started.RunID || fromMethod.RootCommandVersion != 1 {
+		t.Fatalf("Command.GetCurrentRun(v1) = %#v, %t, %v", fromMethod, found, err)
+	}
+	fromNewVersion, found, err := v2.GetCurrentRun(ctx, runtime, "current/visible")
+	if err != nil || !found || fromNewVersion.ID != started.RunID || fromNewVersion.RootCommandVersion != 1 {
+		t.Fatalf("Command.GetCurrentRun(v2) = %#v, %t, %v", fromNewVersion, found, err)
+	}
+	fromTopLevel, found, err := GetCurrentRun(ctx, runtime, v1.Name(), "current/visible")
+	if err != nil || !found || fromTopLevel.ID != started.RunID {
+		t.Fatalf("GetCurrentRun() = %#v, %t, %v", fromTopLevel, found, err)
+	}
+	if _, found, err := GetCurrentRun(ctx, runtime, v1.Queue(), "current/visible"); err != nil || found {
+		t.Fatalf("GetCurrentRun(queue) found=%t error=%v", found, err)
+	}
+	if _, _, err := (Command[None, None]{}).GetCurrentRun(ctx, runtime, "current/visible"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("zero Command.GetCurrentRun() error=%v", err)
+	}
+
+	tx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	txClient := runtime.InTx(tx)
+	uncommitted, err := v1.Enqueue(ctx, txClient, "current/uncommitted", None{}, WithLiveKey(), WithStartDelay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inside, found, err := v1.GetCurrentRun(ctx, txClient, "current/uncommitted")
+	if err != nil || !found || inside.ID != uncommitted.RunID {
+		t.Fatalf("transaction Command.GetCurrentRun() = %#v, %t, %v", inside, found, err)
+	}
+	if _, found, err := v1.GetCurrentRun(ctx, runtime, "current/uncommitted"); err != nil || found {
+		t.Fatalf("outside Command.GetCurrentRun(uncommitted) found=%t error=%v", found, err)
+	}
 }
 
 // A live-scoped key is held while its run is non-terminal — repeated
@@ -133,21 +192,21 @@ func TestLiveKeyReleasesOnSettlement(t *testing.T) {
 	// different arguments both rediscover it silently: live keys are a dedupe
 	// on the entity, not an identity assertion.
 	same, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "a"}, WithLiveKey())
-	if err != nil || same.Created || same.ID != first.ID {
+	if err != nil || same.Created || same.RunID != first.RunID {
 		t.Fatalf("equivalent live start = %#v, %v", same, err)
 	}
 	different, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "different"}, WithLiveKey())
-	if err != nil || different.Created || different.ID != first.ID {
+	if err != nil || different.Created || different.RunID != first.RunID {
 		t.Fatalf("differing live start = %#v, %v", different, err)
 	}
 
 	live, found, err := GetCurrentRun(ctx, runtime, command.Name(), "entity/1")
-	if err != nil || !found || live.ID != first.ID {
+	if err != nil || !found || live.ID != first.RunID {
 		t.Fatalf("GetCurrentRun(live) = %#v, %v, %v", live, found, err)
 	}
 
 	close(release)
-	if _, err := AwaitRun(ctx, runtime, first.ID); err != nil {
+	if _, err := AwaitRun(ctx, runtime, first.RunID); err != nil {
 		t.Fatalf("AwaitRun() error = %v", err)
 	}
 
@@ -157,10 +216,10 @@ func TestLiveKeyReleasesOnSettlement(t *testing.T) {
 
 	// The settled run released the key: the same key starts fresh work.
 	second, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "b"}, WithLiveKey())
-	if err != nil || !second.Created || second.ID == first.ID {
+	if err != nil || !second.Created || second.RunID == first.RunID {
 		t.Fatalf("post-settlement live start = %#v, %v", second, err)
 	}
-	if _, err := AwaitRun(ctx, runtime, second.ID); err != nil {
+	if _, err := AwaitRun(ctx, runtime, second.RunID); err != nil {
 		t.Fatalf("AwaitRun(second) error = %v", err)
 	}
 	if got := invocations.Load(); got != 2 {
@@ -226,10 +285,11 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 		t.Fatalf("delayed start = %#v, %v", exec, err)
 	}
 
-	depth, err := GetQueueDepth(ctx, runtime, "livekey.lane")
+	stats, err := GetQueueStats(ctx, runtime, "livekey.lane")
 	if err != nil {
-		t.Fatalf("GetQueueDepth() error = %v", err)
+		t.Fatalf("GetQueueStats() error = %v", err)
 	}
+	depth := stats["livekey.lane"]
 	if depth.Ready != 0 || depth.Delayed != 1 || depth.Running != 0 {
 		t.Fatalf("pre-delay depth = %#v", depth)
 	}
@@ -238,7 +298,7 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 	defer stop()
 	go runtime.Run(runCtx) //nolint:errcheck // returns nil on cancel
 
-	run, err := AwaitRun(ctx, runtime, exec.ID)
+	run, err := AwaitRun(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatalf("AwaitRun() error = %v", err)
 	}
@@ -251,9 +311,9 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 
 }
 
-// GetQueueDepth counts one lane's deliverable, scheduled, and leased commands
+// GetQueueStats counts requested lanes' deliverable, scheduled, and leased commands
 // without a running runtime.
-func TestGetQueueDepthCountsLane(t *testing.T) {
+func TestGetQueueStatsCountsLanes(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -274,23 +334,137 @@ func TestGetQueueDepthCountsLane(t *testing.T) {
 		t.Fatalf("delayed start error = %v", err)
 	}
 
-	depth, err := GetQueueDepth(ctx, runtime, "livekey.depth.lane")
+	stats, err := GetQueueStats(ctx, runtime, "livekey.depth.lane", "livekey.empty.lane")
 	if err != nil {
-		t.Fatalf("GetQueueDepth() error = %v", err)
+		t.Fatalf("GetQueueStats() error = %v", err)
 	}
+	depth := stats["livekey.depth.lane"]
 	if depth.Ready != 1 || depth.Delayed != 1 || depth.Running != 0 || depth.OldestReadyFor < 0 {
 		t.Fatalf("queue depth = %#v", depth)
 	}
 
-	empty, err := GetQueueDepth(ctx, runtime, "livekey.empty.lane")
-	if err != nil {
-		t.Fatalf("GetQueueDepth(empty) error = %v", err)
-	}
+	empty := stats["livekey.empty.lane"]
 	if empty.Ready != 0 || empty.Delayed != 0 || empty.Running != 0 || empty.OldestReadyFor != 0 {
 		t.Fatalf("empty queue depth = %#v", empty)
 	}
 
-	if _, err := GetQueueDepth(ctx, runtime, ""); !errors.Is(err, ErrInvalid) {
+	if _, err := GetQueueStats(ctx, runtime, ""); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unnamed queue depth error = %v", err)
+	}
+}
+
+func TestGetQueueStatsBatchesValidatesAndObservesTransactions(t *testing.T) {
+	recorder := &queryRecorder{}
+	database := testpg.OpenWithQueryTracer(t, recorder)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queues := make([]string, 16)
+	for index := range queues {
+		queues[index] = fmt.Sprintf("stats.lane.%02d", index)
+	}
+	command := DefineCommand[None, None]("stats.command", 1, WithQueue(queues[0]))
+	if _, err := command.Enqueue(ctx, runtime, "stats/ready", None{}); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder.reset()
+	requested := append(append([]string(nil), queues...), queues[0])
+	stats, err := GetQueueStats(ctx, runtime, requested...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != len(queues) || stats[queues[0]].Ready != 1 {
+		t.Fatalf("queue statistics = %#v", stats)
+	}
+	for _, queue := range queues[1:] {
+		if stats[queue].Queue != queue || stats[queue].Ready != 0 || stats[queue].Delayed != 0 || stats[queue].Running != 0 {
+			t.Fatalf("empty queue %q statistics = %#v", queue, stats[queue])
+		}
+	}
+	queries := recorder.snapshot()
+	if len(queries) != 1 || strings.Count(queries[0], "clock_timestamp()") != 1 ||
+		!strings.Contains(queries[0], "observed AS MATERIALIZED") || !strings.Contains(queries[0], "unnest($1::text[])") {
+		t.Fatalf("queue statistics queries = %#v", queries)
+	}
+
+	recorder.reset()
+	empty, err := GetQueueStats(ctx, runtime)
+	if err != nil || empty == nil || len(empty) != 0 || len(recorder.snapshot()) != 0 {
+		t.Fatalf("empty queue statistics = %#v, %v; queries=%#v", empty, err, recorder.snapshot())
+	}
+	if _, err := GetQueueStats(ctx, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nil-client empty queue statistics error = %v", err)
+	}
+	if _, err := GetQueueStats(ctx, runtime, ""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid queue statistics error = %v", err)
+	}
+	tooMany := make([]string, MaxReadKeys+1)
+	for index := range tooMany {
+		tooMany[index] = queues[0]
+	}
+	if _, err := GetQueueStats(ctx, runtime, tooMany...); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("too many queue statistics error = %v", err)
+	}
+
+	tx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	txCommand := DefineCommand[None, None]("stats.transaction", 1, WithQueue("stats.transaction.lane"))
+	txClient := runtime.InTx(tx)
+	if _, err := txCommand.Enqueue(ctx, txClient, "stats/transaction", None{}); err != nil {
+		t.Fatal(err)
+	}
+	recorder.reset()
+	txStats, err := GetQueueStats(ctx, txClient, "stats.transaction.lane")
+	if err != nil || txStats["stats.transaction.lane"].Ready != 1 || len(recorder.snapshot()) != 1 {
+		t.Fatalf("transaction queue statistics = %#v, %v; queries=%#v", txStats, err, recorder.snapshot())
+	}
+}
+
+func TestGetQueueStatsDoesNotLockClaimableRows(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("stats.nonlocking", 1, WithQueue("stats.nonlocking.lane"))
+	if _, err := command.Enqueue(ctx, runtime, "stats/nonlocking", None{}, WithoutRunDeadline()); err != nil {
+		t.Fatal(err)
+	}
+
+	readTx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readTx.Rollback(ctx)
+	stats, err := GetQueueStats(ctx, runtime.InTx(readTx), command.Queue())
+	if err != nil || stats[command.Queue()].Ready != 1 {
+		t.Fatalf("transaction queue statistics = %#v, %v", stats, err)
+	}
+
+	claimCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	candidates, err := runtime.store.ProbeCommands(claimCtx,
+		[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("ProbeCommands() candidates=%d, err=%v", len(candidates), err)
+	}
+	claimed, err := runtime.store.ClaimCommands(claimCtx, candidates, time.Minute, "stats-nonlocking", nil)
+	if err != nil || len(claimed.Commands) != 1 {
+		t.Fatalf("ClaimCommands() commands=%d, err=%v", len(claimed.Commands), err)
 	}
 }

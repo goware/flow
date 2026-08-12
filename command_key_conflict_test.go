@@ -37,8 +37,8 @@ func TestCrossDecisionCommandKeyReuseIsAConflict(t *testing.T) {
 			}
 			if err := runtime.Register(
 				Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
-					Enqueue(work, "declarer/1", declarer, crossDecisionArgs{Value: test.values[0]}).Optional()
-					Enqueue(work, "declarer/2", declarer, crossDecisionArgs{Value: test.values[1]}).Optional()
+					Enqueue(work, "declarer/1", declarer, crossDecisionArgs{Value: test.values[0]})
+					Enqueue(work, "declarer/2", declarer, crossDecisionArgs{Value: test.values[1]})
 					return None{}, nil
 				}),
 				Handle(declarer, func(_ context.Context, work *Work[crossDecisionArgs]) (None, error) {
@@ -57,8 +57,8 @@ func TestCrossDecisionCommandKeyReuseIsAConflict(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
-			trace, err := Trace(ctx, runtime, exec.ID)
+			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failed", 5*time.Second)
+			trace, err := Trace(ctx, runtime, exec.RunID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -68,9 +68,9 @@ func TestCrossDecisionCommandKeyReuseIsAConflict(t *testing.T) {
 					continue
 				}
 				switch {
-				case command.State == CommandStatusSucceeded:
+				case command.Status == CommandStatusSucceeded:
 					succeeded++
-				case command.State == CommandStatusFailed && command.Failure != nil && command.Failure.Code == "invalid_decision":
+				case command.Status == CommandStatusFailed && command.Failure != nil && command.Failure.Code == "invalid_decision":
 					conflicted++
 				}
 			}

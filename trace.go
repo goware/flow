@@ -3,7 +3,6 @@ package flow
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"sort"
 	"time"
 
@@ -13,30 +12,25 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Run is a durable run state snapshot. Enqueue returns the
-// snapshot as of durable acceptance; GetRun, AwaitRun, and other
-// inspection reads return the current or final state. Created reports whether
-// the producing Enqueue call created the run; it is false for an
-// idempotent rediscovery and always false on inspection reads.
+// Run is a durable run state snapshot returned by GetRun, AwaitRun, and other
+// inspection reads. Enqueue and ReplaceCurrentRun return compact operation
+// results instead of snapshots.
 type Run struct {
-	ID            RunID
-	Type          string
-	Version       int
-	Key           string
-	RootCommandID CommandID
-	Status        RunStatus
-	FailFast      bool
-	MaxCommands   int
-	CommandCount  int
-	OpenCommands  int
-	DeadlineAt    *time.Time
-	Failure       *Failure
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	StatusAt      time.Time
-	FinishedAt    *time.Time
-	Metadata      json.RawMessage
-	Created       bool
+	ID                 RunID
+	RootCommandName    string
+	RootCommandVersion int
+	RunKey             string
+	RootCommandID      CommandID
+	Status             RunStatus
+	MaxCommands        int
+	CommandCount       int
+	OpenCommands       int
+	DeadlineAt         *time.Time
+	Failure            *Failure
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	StatusAt           time.Time
+	FinishedAt         *time.Time
 }
 
 type TraceAttempt struct {
@@ -58,8 +52,7 @@ type TraceCommand struct {
 	Name             string
 	Version          int
 	ParentCommandID  CommandID
-	Required         bool
-	State            CommandStatus
+	Status           CommandStatus
 	Args             json.RawMessage
 	Result           json.RawMessage
 	Queue            string
@@ -115,19 +108,13 @@ type RunTrace struct {
 	History  []HistoryEntry
 }
 
-type TraceOption interface {
-	applyTrace(*traceOptions)
-}
-
-type traceOptions struct{ errs []error }
-
 const maxTraceEntries = 100_000
 
 // Trace reconstructs one run and overlays its current operational
 // projections. A Runtime client gets one Flow-owned Repeatable Read snapshot.
 // A transaction-scoped client inherits the caller's isolation; callers needing
 // a coherent multi-statement snapshot must use Repeatable Read or Serializable.
-func Trace(ctx context.Context, c Client, id RunID, opts ...TraceOption) (RunTrace, error) {
+func Trace(ctx context.Context, c Client, id RunID) (RunTrace, error) {
 	runID, err := parseRunID(id)
 	if err != nil {
 		return RunTrace{}, err
@@ -135,17 +122,6 @@ func Trace(ctx context.Context, c Client, id RunID, opts ...TraceOption) (RunTra
 	client, err := resolveClient(c)
 	if err != nil {
 		return RunTrace{}, err
-	}
-	options := traceOptions{}
-	for _, option := range opts {
-		if option == nil {
-			options.errs = append(options.errs, errors.New("nil trace option"))
-			continue
-		}
-		option.applyTrace(&options)
-	}
-	if err := errors.Join(options.errs...); err != nil {
-		return RunTrace{}, newError(ErrInvalid, "trace", "options", "", err.Error())
 	}
 	var ownedTx pgx.Tx
 	if client.tx == nil {
@@ -212,8 +188,8 @@ func Trace(ctx context.Context, c Client, id RunID, opts ...TraceOption) (RunTra
 		}
 		item := TraceCommand{
 			ID: CommandID(command.ID.String()), Key: command.Key, Name: command.Name, Version: command.Version,
-			Required: command.Required, State: status,
-			Args: json.RawMessage(append([]byte(nil), command.Args...)), Result: json.RawMessage(append([]byte(nil), command.Result...)),
+			Status: status,
+			Args:   json.RawMessage(append([]byte(nil), command.Args...)), Result: json.RawMessage(append([]byte(nil), command.Result...)),
 			Queue: command.Queue, CreatedPosition: JournalPosition(command.CreatedPosition),
 			BudgetStartedAt: cloneTimePointer(command.BudgetStartedAt), NextAttemptAt: cloneTimePointer(command.NextAttemptAt),
 			Failure: cloneFailure(command.Failure),
@@ -246,7 +222,7 @@ func Trace(ctx context.Context, c Client, id RunID, opts ...TraceOption) (RunTra
 			item.TerminalPosition = &position
 		}
 		if current, ok := operationalCommands[command.ID.String()]; ok {
-			item.State, err = commandStatusFromString(current.State)
+			item.Status, err = commandStatusFromString(current.State)
 			if err != nil {
 				return RunTrace{}, newError(ErrInvalidState, "trace", "command status", current.State, "stored status is unknown")
 			}

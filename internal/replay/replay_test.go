@@ -17,12 +17,11 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	commandID := uuid.New()
 	start := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
 		V: 1, RunID: runID.String(), DefinitionName: "work",
-		DefinitionVersion: 1, RunKey: "key", Input: json.RawMessage(`{"x":1}`),
-		FailFast: true, DeadlineMode: "none", MaxCommands: 5, Metadata: json.RawMessage(`{}`),
+		DefinitionVersion: 1, RunKey: "key", DeadlineMode: "none", MaxCommands: 5,
 	})
 	created := row(t, runID, 2, store.CommandCreated, &commandID, journalcodec.CommandCreatedBody{
 		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
-		Args: json.RawMessage(`{"x":1}`), Required: true,
+		Args:         json.RawMessage(`{"x":1}`),
 		InitialState: "ready", Queue: "default", RetryPolicy: json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
 		DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
 	})
@@ -57,6 +56,25 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	if _, err := Fold([]store.JournalRow{duplicateKey}); err == nil {
 		t.Fatal("Fold() accepted a matching-hash duplicate-key body")
 	}
+	unknownVersion := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
+		V: 2, RunID: runID.String(), DefinitionName: "work",
+		DefinitionVersion: 1, RunKey: "key", DeadlineMode: "none", MaxCommands: 5,
+	})
+	if _, err := Fold([]store.JournalRow{unknownVersion}); err == nil {
+		t.Fatal("Fold() accepted an unknown run-start body version")
+	}
+	unknownFieldCommand := row(t, runID, 2, store.CommandCreated, &commandID, struct {
+		journalcodec.CommandCreatedBody
+		Unexpected bool `json:"unexpected"`
+	}{CommandCreatedBody: journalcodec.CommandCreatedBody{
+		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
+		Args: json.RawMessage(`{"x":1}`), InitialState: "ready", Queue: "default",
+		RetryPolicy:            json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
+		DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
+	}, Unexpected: true})
+	if _, err := Fold([]store.JournalRow{start, unknownFieldCommand}); err == nil {
+		t.Fatal("Fold() accepted an unknown command-created field")
+	}
 }
 
 func TestFoldValidatesApplicationEventBodies(t *testing.T) {
@@ -65,8 +83,7 @@ func TestFoldValidatesApplicationEventBodies(t *testing.T) {
 	runID := uuid.New()
 	start := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
 		V: 1, RunID: runID.String(), DefinitionName: "work",
-		DefinitionVersion: 1, RunKey: "key", Input: json.RawMessage(`{}`),
-		FailFast: true, DeadlineMode: "none", MaxCommands: 5, Metadata: json.RawMessage(`{}`),
+		DefinitionVersion: 1, RunKey: "key", DeadlineMode: "none", MaxCommands: 5,
 	})
 	application := row(t, runID, 2, store.EventRecorded, nil, journalcodec.ApplicationEventBody{
 		V: 2, Payload: json.RawMessage(`{"value":"future"}`),

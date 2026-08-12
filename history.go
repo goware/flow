@@ -13,8 +13,8 @@ import (
 type HistoryKind string
 
 const (
-	HistoryRunStarted       HistoryKind = "execution_started"
-	HistoryRunFailing       HistoryKind = "execution_failing"
+	HistoryRunStarted       HistoryKind = "run_started"
+	HistoryRunFailing       HistoryKind = "run_failing"
 	HistoryCommandCreated   HistoryKind = "command_created"
 	HistoryAttemptStarted   HistoryKind = "attempt_started"
 	HistoryAttemptConcluded HistoryKind = "attempt_concluded"

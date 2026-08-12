@@ -16,8 +16,8 @@ func TestDecisionBufferCoalescesAndPoisonsConflicts(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_child", 1)
 	scope := &Work[None]{scope: &scopeState{}}
 
-	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
-	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
+	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Delay(time.Second)
+	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Delay(time.Second)
 	if scope.scope.firstError != nil {
 		t.Fatalf("equivalent duplicate poison = %v", scope.scope.firstError)
 	}
@@ -28,6 +28,26 @@ func TestDecisionBufferCoalescesAndPoisonsConflicts(t *testing.T) {
 	Enqueue(scope, "child/1", command, decisionArgs{Value: "different"})
 	if !errors.Is(scope.scope.firstError, ErrConflict) {
 		t.Fatalf("poison = %v", scope.scope.firstError)
+	}
+}
+
+func TestDecisionBufferBoundsDistinctStagedEvents(t *testing.T) {
+	event := DefineEvent[decisionArgs]("decision.event")
+	scope := &Work[None]{scope: &scopeState{}}
+	for index := range maxStagedApplicationEvents {
+		if err := Emit(scope, event, fmt.Sprintf("event/%03d", index), decisionArgs{Value: "value"}); err != nil {
+			t.Fatalf("Emit(%d) error = %v", index, err)
+		}
+	}
+	if err := Emit(scope, event, "event/000", decisionArgs{Value: "value"}); err != nil {
+		t.Fatalf("equivalent duplicate at limit error = %v", err)
+	}
+	if got := len(scope.scope.decision.events); got != maxStagedApplicationEvents {
+		t.Fatalf("staged events = %d, want %d", got, maxStagedApplicationEvents)
+	}
+	if err := Emit(scope, event, "event/overflow", decisionArgs{Value: "value"}); !errors.Is(err, ErrInvalid) ||
+		!errors.Is(scope.scope.firstError, ErrInvalid) {
+		t.Fatalf("overflow error/poison = %v/%v, want ErrInvalid", err, scope.scope.firstError)
 	}
 }
 
@@ -144,8 +164,8 @@ func TestResultOfEnforcesTraceSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := RunTrace{Commands: []TraceCommand{
-		{Key: "success", Name: command.Name(), Version: command.Version(), State: CommandStatusSucceeded, Result: encoded.Bytes},
-		{Key: "failure", Name: command.Name(), Version: command.Version(), State: CommandStatusFailed, Failure: &Failure{Code: "boom", Message: "failed"}},
+		{Key: "success", Name: command.Name(), Version: command.Version(), Status: CommandStatusSucceeded, Result: encoded.Bytes},
+		{Key: "failure", Name: command.Name(), Version: command.Version(), Status: CommandStatusFailed, Failure: &Failure{Code: "boom", Message: "failed"}},
 	}}
 
 	result, err := ResultOf(source, "success", command)

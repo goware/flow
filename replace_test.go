@@ -36,34 +36,34 @@ func TestReplaceCurrentRunUsesExpectedIDBeforeEquivalence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	replaced, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/42",
+	replaced, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/42",
 		replaceArgs{Generation: 1}, "operator retry", options...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !replaced.Replaced || !replaced.Run.Created || replaced.Run.ID == original.ID {
+	if !replaced.Replaced || replaced.RunID == original.RunID {
 		t.Fatalf("identical replacement = %#v", replaced)
 	}
-	old, err := GetRun(ctx, runtime, original.ID)
+	old, err := GetRun(ctx, runtime, original.RunID)
 	if err != nil || old.Status != RunStatusCancelled {
 		t.Fatalf("old run = %#v, %v", old, err)
 	}
 	current, found, err := GetCurrentRun(ctx, runtime, command.Name(), "intent/42")
-	if err != nil || !found || current.ID != replaced.Run.ID {
+	if err != nil || !found || current.ID != replaced.RunID {
 		t.Fatalf("current replacement = %#v, %v, %v", current, found, err)
 	}
 
-	rediscovered, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/42",
+	rediscovered, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/42",
 		replaceArgs{Generation: 1}, "operator retry", options...)
-	if err != nil || rediscovered.Replaced || rediscovered.Run.Created || rediscovered.Run.ID != replaced.Run.ID {
+	if err != nil || rediscovered.Replaced || rediscovered.RunID != replaced.RunID {
 		t.Fatalf("equivalent retry = %#v, %v", rediscovered, err)
 	}
-	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/42",
+	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/42",
 		replaceArgs{Generation: 2}, "stale retry", options...); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale different replacement error = %v, want ErrConflict", err)
 	}
 	current, found, err = GetCurrentRun(ctx, runtime, command.Name(), "intent/42")
-	if err != nil || !found || current.ID != replaced.Run.ID {
+	if err != nil || !found || current.ID != replaced.RunID {
 		t.Fatalf("stale replacement changed current = %#v, %v, %v", current, found, err)
 	}
 
@@ -76,8 +76,8 @@ func TestReplaceCurrentRunUsesExpectedIDBeforeEquivalence(t *testing.T) {
 	if runs != 2 || live != 1 {
 		t.Fatalf("replacement generations = %d total, %d live", runs, live)
 	}
-	assertReplayMatches(t, runtime, original.ID)
-	assertReplayMatches(t, runtime, replaced.Run.ID)
+	assertReplayMatches(t, runtime, original.RunID)
+	assertReplayMatches(t, runtime, replaced.RunID)
 }
 
 func TestReplaceCurrentRunValidatesLiveRootAndAbsence(t *testing.T) {
@@ -96,16 +96,16 @@ func TestReplaceCurrentRunValidatesLiveRootAndAbsence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/validation", replaceArgs{}, "missing live option"); !errors.Is(err, ErrInvalid) {
+	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/validation", replaceArgs{}, "missing live option"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("permanent replacement error = %v, want ErrInvalid", err)
 	}
-	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "", replaceArgs{}, "empty key", WithLiveKey()); !errors.Is(err, ErrInvalid) {
+	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "", replaceArgs{}, "empty key", WithLiveKey()); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("empty-key replacement error = %v, want ErrInvalid", err)
 	}
-	if err := CancelRun(ctx, runtime, original.ID, "validation complete"); err != nil {
+	if err := CancelRun(ctx, runtime, original.RunID, "validation complete"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/validation", replaceArgs{}, "no current", WithLiveKey(), WithStartDelay(time.Hour)); !errors.Is(err, ErrConflict) {
+	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/validation", replaceArgs{}, "no current", WithLiveKey(), WithStartDelay(time.Hour)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("absent replacement error = %v, want ErrConflict", err)
 	}
 }
@@ -134,14 +134,14 @@ func TestReplaceCurrentRunCallerTransactionRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	flowTx := runtime.InTx(tx)
-	replacement, err := command.ReplaceCurrentRun(ctx, flowTx, original.ID, "intent/rollback",
+	replacement, err := command.ReplaceCurrentRun(ctx, flowTx, original.RunID, "intent/rollback",
 		replaceArgs{}, "rollback replacement", WithLiveKey(), WithStartDelay(time.Hour))
 	if err != nil || !replacement.Replaced {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("transaction replacement = %#v, %v", replacement, err)
 	}
 	current, found, err := GetCurrentRun(ctx, flowTx, command.Name(), "intent/rollback")
-	if err != nil || !found || current.ID != replacement.Run.ID {
+	if err != nil || !found || current.ID != replacement.RunID {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("transaction current = %#v, %v, %v", current, found, err)
 	}
@@ -158,10 +158,10 @@ func TestReplaceCurrentRunCallerTransactionRollback(t *testing.T) {
 	}
 
 	current, found, err = GetCurrentRun(ctx, runtime, command.Name(), "intent/rollback")
-	if err != nil || !found || current.ID != original.ID || current.Status != RunStatusRunning {
+	if err != nil || !found || current.ID != original.RunID || current.Status != RunStatusRunning {
 		t.Fatalf("current after rollback = %#v, %v, %v", current, found, err)
 	}
-	if _, err := GetRun(ctx, runtime, replacement.Run.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := GetRun(ctx, runtime, replacement.RunID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("rolled-back replacement lookup error = %v, want ErrNotFound", err)
 	}
 	var records int
@@ -195,7 +195,7 @@ func TestReplaceCurrentRunCallerTransactionCommit(t *testing.T) {
 	}
 	defer tx.Rollback(ctx)
 	flowTx := runtime.InTx(tx)
-	replacement, err := command.ReplaceCurrentRun(ctx, flowTx, original.ID, "intent/commit",
+	replacement, err := command.ReplaceCurrentRun(ctx, flowTx, original.RunID, "intent/commit",
 		replaceArgs{Generation: 2}, "committed replacement", WithLiveKey(), WithStartDelay(time.Hour))
 	if err != nil || !replacement.Replaced {
 		t.Fatalf("transaction replacement = %#v, %v", replacement, err)
@@ -211,10 +211,10 @@ func TestReplaceCurrentRunCallerTransactionCommit(t *testing.T) {
 	}
 
 	current, found, err := GetCurrentRun(ctx, runtime, command.Name(), "intent/commit")
-	if err != nil || !found || current.ID != replacement.Run.ID {
+	if err != nil || !found || current.ID != replacement.RunID {
 		t.Fatalf("committed current = %#v, %v, %v", current, found, err)
 	}
-	old, err := GetRun(ctx, runtime, original.ID)
+	old, err := GetRun(ctx, runtime, original.RunID)
 	if err != nil || old.Status != RunStatusCancelled {
 		t.Fatalf("committed predecessor = %#v, %v", old, err)
 	}
@@ -222,8 +222,8 @@ func TestReplaceCurrentRunCallerTransactionCommit(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "replace_commit_records")).Scan(&records); err != nil || records != 1 {
 		t.Fatalf("committed records = %d, %v", records, err)
 	}
-	assertReplayMatches(t, runtime, original.ID)
-	assertReplayMatches(t, runtime, replacement.Run.ID)
+	assertReplayMatches(t, runtime, original.RunID)
+	assertReplayMatches(t, runtime, replacement.RunID)
 }
 
 func TestConcurrentEquivalentCurrentRunReplacementCreatesOneSuccessor(t *testing.T) {
@@ -254,7 +254,7 @@ func TestConcurrentEquivalentCurrentRunReplacementCreatesOneSuccessor(t *testing
 		go func() {
 			ready.Done()
 			<-start
-			result, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/concurrent",
+			result, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/concurrent",
 				replaceArgs{}, "concurrent retry", WithLiveKey(), WithStartDelay(time.Hour))
 			outcomes <- outcome{result: result, err: err}
 		}()
@@ -262,7 +262,7 @@ func TestConcurrentEquivalentCurrentRunReplacementCreatesOneSuccessor(t *testing
 	ready.Wait()
 	close(start)
 	first, second := <-outcomes, <-outcomes
-	if first.err != nil || second.err != nil || first.result.Run.ID != second.result.Run.ID || first.result.Replaced == second.result.Replaced {
+	if first.err != nil || second.err != nil || first.result.RunID != second.result.RunID || first.result.Replaced == second.result.Replaced {
 		t.Fatalf("concurrent outcomes = %#v / %#v", first, second)
 	}
 	var live int
@@ -301,7 +301,7 @@ func TestConcurrentDifferentCurrentRunReplacementRejectsLoser(t *testing.T) {
 	for generation := 1; generation <= 2; generation++ {
 		go func(generation int) {
 			<-start
-			result, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/concurrent-different",
+			result, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/concurrent-different",
 				replaceArgs{Generation: generation}, "concurrent different retry", WithLiveKey(), WithStartDelay(time.Hour))
 			outcomes <- outcome{generation: generation, result: result, err: err}
 		}(generation)
@@ -326,7 +326,7 @@ func TestConcurrentDifferentCurrentRunReplacementRejectsLoser(t *testing.T) {
 		t.Fatalf("concurrent outcomes = %#v / %#v", first, second)
 	}
 	current, found, err := GetCurrentRun(ctx, runtime, command.Name(), "intent/concurrent-different")
-	if err != nil || !found || current.ID != winner.result.Run.ID {
+	if err != nil || !found || current.ID != winner.result.RunID {
 		t.Fatalf("current winner = %#v, found=%v err=%v generation=%d", current, found, err, winner.generation)
 	}
 }
@@ -353,13 +353,13 @@ func TestReplaceCurrentRunRollsBackBeforeCommitFault(t *testing.T) {
 		}
 		return nil
 	})
-	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/rollback-fault",
+	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/rollback-fault",
 		replaceArgs{Generation: 1}, "faulted retry", WithLiveKey(), WithStartDelay(time.Hour)); !errors.Is(err, fault.ErrInjected) {
 		t.Fatalf("faulted replacement error = %v", err)
 	}
 	runtime.faults = fault.None{}
 	current, found, err := GetCurrentRun(ctx, runtime, command.Name(), "intent/rollback-fault")
-	if err != nil || !found || current.ID != original.ID || current.Status != RunStatusRunning {
+	if err != nil || !found || current.ID != original.RunID || current.Status != RunStatusRunning {
 		t.Fatalf("current after fault = %#v, %v, %v", current, found, err)
 	}
 	var generations int
@@ -395,13 +395,13 @@ func TestReplaceCurrentRunRollsBackWhenSuccessorInsertFails(t *testing.T) {
 		FOR EACH ROW EXECUTE FUNCTION `+schema+`.reject_replacement_insert()`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/insert-fault",
+	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/insert-fault",
 		replaceArgs{Generation: 2}, "insert failure", WithLiveKey(), WithStartDelay(time.Hour)); err == nil {
 		t.Fatal("replacement unexpectedly survived successor insert failure")
 	}
 
 	current, found, err := GetCurrentRun(ctx, runtime, command.Name(), "intent/insert-fault")
-	if err != nil || !found || current.ID != original.ID || current.Status != RunStatusRunning {
+	if err != nil || !found || current.ID != original.RunID || current.Status != RunStatusRunning {
 		t.Fatalf("current after insert failure = %#v, %v, %v", current, found, err)
 	}
 	var generations int
@@ -412,7 +412,7 @@ func TestReplaceCurrentRunRollsBackWhenSuccessorInsertFails(t *testing.T) {
 	if generations != 1 {
 		t.Fatalf("generations after insert failure = %d, want 1", generations)
 	}
-	assertReplayMatches(t, runtime, original.ID)
+	assertReplayMatches(t, runtime, original.RunID)
 }
 
 func TestReplaceCurrentRunRacingCancellationHasOneAtomicOutcome(t *testing.T) {
@@ -441,7 +441,7 @@ func TestReplaceCurrentRunRacingCancellationHasOneAtomicOutcome(t *testing.T) {
 		cancelResult := make(chan error, 1)
 		go func() {
 			<-start
-			value, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, key,
+			value, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, key,
 				replaceArgs{Generation: 2}, "replacement won", WithLiveKey(), WithStartDelay(time.Hour))
 			replaceResult <- struct {
 				value ReplaceRunResult
@@ -450,7 +450,7 @@ func TestReplaceCurrentRunRacingCancellationHasOneAtomicOutcome(t *testing.T) {
 		}()
 		go func() {
 			<-start
-			cancelResult <- CancelRun(ctx, runtime, original.ID, "cancellation won")
+			cancelResult <- CancelRun(ctx, runtime, original.RunID, "cancellation won")
 		}()
 		close(start)
 		replaced, cancelled := <-replaceResult, <-cancelResult
@@ -461,7 +461,7 @@ func TestReplaceCurrentRunRacingCancellationHasOneAtomicOutcome(t *testing.T) {
 				t.Fatalf("iteration %d replacement winner = %#v, cancel error %v", iteration, replaced, cancelled)
 			}
 			current, found, err := GetCurrentRun(ctx, runtime, command.Name(), key)
-			if err != nil || !found || current.ID != replaced.value.Run.ID {
+			if err != nil || !found || current.ID != replaced.value.RunID {
 				t.Fatalf("iteration %d current replacement = %#v, %v, %v", iteration, current, found, err)
 			}
 		case errors.Is(replaced.err, ErrConflict):
@@ -482,9 +482,9 @@ func TestReplaceCurrentRunRacingCancellationHasOneAtomicOutcome(t *testing.T) {
 		if live > 1 {
 			t.Fatalf("iteration %d live holders = %d", iteration, live)
 		}
-		assertReplayMatches(t, runtime, original.ID)
+		assertReplayMatches(t, runtime, original.RunID)
 		if replaced.err == nil {
-			assertReplayMatches(t, runtime, replaced.value.Run.ID)
+			assertReplayMatches(t, runtime, replaced.value.RunID)
 		}
 	}
 }
@@ -513,12 +513,12 @@ func TestReplaceCurrentRunRacingOrdinaryEnqueueKeepsOneLiveHolder(t *testing.T) 
 			err   error
 		}, 1)
 		enqueueResult := make(chan struct {
-			value Run
+			value EnqueueResult
 			err   error
 		}, 1)
 		go func() {
 			<-start
-			value, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, key,
+			value, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, key,
 				replaceArgs{Generation: 2}, "replacement", WithLiveKey(), WithStartDelay(time.Hour))
 			replaceResult <- struct {
 				value ReplaceRunResult
@@ -529,7 +529,7 @@ func TestReplaceCurrentRunRacingOrdinaryEnqueueKeepsOneLiveHolder(t *testing.T) 
 			<-start
 			value, err := command.Enqueue(ctx, runtime, key, replaceArgs{Generation: 2}, WithLiveKey(), WithStartDelay(time.Hour))
 			enqueueResult <- struct {
-				value Run
+				value EnqueueResult
 				err   error
 			}{value: value, err: err}
 		}()
@@ -538,11 +538,11 @@ func TestReplaceCurrentRunRacingOrdinaryEnqueueKeepsOneLiveHolder(t *testing.T) 
 		if replaced.err != nil || !replaced.value.Replaced || enqueued.err != nil || enqueued.value.Created {
 			t.Fatalf("iteration %d replace=%#v enqueue=%#v", iteration, replaced, enqueued)
 		}
-		if enqueued.value.ID != original.ID && enqueued.value.ID != replaced.value.Run.ID {
-			t.Fatalf("iteration %d enqueue returned unrelated run %s", iteration, enqueued.value.ID)
+		if enqueued.value.RunID != original.RunID && enqueued.value.RunID != replaced.value.RunID {
+			t.Fatalf("iteration %d enqueue returned unrelated run %s", iteration, enqueued.value.RunID)
 		}
 		current, found, err := GetCurrentRun(ctx, runtime, command.Name(), key)
-		if err != nil || !found || current.ID != replaced.value.Run.ID {
+		if err != nil || !found || current.ID != replaced.value.RunID {
 			t.Fatalf("iteration %d current = %#v, %v, %v", iteration, current, found, err)
 		}
 		var live int
@@ -553,8 +553,8 @@ func TestReplaceCurrentRunRacingOrdinaryEnqueueKeepsOneLiveHolder(t *testing.T) 
 		if live != 1 {
 			t.Fatalf("iteration %d live holders = %d, want 1", iteration, live)
 		}
-		assertReplayMatches(t, runtime, original.ID)
-		assertReplayMatches(t, runtime, replaced.value.Run.ID)
+		assertReplayMatches(t, runtime, original.RunID)
+		assertReplayMatches(t, runtime, replaced.value.RunID)
 	}
 }
 
@@ -597,7 +597,7 @@ func TestReplaceCurrentRunRacingTerminalSettlementHasOneWinner(t *testing.T) {
 	}, 1)
 	go func() {
 		<-start
-		value, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/settlement-race",
+		value, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/settlement-race",
 			replaceArgs{Generation: 2}, "settlement race", WithLiveKey(), WithStartDelay(time.Hour))
 		replaceResult <- struct {
 			value ReplaceRunResult
@@ -607,9 +607,9 @@ func TestReplaceCurrentRunRacingTerminalSettlementHasOneWinner(t *testing.T) {
 	close(start)
 	close(release)
 	replaced := <-replaceResult
-	waitForRunStatusAny(t, database.Schema, database.DB.Conn, original.ID,
+	waitForRunStatusAny(t, database.Schema, database.DB.Conn, original.RunID,
 		[]string{"succeeded", "cancelled"}, 5*time.Second)
-	old, err := GetRun(ctx, runtime, original.ID)
+	old, err := GetRun(ctx, runtime, original.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -619,10 +619,10 @@ func TestReplaceCurrentRunRacingTerminalSettlementHasOneWinner(t *testing.T) {
 			t.Fatalf("replacement winner = %#v, predecessor = %#v", replaced, old)
 		}
 		current, found, err := GetCurrentRun(ctx, runtime, command.Name(), "intent/settlement-race")
-		if err != nil || !found || current.ID != replaced.value.Run.ID {
+		if err != nil || !found || current.ID != replaced.value.RunID {
 			t.Fatalf("replacement current = %#v, %v, %v", current, found, err)
 		}
-		assertReplayMatches(t, runtime, replaced.value.Run.ID)
+		assertReplayMatches(t, runtime, replaced.value.RunID)
 	case errors.Is(replaced.err, ErrConflict):
 		if old.Status != RunStatusSucceeded {
 			t.Fatalf("settlement winner predecessor = %#v", old)
@@ -633,7 +633,7 @@ func TestReplaceCurrentRunRacingTerminalSettlementHasOneWinner(t *testing.T) {
 	default:
 		t.Fatalf("replacement error = %v", replaced.err)
 	}
-	assertReplayMatches(t, runtime, original.ID)
+	assertReplayMatches(t, runtime, original.RunID)
 }
 
 func TestReplaceCurrentRunRacingExpiryHasOneAtomicOutcome(t *testing.T) {
@@ -656,7 +656,7 @@ func TestReplaceCurrentRunRacingExpiryHasOneAtomicOutcome(t *testing.T) {
 			t.Fatal(err)
 		}
 		time.Sleep(5 * time.Millisecond)
-		originalID, err := parseRunID(original.ID)
+		originalID, err := parseRunID(original.RunID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -671,7 +671,7 @@ func TestReplaceCurrentRunRacingExpiryHasOneAtomicOutcome(t *testing.T) {
 		}, 1)
 		go func() {
 			<-start
-			value, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, key,
+			value, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, key,
 				replaceArgs{Generation: 2}, "expiry race replacement", WithLiveKey(), WithStartDelay(time.Hour))
 			replaceResult <- struct {
 				value ReplaceRunResult
@@ -691,7 +691,7 @@ func TestReplaceCurrentRunRacingExpiryHasOneAtomicOutcome(t *testing.T) {
 		if expired.err != nil {
 			t.Fatalf("iteration %d expiry error = %v", iteration, expired.err)
 		}
-		old, err := GetRun(ctx, runtime, original.ID)
+		old, err := GetRun(ctx, runtime, original.RunID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -701,10 +701,10 @@ func TestReplaceCurrentRunRacingExpiryHasOneAtomicOutcome(t *testing.T) {
 				t.Fatalf("iteration %d replacement winner=%#v expiry=%#v old=%#v", iteration, replaced, expired, old)
 			}
 			current, found, err := GetCurrentRun(ctx, runtime, command.Name(), key)
-			if err != nil || !found || current.ID != replaced.value.Run.ID {
+			if err != nil || !found || current.ID != replaced.value.RunID {
 				t.Fatalf("iteration %d current replacement=%#v found=%v err=%v", iteration, current, found, err)
 			}
-			assertReplayMatches(t, runtime, replaced.value.Run.ID)
+			assertReplayMatches(t, runtime, replaced.value.RunID)
 		case errors.Is(replaced.err, ErrConflict):
 			if !expired.changed || old.Status != RunStatusExpired {
 				t.Fatalf("iteration %d expiry winner=%#v replacement=%#v old=%#v", iteration, expired, replaced, old)
@@ -715,7 +715,7 @@ func TestReplaceCurrentRunRacingExpiryHasOneAtomicOutcome(t *testing.T) {
 		default:
 			t.Fatalf("iteration %d replacement error=%v expiry=%#v", iteration, replaced.err, expired)
 		}
-		assertReplayMatches(t, runtime, original.ID)
+		assertReplayMatches(t, runtime, original.RunID)
 	}
 }
 
@@ -758,14 +758,14 @@ func TestReplaceCurrentRunRecoversAmbiguousCommit(t *testing.T) {
 		}
 		return nil
 	})
-	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/ambiguous",
+	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/ambiguous",
 		replaceArgs{}, "ambiguous retry", WithLiveKey(), WithStartDelay(time.Hour)); !errors.Is(err, fault.ErrInjected) {
 		t.Fatalf("ambiguous replacement error = %v", err)
 	}
 	runtime.faults = fault.None{}
-	recovered, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/ambiguous",
+	recovered, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/ambiguous",
 		replaceArgs{}, "ambiguous retry", WithLiveKey(), WithStartDelay(time.Hour))
-	if err != nil || recovered.Replaced || recovered.Run.ID == original.ID {
+	if err != nil || recovered.Replaced || recovered.RunID == original.RunID {
 		t.Fatalf("ambiguous retry = %#v, %v", recovered, err)
 	}
 }
@@ -793,7 +793,7 @@ func TestReplaceCurrentRunContextCancellationBeforeCommitIsAtomic(t *testing.T) 
 		}
 		return nil
 	})
-	_, replaceErr := command.ReplaceCurrentRun(commitCtx, runtime, original.ID, "intent/cancelled-commit",
+	_, replaceErr := command.ReplaceCurrentRun(commitCtx, runtime, original.RunID, "intent/cancelled-commit",
 		replaceArgs{Generation: 2}, "cancelled commit", WithLiveKey(), WithStartDelay(time.Hour))
 	if replaceErr == nil {
 		t.Fatal("replacement unexpectedly reported success after its commit context was cancelled")
@@ -804,7 +804,7 @@ func TestReplaceCurrentRunContextCancellationBeforeCommitIsAtomic(t *testing.T) 
 	if err != nil || !found {
 		t.Fatalf("current after cancelled commit = %#v, found=%v err=%v", current, found, err)
 	}
-	old, err := GetRun(ctx, runtime, original.ID)
+	old, err := GetRun(ctx, runtime, original.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -817,7 +817,7 @@ func TestReplaceCurrentRunContextCancellationBeforeCommitIsAtomic(t *testing.T) 
 	if live != 1 || generations < 1 || generations > 2 {
 		t.Fatalf("cancelled commit generations=%d live=%d", generations, live)
 	}
-	if current.ID == original.ID {
+	if current.ID == original.RunID {
 		if old.Status != RunStatusRunning || generations != 1 {
 			t.Fatalf("rolled-back outcome current=%#v old=%#v generations=%d", current, old, generations)
 		}
@@ -827,7 +827,7 @@ func TestReplaceCurrentRunContextCancellationBeforeCommitIsAtomic(t *testing.T) 
 		}
 		assertReplayMatches(t, runtime, current.ID)
 	}
-	assertReplayMatches(t, runtime, original.ID)
+	assertReplayMatches(t, runtime, original.RunID)
 }
 
 func TestReplaceCurrentRunPublishesObservationsOnlyAfterOwnedCommit(t *testing.T) {
@@ -849,21 +849,21 @@ func TestReplaceCurrentRunPublishesObservationsOnlyAfterOwnedCommit(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observations := waitForObservations(t, observer, 1); len(observations) != 1 || observations[0].RunID != original.ID || observations[0].Operation != "start" {
+	if observations := waitForObservations(t, observer, 1); len(observations) != 1 || observations[0].RunID != original.RunID || observations[0].Operation != "start" {
 		t.Fatalf("original observations = %#v", observations)
 	}
-	replaced, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/observations",
+	replaced, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/observations",
 		replaceArgs{Generation: 2}, "observed replacement", WithLiveKey(), WithStartDelay(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	observations := waitForObservations(t, observer, 3)
 	if len(observations) != 3 ||
-		observations[1].Operation != "cancel" || observations[1].RunID != original.ID ||
-		observations[2].Operation != "start" || observations[2].RunID != replaced.Run.ID {
+		observations[1].Operation != "cancel" || observations[1].RunID != original.RunID ||
+		observations[2].Operation != "start" || observations[2].RunID != replaced.RunID {
 		t.Fatalf("replacement observations = %#v", observations)
 	}
-	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.ID, "intent/observations",
+	if _, err := command.ReplaceCurrentRun(ctx, runtime, original.RunID, "intent/observations",
 		replaceArgs{Generation: 2}, "observed replacement", WithLiveKey(), WithStartDelay(time.Hour)); err != nil {
 		t.Fatal(err)
 	}

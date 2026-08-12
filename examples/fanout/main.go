@@ -157,8 +157,8 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Run, fl
 	if err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
-	trace, err := waitForTerminal(ctx, runtime, run.ID, 8*time.Second)
-	return run, trace, err
+	trace, err := waitForTerminal(ctx, runtime, run.RunID, 8*time.Second)
+	return trace.Run, trace, err
 }
 
 // prepareReport discovers the stable part list and atomically stages every

@@ -18,7 +18,6 @@ type StagedCommand struct {
 	Name       string
 	Version    int
 	Args       json.RawMessage
-	Required   bool
 	StartAfter time.Duration
 	Waits      []EventWait
 	Within     time.Duration
@@ -255,7 +254,7 @@ func publicCommands(values []testengine.StagedCommand) []StagedCommand {
 	result := make([]StagedCommand, len(values))
 	for i, value := range values {
 		result[i] = StagedCommand{Key: value.Key, Name: value.Name, Version: value.Version,
-			Args: value.Args, Required: value.Required, StartAfter: value.StartAfter,
+			Args: value.Args, StartAfter: value.StartAfter,
 			Within: value.Within, Waits: make([]EventWait, len(value.Waits))}
 		for j, wait := range value.Waits {
 			result[i].Waits[j] = EventWait{Name: wait.Name, Key: wait.Key}

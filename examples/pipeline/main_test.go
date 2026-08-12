@@ -80,7 +80,7 @@ func TestPipelineEventKeyFencesGenerations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := flow.CancelRun(ctx, runtime, first.ID, "advance generation"); err != nil {
+	if err := flow.CancelRun(ctx, runtime, first.RunID, "advance generation"); err != nil {
 		t.Fatal(err)
 	}
 	secondArgs := orderArgs{OrderID: firstArgs.OrderID, Generation: 2}
@@ -88,18 +88,18 @@ func TestPipelineEventKeyFencesGenerations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := approvalGranted.Deliver(ctx, runtime, second.ID, orderFactKey(firstArgs.OrderID, firstArgs.Generation), approval{Reviewer: "stale"}); err != nil {
+	if err := approvalGranted.Deliver(ctx, runtime, second.RunID, orderFactKey(firstArgs.OrderID, firstArgs.Generation), approval{Reviewer: "stale"}); err != nil {
 		t.Fatal(err)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		trace, err := flow.Trace(ctx, runtime, second.ID)
+		trace, err := flow.Trace(ctx, runtime, second.RunID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, command := range trace.Commands {
-			if command.Key == "approval/resumed" && command.State == flow.CommandStatusPending {
+			if command.Key == "approval/resumed" && command.Status == flow.CommandStatusPending {
 				goto staleDidNotRelease
 			}
 		}
@@ -108,15 +108,15 @@ func TestPipelineEventKeyFencesGenerations(t *testing.T) {
 	t.Fatal("approval successor did not remain pending on the generation-2 fact")
 
 staleDidNotRelease:
-	if err := approvalGranted.Deliver(ctx, runtime, second.ID, orderFactKey(secondArgs.OrderID, secondArgs.Generation), approval{Reviewer: "current"}); err != nil {
+	if err := approvalGranted.Deliver(ctx, runtime, second.RunID, orderFactKey(secondArgs.OrderID, secondArgs.Generation), approval{Reviewer: "current"}); err != nil {
 		t.Fatal(err)
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	settled, err := flow.AwaitRun(waitCtx, runtime, second.ID)
+	settled, err := flow.AwaitRun(waitCtx, runtime, second.RunID)
 	if err != nil || settled.Status != flow.RunStatusSucceeded {
 		t.Fatalf("generation-2 run=%#v err=%v", settled, err)
 	}
-	replaytest.AssertMatchesLive(t, database.DB, database.Schema, first.ID)
-	replaytest.AssertMatchesLive(t, database.DB, database.Schema, second.ID)
+	replaytest.AssertMatchesLive(t, database.DB, database.Schema, first.RunID)
+	replaytest.AssertMatchesLive(t, database.DB, database.Schema, second.RunID)
 }

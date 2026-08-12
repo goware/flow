@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/goware/flow/internal/canonical"
@@ -15,19 +16,24 @@ import (
 // RunStartedBody is the versioned logical start record retained by the
 // journal. Raw JSON fields already contain canonical application values.
 type RunStartedBody struct {
-	V                 int             `json:"v"`
-	RunID             string          `json:"execution_id"`
-	DefinitionName    string          `json:"definition_name"`
-	DefinitionVersion int             `json:"definition_version"`
-	RunKey            string          `json:"execution_key"`
-	KeyScope          string          `json:"key_scope,omitempty"`
-	Input             json.RawMessage `json:"input"`
-	FailFast          bool            `json:"fail_fast"`
-	DeadlineMode      string          `json:"deadline_mode"`
-	DeadlineDuration  int64           `json:"deadline_duration_ms,omitempty"`
-	DeadlineAt        *time.Time      `json:"deadline_at,omitempty"`
-	MaxCommands       int             `json:"max_commands"`
-	Metadata          json.RawMessage `json:"metadata"`
+	V                 int        `json:"v"`
+	RunID             string     `json:"run_id"`
+	DefinitionName    string     `json:"definition_name"`
+	DefinitionVersion int        `json:"definition_version"`
+	RunKey            string     `json:"run_key"`
+	KeyScope          string     `json:"key_scope,omitempty"`
+	DeadlineMode      string     `json:"deadline_mode"`
+	DeadlineDuration  int64      `json:"deadline_duration_ms,omitempty"`
+	DeadlineAt        *time.Time `json:"deadline_at,omitempty"`
+	MaxCommands       int        `json:"max_commands"`
+}
+
+type RunFailingBody struct {
+	V          int      `json:"v"`
+	Status     string   `json:"status"`
+	Reason     string   `json:"reason"`
+	CommandKey string   `json:"command_key"`
+	Survivors  []string `json:"survivors"`
 }
 
 type CommandCreatedBody struct {
@@ -38,7 +44,6 @@ type CommandCreatedBody struct {
 	Version                int             `json:"version"`
 	Args                   json.RawMessage `json:"args"`
 	ParentCommandID        string          `json:"parent_command_id,omitempty"`
-	Required               bool            `json:"required"`
 	InitialState           string          `json:"initial_state"`
 	Queue                  string          `json:"queue"`
 	AttemptTimeoutMS       *int64          `json:"attempt_timeout_ms,omitempty"`
@@ -124,12 +129,25 @@ func Encode(body any) (canonical.Value, error) {
 
 func Decode[T any](body []byte) (T, error) {
 	var zero T
-	if _, err := Version(body); err != nil {
+	version, err := Version(body)
+	if err != nil {
 		return zero, err
 	}
+	if version != 1 {
+		return zero, fmt.Errorf("%w: unsupported journal body version %d", ErrVersion, version)
+	}
 	var decoded T
-	if err := canonical.Decode(body, &decoded); err != nil {
-		return zero, err
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return zero, fmt.Errorf("decode journal body: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return zero, errors.New("decode journal body: trailing value")
+		}
+		return zero, fmt.Errorf("decode journal body: trailing data: %w", err)
 	}
 	return decoded, nil
 }

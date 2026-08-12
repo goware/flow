@@ -364,7 +364,7 @@ func TestSchemaConstraints(t *testing.T) {
 
 	_, err = db.Conn.Exec(ctx, `INSERT INTO `+pgschema.Table(schema, "flow_journal")+`
 		(run_id,position,entry_id,entry_kind,recorded_at,event_id,event_namespace,event_name,event_key,event_class,body,body_hash)
-		VALUES ($1,1,$2,'execution_started',clock_timestamp(),$3,'application','event','key','application','{}'::text::bytea,decode(repeat('00',32),'hex'))`,
+		VALUES ($1,1,$2,'run_started',clock_timestamp(),$3,'application','event','key','application','{}'::text::bytea,decode(repeat('00',32),'hex'))`,
 		validID, uuid.New(), uuid.New())
 	assertConstraint(t, err, "flow_journal_event_shape_ck")
 	if validID == uuid.Nil {
@@ -410,10 +410,10 @@ func TestSparseEventWaitUpdateUsesProductionReverseIndexQuery(t *testing.T) {
 		t.Fatalf("load root command: %v", err)
 	}
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+commands+` (
-		command_id,run_id,command_key,name,version,parent_command_id,required,args,declaration_fingerprint,
+		command_id,run_id,command_key,name,version,parent_command_id,args,declaration_fingerprint,
 		state,unsatisfied_waits,queue,retry_policy,wait_started_at,wait_timeout_ms,
 		created_position,created_at,updated_at,status_at)
-		SELECT md5($1::text||':'||g::text)::uuid,$1::uuid,'scale/'||g::text,'store.sparse.synthetic',1,$2::uuid,true,
+		SELECT md5($1::text||':'||g::text)::uuid,$1::uuid,'scale/'||g::text,'store.sparse.synthetic',1,$2::uuid,
 		       convert_to('{}','UTF8'),decode(repeat('00',32),'hex'),'pending',1,'default',convert_to('{}','UTF8'),
 		       clock_timestamp(),3600000,1,clock_timestamp(),clock_timestamp(),clock_timestamp()
 		FROM generate_series(0,10000) AS g`, runID, rootID); err != nil {
@@ -530,12 +530,11 @@ func seedRun(t *testing.T, db *pgkit.DB, schema, key string) uuid.UUID {
 func runInsertSQL(schema string) string {
 	return `INSERT INTO ` + pgschema.Table(schema, "flow_runs") + ` (
 		run_id, definition_name, definition_version, run_key, status,
-		start_fingerprint, input, metadata, metadata_canonical,
+		start_fingerprint,
 		max_commands, command_count, open_commands, root_command_id,
 		created_at, updated_at, status_at, finished_at
 	) VALUES ($1,$2,$3,$4,$5,
-		decode(repeat('00',32),'hex'), '{}'::text::bytea,
-		'{}'::jsonb, '{}'::text::bytea,
+		decode(repeat('00',32),'hex'),
 		100, 1, 1, $7, clock_timestamp(), clock_timestamp(), clock_timestamp(), $6)`
 }
 

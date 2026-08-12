@@ -368,7 +368,7 @@ func (s *Store) ClaimCommands(
 		current = semantic.continueBatch()
 	}
 
-	// Elapsed-budget expiry is uncommon and can enter fail-fast, append several
+	// Elapsed-budget expiry is uncommon and can fail the run, append several
 	// semantic rows, and terminalize the run. Keep that transition focused
 	// and auditable after ordinary siblings have installed their running fences.
 	for index := range expired {
@@ -380,7 +380,7 @@ func (s *Store) ClaimCommands(
 		if !eligible {
 			continue
 		}
-		if err := s.failBeforeClaimLocked(ctx, current, command.candidate.CommandID, command.key, command.required,
+		if err := s.failBeforeClaimLocked(ctx, current, command.candidate.CommandID, command.key,
 			"retry_elapsed", "retry elapsed budget expired", command.createdPosition); err != nil {
 			return ClaimBatchResult{}, err
 		}
@@ -419,7 +419,6 @@ type claimBatchCommand struct {
 	ordinal         int
 	consumed        int
 	createdPosition int64
-	required        bool
 	retryPolicy     retrypolicy.Policy
 	attemptTimeout  time.Duration
 	attempt         int
@@ -438,7 +437,7 @@ func (s *Store) lockClaimBatch(ctx context.Context, semantic *SemanticTx, candid
 	)
 	SELECT r.ordinality,c.command_key,c.name,c.version,c.args,c.queue,c.attempt_timeout_ms,
 		c.retry_policy,c.created_at,c.budget_started_at,c.attempt_ordinal,c.consumed_attempts,
-		c.created_position,c.required,c.state,q.state,q.next_run_at
+		c.created_position,c.state,q.state,q.next_run_at
 	FROM requested r
 	JOIN `+pgschema.Table(s.schema, "flow_command_queue")+` q ON q.command_id=r.command_id
 	JOIN `+pgschema.Table(s.schema, "flow_commands")+` c ON c.command_id=q.command_id
@@ -457,7 +456,7 @@ func (s *Store) lockClaimBatch(ctx context.Context, semantic *SemanticTx, candid
 		var nextRunAt time.Time
 		if err := rows.Scan(&ordinality, &command.key, &command.name, &command.version, &command.args, &command.queue,
 			&command.timeoutMS, &command.policyBytes, &command.createdAt, &command.budgetStartedAt, &command.ordinal,
-			&command.consumed, &command.createdPosition, &command.required, &commandState, &queueState, &nextRunAt); err != nil {
+			&command.consumed, &command.createdPosition, &commandState, &queueState, &nextRunAt); err != nil {
 			return nil, MapError("scan command claim batch", err)
 		}
 		if ordinality < 1 || ordinality > int64(len(candidates)) {
@@ -600,7 +599,6 @@ func (s *Store) failBeforeClaimLocked(
 	semantic *SemanticTx,
 	commandID uuid.UUID,
 	key string,
-	required bool,
 	code, message string,
 	causation int64,
 ) error {
@@ -608,10 +606,7 @@ func (s *Store) failBeforeClaimLocked(
 	if err != nil {
 		return err
 	}
-	failureEffects := failureResolution{}
-	if required {
-		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, commandID, "failed", head.FailFast)
-	}
+	failureEffects, err := s.resolveCommandFailureLocked(ctx, semantic, commandID, "failed")
 	if err != nil {
 		return err
 	}
@@ -621,14 +616,13 @@ func (s *Store) failBeforeClaimLocked(
 	}
 	commandEvent.CausationPosition = clonePointer(&causation)
 	entries := []JournalEntry{commandEvent}
-	if required && head.Status == "running" {
+	if head.Status == "running" {
 		survivors := make([]string, len(failureEffects.survivors))
 		for index, command := range failureEffects.survivors {
 			survivors[index] = command.key
 		}
-		failing, err := NewJournalEntry(RunFailing, map[string]any{
-			"v": 1, "status": "failing", "reason": message, "command_key": key,
-			"fail_fast": head.FailFast, "survivors": survivors,
+		failing, err := NewJournalEntry(RunFailing, journalcodec.RunFailingBody{
+			V: 1, Status: "failing", Reason: message, CommandKey: key, Survivors: survivors,
 		})
 		if err != nil {
 			return err
@@ -638,12 +632,11 @@ func (s *Store) failBeforeClaimLocked(
 		entries = append(entries, failing)
 	}
 	cancelledOffset := len(entries)
-	cancelledEntries, err := failureEffects.cancellationEntries(0, "cancelled by fail-fast after required command failure")
+	cancelledEntries, err := failureEffects.cancellationEntries(0, "cancelled after command failure")
 	if err != nil {
 		return err
 	}
 	entries = append(entries, cancelledEntries...)
-	runFailed := required || head.Status == "failing"
 	effectiveOpen, err := durable.AddPostgresInteger("run open commands", head.OpenCommands,
 		-1, 0, durable.PostgresIntegerMax)
 	if err != nil {
@@ -656,11 +649,7 @@ func (s *Store) failBeforeClaimLocked(
 	}
 	terminalRun := effectiveOpen == 0
 	if terminalRun {
-		status, eventName, reason := "succeeded", "flow.execution_succeeded", ""
-		if runFailed {
-			status, eventName, reason = "failed", "flow.execution_failed", message
-		}
-		terminal, err := runTerminalEvent(status, reason, eventName)
+		terminal, err := runTerminalEvent("failed", message, "flow.run_failed")
 		if err != nil {
 			return err
 		}
@@ -682,28 +671,20 @@ func (s *Store) failBeforeClaimLocked(
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, commandID); err != nil {
 		return MapError("remove failed command queue row", err)
 	}
-	if required {
-		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
-			"cancelled by fail-fast after required command failure"); err != nil {
-			return err
-		}
+	if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
+		"cancelled after command failure"); err != nil {
+		return err
 	}
-	status := head.Status
-	if required {
-		status = "failing"
-	}
+	status := "failing"
 	if terminalRun {
-		status = "succeeded"
-		if runFailed {
-			status = "failed"
-		}
+		status = "failed"
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_runs")+`
 		SET status=$2,open_commands=$5,failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
 		    finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 		    updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END
 		WHERE run_id=$1`, semantic.RunID(), status, jsonString(failure), semantic.DBNow(),
-		effectiveOpen, runFailed); err != nil {
+		effectiveOpen, true); err != nil {
 		return MapError("update run after pre-claim failure", err)
 	}
 	return nil
@@ -974,7 +955,6 @@ type commandFence struct {
 	Version                int
 	State                  string
 	QueueState             string
-	Required               bool
 	Attempt                int
 	ConsumedAttempts       int
 	BudgetStartedAt        time.Time
@@ -1098,11 +1078,11 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if parentTerminalIndex != layout.parentTerminal {
 		return SettleResult{}, fmt.Errorf("%w: successful settlement journal construction differs", flowerr.ErrInvalidState)
 	}
-	cancelStagedChildren := fence.Head.Status == "failing" && fence.Head.FailFast
+	cancelStagedChildren := fence.Head.Status == "failing"
 	childCancellationIndexes := make([]int, len(request.Children))
 	if cancelStagedChildren {
 		for index, child := range request.Children {
-			cancelled, err := terminalEventWithCode(child.ID, child.Key, "cancelled", "fail_fast",
+			cancelled, err := terminalEventWithCode(child.ID, child.Key, "cancelled", "run_failing",
 				"cancelled because the run is failing", "flow.command_cancelled", "command_terminal")
 			if err != nil {
 				return SettleResult{}, err
@@ -1133,10 +1113,10 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	}
 	terminalRun := effectiveOpen == 0
 	terminalStatus := "succeeded"
-	terminalName := "flow.execution_succeeded"
+	terminalName := "flow.run_succeeded"
 	if fence.Head.Status == "failing" {
 		terminalStatus = "failed"
-		terminalName = "flow.execution_failed"
+		terminalName = "flow.run_failed"
 	}
 	if terminalRun {
 		terminal, err := runTerminalEvent(terminalStatus, "", terminalName)
@@ -1279,7 +1259,7 @@ func (s *Store) cancelStagedCommandBatch(
 		}
 		commandIDs[index] = command.command.ID
 	}
-	failure := terminalFailure{Code: "fail_fast", Message: "cancelled because the run is failing"}
+	failure := terminalFailure{Code: "run_failing", Message: "cancelled because the run is failing"}
 	commandTag, err := semantic.PGX().Exec(ctx, `WITH cancelled(command_id,terminal_position) AS (
 		SELECT * FROM unnest($2::uuid[],$3::bigint[])
 	)
@@ -1429,12 +1409,9 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 	failureEffects := failureResolution{}
 	cancelledOffset := 0
 	terminalRun := false
-	runFailed := false
 	effectiveOpen := fence.Head.OpenCommands
 	if !decision.Retry {
-		if fence.Required {
-			failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, request.Claim.CommandID, "failed", fence.Head.FailFast)
-		}
+		failureEffects, err = s.resolveCommandFailureLocked(ctx, semantic, request.Claim.CommandID, "failed")
 		if err != nil {
 			return SettleResult{}, err
 		}
@@ -1446,15 +1423,13 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		failed.CausationBatchIndex = &zero
 		entries = append(entries, failed)
 		failedIndex := len(entries) - 1
-		runFailed = fence.Required || fence.Head.Status == "failing"
-		if fence.Required && fence.Head.Status == "running" {
+		if fence.Head.Status == "running" {
 			survivors := make([]string, len(failureEffects.survivors))
 			for index, command := range failureEffects.survivors {
 				survivors[index] = command.key
 			}
-			failing, err := NewJournalEntry(RunFailing, map[string]any{
-				"v": 1, "status": "failing", "reason": failure.Message, "command_key": fence.Key,
-				"fail_fast": fence.Head.FailFast, "survivors": survivors,
+			failing, err := NewJournalEntry(RunFailing, journalcodec.RunFailingBody{
+				V: 1, Status: "failing", Reason: failure.Message, CommandKey: fence.Key, Survivors: survivors,
 			})
 			if err != nil {
 				return SettleResult{}, err
@@ -1463,7 +1438,7 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 			entries = append(entries, failing)
 		}
 		cancelledOffset = len(entries)
-		cancelledEntries, err := failureEffects.cancellationEntries(failedIndex, "cancelled by fail-fast after required command failure")
+		cancelledEntries, err := failureEffects.cancellationEntries(failedIndex, "cancelled after command failure")
 		if err != nil {
 			return SettleResult{}, err
 		}
@@ -1480,11 +1455,7 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		}
 		terminalRun = effectiveOpen == 0
 		if terminalRun {
-			status, eventName, reason := "succeeded", "flow.execution_succeeded", ""
-			if runFailed {
-				status, eventName, reason = "failed", "flow.execution_failed", failure.Message
-			}
-			terminal, err := runTerminalEvent(status, reason, eventName)
+			terminal, err := runTerminalEvent("failed", failure.Message, "flow.run_failed")
 			if err != nil {
 				return SettleResult{}, err
 			}
@@ -1523,21 +1494,13 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, request.Claim.CommandID); err != nil {
 			return SettleResult{}, MapError("remove failed command queue row", err)
 		}
-		if fence.Required {
-			if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
-				"cancelled by fail-fast after required command failure"); err != nil {
-				return SettleResult{}, err
-			}
+		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
+			"cancelled after command failure"); err != nil {
+			return SettleResult{}, err
 		}
-		status := fence.Head.Status
-		if fence.Required {
-			status = "failing"
-		}
+		status := "failing"
 		if terminalRun {
-			status = "succeeded"
-			if runFailed {
-				status = "failed"
-			}
+			status = "failed"
 		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_runs")+`
 			SET status=$2,open_commands=$5,
@@ -1545,7 +1508,7 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 			    finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 			    updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END
 			WHERE run_id=$1`, semantic.RunID(), status, jsonString(failure), semantic.DBNow(),
-			effectiveOpen, runFailed); err != nil {
+			effectiveOpen, true); err != nil {
 			return SettleResult{}, MapError("update run after command failure", err)
 		}
 	}
@@ -1585,7 +1548,7 @@ func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, clai
 		return commandFence{}, MapError("load run deadline", err)
 	}
 	var activeAttempt, token *uuid.UUID
-	err = semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.state,c.required,c.attempt_ordinal,
+	err = semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.state,c.attempt_ordinal,
 		c.consumed_attempts,c.budget_started_at,c.retry_policy,
 		q.state,q.active_attempt_id,q.lease_token,q.lease_expires_at,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
@@ -1594,7 +1557,7 @@ func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, clai
 		JOIN `+pgschema.Table(s.schema, "flow_command_queue")+` q ON q.command_id=c.command_id
 		WHERE c.command_id=$1 AND c.run_id=$3
 		FOR UPDATE OF c,q`, claim.CommandID, claim.AttemptID, semantic.RunID()).
-		Scan(&result.Key, &result.Name, &result.Version, &result.State, &result.Required,
+		Scan(&result.Key, &result.Name, &result.Version, &result.State,
 			&result.Attempt, &result.ConsumedAttempts, &result.BudgetStartedAt, &result.RetryPolicy,
 			&result.QueueState, &activeAttempt, &token, &result.LeaseExpiresAt, &result.AttemptStartedPosition)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1750,8 +1713,8 @@ func (s *Store) expireRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 		if command.AttemptID != nil && command.AttemptStartedPosition != nil {
 			concluded, err := NewJournalEntry(AttemptConcluded, journalcodec.AttemptConcludedBody{
 				V: 1, AttemptID: command.AttemptID.String(), CommandID: command.ID.String(), CommandKey: command.Key,
-				Attempt: command.Attempt, Classification: "execution_expired", ConsumedAttempts: command.ConsumedAttempts,
-				FinishedAt: semantic.DBNow(), ErrorCode: "execution_expired", ErrorMessage: reason,
+				Attempt: command.Attempt, Classification: "run_expired", ConsumedAttempts: command.ConsumedAttempts,
+				FinishedAt: semantic.DBNow(), ErrorCode: "run_expired", ErrorMessage: reason,
 			})
 			if err != nil {
 				return err
@@ -1761,7 +1724,7 @@ func (s *Store) expireRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 			concluded.CausationPosition = clonePointer(command.AttemptStartedPosition)
 			entries = append(entries, concluded)
 		}
-		cancelled, err := terminalEventWithCode(command.ID, command.Key, "cancelled", "execution_expired", reason, "flow.command_cancelled", "command_terminal")
+		cancelled, err := terminalEventWithCode(command.ID, command.Key, "cancelled", "run_expired", reason, "flow.command_cancelled", "command_terminal")
 		if err != nil {
 			return err
 		}
@@ -1774,7 +1737,7 @@ func (s *Store) expireRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 		terminalBatchIndex[command.ID] = len(entries)
 		entries = append(entries, cancelled)
 	}
-	terminal, err := runTerminalEvent("expired", reason, "flow.execution_expired")
+	terminal, err := runTerminalEvent("expired", reason, "flow.run_expired")
 	if err != nil {
 		return err
 	}
@@ -1787,7 +1750,7 @@ func (s *Store) expireRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 	if err != nil {
 		return err
 	}
-	failure := terminalFailure{Code: "execution_expired", Message: reason}
+	failure := terminalFailure{Code: "run_expired", Message: reason}
 	commandIDs := make([]uuid.UUID, len(commands))
 	terminalPositions := make([]int64, len(commands))
 	for index, command := range commands {

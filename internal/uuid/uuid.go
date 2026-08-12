@@ -20,8 +20,8 @@ func Parse(value string) (UUID, error) {
 // primary-key indexes append-mostly and make identifier byte order correlate
 // with creation order; generation is strictly monotonic within one process.
 // The tradeoff is deliberate: identifiers encode their creation time, so they
-// are not secrets, matching Flow's existing guidance that keys, metadata, and
-// identifiers must not carry sensitive values.
+// are not secrets, matching Flow's existing guidance that keys and identifiers
+// must not carry sensitive values.
 func New() UUID {
 	return guuid.Must(guuid.NewV7())
 }

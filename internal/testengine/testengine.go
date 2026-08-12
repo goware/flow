@@ -52,7 +52,6 @@ type StagedCommand struct {
 	Name       string
 	Version    int
 	Args       json.RawMessage
-	Required   bool
 	StartAfter time.Duration
 	Waits      []EventWait
 	Within     time.Duration

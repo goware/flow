@@ -32,6 +32,15 @@ func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 		"LookupLiveExecution": {}, "WithExecutionDeadline": {}, "WithoutExecutionDeadline": {},
 		"WithMaxCommandsPerExecution": {}, "ObservationExecution": {},
 		"HistoryExecutionStarted": {}, "HistoryExecutionFailing": {}, "BoundCommand": {},
+		"Node": {}, "LiveWork": {}, "LiveWorkFilter": {}, "LiveWorkPage": {},
+		"ListLiveWork": {}, "ListHistoryByKeys": {}, "GetQueueDepth": {}, "QueueDepth": {}, "TraceOption": {},
+		"CommandFailure": {}, "StatusSucceeded": {}, "StatusFailed": {}, "StatusCancelled": {},
+		"StatusExpired": {}, "NopObserver": {}, "WithFailFast": {}, "WithMetadata": {},
+	}
+	removedFields := map[string]map[string]struct{}{
+		"Run":          {"Type": {}, "Version": {}, "Key": {}, "Created": {}, "FailFast": {}, "Metadata": {}},
+		"TraceCommand": {"State": {}, "Required": {}},
+		"RunFilter":    {"Type": {}, "Metadata": {}},
 	}
 	entries, err := os.ReadDir(filepath.Dir(currentFile))
 	if err != nil {
@@ -59,7 +68,7 @@ func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 			switch value := declaration.(type) {
 			case *ast.FuncDecl:
 				check(value.Name)
-				if value.Recv != nil && (value.Name.Name == "With" || value.Name.Name == "Execute" || value.Name.Name == "Emit") {
+				if value.Recv != nil && (value.Name.Name == "With" || value.Name.Name == "Execute" || value.Name.Name == "Emit" || value.Name.Name == "Optional") {
 					t.Errorf("removed method %s reappeared in %s", value.Name.Name, name)
 				}
 			case *ast.GenDecl:
@@ -72,6 +81,11 @@ func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 								for _, name := range field.Names {
 									if name.IsExported() && strings.HasPrefix(name.Name, "Execution") {
 										t.Errorf("removed public field %s.%s reappeared in %s", specification.Name.Name, name.Name, entry.Name())
+									}
+									if fields := removedFields[specification.Name.Name]; fields != nil {
+										if _, removed := fields[name.Name]; removed {
+											t.Errorf("removed public field %s.%s reappeared in %s", specification.Name.Name, name.Name, entry.Name())
+										}
 									}
 								}
 							}

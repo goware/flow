@@ -37,7 +37,6 @@ type CommandCreate struct {
 	Args                   canonical.Value
 	DeclarationFingerprint [32]byte
 	ParentCommandID        *uuid.UUID
-	Required               bool
 	Queue                  string
 	AttemptTimeout         time.Duration
 	RetryPolicy            canonical.Value
@@ -67,18 +66,15 @@ type StartRequest struct {
 	KeyScope          string
 	StartFingerprint  [32]byte
 	Input             canonical.Value
-	Metadata          canonical.Value
-	FailFast          bool
 	Deadline          DeadlineSpec
 	MaxCommands       int
 	Root              *CommandCreate
 }
 
-// StartResult carries the accepted run row as of durable acceptance.
-// Created is false when an idempotent start rediscovered an existing
-// run.
+// StartResult carries the accepted run identity. Created is false when an
+// idempotent start rediscovered an existing run.
 type StartResult struct {
-	Row     RunRow
+	ID      uuid.UUID
 	Created bool
 }
 
@@ -145,11 +141,7 @@ func (s *Store) ReplaceCurrentRunInTx(
 		if !bytes.Equal(currentFingerprint, request.Start.StartFingerprint[:]) {
 			return ReplaceRunResult{}, fmt.Errorf("%w: current run declaration differs", flowerr.ErrConflict)
 		}
-		row, err := s.GetRunInTx(ctx, tx, currentID)
-		if err != nil {
-			return ReplaceRunResult{}, err
-		}
-		return ReplaceRunResult{Start: StartResult{Row: row}}, nil
+		return ReplaceRunResult{Start: StartResult{ID: currentID}}, nil
 	}
 
 	cancelled, err := s.CancelRunLocked(ctx, semantic, request.Reason)
@@ -163,7 +155,7 @@ func (s *Store) ReplaceCurrentRunInTx(
 	if err != nil {
 		return ReplaceRunResult{}, err
 	}
-	if !started.Created || started.Row.ID == request.Expected {
+	if !started.Created || started.ID == request.Expected {
 		return ReplaceRunResult{}, fmt.Errorf("%w: replacement run was not created", flowerr.ErrInvalidState)
 	}
 	return ReplaceRunResult{Start: started, Replaced: true}, nil
@@ -219,16 +211,14 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 
 	var inserted uuid.UUID
 	err = tx.QueryRow(ctx, `INSERT INTO `+pgschema.Table(s.schema, "flow_runs")+` (
-		run_id,definition_name,definition_version,run_key,key_scope,status,fail_fast,
-		start_fingerprint,input,metadata,metadata_canonical,
+		run_id,definition_name,definition_version,run_key,key_scope,status,
+		start_fingerprint,
 		deadline_at,max_commands,command_count,open_commands,
 		next_journal_position,root_command_id,created_at,updated_at,status_at
-	) VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$13,1,$14,$15,$15,$15)
+	) VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9,$9,1,$10,$11,$11,$11)
 	ON CONFLICT DO NOTHING RETURNING run_id`,
 		request.ID, request.DefinitionName, request.DefinitionVersion, request.Key, request.KeyScope,
-		request.FailFast, request.StartFingerprint[:], request.Input.Bytes,
-		string(request.Metadata.Bytes), request.Metadata.Bytes, deadlineAt,
-		request.MaxCommands, commandCount, rootID, dbNow,
+		request.StartFingerprint[:], deadlineAt, request.MaxCommands, commandCount, rootID, dbNow,
 	).Scan(&inserted)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return StartResult{}, false, MapError("insert run", err)
@@ -276,14 +266,7 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 			return StartResult{}, false, err
 		}
 	}
-	// Mirror the row this transaction just inserted instead of re-reading it.
-	return StartResult{Row: RunRow{
-		ID: request.ID, DefinitionName: request.DefinitionName, DefinitionVersion: request.DefinitionVersion,
-		Key: request.Key, RootCommandID: clonePointer(rootID), Status: "running", FailFast: request.FailFast,
-		MaxCommands: request.MaxCommands, CommandCount: commandCount, OpenCommands: commandCount,
-		DeadlineAt: clonePointer(deadlineAt), CreatedAt: dbNow, UpdatedAt: dbNow, StatusAt: dbNow,
-		Metadata: request.Metadata.BytesCopy(),
-	}, Created: true}, false, nil
+	return StartResult{ID: request.ID, Created: true}, false, nil
 }
 
 // loadEquivalentStart resolves an insert that conflicted on the idempotency
@@ -336,11 +319,7 @@ func (s *Store) loadEquivalentStart(
 			status != "running" && status != "failing" {
 			return StartResult{}, true, fmt.Errorf("%w: live key holder changed during start", flowerr.ErrConflict)
 		}
-		row, err := s.GetRunInTx(ctx, tx, id)
-		if err != nil {
-			return StartResult{}, false, err
-		}
-		return StartResult{Row: row, Created: false}, false, nil
+		return StartResult{ID: id, Created: false}, false, nil
 	}
 	var id uuid.UUID
 	err := tx.QueryRow(ctx, `SELECT run_id
@@ -358,12 +337,18 @@ func (s *Store) loadEquivalentStart(
 	}
 	var definitionName, runKey, keyScope string
 	var version int
-	var fingerprint, input, metadata []byte
-	err = tx.QueryRow(ctx, `SELECT definition_name,run_key,key_scope,definition_version,
-		start_fingerprint,input,metadata_canonical
+	var fingerprint, input []byte
+	err = tx.QueryRow(ctx, `WITH locked_run AS MATERIALIZED (
+		SELECT definition_name,run_key,key_scope,definition_version,start_fingerprint,root_command_id
 		FROM `+pgschema.Table(s.schema, "flow_runs")+`
-		WHERE run_id=$1 FOR UPDATE`, id).
-		Scan(&definitionName, &runKey, &keyScope, &version, &fingerprint, &input, &metadata)
+		WHERE run_id=$1 FOR UPDATE
+	)
+	SELECT r.definition_name,r.run_key,r.key_scope,r.definition_version,r.start_fingerprint,c.args
+	FROM locked_run r
+	JOIN `+pgschema.Table(s.schema, "flow_commands")+` c
+	  ON c.run_id=$1 AND c.command_id=r.root_command_id
+	FOR UPDATE OF c`, id).
+		Scan(&definitionName, &runKey, &keyScope, &version, &fingerprint, &input)
 	if err != nil {
 		return StartResult{}, false, MapError("lock existing run", err)
 	}
@@ -371,14 +356,10 @@ func (s *Store) loadEquivalentStart(
 		return StartResult{}, false, fmt.Errorf("%w: run key owner changed during start", flowerr.ErrConflict)
 	}
 	if version != request.DefinitionVersion || !bytes.Equal(fingerprint, request.StartFingerprint[:]) ||
-		!bytes.Equal(input, request.Input.Bytes) || !bytes.Equal(metadata, request.Metadata.Bytes) {
+		!bytes.Equal(input, request.Input.Bytes) {
 		return StartResult{}, false, fmt.Errorf("%w: run start identity differs", flowerr.ErrConflict)
 	}
-	row, err := s.GetRunInTx(ctx, tx, id)
-	if err != nil {
-		return StartResult{}, false, err
-	}
-	return StartResult{Row: row, Created: false}, false, nil
+	return StartResult{ID: id, Created: false}, false, nil
 }
 
 func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time.Time) ([]JournalEntry, error) {
@@ -394,10 +375,8 @@ func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time
 		V: 1, RunID: request.ID.String(),
 		DefinitionName: request.DefinitionName, DefinitionVersion: request.DefinitionVersion,
 		RunKey: request.Key, KeyScope: keyScope,
-		Input: json.RawMessage(request.Input.BytesCopy()), FailFast: request.FailFast,
 		DeadlineMode: request.Deadline.Mode, DeadlineDuration: deadlineMilliseconds,
 		DeadlineAt: clonePointer(deadlineAt), MaxCommands: request.MaxCommands,
-		Metadata: json.RawMessage(request.Metadata.BytesCopy()),
 	}
 	start, err := NewJournalEntry(RunStarted, body)
 	if err != nil {
@@ -461,8 +440,8 @@ func commandCreatedEntry(
 	body := journalcodec.CommandCreatedBody{
 		V: 1, CommandID: command.ID.String(), CommandKey: command.Key, Name: command.Name,
 		Version: command.Version, Args: json.RawMessage(command.Args.BytesCopy()),
-		Required: command.Required, InitialState: initialState,
-		Queue: command.Queue, AttemptTimeoutMS: timeoutMS,
+		InitialState: initialState,
+		Queue:        command.Queue, AttemptTimeoutMS: timeoutMS,
 		RetryPolicy:    json.RawMessage(command.RetryPolicy.BytesCopy()),
 		InitialDelayMS: initialDelayMS, BudgetStartedAt: clonePointer(budgetStartedAt), NextAttemptAt: clonePointer(nextAttemptAt),
 		DeclarationFingerprint: hex.EncodeToString(command.DeclarationFingerprint[:]),
@@ -791,7 +770,7 @@ func (s *Store) insertPreparedCommandBatch(
 		command := prepared.command
 		commandRows[index] = []any{
 			command.ID, runID, command.Key, command.Name, command.Version,
-			command.ParentCommandID, command.Required, command.Args.Bytes,
+			command.ParentCommandID, command.Args.Bytes,
 			command.DeclarationFingerprint[:], prepared.state, prepared.unsatisfiedWaits,
 			command.Queue, prepared.attemptTimeoutMS, command.RetryPolicy.Bytes, prepared.initialDelayMS,
 			prepared.budgetStartedAt, prepared.nextAttemptAt, prepared.waitStartedAt,
@@ -800,7 +779,7 @@ func (s *Store) insertPreparedCommandBatch(
 		}
 	}
 	count, err := tx.CopyFrom(ctx, pgx.Identifier{s.schema, "flow_commands"}, []string{
-		"command_id", "run_id", "command_key", "name", "version", "parent_command_id", "required",
+		"command_id", "run_id", "command_key", "name", "version", "parent_command_id",
 		"args", "declaration_fingerprint", "state", "unsatisfied_waits", "queue", "attempt_timeout_ms",
 		"retry_policy", "initial_delay_ms", "budget_started_at", "next_attempt_at", "wait_started_at",
 		"wait_deadline_at", "wait_timeout_ms", "created_position", "created_at", "updated_at", "status_at",
@@ -851,7 +830,6 @@ func (s *Store) insertPreparedCommandBatch(
 type RunHead struct {
 	ID           uuid.UUID
 	Status       string
-	FailFast     bool
 	MaxCommands  int
 	CommandCount int
 	OpenCommands int
@@ -862,9 +840,9 @@ func (s *Store) LoadRunHead(ctx context.Context, semantic *SemanticTx) (RunHead,
 		return RunHead{}, fmt.Errorf("%w: semantic transaction is nil", flowerr.ErrInvalid)
 	}
 	var result RunHead
-	err := semantic.PGX().QueryRow(ctx, `SELECT run_id,status,fail_fast,max_commands,command_count,open_commands
+	err := semantic.PGX().QueryRow(ctx, `SELECT run_id,status,max_commands,command_count,open_commands
 		FROM `+pgschema.Table(s.schema, "flow_runs")+` WHERE run_id=$1`, semantic.RunID()).
-		Scan(&result.ID, &result.Status, &result.FailFast, &result.MaxCommands, &result.CommandCount, &result.OpenCommands)
+		Scan(&result.ID, &result.Status, &result.MaxCommands, &result.CommandCount, &result.OpenCommands)
 	if err != nil {
 		return RunHead{}, MapError("load run", err)
 	}
@@ -1104,12 +1082,11 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		return CancelResult{}, err
 	}
 	var key, state string
-	var required bool
 	var failureBytes []byte
-	err = semantic.PGX().QueryRow(ctx, `SELECT command_key,state,required,COALESCE(terminal_failure,'null'::jsonb)
+	err = semantic.PGX().QueryRow(ctx, `SELECT command_key,state,COALESCE(terminal_failure,'null'::jsonb)
 		FROM `+pgschema.Table(s.schema, "flow_commands")+`
 		WHERE command_id=$1 AND run_id=$2 FOR UPDATE`, commandID, head.ID).
-		Scan(&key, &state, &required, &failureBytes)
+		Scan(&key, &state, &failureBytes)
 	if err != nil {
 		return CancelResult{}, MapError("lock command for cancellation", err)
 	}
@@ -1143,22 +1120,18 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	}
 	terminalIndex := len(entries)
 	entries = append(entries, commandEvent)
-	failureEffects := failureResolution{}
-	if required {
-		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, commandID, "cancelled", head.FailFast)
-	}
+	failureEffects, err := s.resolveCommandFailureLocked(ctx, semantic, commandID, "cancelled")
 	if err != nil {
 		return CancelResult{}, err
 	}
-	becameFailing := required && head.Status == "running"
+	becameFailing := head.Status == "running"
 	if becameFailing {
 		survivors := make([]string, len(failureEffects.survivors))
 		for index, command := range failureEffects.survivors {
 			survivors[index] = command.key
 		}
-		failing, err := NewJournalEntry(RunFailing, map[string]any{
-			"v": 1, "status": "failing", "reason": reason, "command_key": key,
-			"fail_fast": head.FailFast, "survivors": survivors,
+		failing, err := NewJournalEntry(RunFailing, journalcodec.RunFailingBody{
+			V: 1, Status: "failing", Reason: reason, CommandKey: key, Survivors: survivors,
 		})
 		if err != nil {
 			return CancelResult{}, err
@@ -1167,7 +1140,7 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 		entries = append(entries, failing)
 	}
 	cancelledOffset := len(entries)
-	cancelledEntries, err := failureEffects.cancellationEntries(terminalIndex, "cancelled by fail-fast after required command cancellation")
+	cancelledEntries, err := failureEffects.cancellationEntries(terminalIndex, "cancelled after command cancellation")
 	if err != nil {
 		return CancelResult{}, err
 	}
@@ -1182,14 +1155,9 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	if err != nil {
 		return CancelResult{}, err
 	}
-	runFailed := required || head.Status == "failing"
 	terminalRun := effectiveOpen == 0
 	if terminalRun {
-		status, eventName, terminalReason := "succeeded", "flow.execution_succeeded", ""
-		if runFailed {
-			status, eventName, terminalReason = "failed", "flow.execution_failed", reason
-		}
-		runEvent, err := runTerminalEvent(status, terminalReason, eventName)
+		runEvent, err := runTerminalEvent("failed", reason, "flow.run_failed")
 		if err != nil {
 			return CancelResult{}, err
 		}
@@ -1209,22 +1177,16 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, commandID); err != nil {
 		return CancelResult{}, MapError("remove cancelled command delivery", err)
 	}
-	if required {
-		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
-			"cancelled by fail-fast after required command cancellation"); err != nil {
-			return CancelResult{}, err
-		}
+	if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
+		"cancelled after command cancellation"); err != nil {
+		return CancelResult{}, err
 	}
 
 	if terminalRun {
-		status := "succeeded"
-		if runFailed {
-			status = "failed"
-		}
 		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_runs")+`
-			SET status=$4,open_commands=0,failure=CASE WHEN $5 THEN $2::jsonb ELSE failure END,
+			SET status='failed',open_commands=0,failure=$2::jsonb,
 			    finished_at=$3,updated_at=$3,status_at=$3
-			WHERE run_id=$1`, head.ID, jsonString(terminalFailure{Code: "command_cancelled", Message: reason}), semantic.DBNow(), status, runFailed); err != nil {
+			WHERE run_id=$1`, head.ID, jsonString(terminalFailure{Code: "command_cancelled", Message: reason}), semantic.DBNow()); err != nil {
 			return CancelResult{}, MapError("fail run after command cancellation", err)
 		}
 	} else {
@@ -1310,7 +1272,7 @@ func (s *Store) CancelRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 	for _, command := range commands {
 		if command.attempt != nil {
 			concluded, err := cancelledAttemptEvent(command.id, command.key, *command.attempt,
-				"execution_cancelled", reason, semantic.DBNow())
+				"run_cancelled", reason, semantic.DBNow())
 			if err != nil {
 				return CancelResult{}, err
 			}
@@ -1327,7 +1289,7 @@ func (s *Store) CancelRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 		terminalBatchIndex[command.id] = len(entries)
 		entries = append(entries, entry)
 	}
-	runEvent, err := runTerminalEvent("cancelled", reason, "flow.execution_cancelled")
+	runEvent, err := runTerminalEvent("cancelled", reason, "flow.run_cancelled")
 	if err != nil {
 		return CancelResult{}, err
 	}
@@ -1409,7 +1371,7 @@ func runTerminalEvent(status, reason, name string) (JournalEntry, error) {
 	body.EventID = &eventID
 	body.EventNamespace = stringPointer("runtime")
 	body.EventName = clonePointer(&name)
-	body.EventClass = stringPointer("execution_terminal")
+	body.EventClass = stringPointer("run_terminal")
 	body.TerminalStatus = clonePointer(&status)
 	return body, nil
 }
@@ -1446,7 +1408,7 @@ func deadlineAt(now time.Time, spec DeadlineSpec) (*time.Time, error) {
 
 func validateStartRequest(request StartRequest) error {
 	if request.ID == uuid.Nil || request.DefinitionName == "" || request.DefinitionVersion <= 0 ||
-		request.MaxCommands < 0 || len(request.Input.Bytes) == 0 || len(request.Metadata.Bytes) == 0 {
+		request.MaxCommands < 0 || len(request.Input.Bytes) == 0 {
 		return fmt.Errorf("%w: incomplete run start", flowerr.ErrInvalid)
 	}
 	if request.KeyScope != "" && request.KeyScope != KeyScopePermanent && request.KeyScope != KeyScopeLive {

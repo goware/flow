@@ -124,7 +124,11 @@ Commands form a tree but readiness is not necessarily tree-shaped. A child can w
 
 ### 5.1 `flow_runs`
 
-This is the aggregate head and first lock for semantic mutation. It stores root definition identity, permanent/live key scope, canonical start identity, accepted input, status, fail-fast, deadline, command/open counters, indexed metadata plus its exact canonical identity bytes, the next journal position, the non-null same-run root command ID, and terminal failure.
+This is the aggregate head and first lock for semantic mutation. It stores root
+definition identity, permanent/live key scope, canonical start fingerprint,
+status, deadline, command/open counters, the next journal position, the
+non-null same-run root command ID, and terminal failure. Root arguments live in
+the root command declaration rather than being duplicated on the run row.
 
 Keeping the journal allocator and counters on the locked aggregate row makes per-run ordering simple: no independent sequence can advance without the same semantic lock.
 
@@ -132,7 +136,10 @@ Permanent-key uniqueness retains one non-empty `(definition name, run key)` fore
 
 ### 5.2 `flow_commands`
 
-This is the semantic command projection. It stores immutable declaration/provenance, canonical arguments and fingerprint, required/optional classification, opaque canonical retry bytes, exact-millisecond timeout/wait/delay settings, current state, attempt counters, result/failures, terminal journal position, and timestamps.
+This is the semantic command projection. It stores immutable
+declaration/provenance, canonical arguments and fingerprint, opaque canonical
+retry bytes, exact-millisecond timeout/wait/delay settings, current state,
+attempt counters, result/failures, terminal journal position, and timestamps.
 
 The projection avoids replay for common inspection and transition validation. Declaration fields are still represented in `command_created` history so replay can independently reconstruct the semantic command model.
 
@@ -152,8 +159,8 @@ The reverse index lets event ingress find affected commands without scanning all
 
 This is immutable ordered semantic history. Entry kinds are:
 
-- `execution_started`;
-- `execution_failing`;
+- `run_started`;
+- `run_failing`;
 - `command_created`;
 - `attempt_started`;
 - `attempt_concluded`; and
@@ -161,10 +168,9 @@ This is immutable ordered semantic history. Entry kinds are:
 
 Recorded event classes distinguish application events, command terminal events, and run terminal events. Bodies are canonical bytes with hashes. Causation positions point only backward.
 
-The `execution_*` strings above are versioned historical wire values retained
-for byte compatibility. The Go API, live schema, projections, and current
-documentation use Run vocabulary; migration 004 does not rewrite journal
-bodies or entry kinds.
+The current-only journal and bodies use Run vocabulary directly. Older
+development journal formats are not decoded because the clean baseline has no
+historical-row compatibility path.
 
 Application-event bodies live directly in the journal. A separate event-payload table would duplicate immutable identity/body storage, while a delivery table would introduce source semantics that targeted ingress does not promise.
 
@@ -208,10 +214,10 @@ typed Enqueue
   -> INSERT run (or find unique-key holder)
       -> permanent: compare complete start identity
       -> live: rediscover current holder without comparison
-  -> append execution_started + command_created
+  -> append run_started + command_created
   -> insert root command, waits, and queue row if ready
   -> commit
-  -> Run snapshot (Created marks a new run)
+  -> EnqueueResult{RunID, Created}
 ```
 
 The insert establishes ownership of a new run row; the store adopts it as the semantic lock rather than selecting it again. A conflicting permanent insert loads the existing row under lock and compares canonical start identity. A live-key conflict loads only the current live holder; if it settles during the race, the start performs one bounded retry.
@@ -266,7 +272,12 @@ The attempt context combines the configured attempt timeout, retry elapsed limit
 
 ## 9. Worker decision and success settlement
 
-The decision engine is memory-only. It records the first misuse/conflict, staged events keyed by name/key, staged commands keyed by command key, and their stable insertion identities. Public staging calls may return an error or an ephemeral `Node`; either path records a defect so ignoring a returned error cannot accidentally commit a partial decision.
+The decision engine is memory-only. It records the first misuse/conflict,
+staged events keyed by name/key, staged commands keyed by command key, and their
+stable insertion identities. Public staging calls may return an error or an
+ephemeral `StagedCommand`; either path records a defect so ignoring a returned
+error cannot accidentally commit a partial decision. At most 256 distinct
+application events are accepted in one decision.
 
 Before settlement the runtime:
 
@@ -330,17 +341,26 @@ Retry policies are canonicalized into every command declaration as opaque bytes 
 
 Ordinary errors, requested delays, panics, and timeouts consume budget. Shutdown interruption and lease loss do not. Permanent errors terminate immediately. Attempt and elapsed bounds plus the run deadline cap every retry.
 
-When the first required command becomes terminal unsuccessfully, the store records its terminal event and the historical `execution_failing` entry. Reduced fail-fast cancels open commands without active attempts; running attempts remain fenced survivors. Completion waits for those survivors because accepting a valid in-flight settlement is safer than revoking an already executing effect.
+When the first command becomes terminal unsuccessfully, the store records its
+terminal event and `run_failing`. It cancels open commands without active
+attempts; running attempts remain fenced survivors. Completion waits for those
+survivors because accepting a valid in-flight settlement is safer than revoking
+an already executing effect.
 
 If a survivor succeeds after failure began, its result and already staged events remain valid. Children newly introduced by that settlement are materialized as cancelled rather than extending a failed run. When no open commands remain, the run records one terminal event and projection state.
 
-Optional unsuccessful commands use the same attempt/history machinery but do not initiate run failure. Readiness and open-command counters determine whether the remaining run can succeed.
+There is one failure rule: every unsuccessful terminal command makes the run
+fail. Readiness and open-command counters determine when the failing run can
+become terminal.
 
 ## 12. Cancellation and expiry
 
 Command and run cancellation use the same run-first semantic transaction protocol.
 
-Command cancellation locks the command, concludes an active attempt if present, records terminal cancellation, deletes its queue row, resolves downstream liveness, and applies required/optional failure rules. Repeating the same reason is idempotent; a different terminal mutation is rejected.
+Command cancellation locks the command, concludes an active attempt if present,
+records terminal cancellation, deletes its queue row, and applies the same run
+failure rule. Repeating the same reason is idempotent; a different terminal
+mutation is rejected.
 
 Run cancellation locks all open commands in stable order, concludes active attempts, records command cancellations followed by one run-cancelled event, deletes delivery rows, and terminally updates the aggregate in one transaction.
 
@@ -405,7 +425,12 @@ verifies hashes and re-canonicalizes every retained body before folding it.
 
 ## 16. Migrations and compatibility
 
-Embedded migrations are rendered for one validated schema while table names retain the `flow_` prefix. `Migrate` takes an advisory transaction lock scoped to database/schema, verifies all known checksums, and applies each pending unit transactionally. `MigrationFS` provides equivalent SQL plus ledger inserts for an external runner.
+The single clean `001_initial.sql` is rendered for one validated schema while
+table names retain the `flow_` prefix. `Migrate` takes an advisory transaction
+lock scoped to database/schema, verifies its checksum, and installs it
+transactionally. `MigrationFS` provides equivalent SQL plus the ledger insert
+for an external runner. Older four-migration development schemas must be
+dropped and recreated; they are not upgraded in place.
 
 `CheckSchema` is read-only and verifies:
 
@@ -419,7 +444,13 @@ Embedded migrations are rendered for one validated schema while table names reta
 
 ## 17. Data safety, retention, and operational limits
 
-Canonical command arguments/results, event payloads, metadata, retry settings, and journal bodies are stored in PostgreSQL. Retained start/declaration fingerprints and journal body hashes support identity comparison and invariant checking; redundant write-only projection hashes are not stored. These values are not encryption. Applications must avoid putting secrets in keys, metadata, errors, or observer dimensions and should prefer stable references for sensitive/large values.
+Canonical command arguments/results, event payloads, retry settings, and journal
+bodies are stored in PostgreSQL. Retained start/declaration fingerprints and
+journal body hashes support identity comparison and invariant checking;
+redundant copies and write-only projection hashes are not stored. These values
+are not encryption. Applications must avoid putting secrets in keys, errors, or
+observer dimensions and should prefer stable references for sensitive/large
+values.
 
 Parent-produced values should travel directly in child arguments, while exact
 events carry sibling, cross-branch, or external facts. Related events and
@@ -428,7 +459,12 @@ sensitive documents stay in application storage behind stable references.
 
 Structured Flow errors map database/constraint failures into safe sentinel categories without including raw SQL or driver details. Observers intentionally exclude payloads, results, SQL, connections, and lease tokens; delivery and shutdown drain are bounded and best-effort. Observers should honor cancellation, and monitoring cannot stall durable correctness or runtime shutdown.
 
-The current schema retains journal and payload data and exposes no pruning API. Operators own PostgreSQL backup, access control, encryption, capacity planning, and any future application-approved archival process. Direct deletion or mutation of Flow-owned rows is outside the supported contract because it can break replay, idempotency, waits, and projection invariants.
+`PruneTerminalRuns` locks and deletes at most 1,000 terminal unkeyed/live-key
+aggregates in `(finished_at, run_id)` order. It deletes journal rows, commands
+(with queue/wait cascades), and runs in one Flow-owned transaction. Permanent
+non-empty keys, non-terminal runs, and application tables are excluded. Direct
+mutation of Flow-owned rows remains unsupported, and there is no automatic TTL
+or archive protocol.
 
 Flow's primary availability boundary is PostgreSQL. Notification loss is tolerated, but loss of database availability pauses starts, claims, settlement, ingress, and inspection until operations can succeed again.
 

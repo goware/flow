@@ -6,8 +6,8 @@ func EventWaitUpdateQueryForTest(s *Store) string {
 	return s.satisfyMatchingEventWaitsSQL()
 }
 
-func LiveWorkListQueryForTest(s *Store, filter LiveWorkListFilter) (string, []any) {
-	return s.listLiveWorkQuery(filter)
+func ActiveCommandListQueryForTest(s *Store, filter ActiveCommandListFilter) (string, []any) {
+	return s.listActiveCommandsQuery(filter)
 }
 
 func KeyedHistoryListQueryForTest(s *Store, filter KeyedHistoryListFilter) (string, []any) {
@@ -18,6 +18,8 @@ func RunListQueryForTest(s *Store, filter RunListFilter) (string, []any) {
 	return s.listRunsQuery(filter)
 }
 
-func QueueDepthQueryForTest(s *Store) string { return s.queueDepthQuery() }
+func QueueStatsQueryForTest(s *Store) string { return s.queueStatsQuery() }
+
+func PruneCandidatesQueryForTest(s *Store) string { return s.pruneCandidatesQuery() }
 
 func TraceWaitsQueryForTest(s *Store) string { return s.traceWaitsQuery() }

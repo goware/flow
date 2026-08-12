@@ -49,7 +49,7 @@ func TestSafeErrorsAndObservations(t *testing.T) {
 			t.Fatalf("Observation exposes forbidden field %q", name)
 		}
 	}
-	NopObserver{}.Observe(context.Background(), Observation{Kind: ObservationRuntime})
+	noOpObserver{}.Observe(context.Background(), Observation{Kind: ObservationRuntime})
 	var nilError *Error
 	if nilError.Error() != "<nil>" || nilError.Unwrap() != nil {
 		t.Fatal("nil structured error is not safe")

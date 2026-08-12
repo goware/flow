@@ -2,7 +2,6 @@ package flow
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -55,24 +54,27 @@ func TestGetResultReadsTypedCommandProjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enqueue() error = %v", err)
 	}
-	if result, found, err := GetResult(ctx, runtime, run.ID, "root", root); err != nil || found || result != (None{}) {
+	if result, found, err := GetResult(ctx, runtime, run.RunID, "root", root); err != nil || found || result != (None{}) {
 		t.Fatalf("GetResult(pending root) = %#v, %t, %v", result, found, err)
 	}
-	if _, found, err := GetResult(ctx, runtime, run.ID, "missing", child); err != nil || found {
+	if result, found, err := root.GetResult(ctx, runtime, run.RunID, "root"); err != nil || found || result != (None{}) {
+		t.Fatalf("Command.GetResult(pending root) = %#v, %t, %v", result, found, err)
+	}
+	if _, found, err := GetResult(ctx, runtime, run.RunID, "missing", child); err != nil || found {
 		t.Fatalf("GetResult(missing command) found=%t error=%v", found, err)
 	}
 	wrongVersion := DefineCommand[inspectionArgs, None](root.Name(), root.Version()+1)
-	if _, _, err := GetResult(ctx, runtime, run.ID, "root", wrongVersion); !errors.Is(err, ErrConflict) {
+	if _, _, err := GetResult(ctx, runtime, run.RunID, "root", wrongVersion); !errors.Is(err, ErrConflict) {
 		t.Fatalf("GetResult(mismatched definition) error = %v", err)
 	}
 	if _, _, err := GetResult(ctx, runtime, RunID("00000000-0000-0000-0000-000000000001"), "root", root); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetResult(missing run) error = %v", err)
 	}
 	invalid := DefineCommand[inspectionArgs, None]("", 1)
-	if _, _, err := GetResult(ctx, runtime, run.ID, "root", invalid); !errors.Is(err, ErrInvalid) {
+	if _, _, err := GetResult(ctx, runtime, run.RunID, "root", invalid); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("GetResult(invalid command) error = %v", err)
 	}
-	if _, _, err := GetResult(ctx, runtime, run.ID, " invalid ", root); !errors.Is(err, ErrInvalid) {
+	if _, _, err := GetResult(ctx, runtime, run.RunID, " invalid ", root); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("GetResult(invalid key) error = %v", err)
 	}
 
@@ -92,15 +94,19 @@ func TestGetResultReadsTypedCommandProjection(t *testing.T) {
 	})
 	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelWait()
-	settled, err := AwaitRun(waitCtx, runtime, run.ID)
+	settled, err := AwaitRun(waitCtx, runtime, run.RunID)
 	if err != nil || settled.Status != RunStatusSucceeded {
 		t.Fatalf("AwaitRun() = %#v, %v", settled, err)
 	}
-	result, found, err := GetResult(ctx, runtime, run.ID, "child", child)
+	result, found, err := GetResult(ctx, runtime, run.RunID, "child", child)
 	if err != nil || !found || result != (inspectionResult{Value: "result/typed"}) {
 		t.Fatalf("GetResult(child) = %#v, %t, %v", result, found, err)
 	}
-	if _, found, err := GetResult(ctx, runtime, run.ID, "root", root); err != nil || !found {
+	methodResult, methodFound, methodErr := child.GetResult(ctx, runtime, run.RunID, "child")
+	if methodErr != nil || !methodFound || methodResult != result {
+		t.Fatalf("Command.GetResult(child) = %#v, %t, %v", methodResult, methodFound, methodErr)
+	}
+	if _, found, err := GetResult(ctx, runtime, run.RunID, "root", root); err != nil || !found {
 		t.Fatalf("GetResult(root) found=%t error=%v", found, err)
 	}
 
@@ -110,19 +116,19 @@ func TestGetResultReadsTypedCommandProjection(t *testing.T) {
 	}
 	failedWaitCtx, cancelFailedWait := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelFailedWait()
-	failedState, err := AwaitRun(failedWaitCtx, runtime, failedRun.ID)
+	failedState, err := AwaitRun(failedWaitCtx, runtime, failedRun.RunID)
 	if err != nil || failedState.Status != RunStatusFailed {
 		t.Fatalf("AwaitRun(failed) = %#v, %v", failedState, err)
 	}
-	if _, found, err := GetResult(ctx, runtime, failedRun.ID, "root", failed); err != nil || found {
+	if _, found, err := GetResult(ctx, runtime, failedRun.RunID, "root", failed); err != nil || found {
 		t.Fatalf("GetResult(failed) found=%t error=%v", found, err)
 	}
 
 	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_commands")+` SET result=$3
-		WHERE run_id=$1 AND command_key=$2`, run.ID, "child", []byte(`{"value":`)); err != nil {
+		WHERE run_id=$1 AND command_key=$2`, run.RunID, "child", []byte(`{"value":`)); err != nil {
 		t.Fatalf("corrupt command result: %v", err)
 	}
-	if _, _, err := GetResult(ctx, runtime, run.ID, "child", child); !errors.Is(err, ErrInvalidState) {
+	if _, _, err := GetResult(ctx, runtime, run.RunID, "child", child); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("GetResult(corrupt result) error = %v", err)
 	}
 }
@@ -140,33 +146,28 @@ func TestRunInspectionAndStablePagination(t *testing.T) {
 	}
 	command := DefineCommand[inspectionArgs, inspectionResult]("inspection.work", 1)
 
-	var execs []Run
+	var execs []EnqueueResult
 	for index := 0; index < 5; index++ {
-		exec, err := command.Enqueue(ctx, runtime, fmt.Sprintf("batch/%02d", index), inspectionArgs{Value: fmt.Sprint(index)},
-			WithMetadata(map[string]string{"tenant": "acme", "bucket": fmt.Sprint(index % 2)}))
+		exec, err := command.Enqueue(ctx, runtime, fmt.Sprintf("batch/%02d", index), inspectionArgs{Value: fmt.Sprint(index)})
 		if err != nil {
 			t.Fatalf("Enqueue(%d) error = %v", index, err)
 		}
 		execs = append(execs, exec)
 	}
 
-	got, err := GetRun(ctx, runtime, execs[2].ID)
+	got, err := GetRun(ctx, runtime, execs[2].RunID)
 	if err != nil {
 		t.Fatalf("GetRun() error = %v", err)
 	}
-	var metadata map[string]string
-	if err := json.Unmarshal(got.Metadata, &metadata); err != nil {
-		t.Fatalf("decode metadata: %v", err)
-	}
-	if got.ID != execs[2].ID || got.Type != command.Name() || got.Status != "running" ||
-		got.CommandCount != 1 || got.OpenCommands != 1 || metadata["bucket"] != "0" || metadata["tenant"] != "acme" {
+	if got.ID != execs[2].RunID || got.RootCommandName != command.Name() || got.Status != "running" ||
+		got.CommandCount != 1 || got.OpenCommands != 1 {
 		t.Fatalf("GetRun() = %#v", got)
 	}
 	if _, err := GetRun(ctx, runtime, RunID("00000000-0000-0000-0000-000000000001")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetRun(missing) error = %v", err)
 	}
 
-	filter := RunFilter{Type: command.Name(), KeyPrefix: "batch/", Metadata: map[string]string{"tenant": "acme"}, PageSize: 2}
+	filter := RunFilter{RootCommandName: command.Name(), KeyPrefix: "batch/", PageSize: 2}
 	var listed []Run
 	for {
 		page, err := ListRuns(ctx, runtime, filter)
@@ -193,12 +194,12 @@ func TestRunInspectionAndStablePagination(t *testing.T) {
 		}
 	}
 	filtered, err := ListRuns(ctx, runtime, RunFilter{
-		Type: command.Name(), Metadata: map[string]string{"bucket": "1"}, Statuses: []RunStatus{RunStatusRunning}, PageSize: 10,
+		RootCommandName: command.Name(), Statuses: []RunStatus{RunStatusRunning}, PageSize: 10,
 	})
-	if err != nil || len(filtered.Runs) != 2 {
+	if err != nil || len(filtered.Runs) != 5 {
 		t.Fatalf("filtered list = %#v, %v", filtered, err)
 	}
-	literalWildcard, err := ListRuns(ctx, runtime, RunFilter{Type: command.Name(), KeyPrefix: "batch/%", PageSize: 10})
+	literalWildcard, err := ListRuns(ctx, runtime, RunFilter{RootCommandName: command.Name(), KeyPrefix: "batch/%", PageSize: 10})
 	if err != nil || len(literalWildcard.Runs) != 0 {
 		t.Fatalf("literal wildcard prefix list = %#v, %v", literalWildcard, err)
 	}
@@ -238,19 +239,22 @@ func TestTransactionScopedInspectionAndAwait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transaction Enqueue() error = %v", err)
 	}
-	if _, err := GetRun(ctx, txClient, uncommitted.ID); err != nil {
+	if _, err := GetRun(ctx, txClient, uncommitted.RunID); err != nil {
 		t.Fatalf("transaction GetRun() error = %v", err)
 	}
-	if _, found, err := GetResult(ctx, txClient, uncommitted.ID, "root", command); err != nil || found {
+	if _, found, err := GetResult(ctx, txClient, uncommitted.RunID, "root", command); err != nil || found {
 		t.Fatalf("transaction GetResult() found=%t error=%v", found, err)
 	}
-	if _, _, err := GetResult(ctx, runtime, uncommitted.ID, "root", command); !errors.Is(err, ErrNotFound) {
+	if _, found, err := command.GetResult(ctx, txClient, uncommitted.RunID, "root"); err != nil || found {
+		t.Fatalf("transaction Command.GetResult() found=%t error=%v", found, err)
+	}
+	if _, _, err := GetResult(ctx, runtime, uncommitted.RunID, "root", command); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("outside GetResult(uncommitted) error = %v", err)
 	}
-	if _, err := GetRun(ctx, runtime, uncommitted.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := GetRun(ctx, runtime, uncommitted.RunID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("outside GetRun(uncommitted) error = %v", err)
 	}
-	if _, err := AwaitRun(ctx, txClient, uncommitted.ID); !errors.Is(err, ErrInvalid) {
+	if _, err := AwaitRun(ctx, txClient, uncommitted.RunID); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("AwaitRun(transaction) error = %v", err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
@@ -266,19 +270,19 @@ func TestTransactionScopedInspectionAndAwait(t *testing.T) {
 	}
 	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelWait()
-	run, err := AwaitRun(waitCtx, runtime, exec.ID)
+	run, err := AwaitRun(waitCtx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatalf("AwaitRun() error = %v", err)
 	}
 	if run.Status != "succeeded" || run.FinishedAt == nil || run.OpenCommands != 0 {
 		t.Fatalf("AwaitRun() = %#v", run)
 	}
-	trace, err := Trace(ctx, runtime, exec.ID)
+	trace, err := Trace(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatalf("Trace() error = %v", err)
 	}
 	if !reflect.DeepEqual(trace.Run, run) || len(trace.Events) != 2 || trace.Events[0].Class != "command_terminal" ||
-		trace.Events[1].Class != "execution_terminal" {
+		trace.Events[1].Class != "run_terminal" {
 		t.Fatalf("Trace() inspection = %#v", trace)
 	}
 	cancelRun()

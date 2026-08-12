@@ -128,11 +128,11 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime) (flow.Run, fl
 	if err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
-	if err = agentUserMessage.Deliver(ctx, runtime, run.ID, "message/1", agentMessage{Text: "focus on durability"}); err != nil {
+	if err = agentUserMessage.Deliver(ctx, runtime, run.RunID, "message/1", agentMessage{Text: "focus on durability"}); err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
-	trace, err := waitForTerminal(ctx, runtime, run.ID, 8*time.Second)
-	return run, trace, err
+	trace, err := waitForTerminal(ctx, runtime, run.RunID, 8*time.Second)
+	return trace.Run, trace, err
 }
 
 // agentThink owns the entire agent transition: it reads only declared event

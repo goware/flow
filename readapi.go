@@ -29,15 +29,15 @@ const (
 
 	keyedReadCursorVersion = 2
 	maxReadCursorBytes     = 4096
-	readKindLiveWork       = "live_work"
+	readKindActiveCommands = "active_commands"
 	readKindHistory        = "keyed_history"
 )
 
-// LiveWork is one queued (or leased) command of a non-terminal run,
+// ActiveCommand is one queued (or leased) command of a non-terminal run,
 // carrying the run's identity. It is the batch, key-addressed read for
 // consumers that decorate their own domain rows with dispatch state, without
 // touching Flow's tables.
-type LiveWork struct {
+type ActiveCommand struct {
 	RunID            RunID
 	DefinitionName   string
 	RunKey           string
@@ -55,68 +55,68 @@ type LiveWork struct {
 	CommandCreatedAt time.Time
 }
 
-// LiveWorkFilter selects bounded queued work for exact run keys. Cursor
+// ActiveCommandFilter selects bounded queued work for exact run keys. Cursor
 // values are opaque and may be reused only with the same Keys filter.
-type LiveWorkFilter struct {
+type ActiveCommandFilter struct {
 	Keys     []string
 	PageSize int
 	Cursor   string
 }
 
-// LiveWorkPage contains one bounded page and an opaque cursor for the next
+// ActiveCommandPage contains one bounded page and an opaque cursor for the next
 // page. NextCursor is empty when no later row was observed.
-type LiveWorkPage struct {
-	Work       []LiveWork
+type ActiveCommandPage struct {
+	Commands   []ActiveCommand
 	NextCursor string
 }
 
-// ListLiveWork returns one bounded page of queued commands for non-terminal
+// ListActiveCommands returns one bounded page of queued commands for non-terminal
 // runs whose run key is in filter.Keys. Rows are ordered by key,
 // definition, run creation, run ID, and command ID. An ordinary
 // client does not provide a cross-page snapshot; a transaction-scoped client
 // uses the caller's transaction and observes its uncommitted writes.
-func ListLiveWork(ctx context.Context, c Client, filter LiveWorkFilter) (LiveWorkPage, error) {
+func ListActiveCommands(ctx context.Context, c Client, filter ActiveCommandFilter) (ActiveCommandPage, error) {
 	client, err := resolveClient(c)
 	if err != nil {
-		return LiveWorkPage{}, err
+		return ActiveCommandPage{}, err
 	}
-	keys, pageSize, cursor, err := prepareKeyedRead(filter.Keys, filter.PageSize, filter.Cursor, readKindLiveWork)
+	keys, pageSize, cursor, err := prepareKeyedRead(filter.Keys, filter.PageSize, filter.Cursor, readKindActiveCommands)
 	if err != nil {
-		return LiveWorkPage{}, err
+		return ActiveCommandPage{}, err
 	}
 	if len(keys) == 0 {
-		return LiveWorkPage{Work: []LiveWork{}}, nil
+		return ActiveCommandPage{Commands: []ActiveCommand{}}, nil
 	}
-	storeFilter := store.LiveWorkListFilter{Keys: keys, Limit: pageSize + 1}
+	storeFilter := store.ActiveCommandListFilter{Keys: keys, Limit: pageSize + 1}
 	if cursor != nil {
-		storeFilter.Cursor = &store.LiveWorkCursor{
+		storeFilter.Cursor = &store.ActiveCommandCursor{
 			RunKey: cursor.RunKey, DefinitionName: cursor.DefinitionName,
 			RunCreatedAt: cursor.RunCreatedAt,
 			RunID:        uuid.MustParse(cursor.RunID),
 			CommandID:    uuid.MustParse(cursor.CommandID),
 		}
 	}
-	rows, err := client.runtime.store.ListLiveWorkInTx(ctx, client.tx, storeFilter)
+	rows, err := client.runtime.store.ListActiveCommandsInTx(ctx, client.tx, storeFilter)
 	if err != nil {
-		return LiveWorkPage{}, err
+		return ActiveCommandPage{}, err
 	}
-	page := LiveWorkPage{Work: make([]LiveWork, min(len(rows), pageSize))}
-	for index := range page.Work {
-		page.Work[index], err = liveWorkFromStore(rows[index])
+	page := ActiveCommandPage{Commands: make([]ActiveCommand, min(len(rows), pageSize))}
+	for index := range page.Commands {
+		page.Commands[index], err = activeCommandFromStore(rows[index])
 		if err != nil {
-			return LiveWorkPage{}, err
+			return ActiveCommandPage{}, err
 		}
 	}
 	if len(rows) > pageSize {
 		last := rows[pageSize-1]
 		page.NextCursor, err = encodeKeyedReadCursor(keyedReadCursor{
-			Version: keyedReadCursorVersion, Kind: readKindLiveWork,
+			Version: keyedReadCursorVersion, Kind: readKindActiveCommands,
 			KeysHash: keyedReadKeysHash(keys), RunKey: last.RunKey,
 			DefinitionName: last.DefinitionName, RunCreatedAt: last.RunCreatedAt.UTC(),
 			RunID: last.RunID.String(), CommandID: last.CommandID.String(),
 		})
 		if err != nil {
-			return LiveWorkPage{}, err
+			return ActiveCommandPage{}, err
 		}
 	}
 	return page, nil
@@ -146,12 +146,12 @@ type KeyedHistoryPage struct {
 	NextCursor string
 }
 
-// ListHistoryByKeys returns one bounded retained-history page for every
+// ListHistoryByRunKeys returns one bounded retained-history page for every
 // run that ever held one of filter.Keys. Rows are ordered by key,
 // definition, run creation, run ID, and journal position. Journal
 // order is preserved within each run. Transaction-scoped clients use the
 // caller's transaction and observe their uncommitted writes.
-func ListHistoryByKeys(ctx context.Context, c Client, filter KeyedHistoryFilter) (KeyedHistoryPage, error) {
+func ListHistoryByRunKeys(ctx context.Context, c Client, filter KeyedHistoryFilter) (KeyedHistoryPage, error) {
 	client, err := resolveClient(c)
 	if err != nil {
 		return KeyedHistoryPage{}, err
@@ -198,20 +198,20 @@ func ListHistoryByKeys(ctx context.Context, c Client, filter KeyedHistoryFilter)
 	return page, nil
 }
 
-func liveWorkFromStore(row store.LiveWorkRow) (LiveWork, error) {
+func activeCommandFromStore(row store.ActiveCommandRow) (ActiveCommand, error) {
 	keyScope, err := keyScopeFromString(row.KeyScope)
 	if err != nil {
-		return LiveWork{}, newError(ErrInvalidState, "decode", "key scope", row.KeyScope, "stored key scope is unknown")
+		return ActiveCommand{}, newError(ErrInvalidState, "decode", "key scope", row.KeyScope, "stored key scope is unknown")
 	}
 	runStatus, err := runStatusFromString(row.RunStatus)
 	if err != nil {
-		return LiveWork{}, newError(ErrInvalidState, "decode", "run status", row.RunStatus, "stored status is unknown")
+		return ActiveCommand{}, newError(ErrInvalidState, "decode", "run status", row.RunStatus, "stored status is unknown")
 	}
 	queueState, err := queueStateFromString(row.QueueState)
 	if err != nil {
-		return LiveWork{}, newError(ErrInvalidState, "decode", "queue state", row.QueueState, "stored state is unknown")
+		return ActiveCommand{}, newError(ErrInvalidState, "decode", "queue state", row.QueueState, "stored state is unknown")
 	}
-	work := LiveWork{
+	work := ActiveCommand{
 		RunID: RunID(row.RunID.String()), DefinitionName: row.DefinitionName,
 		RunKey: row.RunKey, KeyScope: keyScope, RunStatus: runStatus,
 		CommandID: CommandID(row.CommandID.String()), CommandKey: row.CommandKey,
@@ -298,9 +298,9 @@ func prepareKeyedRead(keys []string, pageSize int, encodedCursor, kind string) (
 		return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor run ID is invalid")
 	}
 	switch kind {
-	case readKindLiveWork:
+	case readKindActiveCommands:
 		if cursor.Position != 0 {
-			return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "live-work cursor has history state")
+			return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "active-command cursor has history state")
 		}
 		if _, err := uuid.Parse(cursor.CommandID); err != nil {
 			return nil, 0, nil, newError(ErrInvalid, "list", "cursor", "", "cursor command ID is invalid")

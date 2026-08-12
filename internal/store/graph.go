@@ -12,6 +12,7 @@ import (
 	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/flowerr"
 	"github.com/goware/flow/internal/pgschema"
+	"github.com/goware/flow/internal/store/journalcodec"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -27,45 +28,40 @@ type failureCommand struct {
 	state string
 }
 
-// failureResolution describes the pending work cancelled by fail-fast.
+// failureResolution describes pending work cancelled when a command fails.
 // Attempts already running are deliberately left alone and may settle.
 type failureResolution struct {
 	survivors []failureCommand
 	cancelled []failureCommand
 }
 
-func (s *Store) resolveRequiredFailureLocked(
+func (s *Store) resolveCommandFailureLocked(
 	ctx context.Context,
 	semantic *SemanticTx,
 	commandID uuid.UUID,
 	terminalState string,
-	failFast bool,
 ) (failureResolution, error) {
-	return s.resolveRequiredFailuresLocked(ctx, semantic, map[uuid.UUID]string{commandID: terminalState}, failFast)
+	return s.resolveCommandFailuresLocked(ctx, semantic, map[uuid.UUID]string{commandID: terminalState})
 }
 
-func (s *Store) resolveRequiredFailuresLocked(
+func (s *Store) resolveCommandFailuresLocked(
 	ctx context.Context,
 	semantic *SemanticTx,
 	baseOverrides map[uuid.UUID]string,
-	failFast bool,
 ) (failureResolution, error) {
-	if !failFast {
-		return failureResolution{}, nil
-	}
 	rows, err := semantic.PGX().Query(ctx, `SELECT command_id,command_key,state
 		FROM `+pgschema.Table(s.schema, "flow_commands")+`
 		WHERE run_id=$1 AND state NOT IN ('succeeded','failed','cancelled','expired')
 		ORDER BY command_key FOR UPDATE`, semantic.RunID())
 	if err != nil {
-		return failureResolution{}, MapError("lock fail-fast commands", err)
+		return failureResolution{}, MapError("lock commands after failure", err)
 	}
 	defer rows.Close()
 	result := failureResolution{}
 	for rows.Next() {
 		var command failureCommand
 		if err := rows.Scan(&command.id, &command.key, &command.state); err != nil {
-			return failureResolution{}, MapError("scan fail-fast command", err)
+			return failureResolution{}, MapError("scan command after failure", err)
 		}
 		if _, failed := baseOverrides[command.id]; failed {
 			continue
@@ -77,7 +73,7 @@ func (s *Store) resolveRequiredFailuresLocked(
 		result.cancelled = append(result.cancelled, command)
 	}
 	if err := rows.Err(); err != nil {
-		return failureResolution{}, MapError("read fail-fast commands", err)
+		return failureResolution{}, MapError("read commands after failure", err)
 	}
 	return result, nil
 }
@@ -129,13 +125,12 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return false, nil
 	}
 	var key, state string
-	var required bool
 	var deadline time.Time
 	var createdPosition int64
-	err = semantic.PGX().QueryRow(ctx, `SELECT command_key,state,required,wait_deadline_at,created_position
+	err = semantic.PGX().QueryRow(ctx, `SELECT command_key,state,wait_deadline_at,created_position
 		FROM `+pgschema.Table(s.schema, "flow_commands")+`
 		WHERE command_id=$1 AND run_id=$2 FOR UPDATE`, candidate.CommandID, candidate.RunID).
-		Scan(&key, &state, &required, &deadline, &createdPosition)
+		Scan(&key, &state, &deadline, &createdPosition)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
@@ -204,10 +199,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		return true, nil
 	}
 
-	failureEffects := failureResolution{}
-	if required {
-		failureEffects, err = s.resolveRequiredFailureLocked(ctx, semantic, candidate.CommandID, "expired", head.FailFast)
-	}
+	failureEffects, err := s.resolveCommandFailureLocked(ctx, semantic, candidate.CommandID, "expired")
 	if err != nil {
 		return false, err
 	}
@@ -218,15 +210,13 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	}
 	expired.CausationPosition = clonePointer(&createdPosition)
 	entries := []JournalEntry{expired}
-	runFailed := required || head.Status == "failing"
-	if required && head.Status == "running" {
+	if head.Status == "running" {
 		survivors := make([]string, len(failureEffects.survivors))
 		for index, command := range failureEffects.survivors {
 			survivors[index] = command.key
 		}
-		failing, err := NewJournalEntry(RunFailing, map[string]any{
-			"v": 1, "status": "failing", "reason": "awaited event deadline expired", "command_key": key,
-			"fail_fast": head.FailFast, "survivors": survivors,
+		failing, err := NewJournalEntry(RunFailing, journalcodec.RunFailingBody{
+			V: 1, Status: "failing", Reason: "awaited event deadline expired", CommandKey: key, Survivors: survivors,
 		})
 		if err != nil {
 			return false, err
@@ -236,7 +226,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		entries = append(entries, failing)
 	}
 	cancelledOffset := len(entries)
-	cancelledEntries, err := failureEffects.cancellationEntries(0, "cancelled by fail-fast after required command expiry")
+	cancelledEntries, err := failureEffects.cancellationEntries(0, "cancelled after command expiry")
 	if err != nil {
 		return false, err
 	}
@@ -253,11 +243,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 	}
 	terminalRun := effectiveOpen == 0
 	if terminalRun {
-		status, name, reason := "succeeded", "flow.execution_succeeded", ""
-		if runFailed {
-			status, name, reason = "failed", "flow.execution_failed", "awaited event deadline expired"
-		}
-		terminal, err := runTerminalEvent(status, reason, name)
+		terminal, err := runTerminalEvent("failed", "awaited event deadline expired", "flow.run_failed")
 		if err != nil {
 			return false, err
 		}
@@ -275,28 +261,20 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 		WHERE command_id=$1`, candidate.CommandID, jsonString(failure), journal.Journal[0].Position, semantic.DBNow()); err != nil {
 		return false, MapError("expire command wait", err)
 	}
-	if required {
-		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
-			"cancelled by fail-fast after required command expiry"); err != nil {
-			return false, err
-		}
+	if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
+		"cancelled after command expiry"); err != nil {
+		return false, err
 	}
-	status := head.Status
-	if required {
-		status = "failing"
-	}
+	status := "failing"
 	if terminalRun {
-		status = "succeeded"
-		if runFailed {
-			status = "failed"
-		}
+		status = "failed"
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_runs")+`
 		SET status=$2,open_commands=$5,
 		failure=CASE WHEN $6 THEN $3::jsonb ELSE failure END,
 		finished_at=CASE WHEN $2 IN ('failed','succeeded') THEN $4 ELSE finished_at END,
 		updated_at=$4,status_at=CASE WHEN status<>$2 THEN $4 ELSE status_at END WHERE run_id=$1`,
-		head.ID, status, jsonString(failure), semantic.DBNow(), effectiveOpen, runFailed); err != nil {
+		head.ID, status, jsonString(failure), semantic.DBNow(), effectiveOpen, true); err != nil {
 		return false, MapError("update run after wait expiry", err)
 	}
 	if err := semantic.Commit(ctx); err != nil {
@@ -308,7 +286,7 @@ func (s *Store) ExpireCommandWait(ctx context.Context, candidate ExpiredWaitCand
 func (resolution failureResolution) cancellationEntries(causeBatchIndex int, reason string) ([]JournalEntry, error) {
 	entries := make([]JournalEntry, 0, len(resolution.cancelled))
 	for _, command := range resolution.cancelled {
-		entry, err := terminalEventWithCode(command.id, command.key, "cancelled", "fail_fast", reason,
+		entry, err := terminalEventWithCode(command.id, command.key, "cancelled", "run_failing", reason,
 			"flow.command_cancelled", "command_terminal")
 		if err != nil {
 			return nil, err
@@ -331,13 +309,13 @@ func (s *Store) applyFailureResolution(
 	if len(resolution.cancelled) == 0 {
 		return nil
 	}
-	failure := terminalFailure{Code: "fail_fast", Message: reason}
+	failure := terminalFailure{Code: "run_failing", Message: reason}
 	commandIDs := make([]uuid.UUID, len(resolution.cancelled))
 	positions := make([]int64, len(resolution.cancelled))
 	for index, command := range resolution.cancelled {
 		journalIndex := cancelledOffset + index
 		if journalIndex < 0 || journalIndex >= len(journal.Journal) {
-			return fmt.Errorf("%w: fail-fast journal mapping is invalid", flowerr.ErrInvalidState)
+			return fmt.Errorf("%w: command-failure journal mapping is invalid", flowerr.ErrInvalidState)
 		}
 		commandIDs[index] = command.id
 		positions[index] = journal.Journal[journalIndex].Position
@@ -350,14 +328,14 @@ func (s *Store) applyFailureResolution(
 		AND c.state NOT IN ('succeeded','failed','cancelled','expired')`,
 		commandIDs, positions, semantic.RunID(), jsonString(failure), semantic.DBNow())
 	if err != nil {
-		return MapError("cancel commands after fail-fast", err)
+		return MapError("cancel commands after command failure", err)
 	}
 	if commandTag.RowsAffected() != int64(len(commandIDs)) {
-		return fmt.Errorf("%w: fail-fast cancellation set changed", flowerr.ErrInvalidState)
+		return fmt.Errorf("%w: command-failure cancellation set changed", flowerr.ErrInvalidState)
 	}
 	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+`
 		WHERE run_id=$1 AND command_id=ANY($2::uuid[])`, semantic.RunID(), commandIDs); err != nil {
-		return MapError("remove fail-fast cancelled commands", err)
+		return MapError("remove commands cancelled after command failure", err)
 	}
 	return nil
 }

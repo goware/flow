@@ -48,25 +48,20 @@ Compatible replicas may register different subsets and versions. A command whose
 
 `command.Enqueue(ctx, client, runKey, args, options...)` validates and canonicalizes the start, then creates or rediscovers asynchronous durable work. It never invokes a worker inline.
 
-The returned `Run` is the run's state snapshot as of durable acceptance, including:
+The returned `EnqueueResult` is deliberately compact:
 
-- `ID`: accepted run ID;
-- `Type` and `Version`: root command definition;
-- `Key`: caller-supplied run key;
-- `RootCommandID`: accepted root command ID;
-- `Created`: true only for the call whose transaction created the run; and
-- status, counters, deadline, timestamps, and metadata as of acceptance.
+- `RunID`: the accepted run ID; and
+- `Created`: true only for the call whose transaction created the run.
 
-Inspection APIs return the same `Run` type with the current or final state; `Created` is always false on inspection reads.
+`GetRun` and `AwaitRun` return the full durable `Run` snapshot with root
+definition, key, status, counters, deadline, failures, and timestamps.
 
 ### 4.1 Start options and defaults
 
 Every run has:
 
-- fail-fast enabled by default;
 - a 30-day run deadline by default;
 - a command ceiling copied from its runtime, default 1000;
-- empty metadata by default;
 - a root command eligible immediately unless delayed or gated; and
 - permanent key scope by default.
 
@@ -74,8 +69,6 @@ Options are:
 
 - `WithRunDeadline(d)`: positive duration measured from the accepted database start time;
 - `WithoutRunDeadline()`: removes the run deadline;
-- `WithMetadata(m)`: immutable, indexed start metadata;
-- `WithFailFast(enabled)`: controls required-failure cancellation behavior;
 - `WithLiveKey()`: selects live key scope and requires a non-empty key;
 - `WithStartDelay(d)`: delays root eligibility by a positive duration;
 - `WaitFor(event, key)`: adds one exact root event gate; and
@@ -94,7 +87,9 @@ identity. Store and decode boundaries still reject non-exact durable values.
 
 A non-empty permanent key identifies at most one run for `(root command name, run key)` over the lifetime of retained Flow data.
 
-An equivalent repeat returns the existing run with `Created=false`. Equivalent start identity includes command name/version, canonical arguments, key scope, deadline mode/duration, fail-fast, initial delay, waits, wait budget, and canonical metadata.
+An equivalent repeat returns the existing `RunID` with `Created=false`.
+Equivalent start identity includes command name/version, canonical arguments,
+key scope, deadline mode/duration, initial delay, waits, and wait budget.
 
 Changing any of those fields for an existing permanent identity returns `ErrConflict`. Runtime command ceilings and command-definition defaults such as queue/retry/timeout are not re-applied during rediscovery; the first accepted run and root declaration remain authoritative.
 
@@ -104,7 +99,10 @@ An empty permanent key has no idempotency identity and creates a new run on each
 
 `WithLiveKey` provides at-most-one live run for `(root command name, run key)`, where live means run status `running` or `failing`.
 
-While a live holder exists, another start returns that run with `Created=false` without comparing version, arguments, metadata, or start options. This is an intentional queue-style dedupe no-op. When the holder becomes terminal, a later call creates a new run and acquires the key.
+While a live holder exists, another start returns that `RunID` with
+`Created=false` without comparing version, arguments, or start options. This is
+an intentional queue-style dedupe no-op. When the holder becomes terminal, a
+later call creates a new run and acquires the key.
 
 `GetCurrentRun` follows this invariant and does not return older terminal holders.
 
@@ -128,26 +126,30 @@ The runtime loads arguments and declared event inputs, releases all database res
 
 Inside a worker:
 
-- `Enqueue(work, key, command, args)` stages a sub-command and returns an ephemeral `Node`;
+- `Enqueue(work, key, command, args)` stages a sub-command and returns an ephemeral `StagedCommand`;
 - `Emit(work, event, key, payload)` stages an application event in the current run;
 - `GetEventValue(work, event, key)` decodes a declared event input already loaded in memory; and
 - `work.Info()` returns immutable command/attempt information.
 
-`Node` supports:
+`StagedCommand` supports:
 
-- `Optional()` to make child failure non-fatal to the run;
 - `Delay(d)` to set one positive initial delay;
 - `WaitFor(event, key)` to add an exact gate;
 - `Within(d)` to bound a gated command's wait; and
 - `Key()` to return the stable command key.
 
-Nodes are valid only during the decision that created them.
+Staged commands are valid only during the decision that created them.
 
 ### 5.1 Durable command identity
 
-Command keys are unique within a run. A declaration fingerprint covers command name/version, key, canonical arguments, parent, required flag, queue, retry policy, attempt timeout, initial delay, exact waits, and wait budget.
+Command keys are unique within a run. A declaration fingerprint covers command
+name/version, key, canonical arguments, parent, queue, retry policy, attempt
+timeout, initial delay, exact waits, and wait budget.
 
-Repeating one command key with the same core declaration during a decision coalesces. Distinct waits added by repeated declarations merge. Any disagreement in definition, arguments, optionality, delay, wait budget, queue, timeout, or retry policy poisons the complete decision.
+Repeating one command key with the same core declaration during a decision
+coalesces. Distinct waits added by repeated declarations merge. Any disagreement
+in definition, arguments, delay, wait budget, queue, timeout, or retry policy
+poisons the complete decision.
 
 A later attempt may repeat an already accepted declaration equivalently, but it may not amend it. Conflicting durable content rejects the complete decision. The first recorded defect wins; no partially valid subset is committed.
 
@@ -163,7 +165,10 @@ Sibling/external data may be supplied through:
 - stable references in arguments, resolved from application storage; or
 - application tables read by the worker.
 
-`GetResult(ctx, client, runID, key, command)` is a point inspection read over
+`command.GetResult(ctx, client, runID, key)` is the preferred point inspection
+read over the command projection. The equivalent top-level
+`GetResult(ctx, client, runID, key, command)` form is retained for dynamic
+callers. Both return
 the command projection. It returns the decoded typed value with `found=true`
 only for a successful command. A missing command or one without a successful
 result returns `found=false`; a missing run returns `ErrNotFound`; a mismatched
@@ -242,6 +247,11 @@ All waits are exact AND gates. A command is claimable only when:
 `Within` starts at command creation, independently of `Delay`, and is capped by an earlier run deadline. An event committed at or before the persisted wait deadline satisfies the wait even if maintenance processes expiry later. If any wait is still absent after that deadline, the command becomes `expired`; late events cannot resurrect it.
 
 At most 256 exact waits may be declared on one command. The store records each satisfying journal position. Claim materialization loads every selector and its canonical event body in one bounded query before releasing the connection.
+
+One worker decision may stage at most 256 distinct application events. An
+exact repeated name/key/payload remains an idempotent no-op at the boundary; a
+conflicting duplicate remains `ErrConflict`; a valid 257th identity returns
+`ErrInvalid` and rejects the complete decision atomically.
 
 Accepted event ingress updates only matching unresolved reverse-wait rows,
 decrements the affected commands' `unsatisfied_waits` counters, and queues only
@@ -326,7 +336,8 @@ running -> succeeded | failed | cancelled | expired
 running -> failing -> failed | cancelled | expired
 ```
 
-`failing` means a required command has reached an unsuccessful terminal state but active surviving work may still be settling.
+`failing` means a command has reached an unsuccessful terminal state but active
+surviving work may still be settling.
 
 Public run, command, queue, key-scope, and terminal-status fields use typed string constants. Unknown stored values fail explicit boundary decoding as `ErrInvalidState`.
 
@@ -337,11 +348,15 @@ pending | ready | running | retry_wait
     -> succeeded | failed | cancelled | expired
 ```
 
-An run succeeds when all commands are terminal and no required command failed, was cancelled, or expired. Application events alone do not keep it open; a predeclared gated command does. Optional work still contributes to liveness.
+A run succeeds when all commands are terminal and none failed, was cancelled,
+or expired. Application events alone do not keep it open; a predeclared gated
+command does.
 
-Required terminal failure enters failing state. With fail-fast enabled, Flow cancels commands without active attempts while preserving already running attempts and their valid fences. A survivor that succeeds after failing began may record its result/events, but newly staged children are recorded cancelled. With fail-fast disabled, already declared work continues, but the final run still fails.
-
-Optional command failure/cancellation/expiry remains visible in history and trace but does not by itself fail the run. Externally gated optional commands should normally have a finite `Within` budget so they do not hold the run open forever.
+Any terminal command failure enters failing state. Flow cancels commands
+without active attempts while preserving already running attempts and their
+valid fences. A survivor that succeeds after failing began may record its
+result/events, but newly staged children are recorded cancelled. The final run
+fails after all running survivors settle.
 
 A failed, cancelled, or expired command emits no success application event and stages no children. Flow provides no in-run reaction to unsuccessful command outcomes. Expected business alternatives should be represented as successful typed results/events; infrastructure failures remain failures.
 
@@ -357,10 +372,12 @@ Cancellation requires a non-empty, trimmed UTF-8 reason of at most 1024 bytes.
 - concludes and fences any active attempt;
 - removes delivery state for the command;
 - records command cancellation in the journal;
-- treats cancellation of a required command as required failure; and
-- allows cancellation of an optional command without necessarily failing the run.
+- makes command cancellation a run failure; and
+- cancels queued/non-running siblings while preserving running fences.
 
-Cancelling a required command makes the run fail, not become run status `cancelled`. Normal fail-fast rules apply to its remaining work.
+Cancelling a command makes the run fail, not become run status `cancelled`.
+Queued/non-running siblings are cancelled; running siblings retain their
+fences.
 
 `CancelRun(ctx, client, runID, reason)` atomically concludes active attempts, cancels every open command, removes their queue rows, records command terminal events, and records the run as `cancelled`.
 
@@ -500,31 +517,57 @@ re-canonicalizes retained bodies for stronger history diagnostics.
 
 Database constraints require a non-null root command and enforce same-run ownership for roots, parents, delivery rows, event waits, and journal command references. Durable position references are positive, and journal causation must point to an earlier position.
 
-`Migrate` serializes migration application with an advisory transaction lock, verifies checksums of already applied migrations, and applies each pending embedded migration in its own transaction. `MigrationFS` exposes schema-rendered SQL for an external transactional runner. `CheckSchema` verifies checksums, reader/writer compatibility, current version, and the exact six-table inventory without mutation.
+The current development schema contains one embedded `001_initial.sql` at
+reader/writer version 1. `Migrate` serializes installation with an advisory
+transaction lock and verifies the ledger checksum. `MigrationFS` exposes the
+same schema-rendered SQL for an external transactional runner. `CheckSchema`
+verifies the checksum, compatibility, version, and exact six-table inventory
+without mutation.
 
 `New` fails with `ErrSchema` when the configured schema is absent, incomplete, modified, unknown, or incompatible.
 
-The current release has no journal pruning or archival API. Arguments, results, event payloads, metadata, and journal bodies remain stored for the lifetime of the retained run. Operators must budget retention accordingly and use stable external references for large or sensitive application data.
+Schemas created by the earlier four-migration development chain are
+unsupported. Operators drop and recreate the configured Flow schema, then run
+`Migrate`; there is no in-place upgrade or historical-row compatibility path.
+
+`PruneTerminalRuns(ctx, runtime, finishedBefore, limit)` deletes one explicit
+batch of 1 through 1,000 complete Flow aggregates. The cutoff is exclusive.
+Only terminal unkeyed or live-keyed runs are eligible; permanent non-empty keys
+remain forever to preserve idempotency ownership. Flow deletes its journal,
+commands, queue/waits, and run transactionally, but never application rows
+written through `WithCommit`. There is no automatic TTL, archive, or background
+retention service.
 
 ## 14. Inspection and observability
 
 `GetRun` returns one durable run snapshot by ID.
 
-`GetCurrentRun(type, key)` returns the current live-key holder or `found=false`; terminal runs with the same key may still exist.
+`command.GetCurrentRun(ctx, client, key)` is the preferred typed form and
+derives the root command name. Top-level
+`GetCurrentRun(ctx, client, rootCommandName, key)` supports dynamic names. Both
+return the current live-key holder or
+`found=false`; terminal runs with the same key may still exist. Run and command
+keys remain strings.
 
-`ListRuns` provides indexed keyset pagination with optional command type, key prefix, statuses, creation-time range, and metadata containment. `CreatedAfter` is inclusive, `CreatedBefore` exclusive. Page size defaults to 50 and may be 1 through 200.
+`ListRuns` provides indexed keyset pagination with optional root command name,
+key prefix, statuses, and creation-time range. `CreatedAfter` is inclusive,
+`CreatedBefore` exclusive. Page size defaults to 50 and may be 1 through 200.
 
-`ListLiveWork` returns queued or leased commands for at most 200 exact run
-keys. `ListHistoryByKeys` returns retained journal entries for the same bounded
-key set. Both use opaque, versioned, query-specific keyset cursors bound to the
-normalized keys; pages default to 100 rows and may be 1 through 1000. Keys must
-be non-empty valid UTF-8 no larger than 1024 bytes. Ordinary calls do not
-promise a cross-page snapshot; transaction-scoped clients observe the caller's
-transaction and its uncommitted writes.
+`ListActiveCommands` returns queued or leased commands for at most 200 exact
+run keys. `ListHistoryByRunKeys` returns retained journal entries for the same
+bounded key set. Both use opaque, versioned, query-specific keyset cursors bound
+to the normalized keys; pages default to 100 rows and may be 1 through 1000.
+Keys must be non-empty valid UTF-8 no larger than 1024 bytes. Ordinary calls do
+not promise a cross-page snapshot; transaction-scoped clients observe the
+caller transaction and its uncommitted writes.
 
 `AwaitRun` polls without holding a worker, lease, or database connection between reads until the run is terminal or the context ends.
 
-`GetQueueDepth(queue)` returns a point-in-time count of ready, delayed, and running delivery rows plus how long the oldest ready item has waited. It is operational state, not semantic history.
+`GetQueueStats(ctx, client, queues...)` accepts at most 200 queue-name inputs before
+deduplication and returns an entry for every requested distinct lane, including
+empty lanes. Ready, delayed, running, and oldest-ready values use one SQL
+statement and one shared PostgreSQL timestamp. It is operational state, not
+semantic history.
 
 `History` returns immutable entries ordered by journal position. `HistoryAfter` is exclusive; `HistoryLimit` defaults to 100 and may be 1 through 1000.
 
@@ -564,20 +607,19 @@ Flow canonicalizes durable typed values as JSON and stores them in PostgreSQL; i
 | canonical command arguments | 256 KiB |
 | canonical command results | 256 KiB |
 | canonical application-event payload | 64 KiB |
-| canonical run metadata | 16 KiB |
-| metadata key | 128 bytes |
-| metadata value | 1024 bytes |
 | command/event/queue definition name | 255 bytes |
 | PostgreSQL schema name | 63 bytes and a simple SQL identifier |
 | run key | 1024 bytes; empty allowed only for non-idempotent permanent starts |
 | command/event key | 1024 bytes and non-empty |
 | cancellation reason | 1024 bytes and non-empty |
 | exact waits per command | 256 |
+| distinct staged application events per decision | 256 |
 | commands per run | runtime-configurable, default 1000; zero disables |
 | run listing page | default 50, maximum 200 |
 | history page | default 100, maximum 1000 |
 | by-key read batch | maximum 200 non-empty UTF-8 keys, each at most 1024 bytes |
-| live-work/keyed-history page | default 100, maximum 1000 |
+| active-command/keyed-history page | default 100, maximum 1000 |
+| terminal-run prune batch | 1 through 1000 |
 | opaque by-key cursor | maximum 4096 encoded bytes |
 | initial trace history | fewer than 100,000 entries |
 

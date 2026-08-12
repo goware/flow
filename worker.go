@@ -195,7 +195,6 @@ type stagedCommand struct {
 	defaults   commandDefaults
 	key        string
 	args       canonical.Value
-	required   bool
 	startAfter time.Duration
 	waits      []commandEventWait
 	within     time.Duration
@@ -253,6 +252,11 @@ func Emit[W, T any](work *Work[W], event Event[T], key string, payload T) error 
 		state.poison(err)
 		return err
 	}
+	if len(state.decision.events) >= maxStagedApplicationEvents {
+		err = newError(ErrInvalid, "emit", "event", key, "decision exceeds the 256 staged-event limit")
+		state.poison(err)
+		return err
+	}
 	state.decision.events[identity] = stagedEvent{definition: event.def, key: key, payload: encoded}
 	state.decision.eventOrder = append(state.decision.eventOrder, identity)
 	return nil
@@ -260,9 +264,9 @@ func Emit[W, T any](work *Work[W], event Event[T], key string, payload T) error 
 
 // Enqueue requests a command from a worker. It never invokes
 // the worker inline; the command is staged in the enclosing durable decision.
-func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) *Node {
+func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) *StagedCommand {
 	state, err := usableWork(work, "enqueue")
-	node := &Node{scope: state, key: key}
+	node := &StagedCommand{scope: state, key: key}
 	if err != nil {
 		return node
 	}
@@ -280,10 +284,7 @@ func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) 
 		state.poison(err)
 		return node
 	}
-	staged := stagedCommand{
-		definition: cmd.def, defaults: cmd.defaults, key: key, args: encoded,
-		required: true,
-	}
+	staged := stagedCommand{definition: cmd.def, defaults: cmd.defaults, key: key, args: encoded}
 	if state.decision.commands == nil {
 		state.decision.commands = make(map[string]stagedCommand)
 	}
@@ -302,7 +303,6 @@ func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) 
 
 func equivalentStagedCommandIdentity(a, b stagedCommand) bool {
 	left, right := a, b
-	left.required, right.required = true, true
 	left.startAfter, right.startAfter = 0, 0
 	left.waits, right.waits = nil, nil
 	left.within, right.within = 0, 0
@@ -325,7 +325,7 @@ func equivalentStagedCommand(a, b stagedCommand) bool {
 		return false
 	}
 	if a.definition.Name != b.definition.Name || a.definition.Version != b.definition.Version ||
-		a.required != b.required || a.startAfter != b.startAfter || a.within != b.within ||
+		a.startAfter != b.startAfter || a.within != b.within ||
 		!equivalentCommandDefaults(a.defaults, b.defaults) ||
 		!bytes.Equal(a.args.Bytes, b.args.Bytes) || !slices.Equal(a.waits, b.waits) {
 		return false
@@ -463,7 +463,7 @@ func lookupTraceResult(trace RunTrace, key string, command *definition.Command) 
 		if value.Name != command.Name || value.Version != command.Version {
 			return TraceCommand{}, newError(ErrConflict, "read", "command", key, fmt.Sprintf("definition differs from %s/%d", value.Name, value.Version))
 		}
-		if value.State != CommandStatusSucceeded {
+		if value.Status != CommandStatusSucceeded {
 			return TraceCommand{}, newError(ErrInvalidState, "read", "command", key, "command has no successful result")
 		}
 		return value, nil

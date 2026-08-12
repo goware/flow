@@ -133,16 +133,16 @@ func runExampleCommand(ctx context.Context, runtime *flow.Runtime, monitor *exte
 		return flow.Run{}, flow.RunTrace{}, err
 	}
 	monitorResult := make(chan error, 1)
-	go func() { monitorResult <- monitor.observeBridgeDelivery(ctx, run.ID) }()
+	go func() { monitorResult <- monitor.observeBridgeDelivery(ctx, run.RunID) }()
 
-	trace, err := waitForTerminal(ctx, runtime, run.ID, 8*time.Second)
+	trace, err := waitForTerminal(ctx, runtime, run.RunID, 8*time.Second)
 	if err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
 	if err := <-monitorResult; err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
-	return run, trace, nil
+	return trace.Run, trace, nil
 }
 
 // confirmBridge is the worker handler.

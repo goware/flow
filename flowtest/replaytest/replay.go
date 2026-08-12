@@ -53,8 +53,8 @@ func AssertMatchesLive(t testing.TB, db *pgkit.DB, schema string, id flow.RunID)
 	if err != nil {
 		t.Fatalf("replay.Fold() error = %v", err)
 	}
-	if projected.ID.String() != string(live.ID) || projected.DefinitionName != live.Type || projected.DefinitionVersion != live.Version ||
-		projected.RunKey != live.Key || projected.Status != string(live.Status) || projected.CommandCount != live.CommandCount ||
+	if projected.ID.String() != string(live.ID) || projected.DefinitionName != live.RootCommandName || projected.DefinitionVersion != live.RootCommandVersion ||
+		projected.RunKey != live.RunKey || projected.Status != string(live.Status) || projected.CommandCount != live.CommandCount ||
 		projected.OpenCommands != live.OpenCommands || !equalFailure(projected.Failure, live.Failure) {
 		t.Fatalf("replay/live run mismatch:\nreplay=%#v\nlive=%#v", projected, live)
 	}

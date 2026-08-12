@@ -40,7 +40,7 @@ func TestDurableAdaptiveAgentExampleEndToEnd(t *testing.T) {
 	}
 	statuses := map[string]flow.CommandStatus{}
 	for _, command := range trace.Commands {
-		statuses[command.Key] = command.State
+		statuses[command.Key] = command.Status
 	}
 	if statuses["turn/1/tool/archive"] != flow.CommandStatusSucceeded || statuses["turn/2/think"] != flow.CommandStatusSucceeded {
 		t.Fatalf("statuses=%v", statuses)

@@ -23,9 +23,9 @@ import (
 
 const (
 	defaultSchema         = "public"
-	currentSchemaVersion  = 4
-	currentReaderVersion  = 2
-	currentWriterVersion  = 2
+	currentSchemaVersion  = 1
+	currentReaderVersion  = 1
+	currentWriterVersion  = 1
 	migrationToken        = "{{schema}}"
 	migrationAdvisorySalt = "goware/flow/migrate/v1"
 )
@@ -81,9 +81,6 @@ var migrationFiles = []struct {
 	minWriter int
 }{
 	{version: 1, name: "initial", path: "migrations/001_initial.sql", minReader: 1, minWriter: 1},
-	{version: 2, name: "live_keys", path: "migrations/002_live_keys.sql", minReader: 1, minWriter: 1},
-	{version: 3, name: "release_read_paths", path: "migrations/003_release_read_paths.sql", minReader: 1, minWriter: 1},
-	{version: 4, name: "run_vocabulary", path: "migrations/004_run_vocabulary.sql", minReader: 2, minWriter: 2},
 }
 
 // Migrate applies every unapplied embedded Flow migration in its own

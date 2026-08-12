@@ -51,11 +51,11 @@ func TestStartInTxRejectsDurableBoundsBeforeSQL(t *testing.T) {
 	}
 	base := StartRequest{
 		ID: uuid.New(), DefinitionName: "store.boundary", DefinitionVersion: 1,
-		Key: "key", KeyScope: KeyScopePermanent, Input: value, Metadata: value,
+		Key: "key", KeyScope: KeyScopePermanent, Input: value,
 		Deadline: DeadlineSpec{Mode: "none"}, MaxCommands: 1,
 		Root: &CommandCreate{
 			ID: uuid.New(), Key: "root", Name: "store.boundary", Version: 1,
-			Args: value, Required: true, Queue: "default", RetryPolicy: policy,
+			Args: value, Queue: "default", RetryPolicy: policy,
 		},
 	}
 	repository := &Store{}

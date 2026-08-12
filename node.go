@@ -7,21 +7,21 @@ import (
 	"github.com/goware/flow/internal/durable"
 )
 
-// Node is an ephemeral builder for a command staged by a worker decision. It
+// StagedCommand is an ephemeral builder for a command staged by a worker decision. It
 // is valid only for the duration of that decision.
-type Node struct {
+type StagedCommand struct {
 	scope *scopeState
 	key   string
 }
 
-func (node *Node) Key() string {
+func (node *StagedCommand) Key() string {
 	if node == nil {
 		return ""
 	}
 	return node.key
 }
 
-func (node *Node) WaitFor(event EventRef, key string) *Node {
+func (node *StagedCommand) WaitFor(event EventRef, key string) *StagedCommand {
 	if node == nil {
 		return node
 	}
@@ -41,7 +41,7 @@ func (node *Node) WaitFor(event EventRef, key string) *Node {
 	return node
 }
 
-func (node *Node) Within(duration time.Duration) *Node {
+func (node *StagedCommand) Within(duration time.Duration) *StagedCommand {
 	if node == nil {
 		return node
 	}
@@ -68,7 +68,7 @@ func (node *Node) Within(duration time.Duration) *Node {
 	return node
 }
 
-func (node *Node) Delay(duration time.Duration) *Node {
+func (node *StagedCommand) Delay(duration time.Duration) *StagedCommand {
 	if node == nil {
 		return node
 	}
@@ -95,21 +95,7 @@ func (node *Node) Delay(duration time.Duration) *Node {
 	return node
 }
 
-func (node *Node) Optional() *Node {
-	if node == nil {
-		return node
-	}
-	if command, ok := node.decisionCommand("optional"); ok {
-		if !command.required {
-			return node
-		}
-		command.required = false
-		node.scope.decision.commands[node.key] = command
-	}
-	return node
-}
-
-func (node *Node) decisionCommand(operation string) (stagedCommand, bool) {
+func (node *StagedCommand) decisionCommand(operation string) (stagedCommand, bool) {
 	if node.scope == nil || node.scope.firstError != nil {
 		return stagedCommand{}, false
 	}
@@ -120,7 +106,7 @@ func (node *Node) decisionCommand(operation string) (stagedCommand, bool) {
 	return command, ok
 }
 
-func (node *Node) poison(err error) {
+func (node *StagedCommand) poison(err error) {
 	if node != nil && node.scope != nil {
 		node.scope.poison(err)
 	}

@@ -40,34 +40,32 @@ func TestRunStartsAndEventDeliver(t *testing.T) {
 	}
 
 	command := DefineCommand[ingressArgs, ingressResult]("ingress.work", 1)
-	direct, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"}, WithMetadata(map[string]string{"tenant": "one"}))
+	direct, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"})
 	if err != nil {
 		t.Fatalf("Command.Enqueue() error = %v", err)
 	}
-	if !direct.Created || direct.RootCommandID == "" || direct.Type != command.Name() {
+	directRun := mustGetRun(t, runtime, direct.RunID)
+	if !direct.Created || directRun.RootCommandID == "" || directRun.RootCommandName != command.Name() {
 		t.Fatalf("direct exec = %#v", direct)
 	}
-	assertRunShape(t, database.Schema, database.DB.Conn, direct, 1, 1)
+	assertRunShape(t, database.Schema, database.DB.Conn, directRun, 1, 1)
 
-	repeated, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"}, WithMetadata(map[string]string{"tenant": "one"}))
-	if err != nil || repeated.Created || repeated.ID != direct.ID || repeated.RootCommandID != direct.RootCommandID {
+	repeated, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"})
+	if err != nil || repeated.Created || repeated.RunID != direct.RunID {
 		t.Fatalf("repeated direct = %#v, %v", repeated, err)
 	}
-	if _, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "different"}, WithMetadata(map[string]string{"tenant": "one"})); !errors.Is(err, ErrConflict) {
+	if _, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "different"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting direct error = %v", err)
-	}
-	if _, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"}, WithMetadata(map[string]string{"tenant": "one"}), WithFailFast(false)); !errors.Is(err, ErrConflict) {
-		t.Fatalf("conflicting direct options error = %v", err)
 	}
 
 	event := DefineEvent[ingressArgs]("ingress.fact")
-	if err := event.Deliver(ctx, runtime, direct.ID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
+	if err := event.Deliver(ctx, runtime, direct.RunID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
 		t.Fatalf("Deliver() error = %v", err)
 	}
-	if err := event.Deliver(ctx, runtime, direct.ID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
+	if err := event.Deliver(ctx, runtime, direct.RunID, "fact/1", ingressArgs{Value: "seen"}); err != nil {
 		t.Fatalf("repeated Deliver() error = %v", err)
 	}
-	if err := event.Deliver(ctx, runtime, direct.ID, "fact/1", ingressArgs{Value: "changed"}); !errors.Is(err, ErrConflict) {
+	if err := event.Deliver(ctx, runtime, direct.RunID, "fact/1", ingressArgs{Value: "changed"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting Deliver() error = %v", err)
 	}
 }
@@ -96,19 +94,19 @@ func TestApplicationEventCannotReopenTerminalRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
-	before, err := History(ctx, runtime, exec.ID)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "succeeded", 5*time.Second)
+	before, err := History(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := event.Deliver(ctx, runtime, exec.ID, "late", "must not be recorded"); !errors.Is(err, ErrTerminal) {
+	if err := event.Deliver(ctx, runtime, exec.RunID, "late", "must not be recorded"); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("late Event.Deliver() error=%v, want ErrTerminal", err)
 	}
-	after, err := History(ctx, runtime, exec.ID)
+	after, err := History(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := GetRun(ctx, runtime, exec.ID)
+	run, err := GetRun(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +141,7 @@ func TestCallerOwnedTransactionCommitAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transaction Enqueue() error = %v", err)
 	}
-	uncommittedHistory, err := History(ctx, flowTx, rolledBack.ID)
+	uncommittedHistory, err := History(ctx, flowTx, rolledBack.RunID)
 	if err != nil || len(uncommittedHistory) != 2 {
 		t.Fatalf("History(uncommitted) = %d, %v", len(uncommittedHistory), err)
 	}
@@ -157,7 +155,7 @@ func TestCallerOwnedTransactionCommitAndRollback(t *testing.T) {
 		t.Fatalf("Rollback() error = %v", err)
 	}
 	var count int
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, rolledBack.ID).Scan(&count); err != nil {
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, rolledBack.RunID).Scan(&count); err != nil {
 		t.Fatalf("count rolled-back run: %v", err)
 	}
 	if count != 0 {
@@ -185,7 +183,7 @@ func TestCallerOwnedTransactionCommitAndRollback(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
-	assertRunShape(t, database.Schema, database.DB.Conn, committed, 1, 1)
+	assertRunShape(t, database.Schema, database.DB.Conn, mustGetRun(t, runtime, committed.RunID), 1, 1)
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "app_records")).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("committed application count = %d, %v", count, err)
 	}
@@ -217,7 +215,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	command := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1,
 		WithQueue("original"), WithRetry(Attempts(3)), WithTimeout(111*time.Millisecond))
 	const callers = 16
-	execs := make([]Run, callers)
+	execs := make([]EnqueueResult, callers)
 	errs := make([]error, callers)
 	var group sync.WaitGroup
 	for index := range callers {
@@ -233,7 +231,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 		if errs[index] != nil {
 			t.Fatalf("concurrent Enqueue(%d) error = %v", index, errs[index])
 		}
-		if execs[index].ID != execs[0].ID || execs[index].RootCommandID != execs[0].RootCommandID {
+		if execs[index].RunID != execs[0].RunID {
 			t.Fatalf("concurrent exec %d = %#v, first %#v", index, execs[index], execs[0])
 		}
 		if execs[index].Created {
@@ -243,7 +241,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if created != 1 {
 		t.Fatalf("created execs = %d, want 1", created)
 	}
-	assertRunShape(t, database.Schema, database.DB.Conn, execs[0], 1, 1)
+	assertRunShape(t, database.Schema, database.DB.Conn, mustGetRun(t, runtime, execs[0].RunID), 1, 1)
 
 	changedRuntime, err := New(database.DB, WithSchema(database.Schema), WithMaxCommandsPerRun(99))
 	if err != nil {
@@ -252,7 +250,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	changedCommand := DefineCommand[ingressArgs, ingressResult]("concurrent.work", 1,
 		WithQueue("changed"), WithRetry(Attempts(9)), WithTimeout(999*time.Millisecond))
 	repeated, err := changedCommand.Enqueue(ctx, changedRuntime, "same", ingressArgs{Value: "stable"})
-	if err != nil || repeated.Created || repeated.ID != execs[0].ID {
+	if err != nil || repeated.Created || repeated.RunID != execs[0].RunID {
 		t.Fatalf("start under changed defaults = %#v, %v", repeated, err)
 	}
 	var maxCommands int
@@ -262,7 +260,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT e.max_commands,c.queue,
 		c.retry_policy,c.attempt_timeout_ms FROM `+
 		pgschema.Table(database.Schema, "flow_runs")+` e JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c USING (run_id)
-		WHERE e.run_id=$1`, execs[0].ID).Scan(&maxCommands, &queue, &retryPolicy, &timeoutMS); err != nil {
+		WHERE e.run_id=$1`, execs[0].RunID).Scan(&maxCommands, &queue, &retryPolicy, &timeoutMS); err != nil {
 		t.Fatalf("read accepted defaults: %v", err)
 	}
 	policy, err := retrypolicy.PublicFromCanonical(retryPolicy)
@@ -278,7 +276,9 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	fact := DefineEvent[ingressArgs]("ceiling.fact")
 	publishErrors := make(chan error, callers)
 	for range callers {
-		go func() { publishErrors <- fact.Deliver(ctx, runtime, execs[0].ID, "same", ingressArgs{Value: "fact"}) }()
+		go func() {
+			publishErrors <- fact.Deliver(ctx, runtime, execs[0].RunID, "same", ingressArgs{Value: "fact"})
+		}()
 	}
 	for range callers {
 		if err := <-publishErrors; err != nil {
@@ -287,7 +287,7 @@ func TestConcurrentStartDefaultsAndCommandCeiling(t *testing.T) {
 	}
 	var eventCount int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE run_id=$1 AND event_class='application'`, execs[0].ID).Scan(&eventCount); err != nil || eventCount != 1 {
+		WHERE run_id=$1 AND event_class='application'`, execs[0].RunID).Scan(&eventCount); err != nil || eventCount != 1 {
 		t.Fatalf("concurrent event count = %d, %v", eventCount, err)
 	}
 }
@@ -307,9 +307,9 @@ func TestTransactionRunOrdering(t *testing.T) {
 	command := DefineCommand[ingressArgs, ingressResult]("order.command", 1)
 	first, _ := command.Enqueue(ctx, runtime, "one", ingressArgs{})
 	second, _ := command.Enqueue(ctx, runtime, "two", ingressArgs{})
-	ids := []RunID{first.ID, second.ID}
+	ids := []RunID{first.RunID, second.RunID}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	keyByID := map[RunID]string{first.ID: "one", second.ID: "two"}
+	keyByID := map[RunID]string{first.RunID: "one", second.RunID: "two"}
 	fact := DefineEvent[ingressArgs]("order.fact")
 
 	tx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
@@ -339,7 +339,7 @@ func TestTransactionRunOrdering(t *testing.T) {
 		t.Fatalf("Emit(low) error = %v", err)
 	}
 	rediscovered, err := command.Enqueue(ctx, client, keyByID[ids[1]], ingressArgs{})
-	if err != nil || rediscovered.ID != ids[1] || rediscovered.Created {
+	if err != nil || rediscovered.RunID != ids[1] || rediscovered.Created {
 		t.Fatalf("Enqueue(rediscover ordered) = %#v, %v", rediscovered, err)
 	}
 	if err := fact.Deliver(ctx, client, ids[1], "high", ingressArgs{}); err != nil {
@@ -368,6 +368,7 @@ func TestTransactionStartRejectsApplicationPhaseBeforeSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	targetRun := mustGetRun(t, runtime, target.RunID)
 	tx, err := database.DB.Conn.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -383,16 +384,16 @@ func TestTransactionStartRejectsApplicationPhaseBeforeSQL(t *testing.T) {
 	if _, err := command.Enqueue(ctx, client, "must-not-start", ingressArgs{}); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("Enqueue(application phase) error = %v", err)
 	}
-	if err := event.Deliver(ctx, client, target.ID, "must-not-deliver", ingressArgs{}); !errors.Is(err, ErrInvalidState) {
+	if err := event.Deliver(ctx, client, target.RunID, "must-not-deliver", ingressArgs{}); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("Deliver(application phase) error = %v", err)
 	}
-	if err := CancelCommand(ctx, client, target.RootCommandID, "must not cancel"); !errors.Is(err, ErrInvalidState) {
+	if err := CancelCommand(ctx, client, targetRun.RootCommandID, "must not cancel"); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("CancelCommand(application phase) error = %v", err)
 	}
-	if err := CancelRun(ctx, client, target.ID, "must not cancel"); !errors.Is(err, ErrInvalidState) {
+	if err := CancelRun(ctx, client, target.RunID, "must not cancel"); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("CancelRun(application phase) error = %v", err)
 	}
-	if _, err := command.ReplaceCurrentRun(ctx, client, target.ID, "existing", ingressArgs{}, "must not replace", WithLiveKey()); !errors.Is(err, ErrInvalidState) {
+	if _, err := command.ReplaceCurrentRun(ctx, client, target.RunID, "existing", ingressArgs{}, "must not replace", WithLiveKey()); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("ReplaceCurrentRun(application phase) error = %v", err)
 	}
 	var runs int
@@ -405,7 +406,7 @@ func TestTransactionStartRejectsApplicationPhaseBeforeSQL(t *testing.T) {
 	}
 	var events int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE run_id=$1 AND event_name=$2`, target.ID, event.Name()).Scan(&events); err != nil {
+		WHERE run_id=$1 AND event_name=$2`, target.RunID, event.Name()).Scan(&events); err != nil {
 		t.Fatal(err)
 	}
 	if events != 0 {
@@ -532,9 +533,6 @@ func TestRuntimeAndIngressValidation(t *testing.T) {
 	if _, err := command.Enqueue(ctx, runtime, "bad/options", ingressArgs{}, WithRunDeadline(0)); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Enqueue(invalid deadline) error = %v", err)
 	}
-	if _, err := command.Enqueue(ctx, runtime, "bad/metadata", ingressArgs{}, WithMetadata(map[string]string{"x": strings.Repeat("x", 1025)})); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("Enqueue(invalid metadata) error = %v", err)
-	}
 	large := ingressArgs{Value: strings.Repeat("x", maxCommandArgumentBytes)}
 	if _, err := command.Enqueue(ctx, runtime, "large", large); !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("Enqueue(large args) error = %v", err)
@@ -547,7 +545,7 @@ func TestRuntimeAndIngressValidation(t *testing.T) {
 		t.Fatalf("Command.Enqueue(event size) error = %v", err)
 	}
 	largeEvent := DefineEvent[ingressArgs]("validation.large_event")
-	if err := largeEvent.Deliver(ctx, runtime, exec.ID, "large", ingressArgs{Value: strings.Repeat("x", maxApplicationEventBytes)}); !errors.Is(err, ErrPayloadTooLarge) {
+	if err := largeEvent.Deliver(ctx, runtime, exec.RunID, "large", ingressArgs{Value: strings.Repeat("x", maxApplicationEventBytes)}); !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("Emit(large payload) error = %v", err)
 	}
 	if err := CancelRun(ctx, runtime, RunID("bad"), "reason"); !errors.Is(err, ErrInvalid) {
@@ -578,39 +576,40 @@ func TestIngressCancellationAndTerminalIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enqueue() error = %v", err)
 	}
-	if err := CancelCommand(ctx, runtime, direct.RootCommandID, "operator request"); err != nil {
+	directRun := mustGetRun(t, runtime, direct.RunID)
+	if err := CancelCommand(ctx, runtime, directRun.RootCommandID, "operator request"); err != nil {
 		t.Fatalf("CancelCommand() error = %v", err)
 	}
-	if err := CancelCommand(ctx, runtime, direct.RootCommandID, "operator request"); err != nil {
+	if err := CancelCommand(ctx, runtime, directRun.RootCommandID, "operator request"); err != nil {
 		t.Fatalf("idempotent CancelCommand() error = %v", err)
 	}
-	if err := CancelCommand(ctx, runtime, direct.RootCommandID, "different"); !errors.Is(err, ErrTerminal) {
+	if err := CancelCommand(ctx, runtime, directRun.RootCommandID, "different"); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("changed CancelCommand() error = %v", err)
 	}
 	repeatedDirect, err := command.Enqueue(ctx, runtime, "cancel/direct", ingressArgs{})
-	if err != nil || repeatedDirect.Created || repeatedDirect.ID != direct.ID {
+	if err != nil || repeatedDirect.Created || repeatedDirect.RunID != direct.RunID {
 		t.Fatalf("start retry after terminal = %#v, %v", repeatedDirect, err)
 	}
 	var runStatus, commandStatus string
 	var queueCount, terminalEvents int
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT status FROM `+pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, direct.ID).Scan(&runStatus); err != nil {
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT status FROM `+pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, direct.RunID).Scan(&runStatus); err != nil {
 		t.Fatalf("read run status: %v", err)
 	}
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT state FROM `+pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1`, direct.RootCommandID).Scan(&commandStatus); err != nil {
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT state FROM `+pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1`, directRun.RootCommandID).Scan(&commandStatus); err != nil {
 		t.Fatalf("read command status: %v", err)
 	}
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` WHERE run_id=$1`, direct.ID).Scan(&queueCount); err != nil {
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` WHERE run_id=$1`, direct.RunID).Scan(&queueCount); err != nil {
 		t.Fatalf("count queue: %v", err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE run_id=$1 AND entry_kind='event_recorded'`, direct.ID).Scan(&terminalEvents); err != nil {
+		WHERE run_id=$1 AND entry_kind='event_recorded'`, direct.RunID).Scan(&terminalEvents); err != nil {
 		t.Fatalf("count terminal events: %v", err)
 	}
 	if runStatus != "failed" || commandStatus != "cancelled" || queueCount != 0 || terminalEvents != 2 {
 		t.Fatalf("cancelled direct = run=%s command=%s queue=%d events=%d", runStatus, commandStatus, queueCount, terminalEvents)
 	}
 
-	history, err := History(ctx, runtime, direct.ID, HistoryLimit(2))
+	history, err := History(ctx, runtime, direct.RunID, HistoryLimit(2))
 	if err != nil {
 		t.Fatalf("History() error = %v", err)
 	}
@@ -621,14 +620,14 @@ func TestIngressCancellationAndTerminalIdempotency(t *testing.T) {
 		t.Fatalf("root command causation = %#v", history[1].CausationPosition)
 	}
 	history[0].Body[0] = '['
-	next, err := History(ctx, runtime, direct.ID, HistoryAfter(history[1].Position), HistoryLimit(10))
+	next, err := History(ctx, runtime, direct.RunID, HistoryAfter(history[1].Position), HistoryLimit(10))
 	if err != nil {
 		t.Fatalf("History(next page) error = %v", err)
 	}
 	if len(next) != 3 || next[0].TerminalStatus != "cancelled" || next[2].TerminalStatus != "failed" {
 		t.Fatalf("History(next page) = %#v", next)
 	}
-	again, err := History(ctx, runtime, direct.ID)
+	again, err := History(ctx, runtime, direct.RunID)
 	if err != nil || len(again) != 5 || again[0].Body[0] != '{' {
 		t.Fatalf("History(immutable) = %d, %v, %q", len(again), err, again[0].Body)
 	}
@@ -636,7 +635,7 @@ func TestIngressCancellationAndTerminalIdempotency(t *testing.T) {
 		t.Fatalf("History(missing) error = %v", err)
 	}
 
-	assertReplayMatches(t, runtime, direct.ID)
+	assertReplayMatches(t, runtime, direct.RunID)
 }
 
 type queryRower interface {

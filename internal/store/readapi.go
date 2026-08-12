@@ -22,9 +22,10 @@ const (
 	maxReadKeyBytes  = 1024
 )
 
-// LiveWorkCursor is the last immutable ordering tuple returned by a live-work
-// list. It is internal store state; the public API binds it to its key filter.
-type LiveWorkCursor struct {
+// ActiveCommandCursor is the last immutable ordering tuple returned by an
+// active-command list. It is internal store state; the public API binds it to
+// its key filter.
+type ActiveCommandCursor struct {
 	RunKey         string
 	DefinitionName string
 	RunCreatedAt   time.Time
@@ -32,16 +33,16 @@ type LiveWorkCursor struct {
 	CommandID      uuid.UUID
 }
 
-// LiveWorkListFilter selects a bounded keyset page of live work.
-type LiveWorkListFilter struct {
+// ActiveCommandListFilter selects a bounded keyset page of active commands.
+type ActiveCommandListFilter struct {
 	Keys   []string
 	Limit  int
-	Cursor *LiveWorkCursor
+	Cursor *ActiveCommandCursor
 }
 
-// LiveWorkRow is one queued (or leased) command of a non-terminal run,
+// ActiveCommandRow is one queued (or leased) command of a non-terminal run,
 // carrying the run's identity for key-addressed batch reads.
-type LiveWorkRow struct {
+type ActiveCommandRow struct {
 	RunID            uuid.UUID
 	DefinitionName   string
 	RunKey           string
@@ -114,9 +115,9 @@ func validateReadCursor(runKey, definitionName string, createdAt time.Time, runI
 	return nil
 }
 
-// ListLiveWorkInTx returns one bounded keyset page of queued commands for
+// ListActiveCommandsInTx returns one bounded keyset page of queued commands for
 // non-terminal runs, reading through tx when supplied.
-func (s *Store) ListLiveWorkInTx(ctx context.Context, tx pgx.Tx, filter LiveWorkListFilter) ([]LiveWorkRow, error) {
+func (s *Store) ListActiveCommandsInTx(ctx context.Context, tx pgx.Tx, filter ActiveCommandListFilter) ([]ActiveCommandRow, error) {
 	if err := validateReadKeys(filter.Keys); err != nil {
 		return nil, err
 	}
@@ -128,58 +129,58 @@ func (s *Store) ListLiveWorkInTx(ctx context.Context, tx pgx.Tx, filter LiveWork
 			return nil, err
 		}
 		if filter.Cursor.CommandID == uuid.Nil {
-			return nil, fmt.Errorf("%w: invalid live-work cursor command ID", flowerr.ErrInvalid)
+			return nil, fmt.Errorf("%w: invalid active-command cursor command ID", flowerr.ErrInvalid)
 		}
 	}
 	if len(filter.Keys) == 0 {
-		return []LiveWorkRow{}, nil
+		return []ActiveCommandRow{}, nil
 	}
 
-	query, args := s.listLiveWorkQuery(filter)
+	query, args := s.listActiveCommandsQuery(filter)
 
 	rows, err := queryReadRows(ctx, s, tx, query, args...)
 	if err != nil {
-		return nil, MapError("list live work", err)
+		return nil, MapError("list active commands", err)
 	}
 	defer rows.Close()
-	work := make([]LiveWorkRow, 0, filter.Limit)
+	commands := make([]ActiveCommandRow, 0, filter.Limit)
 	for rows.Next() {
-		var row LiveWorkRow
+		var row ActiveCommandRow
 		if err := rows.Scan(
 			&row.RunID, &row.DefinitionName, &row.RunKey, &row.KeyScope, &row.RunStatus,
 			&row.RunCreatedAt, &row.CommandID, &row.CommandKey, &row.CommandName, &row.Queue,
 			&row.QueueState, &row.NextRunAt, &row.LeaseOwner, &row.LeaseExpiresAt,
 			&row.AttemptOrdinal, &row.CommandCreatedAt,
 		); err != nil {
-			return nil, MapError("scan live work row", err)
+			return nil, MapError("scan active command row", err)
 		}
-		work = append(work, row)
+		commands = append(commands, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, MapError("list live work", err)
+		return nil, MapError("list active commands", err)
 	}
-	return work, nil
+	return commands, nil
 }
 
-func (s *Store) listLiveWorkQuery(filter LiveWorkListFilter) (string, []any) {
-	query := `SELECT fe.run_id, fe.definition_name, fe.run_key, fe.key_scope, fe.status, fe.created_at,
+func (s *Store) listActiveCommandsQuery(filter ActiveCommandListFilter) (string, []any) {
+	query := `SELECT r.run_id, r.definition_name, r.run_key, r.key_scope, r.status, r.created_at,
 			c.command_id, c.command_key, cq.name, cq.queue, cq.state, cq.next_run_at,
 			cq.lease_owner, cq.lease_expires_at, c.attempt_ordinal, c.created_at
-		FROM ` + pgschema.Table(s.schema, "flow_runs") + ` fe
-		JOIN ` + pgschema.Table(s.schema, "flow_command_queue") + ` cq ON cq.run_id = fe.run_id
+		FROM ` + pgschema.Table(s.schema, "flow_runs") + ` r
+		JOIN ` + pgschema.Table(s.schema, "flow_command_queue") + ` cq ON cq.run_id = r.run_id
 		JOIN ` + pgschema.Table(s.schema, "flow_commands") + ` c
 			ON c.run_id = cq.run_id AND c.command_id = cq.command_id
-		WHERE fe.run_key COLLATE "C" = ANY($1::text[])
-			AND fe.status IN ('running', 'failing')`
+		WHERE r.run_key COLLATE "C" = ANY($1::text[])
+			AND r.status IN ('running', 'failing')`
 	args := []any{filter.Keys}
 	if filter.Cursor != nil {
-		query += ` AND (fe.run_key COLLATE "C", fe.definition_name, fe.created_at, fe.run_id, c.command_id)
+		query += ` AND (r.run_key COLLATE "C", r.definition_name, r.created_at, r.run_id, c.command_id)
 			> ($2::text COLLATE "C", $3::text, $4::timestamptz, $5::uuid, $6::uuid)`
 		args = append(args, filter.Cursor.RunKey, filter.Cursor.DefinitionName,
 			filter.Cursor.RunCreatedAt, filter.Cursor.RunID, filter.Cursor.CommandID)
 	}
 	args = append(args, filter.Limit)
-	query += fmt.Sprintf(` ORDER BY fe.run_key COLLATE "C", fe.definition_name, fe.created_at, fe.run_id, c.command_id
+	query += fmt.Sprintf(` ORDER BY r.run_key COLLATE "C", r.definition_name, r.created_at, r.run_id, c.command_id
 		LIMIT $%d`, len(args))
 	return query, args
 }

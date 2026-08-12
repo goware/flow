@@ -211,7 +211,7 @@ func (publisher approvalPublisher) approve(ctx context.Context, order orderArgs,
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	flowTx := publisher.runtime.InTx(tx)
-	current, found, err := flow.GetCurrentRun(ctx, flowTx, startOrder.Name(), order.OrderID)
+	current, found, err := startOrder.GetCurrentRun(ctx, flowTx, order.OrderID)
 	if err != nil {
 		return err
 	}
@@ -244,15 +244,15 @@ func runOrder(ctx context.Context, runtime *flow.Runtime, publisher approvalPubl
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	settled, err := flow.AwaitRun(waitCtx, runtime, run.ID)
+	settled, err := flow.AwaitRun(waitCtx, runtime, run.RunID)
 	if err != nil {
 		return flow.Run{}, flow.RunTrace{}, err
 	}
 	if settled.Status != flow.RunStatusSucceeded {
 		return flow.Run{}, flow.RunTrace{}, fmt.Errorf("order run ended %s", settled.Status)
 	}
-	trace, err := flow.Trace(ctx, runtime, run.ID)
-	return run, trace, err
+	trace, err := flow.Trace(ctx, runtime, run.RunID)
+	return settled, trace, err
 }
 
 func orderFactKey(orderID string, generation int) string {

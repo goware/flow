@@ -46,9 +46,9 @@ type Observer interface {
 	Observe(context.Context, Observation)
 }
 
-type NopObserver struct{}
+type noOpObserver struct{}
 
-func (NopObserver) Observe(context.Context, Observation) {}
+func (noOpObserver) Observe(context.Context, Observation) {}
 
 const observerQueueSize = 1024
 
