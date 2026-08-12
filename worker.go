@@ -259,9 +259,9 @@ func Emit[W, T any](work *Work[W], event Event[T], key string, payload T) error 
 
 // Enqueue requests a command from a worker. It never invokes
 // the worker inline; the command is staged in the enclosing durable decision.
-func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) *Node {
+func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) *StagedCommand {
 	state, err := usableWork(work, "enqueue")
-	node := &Node{scope: state, key: key}
+	node := &StagedCommand{scope: state, key: key}
 	if err != nil {
 		return node
 	}
@@ -458,7 +458,7 @@ func lookupTraceResult(trace RunTrace, key string, command *definition.Command) 
 		if value.Name != command.Name || value.Version != command.Version {
 			return TraceCommand{}, newError(ErrConflict, "read", "command", key, fmt.Sprintf("definition differs from %s/%d", value.Name, value.Version))
 		}
-		if value.State != CommandStatusSucceeded {
+		if value.Status != CommandStatusSucceeded {
 			return TraceCommand{}, newError(ErrInvalidState, "read", "command", key, "command has no successful result")
 		}
 		return value, nil

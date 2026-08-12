@@ -124,7 +124,7 @@ func WithStartDelay(delay time.Duration) RunOption {
 
 // WaitFor gates a root command on one exact application event inside the
 // run it creates. Multiple waits are AND conditions. Worker decisions
-// use the matching Node.WaitFor method.
+// use the matching StagedCommand.WaitFor method.
 func WaitFor(event EventRef, key string) RunOption {
 	return runOptionFunc(func(options *runOptions) {
 		wait, err := makeCommandEventWait(event, key)

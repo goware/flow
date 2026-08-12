@@ -1306,15 +1306,15 @@ exact accepted commit.
 
 ### Public vocabulary and surface
 
-- [ ] Apply every rename in Section 4.2 without aliases.
-- [ ] Remove `TraceOption`, `CommandFailure`, short status aliases, and public
+- [x] Apply every rename in Section 4.2 without aliases.
+- [x] Remove `TraceOption`, `CommandFailure`, short status aliases, and public
   `NopObserver`.
-- [ ] Preserve `ResultOf`, history options, queue/event/transaction/cancellation
+- [x] Preserve `ResultOf`, history options, queue/event/transaction/cancellation
   capabilities, and `Work`.
 - [ ] Update examples and `go doc`; exclude only historical plan/evidence prose,
   ordinary execute verbs, and explicit negative compile tests from old-name
   scans.
-- [ ] Pass build, vet, formatting, diff, API-surface, example, and focused read
+- [x] Pass build, vet, formatting, diff, API-surface, example, and focused read
   tests.
 
 ### Queue statistics and decision bounds

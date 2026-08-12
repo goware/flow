@@ -107,11 +107,11 @@ func TestCommandGetCurrentRunUsesDefinitionNameAndCallerTransaction(t *testing.T
 		t.Fatal(err)
 	}
 	fromMethod, found, err := v1.GetCurrentRun(ctx, runtime, "current/visible")
-	if err != nil || !found || fromMethod.ID != started.RunID || fromMethod.Version != 1 {
+	if err != nil || !found || fromMethod.ID != started.RunID || fromMethod.RootCommandVersion != 1 {
 		t.Fatalf("Command.GetCurrentRun(v1) = %#v, %t, %v", fromMethod, found, err)
 	}
 	fromNewVersion, found, err := v2.GetCurrentRun(ctx, runtime, "current/visible")
-	if err != nil || !found || fromNewVersion.ID != started.RunID || fromNewVersion.Version != 1 {
+	if err != nil || !found || fromNewVersion.ID != started.RunID || fromNewVersion.RootCommandVersion != 1 {
 		t.Fatalf("Command.GetCurrentRun(v2) = %#v, %t, %v", fromNewVersion, found, err)
 	}
 	fromTopLevel, found, err := GetCurrentRun(ctx, runtime, v1.Name(), "current/visible")

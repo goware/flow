@@ -188,7 +188,7 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 		workerConcurrency: max(1, runtime.GOMAXPROCS(0)), commandLease: 60 * time.Second,
 		pollInterval: time.Second, shutdownGrace: 30 * time.Second,
 		notifications: true,
-		observer:      NopObserver{}, faults: fault.None{},
+		observer:      noOpObserver{}, faults: fault.None{},
 	}
 	for _, option := range opts {
 		if option == nil {

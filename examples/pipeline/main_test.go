@@ -99,7 +99,7 @@ func TestPipelineEventKeyFencesGenerations(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, command := range trace.Commands {
-			if command.Key == "approval/resumed" && command.State == flow.CommandStatusPending {
+			if command.Key == "approval/resumed" && command.Status == flow.CommandStatusPending {
 				goto staleDidNotRelease
 			}
 		}

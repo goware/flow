@@ -21,13 +21,13 @@ const (
 // RunFilter is the bounded, indexed filter supported by
 // ListRuns. CreatedBefore is exclusive and CreatedAfter is inclusive.
 type RunFilter struct {
-	Type          string
-	KeyPrefix     string
-	Statuses      []RunStatus
-	CreatedAfter  *time.Time
-	CreatedBefore *time.Time
-	PageSize      int
-	Cursor        string
+	RootCommandName string
+	KeyPrefix       string
+	Statuses        []RunStatus
+	CreatedAfter    *time.Time
+	CreatedBefore   *time.Time
+	PageSize        int
+	Cursor          string
 }
 
 type RunPage struct {
@@ -176,9 +176,9 @@ func ListRuns(ctx context.Context, c Client, filter RunFilter) (RunPage, error) 
 	if err != nil {
 		return RunPage{}, err
 	}
-	if filter.Type != "" {
-		if err := definition.ValidateName(filter.Type); err != nil {
-			return RunPage{}, newError(ErrInvalid, "list", "run type", filter.Type, "invalid definition name")
+	if filter.RootCommandName != "" {
+		if err := definition.ValidateName(filter.RootCommandName); err != nil {
+			return RunPage{}, newError(ErrInvalid, "list", "root command name", filter.RootCommandName, "invalid definition name")
 		}
 	}
 	if len(filter.KeyPrefix) > maxRunKeyBytes || !utf8.ValidString(filter.KeyPrefix) {
@@ -208,7 +208,7 @@ func ListRuns(ctx context.Context, c Client, filter RunFilter) (RunPage, error) 
 		cursorTime, cursorID = &decoded.CreatedAt, &decoded.ID
 	}
 	rows, err := client.runtime.store.ListRunsInTx(ctx, client.tx, store.RunListFilter{
-		DefinitionName: filter.Type, KeyPrefix: filter.KeyPrefix, Statuses: statuses,
+		DefinitionName: filter.RootCommandName, KeyPrefix: filter.KeyPrefix, Statuses: statuses,
 		CreatedAfter: cloneTimePointer(filter.CreatedAfter), CreatedBefore: cloneTimePointer(filter.CreatedBefore),
 		CursorCreated: cursorTime, CursorID: cursorID, Limit: pageSize + 1,
 	})
@@ -275,8 +275,8 @@ func runFromStore(row store.RunRow) (Run, error) {
 		return Run{}, newError(ErrInvalidState, "decode", "root command", row.ID.String(), "stored root command is missing")
 	}
 	run := Run{
-		ID: RunID(row.ID.String()), Type: row.DefinitionName, Version: row.DefinitionVersion,
-		Key: row.Key, Status: status, MaxCommands: row.MaxCommands,
+		ID: RunID(row.ID.String()), RootCommandName: row.DefinitionName, RootCommandVersion: row.DefinitionVersion,
+		RunKey: row.Key, Status: status, MaxCommands: row.MaxCommands,
 		RootCommandID: CommandID(row.RootCommandID.String()),
 		CommandCount:  row.CommandCount, OpenCommands: row.OpenCommands,
 		DeadlineAt: cloneTimePointer(row.DeadlineAt), Failure: failure.Clone(row.Failure),
@@ -347,13 +347,13 @@ func decodeRunCursor(value string) (struct {
 	return result, nil
 }
 
-// QueueDepth is a point-in-time operational snapshot of one queue lane.
+// QueueStats is a point-in-time operational snapshot of one queue lane.
 // Ready commands are deliverable now, Delayed commands wait out a retry
 // backoff or start delay, and Running commands hold an attempt lease.
 // OldestReadyFor is how long the oldest deliverable command has been ready;
 // a growing value with stable Ready means no compatible worker is claiming
 // the lane.
-type QueueDepth struct {
+type QueueStats struct {
 	Queue          string
 	Ready          int64
 	Delayed        int64
@@ -364,16 +364,16 @@ type QueueDepth struct {
 // GetQueueDepth reports the lane's current deliverable, scheduled, and leased
 // command counts. It reads operational delivery state, not application
 // events: the counts change as attempts are claimed and settled.
-func GetQueueDepth(ctx context.Context, c Client, queue string) (QueueDepth, error) {
+func GetQueueDepth(ctx context.Context, c Client, queue string) (QueueStats, error) {
 	client, err := resolveClient(c)
 	if err != nil {
-		return QueueDepth{}, err
+		return QueueStats{}, err
 	}
 	row, err := client.runtime.store.QueueDepthInTx(ctx, client.tx, queue)
 	if err != nil {
-		return QueueDepth{}, err
+		return QueueStats{}, err
 	}
-	return QueueDepth{
+	return QueueStats{
 		Queue: queue, Ready: row.Ready, Delayed: row.Delayed,
 		Running: row.Running, OldestReadyFor: row.OldestReadyFor,
 	}, nil

@@ -628,10 +628,10 @@ func TestRuntimeCommandFailureCancelsQueuedSiblings(t *testing.T) {
 	var siblingStatus CommandStatus
 	for _, command := range trace.Commands {
 		if command.Key == "z-sibling" {
-			siblingStatus = command.State
+			siblingStatus = command.Status
 		}
 	}
-	if siblingStatus != StatusCancelled || siblingCalls.Load() != 0 {
+	if siblingStatus != CommandStatusCancelled || siblingCalls.Load() != 0 {
 		t.Fatalf("sibling status/calls = %q/%d, want cancelled/0", siblingStatus, siblingCalls.Load())
 	}
 	assertReplayMatches(t, runtime, run.RunID)
@@ -707,8 +707,8 @@ func TestRunningAttemptSettlementAfterCommandFailureCancelsNewChildren(t *testin
 	for _, command := range trace.Commands {
 		if strings.HasPrefix(command.Key, "late-child/") {
 			lateChildren++
-			if command.State != StatusCancelled {
-				t.Fatalf("late child %q state=%s, want %s", command.Key, command.State, StatusCancelled)
+			if command.Status != CommandStatusCancelled {
+				t.Fatalf("late child %q state=%s, want %s", command.Key, command.Status, CommandStatusCancelled)
 			}
 		}
 	}
@@ -1969,7 +1969,7 @@ func TestRuntimeCommandCancellationConcludesOnlyOwnedAttempt(t *testing.T) {
 		t.Fatalf("Trace(cancelled) error = %v", err)
 	}
 	stopRuntime(t, cancelRun, runResult)
-	if trace.Run.Status != "failed" || len(trace.Commands) != 1 || trace.Commands[0].State != "cancelled" ||
+	if trace.Run.Status != "failed" || len(trace.Commands) != 1 || trace.Commands[0].Status != "cancelled" ||
 		len(trace.Commands[0].Attempts) != 1 || trace.Commands[0].Attempts[0].Classification != "cancelled" ||
 		trace.Commands[0].Attempts[0].FinishedAt == nil || trace.Commands[0].Attempts[0].ConsumedBudget {
 		t.Fatalf("cancelled Trace = %#v", trace)
@@ -2229,7 +2229,7 @@ func TestRuntimeEnqueuesDirectCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Trace() error = %v", err)
 	}
-	if trace.Run.Status != "succeeded" || len(trace.Commands) != 1 || trace.Commands[0].State != "succeeded" ||
+	if trace.Run.Status != "succeeded" || len(trace.Commands) != 1 || trace.Commands[0].Status != "succeeded" ||
 		len(trace.Commands[0].Attempts) != 1 || trace.Commands[0].Attempts[0].Classification != "succeeded" ||
 		string(trace.Commands[0].Result) != `{"value":"done:work"}` {
 		t.Fatalf("Trace() = %#v", trace)

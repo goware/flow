@@ -159,7 +159,7 @@ func TestRunInspectionAndStablePagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRun() error = %v", err)
 	}
-	if got.ID != execs[2].RunID || got.Type != command.Name() || got.Status != "running" ||
+	if got.ID != execs[2].RunID || got.RootCommandName != command.Name() || got.Status != "running" ||
 		got.CommandCount != 1 || got.OpenCommands != 1 {
 		t.Fatalf("GetRun() = %#v", got)
 	}
@@ -167,7 +167,7 @@ func TestRunInspectionAndStablePagination(t *testing.T) {
 		t.Fatalf("GetRun(missing) error = %v", err)
 	}
 
-	filter := RunFilter{Type: command.Name(), KeyPrefix: "batch/", PageSize: 2}
+	filter := RunFilter{RootCommandName: command.Name(), KeyPrefix: "batch/", PageSize: 2}
 	var listed []Run
 	for {
 		page, err := ListRuns(ctx, runtime, filter)
@@ -194,12 +194,12 @@ func TestRunInspectionAndStablePagination(t *testing.T) {
 		}
 	}
 	filtered, err := ListRuns(ctx, runtime, RunFilter{
-		Type: command.Name(), Statuses: []RunStatus{RunStatusRunning}, PageSize: 10,
+		RootCommandName: command.Name(), Statuses: []RunStatus{RunStatusRunning}, PageSize: 10,
 	})
 	if err != nil || len(filtered.Runs) != 5 {
 		t.Fatalf("filtered list = %#v, %v", filtered, err)
 	}
-	literalWildcard, err := ListRuns(ctx, runtime, RunFilter{Type: command.Name(), KeyPrefix: "batch/%", PageSize: 10})
+	literalWildcard, err := ListRuns(ctx, runtime, RunFilter{RootCommandName: command.Name(), KeyPrefix: "batch/%", PageSize: 10})
 	if err != nil || len(literalWildcard.Runs) != 0 {
 		t.Fatalf("literal wildcard prefix list = %#v, %v", literalWildcard, err)
 	}

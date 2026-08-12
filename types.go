@@ -51,16 +51,9 @@ const (
 	TerminalStatusFailed    TerminalStatus = "failed"
 	TerminalStatusCancelled TerminalStatus = "cancelled"
 	TerminalStatusExpired   TerminalStatus = "expired"
-
-	// Short names remain source-compatible aliases for terminal command states.
-	StatusSucceeded = CommandStatusSucceeded
-	StatusFailed    = CommandStatusFailed
-	StatusCancelled = CommandStatusCancelled
-	StatusExpired   = CommandStatusExpired
 )
 
 type Failure = failure.Value
-type CommandFailure = Failure
 
 // EnqueueResult reports the run accepted by Enqueue. Created is false when a
 // keyed enqueue idempotently rediscovers an existing run.

@@ -536,7 +536,7 @@ func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	var optionalState CommandStatus
 	for _, command := range trace.Commands {
 		if command.Key == "waiting" {
-			optionalState = command.State
+			optionalState = command.Status
 		}
 	}
 	if len(trace.Commands) != 2 || optionalState != CommandStatusExpired {
@@ -558,7 +558,7 @@ func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 			deadlineWaiting = command
 		}
 	}
-	if deadlineWaiting.State != CommandStatusCancelled || deadlineWaiting.Failure == nil || deadlineWaiting.Failure.Code != "run_expired" {
+	if deadlineWaiting.Status != CommandStatusCancelled || deadlineWaiting.Failure == nil || deadlineWaiting.Failure.Code != "run_expired" {
 		t.Fatalf("optional deadline trace=%+v", deadlineTrace.Commands)
 	}
 	if calls.Load() != 1 {
@@ -762,7 +762,7 @@ func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
 	for _, command := range trace.Commands {
 		states[command.Key] = command
 	}
-	if states["producer"].State != CommandStatusFailed || states["join"].State != CommandStatusCancelled ||
+	if states["producer"].Status != CommandStatusFailed || states["join"].Status != CommandStatusCancelled ||
 		states["join"].Failure == nil || states["join"].Failure.Code != "run_failing" || joinCalls.Load() != 0 {
 		t.Fatalf("required failure trace=%+v join calls=%d", trace.Commands, joinCalls.Load())
 	}
@@ -803,7 +803,7 @@ func TestWaitCanExpireWhileInitialDelayIsPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(trace.Commands) != 1 || trace.Commands[0].State != CommandStatusExpired || trace.Commands[0].Failure == nil || trace.Commands[0].Failure.Code != "wait_expired" {
+	if len(trace.Commands) != 1 || trace.Commands[0].Status != CommandStatusExpired || trace.Commands[0].Failure == nil || trace.Commands[0].Failure.Code != "wait_expired" {
 		t.Fatalf("expired gate trace=%+v", trace.Commands)
 	}
 	if err := event.Deliver(ctx, runtime, exec.RunID, "missing", None{}); !errors.Is(err, ErrTerminal) {

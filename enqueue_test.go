@@ -45,7 +45,7 @@ func TestRunStartsAndEventDeliver(t *testing.T) {
 		t.Fatalf("Command.Enqueue() error = %v", err)
 	}
 	directRun := mustGetRun(t, runtime, direct.RunID)
-	if !direct.Created || directRun.RootCommandID == "" || directRun.Type != command.Name() {
+	if !direct.Created || directRun.RootCommandID == "" || directRun.RootCommandName != command.Name() {
 		t.Fatalf("direct exec = %#v", direct)
 	}
 	assertRunShape(t, database.Schema, database.DB.Conn, directRun, 1, 1)

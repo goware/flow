@@ -310,8 +310,8 @@ func TestLargestPostgresIntegerPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	runSnapshot := mustGetRun(t, runtime, run.RunID)
-	if runSnapshot.Version != math.MaxInt32 || runSnapshot.MaxCommands != math.MaxInt32 {
-		t.Fatalf("persisted integer boundaries = version %d max %d", runSnapshot.Version, runSnapshot.MaxCommands)
+	if runSnapshot.RootCommandVersion != math.MaxInt32 || runSnapshot.MaxCommands != math.MaxInt32 {
+		t.Fatalf("persisted integer boundaries = version %d max %d", runSnapshot.RootCommandVersion, runSnapshot.MaxCommands)
 	}
 }
 

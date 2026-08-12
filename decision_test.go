@@ -144,8 +144,8 @@ func TestResultOfEnforcesTraceSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := RunTrace{Commands: []TraceCommand{
-		{Key: "success", Name: command.Name(), Version: command.Version(), State: CommandStatusSucceeded, Result: encoded.Bytes},
-		{Key: "failure", Name: command.Name(), Version: command.Version(), State: CommandStatusFailed, Failure: &Failure{Code: "boom", Message: "failed"}},
+		{Key: "success", Name: command.Name(), Version: command.Version(), Status: CommandStatusSucceeded, Result: encoded.Bytes},
+		{Key: "failure", Name: command.Name(), Version: command.Version(), Status: CommandStatusFailed, Failure: &Failure{Code: "boom", Message: "failed"}},
 	}}
 
 	result, err := ResultOf(source, "success", command)

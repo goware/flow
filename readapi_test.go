@@ -16,8 +16,8 @@ import (
 
 // The bounded by-keys reads are the supported surface for consumers that
 // decorate their own domain rows with flow state: a live-keyed run's
-// queued work is addressable by its key through ListLiveWork, its journal
-// through ListHistoryByKeys, and settling the run removes it from live
+// queued work is addressable by its key through ListActiveCommands, its journal
+// through ListHistoryByRunKeys, and settling the run removes it from live
 // work while its history remains.
 func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 	t.Parallel()
@@ -41,9 +41,9 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 		t.Fatalf("run not created: %#v", started)
 	}
 
-	workPage, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"txn:42", "txn:missing"}})
+	workPage, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: []string{"txn:42", "txn:missing"}})
 	if err != nil {
-		t.Fatalf("ListLiveWork() error = %v", err)
+		t.Fatalf("ListActiveCommands() error = %v", err)
 	}
 	work := workPage.Work
 	if len(work) != 1 {
@@ -55,9 +55,9 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 		t.Fatalf("live work row = %#v", row)
 	}
 
-	historyPage, err := ListHistoryByKeys(ctx, runtime, KeyedHistoryFilter{Keys: []string{"txn:42"}})
+	historyPage, err := ListHistoryByRunKeys(ctx, runtime, KeyedHistoryFilter{Keys: []string{"txn:42"}})
 	if err != nil {
-		t.Fatalf("ListHistoryByKeys() error = %v", err)
+		t.Fatalf("ListHistoryByRunKeys() error = %v", err)
 	}
 	history := historyPage.Entries
 	if len(history) == 0 {
@@ -72,27 +72,27 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 		t.Fatalf("CancelRun() error = %v", err)
 	}
 
-	workPage, err = ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"txn:42"}})
+	workPage, err = ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: []string{"txn:42"}})
 	if err != nil {
-		t.Fatalf("ListLiveWork() after settle error = %v", err)
+		t.Fatalf("ListActiveCommands() after settle error = %v", err)
 	}
 	work = workPage.Work
 	if len(work) != 0 {
 		t.Fatalf("settled run still has %d live-work rows", len(work))
 	}
-	historyPage, err = ListHistoryByKeys(ctx, runtime, KeyedHistoryFilter{Keys: []string{"txn:42"}})
+	historyPage, err = ListHistoryByRunKeys(ctx, runtime, KeyedHistoryFilter{Keys: []string{"txn:42"}})
 	if err != nil {
-		t.Fatalf("ListHistoryByKeys() after settle error = %v", err)
+		t.Fatalf("ListHistoryByRunKeys() after settle error = %v", err)
 	}
 	history = historyPage.Entries
 	if len(history) == 0 {
 		t.Fatal("history lost after settle")
 	}
 
-	if _, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: make([]string, MaxReadKeys+1)}); err == nil {
+	if _, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: make([]string, MaxReadKeys+1)}); err == nil {
 		t.Fatal("oversized key batch must error")
 	}
-	if _, err := ListHistoryByKeys(ctx, runtime, KeyedHistoryFilter{Keys: []string{""}}); err == nil {
+	if _, err := ListHistoryByRunKeys(ctx, runtime, KeyedHistoryFilter{Keys: []string{""}}); err == nil {
 		t.Fatal("empty key must error")
 	}
 }
@@ -118,12 +118,12 @@ func TestBoundedReadPaginationIsStableAndFilterBound(t *testing.T) {
 		}
 	}
 
-	liveFilter := LiveWorkFilter{Keys: inputKeys, PageSize: 2}
-	var work []LiveWork
+	liveFilter := ActiveCommandFilter{Keys: inputKeys, PageSize: 2}
+	var work []ActiveCommand
 	for {
-		page, err := ListLiveWork(ctx, runtime, liveFilter)
+		page, err := ListActiveCommands(ctx, runtime, liveFilter)
 		if err != nil {
-			t.Fatalf("ListLiveWork() error = %v", err)
+			t.Fatalf("ListActiveCommands() error = %v", err)
 		}
 		if len(page.Work) > liveFilter.PageSize {
 			t.Fatalf("live page length = %d, want at most %d", len(page.Work), liveFilter.PageSize)
@@ -133,10 +133,10 @@ func TestBoundedReadPaginationIsStableAndFilterBound(t *testing.T) {
 			break
 		}
 		if len(work) == len(page.Work) {
-			if _, err := ListHistoryByKeys(ctx, runtime, KeyedHistoryFilter{Keys: inputKeys, Cursor: page.NextCursor}); !errors.Is(err, ErrInvalid) {
+			if _, err := ListHistoryByRunKeys(ctx, runtime, KeyedHistoryFilter{Keys: inputKeys, Cursor: page.NextCursor}); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("cross-query cursor error = %v, want ErrInvalid", err)
 			}
-			if _, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"read/A"}, Cursor: page.NextCursor}); !errors.Is(err, ErrInvalid) {
+			if _, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: []string{"read/A"}, Cursor: page.NextCursor}); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("changed-filter cursor error = %v, want ErrInvalid", err)
 			}
 		}
@@ -162,9 +162,9 @@ func TestBoundedReadPaginationIsStableAndFilterBound(t *testing.T) {
 	historyFilter := KeyedHistoryFilter{Keys: inputKeys, PageSize: 3}
 	var history []KeyedHistoryEntry
 	for {
-		page, err := ListHistoryByKeys(ctx, runtime, historyFilter)
+		page, err := ListHistoryByRunKeys(ctx, runtime, historyFilter)
 		if err != nil {
-			t.Fatalf("ListHistoryByKeys() error = %v", err)
+			t.Fatalf("ListHistoryByRunKeys() error = %v", err)
 		}
 		if len(page.Entries) > historyFilter.PageSize {
 			t.Fatalf("history page length = %d, want at most %d", len(page.Entries), historyFilter.PageSize)
@@ -198,7 +198,7 @@ func TestBoundedReadValidationAndCursorStrictness(t *testing.T) {
 	t.Parallel()
 
 	keys := []string{"z", "a", "a"}
-	normalized, pageSize, _, err := prepareKeyedRead(keys, 0, "", readKindLiveWork)
+	normalized, pageSize, _, err := prepareKeyedRead(keys, 0, "", readKindActiveCommands)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,12 +226,12 @@ func TestBoundedReadValidationAndCursorStrictness(t *testing.T) {
 	if _, err := other.Enqueue(ctx, runtime, "cursor/key", ingressArgs{}); err != nil {
 		t.Fatal(err)
 	}
-	first, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"cursor/key"}, PageSize: 1})
+	first, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: []string{"cursor/key"}, PageSize: 1})
 	if err != nil || first.NextCursor == "" {
-		t.Fatalf("first ListLiveWork() = %#v, %v", first, err)
+		t.Fatalf("first ListActiveCommands() = %#v, %v", first, err)
 	}
 
-	invalid := []LiveWorkFilter{
+	invalid := []ActiveCommandFilter{
 		{Keys: []string{"cursor/key"}, PageSize: -1},
 		{Keys: []string{"cursor/key"}, PageSize: MaxReadPageSize + 1},
 		{Keys: []string{""}},
@@ -242,7 +242,7 @@ func TestBoundedReadValidationAndCursorStrictness(t *testing.T) {
 		{Keys: []string{"cursor/key"}, Cursor: strings.Repeat("x", maxReadCursorBytes+1)},
 	}
 	for index, filter := range invalid {
-		if _, err := ListLiveWork(ctx, runtime, filter); !errors.Is(err, ErrInvalid) {
+		if _, err := ListActiveCommands(ctx, runtime, filter); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("invalid filter %d error = %v, want ErrInvalid", index, err)
 		}
 	}
@@ -250,7 +250,7 @@ func TestBoundedReadValidationAndCursorStrictness(t *testing.T) {
 	encodedUnknown := base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"unknown":true}`))
 	encodedTrailing := base64.RawURLEncoding.EncodeToString([]byte(`{} {}`))
 	for _, cursor := range []string{encodedUnknown, encodedTrailing} {
-		if _, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"cursor/key"}, Cursor: cursor}); !errors.Is(err, ErrInvalid) {
+		if _, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: []string{"cursor/key"}, Cursor: cursor}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("strict cursor %q error = %v, want ErrInvalid", cursor, err)
 		}
 	}
@@ -264,15 +264,15 @@ func TestBoundedReadValidationAndCursorStrictness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"cursor/key"}, Cursor: wrongVersion}); !errors.Is(err, ErrInvalid) {
+	if _, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: []string{"cursor/key"}, Cursor: wrongVersion}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("wrong-version cursor error = %v, want ErrInvalid", err)
 	}
 
-	emptyLive, err := ListLiveWork(ctx, runtime, LiveWorkFilter{})
+	emptyLive, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{})
 	if err != nil || emptyLive.NextCursor != "" || len(emptyLive.Work) != 0 {
 		t.Fatalf("empty live filter = %#v, %v", emptyLive, err)
 	}
-	emptyHistory, err := ListHistoryByKeys(ctx, runtime, KeyedHistoryFilter{})
+	emptyHistory, err := ListHistoryByRunKeys(ctx, runtime, KeyedHistoryFilter{})
 	if err != nil || emptyHistory.NextCursor != "" || len(emptyHistory.Entries) != 0 {
 		t.Fatalf("empty history filter = %#v, %v", emptyHistory, err)
 	}
@@ -300,16 +300,16 @@ func TestBoundedReadsObserveCallerTransaction(t *testing.T) {
 	if _, err := command.Enqueue(ctx, client, "transaction/read", ingressArgs{}); err != nil {
 		t.Fatal(err)
 	}
-	live, err := ListLiveWork(ctx, client, LiveWorkFilter{Keys: []string{"transaction/read"}})
+	live, err := ListActiveCommands(ctx, client, ActiveCommandFilter{Keys: []string{"transaction/read"}})
 	if err != nil || len(live.Work) != 1 {
-		t.Fatalf("transaction ListLiveWork() = %#v, %v", live, err)
+		t.Fatalf("transaction ListActiveCommands() = %#v, %v", live, err)
 	}
-	history, err := ListHistoryByKeys(ctx, client, KeyedHistoryFilter{Keys: []string{"transaction/read"}})
+	history, err := ListHistoryByRunKeys(ctx, client, KeyedHistoryFilter{Keys: []string{"transaction/read"}})
 	if err != nil || len(history.Entries) != 2 {
-		t.Fatalf("transaction ListHistoryByKeys() = %#v, %v", history, err)
+		t.Fatalf("transaction ListHistoryByRunKeys() = %#v, %v", history, err)
 	}
-	outside, err := ListLiveWork(ctx, runtime, LiveWorkFilter{Keys: []string{"transaction/read"}})
+	outside, err := ListActiveCommands(ctx, runtime, ActiveCommandFilter{Keys: []string{"transaction/read"}})
 	if err != nil || len(outside.Work) != 0 {
-		t.Fatalf("outside ListLiveWork() = %#v, %v", outside, err)
+		t.Fatalf("outside ListActiveCommands() = %#v, %v", outside, err)
 	}
 }
