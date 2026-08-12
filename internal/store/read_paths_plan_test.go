@@ -3,8 +3,10 @@ package store_test
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goware/flow"
 	"github.com/goware/flow/internal/pgschema"
@@ -87,6 +89,90 @@ func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 			t.Fatalf("%s did not use %s:\n%s", test.name, test.wantIndex, plan)
 		}
 		t.Logf("%s plan:\n%s", test.name, plan)
+	}
+}
+
+func TestPruneCandidateProductionQueryUsesPartialIndexAndBoundsRows(t *testing.T) {
+	t.Parallel()
+
+	db, schema, repository := setupStore(t)
+	ctx := context.Background()
+	tx, err := db.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	runs := pgschema.Table(schema, "flow_runs")
+	commands := pgschema.Table(schema, "flow_commands")
+	if _, err := tx.Exec(ctx, `INSERT INTO `+runs+` (
+		run_id,definition_name,definition_version,run_key,key_scope,status,start_fingerprint,
+		max_commands,command_count,open_commands,root_command_id,created_at,updated_at,status_at,finished_at
+	) SELECT md5('prune-run:'||g)::uuid,'store.prune',1,'permanent/'||g,'permanent','succeeded',
+		decode(repeat('00',32),'hex'),1,1,0,md5('prune-command:'||g)::uuid,
+		clock_timestamp()-interval '3 hours',clock_timestamp(),clock_timestamp(),clock_timestamp()-interval '2 hours'
+	FROM generate_series(1,10000) g`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+commands+` (
+		command_id,run_id,command_key,name,version,args,declaration_fingerprint,state,
+		queue,retry_policy,result,terminal_position,created_position,created_at,updated_at,status_at,finished_at
+	) SELECT root_command_id,run_id,'root','store.prune',1,'{}'::text::bytea,
+		decode(repeat('00',32),'hex'),'succeeded','default','{}'::text::bytea,'{}'::text::bytea,
+		1,1,created_at,updated_at,status_at,finished_at FROM `+runs+` WHERE definition_name='store.prune'`); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 3 {
+		runID := fmt.Sprintf("00000000-0000-7000-8000-%012d", index+1)
+		commandID := fmt.Sprintf("00000000-0000-7000-9000-%012d", index+1)
+		if _, err := tx.Exec(ctx, `INSERT INTO `+runs+` (
+			run_id,definition_name,definition_version,run_key,key_scope,status,start_fingerprint,
+			max_commands,command_count,open_commands,root_command_id,created_at,updated_at,status_at,finished_at
+		) VALUES ($1,'store.prune.eligible',1,'','permanent','succeeded',decode(repeat('00',32),'hex'),
+			1,1,0,$2,clock_timestamp()-interval '3 hours',clock_timestamp(),clock_timestamp(),
+			clock_timestamp()-interval '2 hours'+$3::int*interval '1 second')`, runID, commandID, index); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO `+commands+` (
+			command_id,run_id,command_key,name,version,args,declaration_fingerprint,state,
+			queue,retry_policy,result,terminal_position,created_position,created_at,updated_at,status_at,finished_at
+		) VALUES ($1,$2,'root','store.prune.eligible',1,'{}'::text::bytea,decode(repeat('00',32),'hex'),
+			'succeeded','default','{}'::text::bytea,'{}'::text::bytea,1,1,clock_timestamp(),clock_timestamp(),
+			clock_timestamp(),clock_timestamp())`, commandID, runID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Conn.Exec(ctx, `ANALYZE `+runs+`,`+commands); err != nil {
+		t.Fatal(err)
+	}
+
+	query := store.PruneCandidatesQueryForTest(repository)
+	rows, err := db.Conn.Query(ctx, `EXPLAIN (ANALYZE,BUFFERS,FORMAT TEXT) `+query, time.Now().UTC(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := strings.Join(lines, "\n")
+	if !strings.Contains(plan, "flow_runs_prune_idx") ||
+		!regexp.MustCompile(`(?m)^Limit .*actual .*rows=2(?:\.00)? loops=1`).MatchString(plan) {
+		t.Fatalf("prune candidate plan did not use the partial index for a two-row batch:\n%s", plan)
+	}
+	result, err := repository.PruneTerminalRuns(ctx, time.Now().UTC(), 2)
+	if err != nil || result.Runs != 2 || result.Commands != 2 {
+		t.Fatalf("bounded prune result = %#v, %v", result, err)
+	}
+	var eligible int
+	if err := db.Conn.QueryRow(ctx, `SELECT count(*) FROM `+runs+`
+		WHERE definition_name='store.prune.eligible'`).Scan(&eligible); err != nil {
+		t.Fatal(err)
+	}
+	if eligible != 1 {
+		t.Fatalf("eligible rows after bounded prune = %d, want 1", eligible)
 	}
 }
 

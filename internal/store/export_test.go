@@ -20,4 +20,6 @@ func RunListQueryForTest(s *Store, filter RunListFilter) (string, []any) {
 
 func QueueStatsQueryForTest(s *Store) string { return s.queueStatsQuery() }
 
+func PruneCandidatesQueryForTest(s *Store) string { return s.pruneCandidatesQuery() }
+
 func TraceWaitsQueryForTest(s *Store) string { return s.traceWaitsQuery() }

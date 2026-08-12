@@ -1334,17 +1334,17 @@ exact accepted commit.
 
 ### Bounded retention
 
-- [ ] Add `PruneResult` and `PruneTerminalRuns` with explicit cutoff and 1-1,000
+- [x] Add `PruneResult` and `PruneTerminalRuns` with explicit cutoff and 1-1,000
   limit.
-- [ ] Select eligible terminal live-key/unkeyed runs in deterministic order with
+- [x] Select eligible terminal live-key/unkeyed runs in deterministic order with
   `FOR UPDATE SKIP LOCKED`.
-- [ ] Delete selected journal/command/run aggregates set-wise in one transaction
+- [x] Delete selected journal/command/run aggregates set-wise in one transaction
   without weakening FKs.
-- [ ] Prove permanent non-empty keys and all non-terminal runs remain.
-- [ ] Prove cutoff, batch limit, exact counts, complete aggregate deletion,
+- [x] Prove permanent non-empty keys and all non-terminal runs remain.
+- [x] Prove cutoff, batch limit, exact counts, complete aggregate deletion,
   concurrent pruners, locked-candidate progress, coherent reads, and unrelated
   runtime progress.
-- [ ] Prove the partial prune index on a selective 10,000-row plan shape.
+- [x] Prove the partial prune index on a selective 10,000-row plan shape.
 
 ### Consumer, performance, and final closure
 
