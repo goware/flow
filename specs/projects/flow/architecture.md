@@ -260,7 +260,7 @@ in one query, appends one stable `attempt_started` batch, and updates queue and
 command projections in sets. The scheduler gathers the selected claims before
 probing again, preserving centralized capacity and fairness accounting.
 
-Claim materialization validates that all waits are satisfied, joins their recorded positions to the exact application-event journal bodies, and enforces the 256-input bound. The connection is released before application argument/event codec decoding and worker invocation proceed.
+Claim materialization validates that all waits are satisfied, joins their recorded positions to the exact application-event journal bodies, and enforces the 256-input bound. It resolves each command's durable recovery-lease override or the fixed 60-second fallback and installs aligned per-row expiries without splitting a same-run claim batch. The connection is released before application argument/event codec decoding and worker invocation proceed.
 
 The claim hot path hashes each retained event body directly, compares its
 stored digest, performs one typed envelope decode, and validates the nested
@@ -376,7 +376,7 @@ Each runtime has one scheduler and process-local capacity accounting:
 
 There is no global worker-count table. PostgreSQL row locks, queue state, and fences coordinate replicas. Adding replicas increases competing claimers; each successful claim still belongs to exactly one active fence.
 
-Lease renewals run as one bounded set-oriented statement for locally active attempts. Exact running fences are selected `FOR UPDATE SKIP LOCKED`, so one row held by settlement cannot block unrelated renewals. Each request is classified as renewed, definitely lost, or uncertain. Definitely lost fences cancel the matching local context immediately; an uncertain locked row is neither extended nor immediately cancelled and retains its prior conservative local deadline. A separate runtime watchdog continues checking those deadlines even while renewal SQL or pool acquisition is blocked. Maintenance later recovers expired durable queue rows.
+Lease renewals run as one bounded set-oriented statement for the locally active attempts whose individual renewal times are due. Each request carries its own durable duration; a short command never forces unrelated default commands onto its cadence. Exact running fences are selected `FOR UPDATE SKIP LOCKED`, so one row held by settlement cannot block unrelated renewals. Each request is classified as renewed, definitely lost, or uncertain. Definitely lost fences cancel the matching local context immediately; an error or uncertain locked row retains its prior conservative deadline and receives a bounded retry inside that window. A separate earliest-expiry watchdog skips known in-flight renewals, closing the committed-result/local-application race without weakening the durable fence. Both services use shared active-registry timers rather than per-attempt goroutines. Maintenance later recovers expired durable queue rows through the existing path.
 
 Notifications use one separately established session-capable PostgreSQL connection because pool/transaction connections cannot reliably own `LISTEN`. The listener reconnects with bounded backoff and performs a broad wake after every connection to close commit-before-LISTEN gaps. Every scheduler continues polling regardless.
 

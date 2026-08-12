@@ -39,6 +39,7 @@ type CommandCreate struct {
 	ParentCommandID        *uuid.UUID
 	Queue                  string
 	AttemptTimeout         time.Duration
+	RecoveryLease          time.Duration
 	RetryPolicy            canonical.Value
 	InitialDelay           time.Duration
 	Waits                  []EventWaitCreate
@@ -430,6 +431,14 @@ func commandCreatedEntry(
 		timeoutMS = &value
 	}
 	var initialDelayMS *int64
+	var recoveryLeaseMS *int64
+	if command.RecoveryLease > 0 {
+		value, err := durable.ExactMilliseconds("recovery lease", command.RecoveryLease)
+		if err != nil {
+			return JournalEntry{}, err
+		}
+		recoveryLeaseMS = &value
+	}
 	if command.InitialDelay > 0 {
 		value, err := durable.ExactMilliseconds("initial delay", command.InitialDelay)
 		if err != nil {
@@ -441,7 +450,7 @@ func commandCreatedEntry(
 		V: 1, CommandID: command.ID.String(), CommandKey: command.Key, Name: command.Name,
 		Version: command.Version, Args: json.RawMessage(command.Args.BytesCopy()),
 		InitialState: initialState,
-		Queue:        command.Queue, AttemptTimeoutMS: timeoutMS,
+		Queue:        command.Queue, AttemptTimeoutMS: timeoutMS, RecoveryLeaseMS: recoveryLeaseMS,
 		RetryPolicy:    json.RawMessage(command.RetryPolicy.BytesCopy()),
 		InitialDelayMS: initialDelayMS, BudgetStartedAt: clonePointer(budgetStartedAt), NextAttemptAt: clonePointer(nextAttemptAt),
 		DeclarationFingerprint: hex.EncodeToString(command.DeclarationFingerprint[:]),
@@ -485,6 +494,7 @@ type preparedCommandInsert struct {
 	state            string
 	unsatisfiedWaits int
 	attemptTimeoutMS *int64
+	recoveryLeaseMS  *int64
 	initialDelayMS   *int64
 	budgetStartedAt  *time.Time
 	nextAttemptAt    *time.Time
@@ -648,6 +658,13 @@ func (s *Store) prepareCommandBatch(
 			}
 			prepared.attemptTimeoutMS = &value
 		}
+		if command.RecoveryLease > 0 {
+			value, err := durable.ExactMilliseconds("recovery lease", command.RecoveryLease)
+			if err != nil {
+				return preparedCommandBatch{}, err
+			}
+			prepared.recoveryLeaseMS = &value
+		}
 		if command.InitialDelay > 0 {
 			value, err := durable.ExactMilliseconds("initial delay", command.InitialDelay)
 			if err != nil {
@@ -772,7 +789,8 @@ func (s *Store) insertPreparedCommandBatch(
 			command.ID, runID, command.Key, command.Name, command.Version,
 			command.ParentCommandID, command.Args.Bytes,
 			command.DeclarationFingerprint[:], prepared.state, prepared.unsatisfiedWaits,
-			command.Queue, prepared.attemptTimeoutMS, command.RetryPolicy.Bytes, prepared.initialDelayMS,
+			command.Queue, prepared.attemptTimeoutMS, prepared.recoveryLeaseMS,
+			command.RetryPolicy.Bytes, prepared.initialDelayMS,
 			prepared.budgetStartedAt, prepared.nextAttemptAt, prepared.waitStartedAt,
 			prepared.waitDeadlineAt, prepared.waitTimeoutMS, prepared.createdPosition,
 			createdAt, createdAt, createdAt,
@@ -780,7 +798,7 @@ func (s *Store) insertPreparedCommandBatch(
 	}
 	count, err := tx.CopyFrom(ctx, pgx.Identifier{s.schema, "flow_commands"}, []string{
 		"command_id", "run_id", "command_key", "name", "version", "parent_command_id",
-		"args", "declaration_fingerprint", "state", "unsatisfied_waits", "queue", "attempt_timeout_ms",
+		"args", "declaration_fingerprint", "state", "unsatisfied_waits", "queue", "attempt_timeout_ms", "recovery_lease_ms",
 		"retry_policy", "initial_delay_ms", "budget_started_at", "next_attempt_at", "wait_started_at",
 		"wait_deadline_at", "wait_timeout_ms", "created_position", "created_at", "updated_at", "status_at",
 	}, pgx.CopyFromRows(commandRows))
@@ -1473,12 +1491,16 @@ func validateCommandCreate(command CommandCreate) error {
 	}
 	for field, value := range map[string]time.Duration{
 		"attempt timeout": command.AttemptTimeout,
+		"recovery lease":  command.RecoveryLease,
 		"initial delay":   command.InitialDelay,
 		"wait timeout":    command.Within,
 	} {
 		if _, err := durable.ExactMilliseconds(field, value); err != nil {
 			return err
 		}
+	}
+	if command.RecoveryLease > 0 && command.RecoveryLease < 30*time.Millisecond {
+		return fmt.Errorf("%w: recovery lease must be at least 30ms", flowerr.ErrInvalid)
 	}
 	if _, err := retrypolicy.PublicFromCanonical(command.RetryPolicy.Bytes); err != nil {
 		return fmt.Errorf("%w: retry policy is invalid", flowerr.ErrInvalid)

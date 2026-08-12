@@ -94,6 +94,7 @@ CREATE TABLE {{schema}}.flow_commands (
 
     queue                   text NOT NULL,
     attempt_timeout_ms      bigint CHECK (attempt_timeout_ms IS NULL OR attempt_timeout_ms > 0),
+    recovery_lease_ms       bigint CHECK (recovery_lease_ms IS NULL OR recovery_lease_ms >= 30),
     retry_policy            bytea NOT NULL,
 
     initial_delay_ms        bigint CHECK (initial_delay_ms IS NULL OR initial_delay_ms > 0),

@@ -26,6 +26,7 @@ const (
 	SettleBeforeCommit         Point = "settle_before_commit"
 	SettleCommitAmbiguous      Point = "settle_commit_ambiguous"
 	RenewBeforeResult          Point = "renew_before_result"
+	RenewAfterStore            Point = "renew_after_store"
 	MaintenanceAfterProbe      Point = "maintenance_after_probe"
 	NotifyConnect              Point = "notify_connect"
 	NotifyBeforeWait           Point = "notify_before_wait"

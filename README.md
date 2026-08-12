@@ -70,6 +70,23 @@ definition without accessing the database. `Queue` returns the configured
 delivery lane, or Flow's normalized `"default"` lane when `WithQueue` was not
 specified.
 
+Commands use a conservative 60-second recovery lease by default.
+`WithRecoveryLease` durably opts one command definition into faster dead-worker
+takeover:
+
+```go
+var refreshStatus = flow.DefineCommand[refreshArgs, refreshResult](
+	"intent.refresh_status", 1,
+	flow.WithRecoveryLease(5*time.Second),
+)
+```
+
+Use a shorter lease only when repeating the handler is safe. It does not make
+worker execution exactly once: a pause or partition can let a new worker begin
+before the old handler stops. Attempt and lease-token fencing still permits
+only the current owner to settle durable Flow state. `WithTimeout` instead
+limits one handler attempt; neither option sets the other.
+
 `Work[A]` is the attempt-local scope for one claimed command. It is not the
 whole `Run` and it is not the immutable `Command[A, R]` definition. Each
 worker invocation receives a fresh `Work` containing typed arguments,
@@ -250,7 +267,7 @@ always replaced, even when its declaration equals the requested successor.
 
 - Claims match exact registered command name/version pairs. Unknown work remains durable until a compatible worker appears.
 - Workers are at-least-once at the application boundary; settlement is fenced and durable progression commits once. External effects still need stable idempotency keys.
-- Lease renewal is bounded and skip-locked: one busy settlement cannot block unrelated renewals. A locked row remains uncertain until settlement, a later renewal, or the conservative local-expiry watchdog resolves it.
+- Lease renewal is bounded, mixed-duration, and skip-locked: one busy settlement cannot block unrelated renewals. The shared manager renews only attempts that are due, so a short recovery lease does not increase the cadence of unrelated default commands. A locked row remains uncertain until settlement, a later renewal, or the conservative local-expiry watchdog resolves it.
 - Deadline, wait-expiry, and lease-recovery maintenance drains full progressing pages promptly but remains sequential and bounded; locked/no-op pages fall back to polling.
 - Any command failure, cancellation, or expiry makes the run fail. Flow cancels
   queued/non-running siblings while already running attempts retain their

@@ -464,12 +464,32 @@ func TestMigrationPrunesOnlyUnusedProjectionColumns(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
 		FROM information_schema.columns
 		WHERE table_schema=$1 AND table_name='flow_commands' AND column_name IN
-				('declaration_fingerprint','result','last_error','terminal_failure')
+				('declaration_fingerprint','result','last_error','terminal_failure','recovery_lease_ms')
 		`, database.Schema).Scan(&retained); err != nil {
 		t.Fatalf("inspect retained columns: %v", err)
 	}
-	if retained != 4 {
-		t.Fatalf("retained semantic projection columns = %d, want 4", retained)
+	if retained != 5 {
+		t.Fatalf("retained semantic projection columns = %d, want 5", retained)
+	}
+	var nullable string
+	var dataType string
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT is_nullable,data_type FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='flow_commands' AND column_name='recovery_lease_ms'`, database.Schema).
+		Scan(&nullable, &dataType); err != nil {
+		t.Fatal(err)
+	}
+	if nullable != "YES" || dataType != "bigint" {
+		t.Fatalf("recovery_lease_ms shape = nullable %s type %s", nullable, dataType)
+	}
+	var recoveryConstraint string
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE connamespace=$1::regnamespace AND conrelid=$2::regclass
+		  AND pg_get_constraintdef(oid) LIKE '%recovery_lease_ms%'`, database.Schema,
+		database.Schema+".flow_commands").Scan(&recoveryConstraint); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recoveryConstraint, ">= 30") {
+		t.Fatalf("recovery lease constraint = %s", recoveryConstraint)
 	}
 }
 

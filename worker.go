@@ -334,7 +334,7 @@ func equivalentStagedCommand(a, b stagedCommand) bool {
 }
 
 func equivalentCommandDefaults(a, b commandDefaults) bool {
-	if a.queue != b.queue || a.attemptTimeout != b.attemptTimeout {
+	if a.queue != b.queue || a.attemptTimeout != b.attemptTimeout || a.recoveryLease != b.recoveryLease {
 		return false
 	}
 	left, leftErr := retrypolicy.CanonicalPublic(a.retryPolicy)

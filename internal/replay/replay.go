@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/canonical"
+	"github.com/goware/flow/internal/durable"
 	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/store/journalcodec"
@@ -52,6 +53,7 @@ type Command struct {
 	Queue                  string
 	RetryPolicy            []byte
 	AttemptTimeoutMS       *int64
+	RecoveryLeaseMS        *int64
 	InitialDelayMS         *int64
 	BudgetStartedAt        *time.Time
 	NextAttemptAt          *time.Time
@@ -70,6 +72,7 @@ type Attempt struct {
 	StartedAt        time.Time
 	FinishedAt       *time.Time
 	Worker           string
+	LeaseDurationMS  int64
 	Classification   string
 	ConsumedBudget   bool
 	ConsumedAttempts int
@@ -172,11 +175,18 @@ func (state *Run) Apply(row store.JournalRow) error {
 		if err != nil || len(declarationFingerprint) != sha256.Size {
 			return errors.New("CommandCreated declaration fingerprint is invalid")
 		}
+		if body.RecoveryLeaseMS != nil {
+			duration, err := durable.MillisecondsDuration("recovery lease", *body.RecoveryLeaseMS)
+			if err != nil || duration < 30*time.Millisecond {
+				return errors.New("CommandCreated recovery lease is invalid")
+			}
+		}
 		command := Command{
 			ID: bodyID, Key: body.CommandKey, Name: body.Name, Version: body.Version,
 			State: body.InitialState,
 			Args:  slices.Clone(body.Args), Queue: body.Queue, RetryPolicy: slices.Clone(body.RetryPolicy),
-			AttemptTimeoutMS: pointerClone(body.AttemptTimeoutMS), CreatedPosition: row.Position,
+			AttemptTimeoutMS: pointerClone(body.AttemptTimeoutMS), RecoveryLeaseMS: pointerClone(body.RecoveryLeaseMS),
+			CreatedPosition: row.Position,
 			InitialDelayMS:  pointerClone(body.InitialDelayMS),
 			BudgetStartedAt: pointerClone(body.BudgetStartedAt), NextAttemptAt: pointerClone(body.NextAttemptAt),
 			Waits: slices.Clone(body.Waits), WithinMS: pointerClone(body.WithinMS),
@@ -216,6 +226,13 @@ func (state *Run) Apply(row store.JournalRow) error {
 		if err != nil || bodyAttemptID != *row.AttemptID || body.CommandID != row.CommandID.String() {
 			return errors.New("AttemptStarted identity differs")
 		}
+		leaseDuration, err := durable.MillisecondsDuration("attempt lease duration", body.LeaseDurationMS)
+		if err != nil || leaseDuration <= 0 {
+			return errors.New("AttemptStarted lease duration is invalid")
+		}
+		if command.RecoveryLeaseMS != nil && body.LeaseDurationMS != *command.RecoveryLeaseMS {
+			return errors.New("AttemptStarted lease duration differs from command declaration")
+		}
 		for _, attempt := range command.Attempts {
 			if attempt.ID == bodyAttemptID {
 				return errors.New("attempt started more than once")
@@ -224,7 +241,8 @@ func (state *Run) Apply(row store.JournalRow) error {
 		command.State = "running"
 		command.Attempts = append(command.Attempts, Attempt{
 			ID: bodyAttemptID, Ordinal: body.Attempt, StartedAt: body.StartedAt,
-			Worker: body.Worker, ConsumedAttempts: body.ConsumedAttempts,
+			Worker: body.Worker, LeaseDurationMS: body.LeaseDurationMS,
+			ConsumedAttempts: body.ConsumedAttempts,
 		})
 		state.Commands[*row.CommandID] = command
 

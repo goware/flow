@@ -155,6 +155,7 @@ type ClaimedCommand struct {
 	AttemptID              uuid.UUID
 	LeaseToken             uuid.UUID
 	DBNow                  time.Time
+	LeaseDuration          time.Duration
 	LeaseExpiresAt         time.Time
 	LocalLeaseExpiresAt    time.Time
 	AttemptStartedPosition int64
@@ -180,11 +181,11 @@ type ClaimBatchResult struct {
 func (s *Store) ClaimCommand(
 	ctx context.Context,
 	candidate CommandCandidate,
-	lease time.Duration,
+	defaultLease time.Duration,
 	owner string,
 	hook fault.Hook,
 ) (ClaimResult, error) {
-	batch, err := s.ClaimCommands(ctx, []CommandCandidate{candidate}, lease, owner, hook)
+	batch, err := s.ClaimCommands(ctx, []CommandCandidate{candidate}, defaultLease, owner, hook)
 	result := ClaimResult{Progressed: batch.Progressed}
 	if len(batch.Commands) > 0 {
 		result.Command = &batch.Commands[0]
@@ -198,7 +199,7 @@ func (s *Store) ClaimCommand(
 func (s *Store) ClaimCommands(
 	ctx context.Context,
 	candidates []CommandCandidate,
-	lease time.Duration,
+	defaultLease time.Duration,
 	owner string,
 	hook fault.Hook,
 ) (ClaimBatchResult, error) {
@@ -220,10 +221,10 @@ func (s *Store) ClaimCommands(
 		}
 		seen[candidate.CommandID] = struct{}{}
 	}
-	if lease <= 0 || owner == "" {
+	if defaultLease <= 0 || owner == "" {
 		return ClaimBatchResult{}, fmt.Errorf("%w: incomplete command claim", flowerr.ErrInvalid)
 	}
-	if _, err := durable.ExactMilliseconds("command lease", lease); err != nil {
+	if _, err := durable.ExactMilliseconds("default command lease", defaultLease); err != nil {
 		return ClaimBatchResult{}, err
 	}
 	if hook == nil {
@@ -272,15 +273,6 @@ func (s *Store) ClaimCommands(
 	if err != nil {
 		return ClaimBatchResult{}, err
 	}
-	leaseMilliseconds, err := durable.ExactMilliseconds("command lease", lease)
-	if err != nil {
-		return ClaimBatchResult{}, err
-	}
-	leaseExpiresAt, err := durable.AddExactDuration("command lease", semantic.DBNow(), lease)
-	if err != nil {
-		return ClaimBatchResult{}, err
-	}
-
 	claimable := make([]claimBatchCommand, 0, len(locked))
 	expired := make([]claimBatchCommand, 0)
 	for index := range locked {
@@ -312,6 +304,21 @@ func (s *Store) ClaimCommands(
 				return ClaimBatchResult{}, fmt.Errorf("%w: invalid stored command attempt timeout", flowerr.ErrInvalidState)
 			}
 		}
+		command.leaseDuration = defaultLease
+		if command.recoveryLeaseMS != nil {
+			command.leaseDuration, err = durable.MillisecondsDuration("stored recovery lease", *command.recoveryLeaseMS)
+			if err != nil || command.leaseDuration < 30*time.Millisecond {
+				return ClaimBatchResult{}, fmt.Errorf("%w: invalid stored recovery lease", flowerr.ErrInvalidState)
+			}
+		}
+		command.leaseMilliseconds, err = durable.ExactMilliseconds("resolved command lease", command.leaseDuration)
+		if err != nil {
+			return ClaimBatchResult{}, err
+		}
+		command.leaseExpiresAt, err = durable.AddExactDuration("resolved command lease", semantic.DBNow(), command.leaseDuration)
+		if err != nil {
+			return ClaimBatchResult{}, err
+		}
 		command.attemptID, command.leaseToken = uuid.New(), uuid.New()
 		claimable = append(claimable, command)
 	}
@@ -328,7 +335,7 @@ func (s *Store) ClaimCommands(
 			started, entryErr := NewJournalEntry(AttemptStarted, journalcodec.AttemptStartedBody{
 				V: 1, AttemptID: command.attemptID.String(), CommandID: command.candidate.CommandID.String(),
 				CommandKey: command.key, Attempt: command.attempt, StartedAt: semantic.DBNow(), Worker: owner,
-				LeaseDurationMS: leaseMilliseconds, ConsumedAttempts: command.consumed,
+				LeaseDurationMS: command.leaseMilliseconds, ConsumedAttempts: command.consumed,
 				BudgetStartedAt: command.budgetStartedAt,
 			})
 			if entryErr != nil {
@@ -343,7 +350,7 @@ func (s *Store) ClaimCommands(
 		if applyErr != nil {
 			return ClaimBatchResult{}, applyErr
 		}
-		if err := s.updateClaimBatch(ctx, semantic, claimable, owner, leaseExpiresAt); err != nil {
+		if err := s.updateClaimBatch(ctx, semantic, claimable, owner); err != nil {
 			return ClaimBatchResult{}, err
 		}
 		for index := range claimable {
@@ -361,7 +368,8 @@ func (s *Store) ClaimCommands(
 				CreatedAt: command.createdAt, BudgetStartedAt: command.budgetStartedAt,
 				RunDeadline: clonePointer(runDeadline), Attempt: command.attempt,
 				ConsumedAttempts: command.consumed, AttemptID: command.attemptID, LeaseToken: command.leaseToken,
-				DBNow: semantic.DBNow(), LeaseExpiresAt: leaseExpiresAt, AttemptStartedPosition: row.Position,
+				DBNow: semantic.DBNow(), LeaseDuration: command.leaseDuration,
+				LeaseExpiresAt: command.leaseExpiresAt, AttemptStartedPosition: row.Position,
 			})
 		}
 		result.Progressed = true
@@ -406,25 +414,29 @@ func (s *Store) ClaimCommands(
 }
 
 type claimBatchCommand struct {
-	candidate       CommandCandidate
-	key             string
-	name            string
-	version         int
-	queue           string
-	args            []byte
-	timeoutMS       *int64
-	policyBytes     []byte
-	createdAt       time.Time
-	budgetStartedAt time.Time
-	ordinal         int
-	consumed        int
-	createdPosition int64
-	retryPolicy     retrypolicy.Policy
-	attemptTimeout  time.Duration
-	attempt         int
-	attemptID       uuid.UUID
-	leaseToken      uuid.UUID
-	eventInputs     []ClaimedEventInput
+	candidate         CommandCandidate
+	key               string
+	name              string
+	version           int
+	queue             string
+	args              []byte
+	timeoutMS         *int64
+	recoveryLeaseMS   *int64
+	policyBytes       []byte
+	createdAt         time.Time
+	budgetStartedAt   time.Time
+	ordinal           int
+	consumed          int
+	createdPosition   int64
+	retryPolicy       retrypolicy.Policy
+	attemptTimeout    time.Duration
+	leaseDuration     time.Duration
+	leaseMilliseconds int64
+	leaseExpiresAt    time.Time
+	attempt           int
+	attemptID         uuid.UUID
+	leaseToken        uuid.UUID
+	eventInputs       []ClaimedEventInput
 }
 
 func (s *Store) lockClaimBatch(ctx context.Context, semantic *SemanticTx, candidates []CommandCandidate) ([]claimBatchCommand, error) {
@@ -435,7 +447,7 @@ func (s *Store) lockClaimBatch(ctx context.Context, semantic *SemanticTx, candid
 	rows, err := semantic.PGX().Query(ctx, `WITH requested AS (
 		SELECT command_id,ordinality FROM unnest($1::uuid[]) WITH ORDINALITY AS r(command_id,ordinality)
 	)
-	SELECT r.ordinality,c.command_key,c.name,c.version,c.args,c.queue,c.attempt_timeout_ms,
+	SELECT r.ordinality,c.command_key,c.name,c.version,c.args,c.queue,c.attempt_timeout_ms,c.recovery_lease_ms,
 		c.retry_policy,c.created_at,c.budget_started_at,c.attempt_ordinal,c.consumed_attempts,
 		c.created_position,c.state,q.state,q.next_run_at
 	FROM requested r
@@ -455,7 +467,7 @@ func (s *Store) lockClaimBatch(ctx context.Context, semantic *SemanticTx, candid
 		var commandState, queueState string
 		var nextRunAt time.Time
 		if err := rows.Scan(&ordinality, &command.key, &command.name, &command.version, &command.args, &command.queue,
-			&command.timeoutMS, &command.policyBytes, &command.createdAt, &command.budgetStartedAt, &command.ordinal,
+			&command.timeoutMS, &command.recoveryLeaseMS, &command.policyBytes, &command.createdAt, &command.budgetStartedAt, &command.ordinal,
 			&command.consumed, &command.createdPosition, &commandState, &queueState, &nextRunAt); err != nil {
 			return nil, MapError("scan command claim batch", err)
 		}
@@ -535,27 +547,28 @@ func (s *Store) updateClaimBatch(
 	semantic *SemanticTx,
 	commands []claimBatchCommand,
 	owner string,
-	leaseExpiresAt time.Time,
 ) error {
 	commandIDs := make([]uuid.UUID, len(commands))
 	attemptIDs := make([]uuid.UUID, len(commands))
 	leaseTokens := make([]uuid.UUID, len(commands))
+	leaseExpiries := make([]time.Time, len(commands))
 	attempts := make([]int32, len(commands))
 	for index := range commands {
 		commandIDs[index] = commands[index].candidate.CommandID
 		attemptIDs[index] = commands[index].attemptID
 		leaseTokens[index] = commands[index].leaseToken
+		leaseExpiries[index] = commands[index].leaseExpiresAt
 		attempts[index] = int32(commands[index].attempt)
 	}
-	queueResult, err := semantic.PGX().Exec(ctx, `WITH claimed(command_id,attempt_id,lease_token) AS (
-		SELECT * FROM unnest($1::uuid[],$2::uuid[],$3::uuid[])
+	queueResult, err := semantic.PGX().Exec(ctx, `WITH claimed(command_id,attempt_id,lease_token,lease_expires_at) AS (
+		SELECT * FROM unnest($1::uuid[],$2::uuid[],$3::uuid[],$4::timestamptz[])
 	)
 	UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+` q
-	SET state='running',active_attempt_id=claimed.attempt_id,lease_token=claimed.lease_token,lease_owner=$4,
-	    lease_started_at=$5,lease_expires_at=$6
+	SET state='running',active_attempt_id=claimed.attempt_id,lease_token=claimed.lease_token,lease_owner=$5,
+	    lease_started_at=$6,lease_expires_at=claimed.lease_expires_at
 	FROM claimed
 	WHERE q.command_id=claimed.command_id AND q.run_id=$7 AND q.state IN ('ready','retry_wait')`,
-		commandIDs, attemptIDs, leaseTokens, owner, semantic.DBNow(), leaseExpiresAt, semantic.RunID())
+		commandIDs, attemptIDs, leaseTokens, leaseExpiries, owner, semantic.DBNow(), semantic.RunID())
 	if err != nil {
 		return MapError("claim command queue batch", err)
 	}
@@ -694,6 +707,7 @@ type LeaseRenewal struct {
 	CommandID uuid.UUID
 	AttemptID uuid.UUID
 	Token     uuid.UUID
+	Duration  time.Duration
 }
 
 type LeaseRenewalOutcome string
@@ -711,41 +725,41 @@ type LeaseRenewalResult struct {
 	LeaseExpiresAt *time.Time
 }
 
-func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, duration time.Duration) ([]LeaseRenewalResult, error) {
+func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal) ([]LeaseRenewalResult, error) {
 	if len(leases) == 0 {
 		return nil, nil
-	}
-	if duration <= 0 {
-		return nil, fmt.Errorf("%w: lease duration must be positive", flowerr.ErrInvalid)
-	}
-	durationMilliseconds, err := durable.ExactMilliseconds("lease duration", duration)
-	if err != nil {
-		return nil, err
 	}
 	commandIDs := make([]uuid.UUID, len(leases))
 	attemptIDs := make([]uuid.UUID, len(leases))
 	tokens := make([]uuid.UUID, len(leases))
+	durationMilliseconds := make([]int64, len(leases))
 	seen := make(map[uuid.UUID]struct{}, len(leases))
 	for index, lease := range leases {
-		if lease.CommandID == uuid.Nil || lease.AttemptID == uuid.Nil || lease.Token == uuid.Nil {
+		if lease.CommandID == uuid.Nil || lease.AttemptID == uuid.Nil || lease.Token == uuid.Nil || lease.Duration <= 0 {
 			return nil, fmt.Errorf("%w: incomplete command lease renewal", flowerr.ErrInvalid)
+		}
+		milliseconds, err := durable.ExactMilliseconds("lease duration", lease.Duration)
+		if err != nil {
+			return nil, err
 		}
 		if _, duplicate := seen[lease.CommandID]; duplicate {
 			return nil, fmt.Errorf("%w: duplicate command lease renewal", flowerr.ErrInvalid)
 		}
 		seen[lease.CommandID] = struct{}{}
 		commandIDs[index], attemptIDs[index], tokens[index] = lease.CommandID, lease.AttemptID, lease.Token
+		durationMilliseconds[index] = milliseconds
 	}
-	rows, err := s.db.Conn.Query(ctx, `WITH now_value AS (SELECT clock_timestamp() AS now), requested(command_id,attempt_id,token,ordinal) AS (
-		SELECT command_id,attempt_id,token,ordinality
-		FROM unnest($1::uuid[],$2::uuid[],$3::uuid[]) WITH ORDINALITY AS input(command_id,attempt_id,token,ordinality)
+	rows, err := s.db.Conn.Query(ctx, `WITH now_value AS (SELECT clock_timestamp() AS now), requested(command_id,attempt_id,token,duration_ms,ordinal) AS (
+		SELECT command_id,attempt_id,token,duration_ms,ordinality
+		FROM unnest($1::uuid[],$2::uuid[],$3::uuid[],$4::bigint[])
+			WITH ORDINALITY AS input(command_id,attempt_id,token,duration_ms,ordinality)
 	), observed AS MATERIALIZED (
 		SELECT r.command_id AS requested_command_id,r.attempt_id AS requested_attempt_id,r.token AS requested_token,r.ordinal,
 		       q.command_id,q.state,q.active_attempt_id,q.lease_token,q.lease_expires_at
 		FROM requested r
 		LEFT JOIN `+pgschema.Table(s.schema, "flow_command_queue")+` q ON q.command_id=r.command_id
 	), lockable AS (
-		SELECT q.command_id
+		SELECT q.command_id,r.duration_ms
 		FROM `+pgschema.Table(s.schema, "flow_command_queue")+` q
 		JOIN requested r ON r.command_id=q.command_id
 		CROSS JOIN now_value n
@@ -754,7 +768,7 @@ func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, d
 		FOR UPDATE OF q SKIP LOCKED
 	), renewed AS (
 		UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+` q
-		SET lease_expires_at=n.now+($4 * interval '1 millisecond')
+		SET lease_expires_at=n.now+(l.duration_ms * interval '1 millisecond')
 		FROM lockable l,now_value n
 		WHERE q.command_id=l.command_id
 		RETURNING q.command_id,q.lease_expires_at
@@ -774,7 +788,7 @@ func (s *Store) RenewCommandLeases(ctx context.Context, leases []LeaseRenewal, d
 	FROM observed o
 	CROSS JOIN now_value n
 	LEFT JOIN renewed x ON x.command_id=o.requested_command_id
-	ORDER BY o.ordinal`, commandIDs, attemptIDs, tokens, durationMilliseconds)
+		ORDER BY o.ordinal`, commandIDs, attemptIDs, tokens, durationMilliseconds)
 	if err != nil {
 		return nil, MapError("renew command leases", err)
 	}

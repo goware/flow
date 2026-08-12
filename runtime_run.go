@@ -74,26 +74,40 @@ func (hub *wakeHub) wait(ctx context.Context, seen uint64, interval time.Duratio
 }
 
 type activeCommand struct {
-	commandID   uuid.UUID
-	attemptID   uuid.UUID
-	token       uuid.UUID
-	localExpiry time.Time
-	cancel      context.CancelCauseFunc
-	cancelled   bool
+	commandID     uuid.UUID
+	attemptID     uuid.UUID
+	token         uuid.UUID
+	leaseDuration time.Duration
+	localExpiry   time.Time
+	nextRenewAt   time.Time
+	renewing      bool
+	retryRenewal  bool
+	cancel        context.CancelCauseFunc
+	cancelled     bool
 }
 
 type activeCommands struct {
-	mu     sync.Mutex
-	values map[uuid.UUID]activeCommand
+	mu      sync.Mutex
+	values  map[uuid.UUID]activeCommand
+	changed chan struct{}
 }
 
 func newActiveCommands() *activeCommands {
-	return &activeCommands{values: make(map[uuid.UUID]activeCommand)}
+	return &activeCommands{values: make(map[uuid.UUID]activeCommand), changed: make(chan struct{})}
+}
+
+func (active *activeCommands) signalLocked() {
+	close(active.changed)
+	active.changed = make(chan struct{})
 }
 
 func (active *activeCommands) register(command activeCommand) {
 	active.mu.Lock()
+	if command.leaseDuration > 0 && command.nextRenewAt.IsZero() {
+		command.nextRenewAt = command.localExpiry.Add(-2 * command.leaseDuration / 3)
+	}
 	active.values[command.commandID] = command
+	active.signalLocked()
 	active.mu.Unlock()
 }
 
@@ -102,6 +116,7 @@ func (active *activeCommands) unregister(commandID, attemptID uuid.UUID) {
 	command, exists := active.values[commandID]
 	if exists && command.attemptID == attemptID {
 		delete(active.values, commandID)
+		active.signalLocked()
 	}
 	active.mu.Unlock()
 }
@@ -119,29 +134,21 @@ func (active *activeCommands) snapshot() []activeCommand {
 	return result
 }
 
-func (active *activeCommands) renewed(commandID, attemptID uuid.UUID, expiresAt time.Time) {
+func (active *activeCommands) cancelExpired(now time.Time) int {
 	active.mu.Lock()
-	defer active.mu.Unlock()
-	command, exists := active.values[commandID]
-	if exists && command.attemptID == attemptID && !command.cancelled {
-		command.localExpiry = expiresAt
-		active.values[commandID] = command
-	}
-}
-
-func (active *activeCommands) cancelExpired() int {
-	now := time.Now()
-	active.mu.Lock()
-	defer active.mu.Unlock()
 	cancelled := 0
 	for id, command := range active.values {
-		if !command.cancelled && !now.Before(command.localExpiry) {
+		if !command.cancelled && !command.renewing && !now.Before(command.localExpiry) {
 			command.cancelled = true
 			active.values[id] = command
 			command.cancel(ErrLeaseLost)
 			cancelled++
 		}
 	}
+	if cancelled > 0 {
+		active.signalLocked()
+	}
+	active.mu.Unlock()
 	return cancelled
 }
 
@@ -155,6 +162,7 @@ func (active *activeCommands) cancelAttempt(commandID, attemptID uuid.UUID, caus
 	command.cancelled = true
 	active.values[commandID] = command
 	command.cancel(cause)
+	active.signalLocked()
 	return true
 }
 
@@ -164,7 +172,7 @@ func (active *activeCommands) cancelLost(commandID, attemptID uuid.UUID) bool {
 
 func (active *activeCommands) cancelAll(cause error) {
 	active.mu.Lock()
-	defer active.mu.Unlock()
+	changed := false
 	for id, command := range active.values {
 		if command.cancelled {
 			continue
@@ -172,7 +180,111 @@ func (active *activeCommands) cancelAll(cause error) {
 		command.cancelled = true
 		active.values[id] = command
 		command.cancel(cause)
+		changed = true
 	}
+	if changed {
+		active.signalLocked()
+	}
+	active.mu.Unlock()
+}
+
+func (active *activeCommands) nextRenewal() (<-chan struct{}, time.Time, bool) {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	var earliest time.Time
+	found := false
+	for _, command := range active.values {
+		if command.cancelled || command.renewing || command.leaseDuration <= 0 {
+			continue
+		}
+		if !found || command.nextRenewAt.Before(earliest) {
+			earliest, found = command.nextRenewAt, true
+		}
+	}
+	return active.changed, earliest, found
+}
+
+func (active *activeCommands) nextExpiry() (<-chan struct{}, time.Time, bool) {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	var earliest time.Time
+	found := false
+	for _, command := range active.values {
+		if command.cancelled || command.renewing || command.localExpiry.IsZero() {
+			continue
+		}
+		if !found || command.localExpiry.Before(earliest) {
+			earliest, found = command.localExpiry, true
+		}
+	}
+	return active.changed, earliest, found
+}
+
+func (active *activeCommands) takeDue(now time.Time) []activeCommand {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	result := make([]activeCommand, 0, len(active.values))
+	for id, command := range active.values {
+		if command.cancelled || command.renewing || command.leaseDuration <= 0 || command.nextRenewAt.After(now) {
+			continue
+		}
+		command.renewing = true
+		active.values[id] = command
+		result = append(result, command)
+	}
+	if len(result) > 0 {
+		active.signalLocked()
+	}
+	return result
+}
+
+func (active *activeCommands) renewalSucceeded(command activeCommand, started time.Time) bool {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	current, exists := active.values[command.commandID]
+	if !exists || current.attemptID != command.attemptID || current.cancelled || !current.renewing {
+		return false
+	}
+	current.localExpiry = started.Add(current.leaseDuration)
+	current.nextRenewAt = started.Add(current.leaseDuration / 3)
+	current.renewing = false
+	current.retryRenewal = false
+	active.values[command.commandID] = current
+	active.signalLocked()
+	return true
+}
+
+func (active *activeCommands) renewalRetry(command activeCommand, now time.Time) bool {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	current, exists := active.values[command.commandID]
+	if !exists || current.attemptID != command.attemptID || current.cancelled || !current.renewing {
+		return false
+	}
+	current.renewing = false
+	remaining := current.localExpiry.Sub(now)
+	if remaining <= 0 {
+		// Hand local expiry back to the watchdog so it remains the single
+		// cancellation/observation path. Keep renewal sufficiently in the
+		// future to avoid racing the watchdog with a hot retry loop.
+		current.nextRenewAt = now.Add(max(time.Millisecond, current.leaseDuration))
+		active.values[command.commandID] = current
+		active.signalLocked()
+		return false
+	}
+	delay := min(max(10*time.Millisecond, current.leaseDuration/12), remaining/4)
+	if delay <= 0 {
+		delay = min(time.Millisecond, remaining)
+	}
+	current.nextRenewAt = now.Add(delay)
+	current.retryRenewal = true
+	active.values[command.commandID] = current
+	active.signalLocked()
+	return true
+}
+
+func (active *activeCommands) renewalLost(command activeCommand) bool {
+	return active.cancelLost(command.commandID, command.attemptID)
 }
 
 func waitGroupContext(ctx context.Context, group *sync.WaitGroup) bool {
@@ -389,51 +501,61 @@ func (r *Runtime) Stop(ctx context.Context) error {
 }
 
 func (r *Runtime) runLeaseManager(ctx context.Context) {
-	interval := max(10*time.Millisecond, r.commandLease/3)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+	for ctx.Err() == nil {
+		changed, dueAt, found := r.active.nextRenewal()
+		if !waitActiveDeadline(ctx, changed, dueAt, found) {
 			return
-		case <-ticker.C:
 		}
-		current := r.active.snapshot()
+		current := r.active.takeDue(time.Now())
 		if len(current) == 0 {
 			continue
 		}
 		renewals := make([]store.LeaseRenewal, len(current))
 		for index, command := range current {
-			renewals[index] = store.LeaseRenewal{CommandID: command.commandID, AttemptID: command.attemptID, Token: command.token}
+			renewals[index] = store.LeaseRenewal{
+				CommandID: command.commandID, AttemptID: command.attemptID,
+				Token: command.token, Duration: command.leaseDuration,
+			}
 		}
 		started := time.Now()
-		renewCtx, cancel := context.WithTimeout(ctx, commandRenewalTimeout(r.commandLease))
+		renewCtx, cancel := context.WithTimeout(ctx, renewalCallTimeout(current, started))
 		err := r.faults.Hit(renewCtx, fault.RenewBeforeResult)
 		var results []store.LeaseRenewalResult
 		if err == nil {
-			results, err = r.store.RenewCommandLeases(renewCtx, renewals, r.commandLease)
+			results, err = r.store.RenewCommandLeases(renewCtx, renewals)
+		}
+		if err == nil {
+			// This test seam sits after the bounded store call and before the
+			// result is applied under the active-registry lock. Runtime shutdown
+			// still cancels it through the service context.
+			err = r.faults.Hit(ctx, fault.RenewAfterStore)
 		}
 		cancel()
-		duration := time.Since(started)
+		finished := time.Now()
 		if err != nil {
+			for _, command := range current {
+				r.active.renewalRetry(command, finished)
+			}
 			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: "error",
-				Count: int64(len(current)), Duration: duration, Worker: r.replicaName()})
+				Count: int64(len(current)), Duration: finished.Sub(started), Worker: r.replicaName()})
 			continue
 		}
 		counts := map[store.LeaseRenewalOutcome]int64{
 			store.LeaseRenewed: 0, store.LeaseLost: 0, store.LeaseUncertain: 0,
 		}
 		localLost := int64(0)
-		for _, result := range results {
+		for index, result := range results {
 			counts[result.Outcome]++
+			command := current[index]
 			switch result.Outcome {
 			case store.LeaseRenewed:
-				r.active.renewed(result.CommandID, result.AttemptID, started.Add(r.commandLease))
+				r.active.renewalSucceeded(command, started)
 			case store.LeaseLost:
-				if r.active.cancelLost(result.CommandID, result.AttemptID) {
+				if r.active.renewalLost(command) {
 					localLost++
 				}
 			case store.LeaseUncertain:
+				r.active.renewalRetry(command, finished)
 			}
 		}
 		outcome := "ok"
@@ -441,13 +563,12 @@ func (r *Runtime) runLeaseManager(ctx context.Context) {
 			outcome = "partial"
 		}
 		r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew", Outcome: outcome,
-			Count: int64(len(current)), Duration: duration, Worker: r.replicaName()})
+			Count: int64(len(current)), Duration: finished.Sub(started), Worker: r.replicaName()})
 		for _, resultOutcome := range []store.LeaseRenewalOutcome{store.LeaseRenewed, store.LeaseLost, store.LeaseUncertain} {
-			if counts[resultOutcome] == 0 {
-				continue
+			if counts[resultOutcome] > 0 {
+				r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew_result", Outcome: string(resultOutcome),
+					Count: counts[resultOutcome], Worker: r.replicaName()})
 			}
-			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "renew_result", Outcome: string(resultOutcome),
-				Count: counts[resultOutcome], Worker: r.replicaName()})
 		}
 		if localLost > 0 {
 			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "local_cancel", Outcome: "lost",
@@ -460,23 +581,60 @@ func commandRenewalTimeout(lease time.Duration) time.Duration {
 	return max(10*time.Millisecond, min(5*time.Second, lease/6))
 }
 
-func leaseWatchdogInterval(lease time.Duration) time.Duration {
-	return max(10*time.Millisecond, min(time.Second, lease/6))
+func renewalCallTimeout(commands []activeCommand, now time.Time) time.Duration {
+	shortestLease := commands[0].leaseDuration
+	shortestRemaining := commands[0].localExpiry.Sub(now)
+	retry := commands[0].retryRenewal
+	for _, command := range commands[1:] {
+		shortestLease = min(shortestLease, command.leaseDuration)
+		shortestRemaining = min(shortestRemaining, command.localExpiry.Sub(now))
+		retry = retry || command.retryRenewal
+	}
+	if !retry {
+		return commandRenewalTimeout(shortestLease)
+	}
+	// A retry may use more than the ordinary cap while there is enough local
+	// lease window left, but one nearly expired member must not collapse the
+	// shared batch deadline below its normal bounded timeout. The store still
+	// classifies each fence independently in one set-oriented call.
+	return max(commandRenewalTimeout(shortestLease), min(shortestLease/3, shortestRemaining/2))
 }
 
 func (r *Runtime) runLeaseWatchdog(ctx context.Context) {
-	ticker := time.NewTicker(leaseWatchdogInterval(r.commandLease))
-	defer ticker.Stop()
-	for {
+	for ctx.Err() == nil {
+		changed, expiresAt, found := r.active.nextExpiry()
+		if !waitActiveDeadline(ctx, changed, expiresAt, found) {
+			return
+		}
+		if cancelled := r.active.cancelExpired(time.Now()); cancelled > 0 {
+			r.observe(ctx, Observation{Kind: ObservationLease, Operation: "local_cancel", Outcome: "expired",
+				Count: int64(cancelled), Worker: r.replicaName()})
+		}
+	}
+}
+
+func waitActiveDeadline(ctx context.Context, changed <-chan struct{}, deadline time.Time, found bool) bool {
+	if !found {
 		select {
 		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if cancelled := r.active.cancelExpired(); cancelled > 0 {
-				r.observe(ctx, Observation{Kind: ObservationLease, Operation: "local_cancel", Outcome: "expired",
-					Count: int64(cancelled), Worker: r.replicaName()})
-			}
+			return false
+		case <-changed:
+			return true
 		}
+	}
+	delay := time.Until(deadline)
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-changed:
+		return true
+	case <-timer.C:
+		return true
 	}
 }
 
