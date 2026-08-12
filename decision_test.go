@@ -31,6 +31,26 @@ func TestDecisionBufferCoalescesAndPoisonsConflicts(t *testing.T) {
 	}
 }
 
+func TestDecisionBufferBoundsDistinctStagedEvents(t *testing.T) {
+	event := DefineEvent[decisionArgs]("decision.event")
+	scope := &Work[None]{scope: &scopeState{}}
+	for index := range maxStagedApplicationEvents {
+		if err := Emit(scope, event, fmt.Sprintf("event/%03d", index), decisionArgs{Value: "value"}); err != nil {
+			t.Fatalf("Emit(%d) error = %v", index, err)
+		}
+	}
+	if err := Emit(scope, event, "event/000", decisionArgs{Value: "value"}); err != nil {
+		t.Fatalf("equivalent duplicate at limit error = %v", err)
+	}
+	if got := len(scope.scope.decision.events); got != maxStagedApplicationEvents {
+		t.Fatalf("staged events = %d, want %d", got, maxStagedApplicationEvents)
+	}
+	if err := Emit(scope, event, "event/overflow", decisionArgs{Value: "value"}); !errors.Is(err, ErrInvalid) ||
+		!errors.Is(scope.scope.firstError, ErrInvalid) {
+		t.Fatalf("overflow error/poison = %v/%v, want ErrInvalid", err, scope.scope.firstError)
+	}
+}
+
 func TestDecisionBufferUsesCanonicalRetryPolicyIdentity(t *testing.T) {
 	equivalentA := DefineCommand[decisionArgs, decisionResult]("decision_retry", 1, WithRetry(Attempts(2)))
 	equivalentB := DefineCommand[decisionArgs, decisionResult]("decision_retry", 1, WithRetry(Attempts(2)))

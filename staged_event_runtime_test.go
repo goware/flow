@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -367,6 +368,95 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 		}
 	}
 	assertReplayMatches(t, runtime, successHandle.RunID)
+}
+
+func TestStagedEventOverflowRejectsTheDecisionAtomically(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, `CREATE TABLE `+pgschema.Table(database.Schema, "overflow_commits")+`
+		(run_id text PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	event := DefineEvent[None]("staged.overflow.event")
+	child := DefineCommand[None, None]("staged.overflow.child", 1)
+	root := DefineCommand[None, None]("staged.overflow.root", 1, WithRetry(Attempts(1)))
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
+		for index := range maxStagedApplicationEvents + 1 {
+			_ = Emit(work, event, fmt.Sprintf("event/%03d", index), None{})
+		}
+		Enqueue(work, "child", child, None{})
+		return None{}, nil
+	}, WithCommit(func(ctx context.Context, tx Tx, commit Commit[None, None]) error {
+		_, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "overflow_commits")+`
+			(run_id) VALUES ($1)`, commit.Info.RunID)
+		return err
+	}))); err != nil {
+		t.Fatal(err)
+	}
+	cancel, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancel, runResult)
+	started, err := root.Enqueue(ctx, runtime, "overflow", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunStatus(t, database.Schema, database.DB.Conn, started.RunID, "failed", 5*time.Second)
+
+	var status, commandStatus, failureCode string
+	var commandCount, openCommands, nextPosition, events, children, queueRows, commitRows int
+	var hasResult bool
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT r.status,r.command_count,r.open_commands,r.next_journal_position,
+		c.state,c.terminal_failure->>'code',c.result IS NOT NULL,
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+` j
+		 WHERE j.run_id=r.run_id AND j.event_class='application'),
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+` child
+		 WHERE child.run_id=r.run_id AND child.parent_command_id IS NOT NULL),
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` q WHERE q.run_id=r.run_id),
+		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "overflow_commits")+` a WHERE a.run_id=r.run_id::text)
+		FROM `+pgschema.Table(database.Schema, "flow_runs")+` r
+		JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c ON c.command_id=r.root_command_id
+		WHERE r.run_id=$1`, started.RunID).Scan(&status, &commandCount, &openCommands, &nextPosition,
+		&commandStatus, &failureCode, &hasResult, &events, &children, &queueRows, &commitRows); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || commandStatus != "failed" || failureCode != "invalid_decision" || hasResult ||
+		commandCount != 1 || openCommands != 0 || nextPosition != 8 || events != 0 || children != 0 || queueRows != 0 || commitRows != 0 {
+		t.Fatalf("overflow projection run=%s/%d/%d/%d command=%s/%s result=%t events=%d children=%d queue=%d commits=%d",
+			status, commandCount, openCommands, nextPosition, commandStatus, failureCode, hasResult,
+			events, children, queueRows, commitRows)
+	}
+	rows, err := database.DB.Conn.Query(ctx, `SELECT entry_kind FROM `+
+		pgschema.Table(database.Schema, "flow_journal")+` WHERE run_id=$1 ORDER BY position`, started.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	for rows.Next() {
+		var kind string
+		if err := rows.Scan(&kind); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		kinds = append(kinds, kind)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	wantKinds := []string{"run_started", "command_created", "attempt_started", "attempt_concluded", "event_recorded", "run_failing", "event_recorded"}
+	if !reflect.DeepEqual(kinds, wantKinds) {
+		t.Fatalf("overflow journal kinds = %v, want %v", kinds, wantKinds)
+	}
+	assertReplayMatches(t, runtime, started.RunID)
 }
 
 func waitForMatchingObservations(t *testing.T, observer *recordingObserver, count int,

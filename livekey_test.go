@@ -3,6 +3,8 @@ package flow
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -282,10 +284,11 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 		t.Fatalf("delayed start = %#v, %v", exec, err)
 	}
 
-	depth, err := GetQueueDepth(ctx, runtime, "livekey.lane")
+	stats, err := GetQueueStats(ctx, runtime, "livekey.lane")
 	if err != nil {
-		t.Fatalf("GetQueueDepth() error = %v", err)
+		t.Fatalf("GetQueueStats() error = %v", err)
 	}
+	depth := stats["livekey.lane"]
 	if depth.Ready != 0 || depth.Delayed != 1 || depth.Running != 0 {
 		t.Fatalf("pre-delay depth = %#v", depth)
 	}
@@ -307,9 +310,9 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 
 }
 
-// GetQueueDepth counts one lane's deliverable, scheduled, and leased commands
+// GetQueueStats counts requested lanes' deliverable, scheduled, and leased commands
 // without a running runtime.
-func TestGetQueueDepthCountsLane(t *testing.T) {
+func TestGetQueueStatsCountsLanes(t *testing.T) {
 	t.Parallel()
 
 	database := testpg.Open(t)
@@ -330,23 +333,97 @@ func TestGetQueueDepthCountsLane(t *testing.T) {
 		t.Fatalf("delayed start error = %v", err)
 	}
 
-	depth, err := GetQueueDepth(ctx, runtime, "livekey.depth.lane")
+	stats, err := GetQueueStats(ctx, runtime, "livekey.depth.lane", "livekey.empty.lane")
 	if err != nil {
-		t.Fatalf("GetQueueDepth() error = %v", err)
+		t.Fatalf("GetQueueStats() error = %v", err)
 	}
+	depth := stats["livekey.depth.lane"]
 	if depth.Ready != 1 || depth.Delayed != 1 || depth.Running != 0 || depth.OldestReadyFor < 0 {
 		t.Fatalf("queue depth = %#v", depth)
 	}
 
-	empty, err := GetQueueDepth(ctx, runtime, "livekey.empty.lane")
-	if err != nil {
-		t.Fatalf("GetQueueDepth(empty) error = %v", err)
-	}
+	empty := stats["livekey.empty.lane"]
 	if empty.Ready != 0 || empty.Delayed != 0 || empty.Running != 0 || empty.OldestReadyFor != 0 {
 		t.Fatalf("empty queue depth = %#v", empty)
 	}
 
-	if _, err := GetQueueDepth(ctx, runtime, ""); !errors.Is(err, ErrInvalid) {
+	if _, err := GetQueueStats(ctx, runtime, ""); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unnamed queue depth error = %v", err)
+	}
+}
+
+func TestGetQueueStatsBatchesValidatesAndObservesTransactions(t *testing.T) {
+	recorder := &queryRecorder{}
+	database := testpg.OpenWithQueryTracer(t, recorder)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queues := make([]string, 16)
+	for index := range queues {
+		queues[index] = fmt.Sprintf("stats.lane.%02d", index)
+	}
+	command := DefineCommand[None, None]("stats.command", 1, WithQueue(queues[0]))
+	if _, err := command.Enqueue(ctx, runtime, "stats/ready", None{}); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder.reset()
+	requested := append(append([]string(nil), queues...), queues[0])
+	stats, err := GetQueueStats(ctx, runtime, requested...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != len(queues) || stats[queues[0]].Ready != 1 {
+		t.Fatalf("queue statistics = %#v", stats)
+	}
+	for _, queue := range queues[1:] {
+		if stats[queue].Queue != queue || stats[queue].Ready != 0 || stats[queue].Delayed != 0 || stats[queue].Running != 0 {
+			t.Fatalf("empty queue %q statistics = %#v", queue, stats[queue])
+		}
+	}
+	queries := recorder.snapshot()
+	if len(queries) != 1 || strings.Count(queries[0], "clock_timestamp()") != 1 ||
+		!strings.Contains(queries[0], "observed AS MATERIALIZED") || !strings.Contains(queries[0], "unnest($1::text[])") {
+		t.Fatalf("queue statistics queries = %#v", queries)
+	}
+
+	recorder.reset()
+	empty, err := GetQueueStats(ctx, runtime)
+	if err != nil || empty == nil || len(empty) != 0 || len(recorder.snapshot()) != 0 {
+		t.Fatalf("empty queue statistics = %#v, %v; queries=%#v", empty, err, recorder.snapshot())
+	}
+	if _, err := GetQueueStats(ctx, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nil-client empty queue statistics error = %v", err)
+	}
+	if _, err := GetQueueStats(ctx, runtime, ""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid queue statistics error = %v", err)
+	}
+	tooMany := make([]string, MaxReadKeys+1)
+	for index := range tooMany {
+		tooMany[index] = queues[0]
+	}
+	if _, err := GetQueueStats(ctx, runtime, tooMany...); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("too many queue statistics error = %v", err)
+	}
+
+	tx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	txCommand := DefineCommand[None, None]("stats.transaction", 1, WithQueue("stats.transaction.lane"))
+	txClient := runtime.InTx(tx)
+	if _, err := txCommand.Enqueue(ctx, txClient, "stats/transaction", None{}); err != nil {
+		t.Fatal(err)
+	}
+	recorder.reset()
+	txStats, err := GetQueueStats(ctx, txClient, "stats.transaction.lane")
+	if err != nil || txStats["stats.transaction.lane"].Ready != 1 || len(recorder.snapshot()) != 1 {
+		t.Fatalf("transaction queue statistics = %#v, %v; queries=%#v", txStats, err, recorder.snapshot())
 	}
 }

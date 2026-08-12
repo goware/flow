@@ -361,20 +361,45 @@ type QueueStats struct {
 	OldestReadyFor time.Duration
 }
 
-// GetQueueDepth reports the lane's current deliverable, scheduled, and leased
-// command counts. It reads operational delivery state, not application
-// events: the counts change as attempts are claimed and settled.
-func GetQueueDepth(ctx context.Context, c Client, queue string) (QueueStats, error) {
+// GetQueueStats reports each requested lane's current deliverable, scheduled,
+// and leased command counts. All lanes use one database statement and one
+// observation timestamp.
+func GetQueueStats(ctx context.Context, c Client, queues ...string) (map[string]QueueStats, error) {
 	client, err := resolveClient(c)
 	if err != nil {
-		return QueueStats{}, err
+		return nil, err
 	}
-	row, err := client.runtime.store.QueueDepthInTx(ctx, client.tx, queue)
+	if len(queues) > MaxReadKeys {
+		return nil, newError(ErrInvalid, "read", "queues", "", "too many queue names")
+	}
+	distinct := make([]string, 0, len(queues))
+	seen := make(map[string]struct{}, len(queues))
+	for _, queue := range queues {
+		if err := definition.ValidateName(queue); err != nil {
+			return nil, newError(ErrInvalid, "read", "queue", queue, "invalid queue name")
+		}
+		if _, exists := seen[queue]; exists {
+			continue
+		}
+		seen[queue] = struct{}{}
+		distinct = append(distinct, queue)
+	}
+	result := make(map[string]QueueStats, len(distinct))
+	if len(distinct) == 0 {
+		return result, nil
+	}
+	rows, err := client.runtime.store.QueueStatsInTx(ctx, client.tx, distinct)
 	if err != nil {
-		return QueueStats{}, err
+		return nil, err
 	}
-	return QueueStats{
-		Queue: queue, Ready: row.Ready, Delayed: row.Delayed,
-		Running: row.Running, OldestReadyFor: row.OldestReadyFor,
-	}, nil
+	for _, row := range rows {
+		result[row.Queue] = QueueStats{
+			Queue: row.Queue, Ready: row.Ready, Delayed: row.Delayed,
+			Running: row.Running, OldestReadyFor: row.OldestReadyFor,
+		}
+	}
+	if len(result) != len(distinct) {
+		return nil, newError(ErrInvalidState, "read", "queues", "", "queue statistics result is incomplete")
+	}
+	return result, nil
 }

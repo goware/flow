@@ -233,45 +233,68 @@ func scanRun(row pgx.Row) (RunRow, error) {
 	return value, nil
 }
 
-// QueueDepthRow is a point-in-time projection of one queue lane's operational
-// depth, derived from flow_command_queue.
-type QueueDepthRow struct {
+// QueueStatsRow is a point-in-time projection of one queue lane's operational
+// state, derived from flow_command_queue.
+type QueueStatsRow struct {
+	Queue          string
 	Ready          int64
 	Delayed        int64
 	Running        int64
 	OldestReadyFor time.Duration
 }
 
-// QueueDepthInTx counts the lane's deliverable, scheduled, and leased
-// commands. Ready commands are claimable now; Delayed commands wait out a
-// retry backoff or start delay; Running commands hold a lease.
-func (s *Store) QueueDepthInTx(ctx context.Context, tx pgx.Tx, queue string) (QueueDepthRow, error) {
-	if queue == "" {
-		return QueueDepthRow{}, fmt.Errorf("%w: queue name is required", flowerr.ErrInvalid)
+// QueueStatsInTx counts each requested lane's deliverable, scheduled, and
+// leased commands against one statement-stable timestamp.
+func (s *Store) QueueStatsInTx(ctx context.Context, tx pgx.Tx, queues []string) ([]QueueStatsRow, error) {
+	for _, queue := range queues {
+		if queue == "" {
+			return nil, fmt.Errorf("%w: queue name is required", flowerr.ErrInvalid)
+		}
 	}
-	query := s.queueDepthQuery()
-	var row QueueDepthRow
-	var oldestSeconds float64
-	var scan pgx.Row
+	query := s.queueStatsQuery()
+	var rows pgx.Rows
+	var err error
 	if tx != nil {
-		scan = tx.QueryRow(ctx, query, queue)
+		rows, err = tx.Query(ctx, query, queues)
 	} else {
-		scan = s.db.Conn.QueryRow(ctx, query, queue)
+		rows, err = s.db.Conn.Query(ctx, query, queues)
 	}
-	if err := scan.Scan(&row.Ready, &row.Delayed, &row.Running, &oldestSeconds); err != nil {
-		return QueueDepthRow{}, MapError("count queue depth", err)
+	if err != nil {
+		return nil, MapError("query queue statistics", err)
 	}
-	row.OldestReadyFor = time.Duration(oldestSeconds * float64(time.Second))
-	return row, nil
+	defer rows.Close()
+	result := make([]QueueStatsRow, 0, len(queues))
+	for rows.Next() {
+		var row QueueStatsRow
+		var oldestSeconds float64
+		if err := rows.Scan(&row.Queue, &row.Ready, &row.Delayed, &row.Running, &oldestSeconds); err != nil {
+			return nil, MapError("scan queue statistics", err)
+		}
+		row.OldestReadyFor = time.Duration(oldestSeconds * float64(time.Second))
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, MapError("read queue statistics", err)
+	}
+	return result, nil
 }
 
-func (s *Store) queueDepthQuery() string {
-	return `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now)
-	SELECT
-		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= observed.now),
-		COUNT(*) FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at > observed.now),
-		COUNT(*) FILTER (WHERE state = 'running'),
-		COALESCE(EXTRACT(EPOCH FROM MAX(observed.now) - MIN(next_run_at)
-			FILTER (WHERE state IN ('ready','retry_wait') AND next_run_at <= observed.now)), 0)
-	FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` CROSS JOIN observed WHERE queue = $1`
+func (s *Store) queueStatsQuery() string {
+	return `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now),
+	requested(queue) AS (SELECT * FROM unnest($1::text[])),
+	stats AS (
+		SELECT q.queue,
+			COUNT(*) FILTER (WHERE q.state IN ('ready','retry_wait') AND q.next_run_at <= observed.now) AS ready,
+			COUNT(*) FILTER (WHERE q.state IN ('ready','retry_wait') AND q.next_run_at > observed.now) AS delayed,
+			COUNT(*) FILTER (WHERE q.state = 'running') AS running,
+			COALESCE(EXTRACT(EPOCH FROM observed.now - MIN(q.next_run_at)
+				FILTER (WHERE q.state IN ('ready','retry_wait') AND q.next_run_at <= observed.now)), 0) AS oldest_ready_seconds
+		FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` q CROSS JOIN observed
+		WHERE q.queue=ANY($1::text[])
+		GROUP BY q.queue,observed.now
+	)
+	SELECT requested.queue,COALESCE(stats.ready,0),COALESCE(stats.delayed,0),
+		COALESCE(stats.running,0),COALESCE(stats.oldest_ready_seconds,0)
+	FROM requested LEFT JOIN stats USING (queue)
+	ORDER BY requested.queue`
 }

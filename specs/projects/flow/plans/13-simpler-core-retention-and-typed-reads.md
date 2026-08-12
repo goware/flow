@@ -1319,15 +1319,15 @@ exact accepted commit.
 
 ### Queue statistics and decision bounds
 
-- [ ] Replace `GetQueueDepth` with batched `GetQueueStats` and `QueueStats`.
-- [ ] Return every requested distinct lane, including empty lanes, from one SQL
+- [x] Replace `GetQueueDepth` with batched `GetQueueStats` and `QueueStats`.
+- [x] Return every requested distinct lane, including empty lanes, from one SQL
   statement and one statement-stable timestamp.
-- [ ] Add zero/one/16/duplicate/invalid/too-many/transaction query tests and an
+- [x] Add zero/one/16/duplicate/invalid/too-many/transaction query tests and an
   exact query-count assertion.
-- [ ] Prove the existing queue read index supports the grouped query.
-- [ ] Enforce a 256-distinct-event decision limit with duplicate-idempotency
+- [x] Prove the existing queue read index supports the grouped query.
+- [x] Enforce a 256-distinct-event decision limit with duplicate-idempotency
   semantics unchanged.
-- [ ] Prove 257-event overflow writes no result, application event, child,
+- [x] Prove 257-event overflow writes no result, application event, child,
   application commit, or partial successful-decision projection; assert the
   exact ordinary attempt conclusion, allocator positions, journal, retry or
   terminal projection, and run counters instead of requiring no writes at all.

@@ -22,12 +22,13 @@ import (
 )
 
 const (
-	maxCommandArgumentBytes  = 256 << 10
-	maxApplicationEventBytes = journalcodec.MaxApplicationEventPayloadBytes
-	maxCommandEventWaits     = 256
-	maxRunKeyBytes           = 1024
-	maxCommandKeyBytes       = 1024
-	defaultRunDeadline       = 30 * 24 * time.Hour
+	maxCommandArgumentBytes    = 256 << 10
+	maxApplicationEventBytes   = journalcodec.MaxApplicationEventPayloadBytes
+	maxStagedApplicationEvents = 256
+	maxCommandEventWaits       = 256
+	maxRunKeyBytes             = 1024
+	maxCommandKeyBytes         = 1024
+	defaultRunDeadline         = 30 * 24 * time.Hour
 )
 
 // RunOption is a sealed command run option.

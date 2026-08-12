@@ -18,6 +18,6 @@ func RunListQueryForTest(s *Store, filter RunListFilter) (string, []any) {
 	return s.listRunsQuery(filter)
 }
 
-func QueueDepthQueryForTest(s *Store) string { return s.queueDepthQuery() }
+func QueueStatsQueryForTest(s *Store) string { return s.queueStatsQuery() }
 
 func TraceWaitsQueryForTest(s *Store) string { return s.traceWaitsQuery() }

@@ -462,11 +462,14 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		r.concludeClaim(context.Background(), claim, classifyWorkerError(cause, false))
 		return
 	}
-	if panicked || workerErr != nil || scope.state.firstError != nil {
-		if scope.state.firstError != nil {
-			workerErr = scope.state.firstError
-		}
+	if panicked || workerErr != nil {
 		r.concludeClaim(context.Background(), claim, classifyWorkerError(workerErr, panicked))
+		return
+	}
+	if scope.state.firstError != nil {
+		r.concludeClaim(context.Background(), claim, classifiedConclusion{
+			class: retrypolicy.ClassPermanent, code: "invalid_decision", message: safeErrorMessage(scope.state.firstError),
+		})
 		return
 	}
 	encoded, err := worker.command.Result.Encode(result, maxCommandResultBytes)

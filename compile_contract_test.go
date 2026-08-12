@@ -33,7 +33,7 @@ func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 		"WithMaxCommandsPerExecution": {}, "ObservationExecution": {},
 		"HistoryExecutionStarted": {}, "HistoryExecutionFailing": {}, "BoundCommand": {},
 		"Node": {}, "LiveWork": {}, "LiveWorkFilter": {}, "LiveWorkPage": {},
-		"ListLiveWork": {}, "ListHistoryByKeys": {}, "QueueDepth": {}, "TraceOption": {},
+		"ListLiveWork": {}, "ListHistoryByKeys": {}, "GetQueueDepth": {}, "QueueDepth": {}, "TraceOption": {},
 		"CommandFailure": {}, "StatusSucceeded": {}, "StatusFailed": {}, "StatusCancelled": {},
 		"StatusExpired": {}, "NopObserver": {}, "WithFailFast": {}, "WithMetadata": {},
 	}

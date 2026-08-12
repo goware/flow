@@ -21,7 +21,8 @@ func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	target := flow.DefineCommand[flow.None, flow.None]("store.release_read_target", 1, flow.WithQueue("release.rare"))
+	target := flow.DefineCommand[flow.None, flow.None]("store.release_read_target", 1)
+	statsTarget := flow.DefineCommand[flow.None, flow.None]("store.release_read_stats_target", 1, flow.WithQueue("release.rare"))
 	filler := flow.DefineCommand[flow.None, flow.None]("store.release_read_filler", 1)
 	for index := range 40 {
 		prefix := "other"
@@ -37,6 +38,9 @@ func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 		if _, err := filler.Enqueue(ctx, runtime, fmt.Sprintf("release/filler/%03d", index), flow.None{}, flow.WithoutRunDeadline()); err != nil {
 			t.Fatalf("create filler %d: %v", index, err)
 		}
+	}
+	if _, err := statsTarget.Enqueue(ctx, runtime, "release/stats", flow.None{}, flow.WithoutRunDeadline()); err != nil {
+		t.Fatalf("create queue statistics target: %v", err)
 	}
 	if _, err := db.Conn.Exec(ctx, `ANALYZE `+pgschema.Table(schema, "flow_runs")+`, `+
 		pgschema.Table(schema, "flow_commands")+`, `+pgschema.Table(schema, "flow_command_queue")+`, `+
@@ -62,8 +66,8 @@ func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 	query, args = store.RunListQueryForTest(repository, store.RunListFilter{Limit: 11})
 	tests = append(tests, planTest{"default_run_list", query, args, "flow_runs_created_idx"})
 	tests = append(tests, planTest{
-		name: "queue_depth", query: store.QueueDepthQueryForTest(repository),
-		args: []any{"release.rare"}, wantIndex: "flow_command_queue_depth_idx",
+		name: "queue_stats", query: store.QueueStatsQueryForTest(repository),
+		args: []any{[]string{"release.rare"}}, wantIndex: "flow_command_queue_depth_idx",
 	})
 	query, args = store.RunListQueryForTest(repository, store.RunListFilter{
 		DefinitionName: target.Name(), KeyPrefix: "release/needle/", Limit: 11,

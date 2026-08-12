@@ -252,6 +252,11 @@ func Emit[W, T any](work *Work[W], event Event[T], key string, payload T) error 
 		state.poison(err)
 		return err
 	}
+	if len(state.decision.events) >= maxStagedApplicationEvents {
+		err = newError(ErrInvalid, "emit", "event", key, "decision exceeds the 256 staged-event limit")
+		state.poison(err)
+		return err
+	}
 	state.decision.events[identity] = stagedEvent{definition: event.def, key: key, payload: encoded}
 	state.decision.eventOrder = append(state.decision.eventOrder, identity)
 	return nil
