@@ -1,6 +1,6 @@
 # Plan 13: Simplify the shipped core, make reads definition-safe, and bound retention
 
-Status: In progress
+Status: Implemented — pending independent final review
 
 Planned at: `7abfb8c` on 2026-08-12
 
@@ -1248,7 +1248,7 @@ exact accepted commit.
 
 ### Baseline and decisions
 
-- [ ] Record Flow/Trails/Absurd commits, dirty state, Go/PostgreSQL versions,
+- [x] Record Flow/Trails/Absurd commits, dirty state, Go/PostgreSQL versions,
   migration checksums, schema catalog, supported durability settings, and exact
   baseline test/benchmark commands.
 - [x] Confirm Trails has no production `Optional`, `WithFailFast(false)`, or
@@ -1356,12 +1356,12 @@ exact accepted commit.
   worktree and record every required consumer edit.
 - [x] Pass Trails Flow-focused compile/tests with all core graphs, delivery, and
   transaction ownership intact.
-- [ ] Repeat retained benchmarks and add compact rediscovery, 16-lane stats,
+- [x] Repeat retained benchmarks and add compact rediscovery, 16-lane stats,
   and 100/1,000-run pruning measurements.
-- [ ] Pass multi-replica fence/replacement/pruning/queue-read concurrency gates.
-- [ ] Pass PostgreSQL 17 and 18 ordinary plus full race suites with durability
+- [x] Pass multi-replica fence/replacement/pruning/queue-read concurrency gates.
+- [x] Pass PostgreSQL 17 and 18 ordinary plus full race suites with durability
   enabled and zero named-test skips/failures.
-- [ ] Pass build, vet, gofmt, diff, module verify/tidy, consolidated migration
+- [x] Pass build, vet, gofmt, diff, module verify/tidy, consolidated migration
   checksum/inventory, public surface, current journal/replay, and source scans.
 - [ ] Review every hunk against Plan 13 and obtain an independent final review.
 - [ ] Record the final accepted commit; only then amend Plan 12 against it.

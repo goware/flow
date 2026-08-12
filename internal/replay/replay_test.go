@@ -63,17 +63,17 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	if _, err := Fold([]store.JournalRow{unknownVersion}); err == nil {
 		t.Fatal("Fold() accepted an unknown run-start body version")
 	}
-	legacyCommand := row(t, runID, 2, store.CommandCreated, &commandID, struct {
+	unknownFieldCommand := row(t, runID, 2, store.CommandCreated, &commandID, struct {
 		journalcodec.CommandCreatedBody
-		Required bool `json:"required"`
+		Unexpected bool `json:"unexpected"`
 	}{CommandCreatedBody: journalcodec.CommandCreatedBody{
 		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
 		Args: json.RawMessage(`{"x":1}`), InitialState: "ready", Queue: "default",
 		RetryPolicy:            json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
 		DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
-	}, Required: true})
-	if _, err := Fold([]store.JournalRow{start, legacyCommand}); err == nil {
-		t.Fatal("Fold() accepted a retired required field")
+	}, Unexpected: true})
+	if _, err := Fold([]store.JournalRow{start, unknownFieldCommand}); err == nil {
+		t.Fatal("Fold() accepted an unknown command-created field")
 	}
 }
 
