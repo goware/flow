@@ -1,6 +1,6 @@
 # Plan 13: Simplify the shipped core, make reads definition-safe, and bound retention
 
-Status: Proposed
+Status: In progress
 
 Planned at: `7abfb8c` on 2026-08-12
 
@@ -1273,34 +1273,34 @@ exact accepted commit.
 
 ### One failure rule and metadata removal
 
-- [ ] Add current-default characterization tests before deleting branches.
-- [ ] Remove `Optional`, `WithFailFast`, `Run.FailFast`, and
+- [x] Add current-default characterization tests before deleting branches.
+- [x] Remove `Optional`, `WithFailFast`, `Run.FailFast`, and
   `TraceCommand.Required` from current/public behavior.
-- [ ] Collapse failure/cancellation/expiry settlement to one reduced fail-fast
+- [x] Collapse failure/cancellation/expiry settlement to one reduced fail-fast
   rule while retaining running survivors.
-- [ ] Remove `WithMetadata`, `Run.Metadata`, and `RunFilter.Metadata`.
-- [ ] Delete retired fields from journal codecs, replay, fingerprints,
+- [x] Remove `WithMetadata`, `Run.Metadata`, and `RunFilter.Metadata`.
+- [x] Delete retired fields from journal codecs, replay, fingerprints,
   test-engine shapes, and fixtures; add no legacy decoder.
-- [ ] Replace retired-mode tests with complete one-rule transition coverage.
-- [ ] Pass failure/retry/cancel/expiry/wait/replay/trace focused PostgreSQL and
+- [x] Replace retired-mode tests with complete one-rule transition coverage.
+- [x] Pass failure/retry/cancel/expiry/wait/replay/trace focused PostgreSQL and
   race gates.
 
 ### Clean baseline and projection pruning
 
-- [ ] Rewrite `001_initial.sql` as the direct final Run-named schema, fold in
+- [x] Rewrite `001_initial.sql` as the direct final Run-named schema, fold in
   retained 002-004 behavior, delete 002-004, and add no 005.
 - [ ] Reset the registry to one schema-version-1, reader/writer-1 migration and
   document drop/recreate as the only transition from the old catalog.
-- [ ] Omit five projection columns and the metadata GIN index from the clean
+- [x] Omit five projection columns and the metadata GIN index from the clean
   baseline.
-- [ ] Include `flow_runs_prune_idx` with the exact eligibility predicate.
-- [ ] Load canonical input from the root command for permanent-key equivalence
+- [x] Include `flow_runs_prune_idx` with the exact eligibility predicate.
+- [x] Load canonical input from the root command for permanent-key equivalence
   after removing `flow_runs.input`.
-- [ ] Remove the start-body input copy; prove fresh permanent-key rediscovery
+- [x] Remove the start-body input copy; prove fresh permanent-key rediscovery
   succeeds and different input still conflicts.
-- [ ] Rename execution-era journal kinds/classes/event names/failure codes to
+- [x] Rename execution-era journal kinds/classes/event names/failure codes to
   the exact Run strings in Section 5.4.
-- [ ] Prove clean/idempotent embedded and external installs, exact six-table
+- [x] Prove clean/idempotent embedded and external installs, exact six-table
   catalog and ownership constraints, one-file migration inventory, and generic
   checksum/unknown-ledger rejection.
 

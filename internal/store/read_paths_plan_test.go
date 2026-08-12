@@ -120,9 +120,9 @@ func TestTraceWaitProductionQueryAvoidsUnrelatedSatisfiedWaits(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+commands+` (
-		command_id,run_id,command_key,name,version,parent_command_id,required,args,declaration_fingerprint,
+		command_id,run_id,command_key,name,version,parent_command_id,args,declaration_fingerprint,
 		state,unsatisfied_waits,queue,retry_policy,created_position,created_at,updated_at,status_at)
-		SELECT md5($1::text||':'||g::text)::uuid,$1::uuid,'trace/sparse/'||g::text,'store.trace.synthetic',1,$2::uuid,true,
+		SELECT md5($1::text||':'||g::text)::uuid,$1::uuid,'trace/sparse/'||g::text,'store.trace.synthetic',1,$2::uuid,
 		       convert_to('{}','UTF8'),decode(repeat('00',32),'hex'),'pending',1,'default',convert_to('{}','UTF8'),
 		       1,clock_timestamp(),clock_timestamp(),clock_timestamp()
 		FROM generate_series(1,10000) AS g`, filler.RunID, fillerRun.RootCommandID); err != nil {

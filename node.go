@@ -95,20 +95,6 @@ func (node *Node) Delay(duration time.Duration) *Node {
 	return node
 }
 
-func (node *Node) Optional() *Node {
-	if node == nil {
-		return node
-	}
-	if command, ok := node.decisionCommand("optional"); ok {
-		if !command.required {
-			return node
-		}
-		command.required = false
-		node.scope.decision.commands[node.key] = command
-	}
-	return node
-}
-
 func (node *Node) decisionCommand(operation string) (stagedCommand, bool) {
 	if node.scope == nil || node.scope.firstError != nil {
 		return stagedCommand{}, false

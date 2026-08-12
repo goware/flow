@@ -25,7 +25,6 @@ type Run struct {
 	DefinitionVersion int
 	RunKey            string
 	Status            string
-	FailFast          bool
 	MaxCommands       int
 	CommandCount      int
 	OpenCommands      int
@@ -36,8 +35,6 @@ type Run struct {
 	UpdatedAt         time.Time
 	StatusAt          time.Time
 	FinishedAt        *time.Time
-	Input             []byte
-	Metadata          []byte
 	DeadlineAt        *time.Time
 	Commands          map[uuid.UUID]Command
 	Events            []Event
@@ -49,7 +46,6 @@ type Command struct {
 	Name                   string
 	Version                int
 	ParentCommandID        *uuid.UUID
-	Required               bool
 	State                  string
 	Args                   []byte
 	DeclarationFingerprint [sha256.Size]byte
@@ -148,10 +144,7 @@ func (state *Run) Apply(row store.JournalRow) error {
 		state.Status = "running"
 		state.CreatedAt = row.RecordedAt
 		state.StatusAt = row.RecordedAt
-		state.FailFast = body.FailFast
 		state.MaxCommands = body.MaxCommands
-		state.Input = slices.Clone(body.Input)
-		state.Metadata = slices.Clone(body.Metadata)
 		state.DeadlineAt = pointerClone(body.DeadlineAt)
 
 	case store.CommandCreated:
@@ -175,8 +168,8 @@ func (state *Run) Apply(row store.JournalRow) error {
 		}
 		command := Command{
 			ID: bodyID, Key: body.CommandKey, Name: body.Name, Version: body.Version,
-			Required: body.Required, State: body.InitialState,
-			Args: slices.Clone(body.Args), Queue: body.Queue, RetryPolicy: slices.Clone(body.RetryPolicy),
+			State: body.InitialState,
+			Args:  slices.Clone(body.Args), Queue: body.Queue, RetryPolicy: slices.Clone(body.RetryPolicy),
 			AttemptTimeoutMS: pointerClone(body.AttemptTimeoutMS), CreatedPosition: row.Position,
 			InitialDelayMS:  pointerClone(body.InitialDelayMS),
 			BudgetStartedAt: pointerClone(body.BudgetStartedAt), NextAttemptAt: pointerClone(body.NextAttemptAt),
@@ -329,7 +322,7 @@ func (state *Run) Apply(row store.JournalRow) error {
 			}
 			state.Commands[*row.CommandID] = command
 			state.OpenCommands--
-		case "execution_terminal":
+		case "run_terminal":
 			if row.TerminalStatus == nil {
 				return errors.New("run terminal event has no status")
 			}

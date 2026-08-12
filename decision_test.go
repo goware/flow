@@ -16,8 +16,8 @@ func TestDecisionBufferCoalescesAndPoisonsConflicts(t *testing.T) {
 	command := DefineCommand[decisionArgs, decisionResult]("decision_child", 1)
 	scope := &Work[None]{scope: &scopeState{}}
 
-	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
-	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Optional().Delay(time.Second)
+	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Delay(time.Second)
+	Enqueue(scope, "child/1", command, decisionArgs{Value: "one"}).Delay(time.Second)
 	if scope.scope.firstError != nil {
 		t.Fatalf("equivalent duplicate poison = %v", scope.scope.firstError)
 	}

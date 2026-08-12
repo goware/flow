@@ -24,7 +24,6 @@ type RunRow struct {
 	Key               string
 	RootCommandID     *uuid.UUID
 	Status            string
-	FailFast          bool
 	MaxCommands       int
 	CommandCount      int
 	OpenCommands      int
@@ -34,7 +33,6 @@ type RunRow struct {
 	UpdatedAt         time.Time
 	StatusAt          time.Time
 	FinishedAt        *time.Time
-	Metadata          []byte
 }
 
 type RunListFilter struct {
@@ -43,7 +41,6 @@ type RunListFilter struct {
 	Statuses       []string
 	CreatedAfter   *time.Time
 	CreatedBefore  *time.Time
-	Metadata       []byte
 	CursorCreated  *time.Time
 	CursorID       *uuid.UUID
 	Limit          int
@@ -168,9 +165,6 @@ func (s *Store) listRunsQuery(filter RunListFilter) (string, []any) {
 	if filter.CreatedBefore != nil {
 		add(`created_at < $%d`, *filter.CreatedBefore)
 	}
-	if len(filter.Metadata) != 0 {
-		add(`metadata @> $%d::jsonb`, string(filter.Metadata))
-	}
 	if filter.CursorCreated != nil {
 		args = append(args, *filter.CursorCreated, *filter.CursorID)
 		clauses = append(clauses, fmt.Sprintf(`(created_at,run_id) < ($%d,$%d)`, len(args)-1, len(args)))
@@ -185,8 +179,8 @@ func (s *Store) listRunsQuery(filter RunListFilter) (string, []any) {
 }
 
 const runSelectColumns = `SELECT run_id,definition_name,definition_version,run_key,status,
-	fail_fast,max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
-	finished_at,metadata,root_command_id FROM `
+	max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
+	finished_at,root_command_id FROM `
 
 func (s *Store) runSelect() string {
 	return runSelectColumns + pgschema.Table(s.schema, "flow_runs")
@@ -220,11 +214,11 @@ func (s *Store) queryRuns(ctx context.Context, tx pgx.Tx, query string, args ...
 
 func scanRun(row pgx.Row) (RunRow, error) {
 	var value RunRow
-	var failureBytes, metadata []byte
+	var failureBytes []byte
 	if err := row.Scan(
 		&value.ID, &value.DefinitionName, &value.DefinitionVersion, &value.Key, &value.Status,
-		&value.FailFast, &value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.DeadlineAt,
-		&failureBytes, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt, &metadata,
+		&value.MaxCommands, &value.CommandCount, &value.OpenCommands, &value.DeadlineAt,
+		&failureBytes, &value.CreatedAt, &value.UpdatedAt, &value.StatusAt, &value.FinishedAt,
 		&value.RootCommandID,
 	); err != nil {
 		return RunRow{}, MapError("scan run", err)
@@ -236,7 +230,6 @@ func scanRun(row pgx.Row) (RunRow, error) {
 		}
 		value.Failure = decoded
 	}
-	value.Metadata = append([]byte(nil), metadata...)
 	return value, nil
 }
 

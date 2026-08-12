@@ -17,12 +17,11 @@ func TestFoldInitialProjectionAndValidation(t *testing.T) {
 	commandID := uuid.New()
 	start := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
 		V: 1, RunID: runID.String(), DefinitionName: "work",
-		DefinitionVersion: 1, RunKey: "key", Input: json.RawMessage(`{"x":1}`),
-		FailFast: true, DeadlineMode: "none", MaxCommands: 5, Metadata: json.RawMessage(`{}`),
+		DefinitionVersion: 1, RunKey: "key", DeadlineMode: "none", MaxCommands: 5,
 	})
 	created := row(t, runID, 2, store.CommandCreated, &commandID, journalcodec.CommandCreatedBody{
 		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
-		Args: json.RawMessage(`{"x":1}`), Required: true,
+		Args:         json.RawMessage(`{"x":1}`),
 		InitialState: "ready", Queue: "default", RetryPolicy: json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
 		DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
 	})
@@ -65,8 +64,7 @@ func TestFoldValidatesApplicationEventBodies(t *testing.T) {
 	runID := uuid.New()
 	start := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
 		V: 1, RunID: runID.String(), DefinitionName: "work",
-		DefinitionVersion: 1, RunKey: "key", Input: json.RawMessage(`{}`),
-		FailFast: true, DeadlineMode: "none", MaxCommands: 5, Metadata: json.RawMessage(`{}`),
+		DefinitionVersion: 1, RunKey: "key", DeadlineMode: "none", MaxCommands: 5,
 	})
 	application := row(t, runID, 2, store.EventRecorded, nil, journalcodec.ApplicationEventBody{
 		V: 2, Payload: json.RawMessage(`{"value":"future"}`),

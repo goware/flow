@@ -40,7 +40,7 @@ func TestRunStartsAndEventDeliver(t *testing.T) {
 	}
 
 	command := DefineCommand[ingressArgs, ingressResult]("ingress.work", 1)
-	direct, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"}, WithMetadata(map[string]string{"tenant": "one"}))
+	direct, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"})
 	if err != nil {
 		t.Fatalf("Command.Enqueue() error = %v", err)
 	}
@@ -50,15 +50,12 @@ func TestRunStartsAndEventDeliver(t *testing.T) {
 	}
 	assertRunShape(t, database.Schema, database.DB.Conn, directRun, 1, 1)
 
-	repeated, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"}, WithMetadata(map[string]string{"tenant": "one"}))
+	repeated, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"})
 	if err != nil || repeated.Created || repeated.RunID != direct.RunID {
 		t.Fatalf("repeated direct = %#v, %v", repeated, err)
 	}
-	if _, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "different"}, WithMetadata(map[string]string{"tenant": "one"})); !errors.Is(err, ErrConflict) {
+	if _, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "different"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting direct error = %v", err)
-	}
-	if _, err := command.Enqueue(ctx, runtime, "direct/1", ingressArgs{Value: "a"}, WithMetadata(map[string]string{"tenant": "one"}), WithFailFast(false)); !errors.Is(err, ErrConflict) {
-		t.Fatalf("conflicting direct options error = %v", err)
 	}
 
 	event := DefineEvent[ingressArgs]("ingress.fact")
@@ -535,9 +532,6 @@ func TestRuntimeAndIngressValidation(t *testing.T) {
 	}
 	if _, err := command.Enqueue(ctx, runtime, "bad/options", ingressArgs{}, WithRunDeadline(0)); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Enqueue(invalid deadline) error = %v", err)
-	}
-	if _, err := command.Enqueue(ctx, runtime, "bad/metadata", ingressArgs{}, WithMetadata(map[string]string{"x": strings.Repeat("x", 1025)})); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("Enqueue(invalid metadata) error = %v", err)
 	}
 	large := ingressArgs{Value: strings.Repeat("x", maxCommandArgumentBytes)}
 	if _, err := command.Enqueue(ctx, runtime, "large", large); !errors.Is(err, ErrPayloadTooLarge) {

@@ -484,7 +484,7 @@ func TestRuntimeStagesDelayedChildrenAtomically(t *testing.T) {
 				return rootResult{}, fmt.Errorf("root RunKey = %q", work.Info().RunKey)
 			}
 			Enqueue(work, "child/required", child, childArgs{Value: "required"})
-			Enqueue(work, "child/delayed", child, childArgs{Value: "delayed"}).Optional().Delay(80 * time.Millisecond)
+			Enqueue(work, "child/delayed", child, childArgs{Value: "delayed"}).Delay(80 * time.Millisecond)
 			if rootCalls.Add(1) == 1 {
 				return rootResult{}, errors.New("retry after staging")
 			}
@@ -582,176 +582,146 @@ func TestRuntimeCommandInfoRunKeyIsEmptyForUnkeyedRun(t *testing.T) {
 	waitForRunStatus(t, database.Schema, database.DB.Conn, run.RunID, "succeeded", 5*time.Second)
 }
 
-func TestRuntimeFailFastCancelsQueuedSiblings(t *testing.T) {
+func TestRuntimeCommandFailureCancelsQueuedSiblings(t *testing.T) {
 	t.Parallel()
-	for _, test := range []struct {
-		name        string
-		failFast    bool
-		wantSibling string
-	}{
-		{name: "enabled", failFast: true, wantSibling: string(StatusCancelled)},
-		{name: "disabled", failFast: false, wantSibling: string(StatusSucceeded)},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			database := testpg.Open(t)
-			ctx := context.Background()
-			if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
-				t.Fatal(err)
-			}
-			type args struct{ Kind string }
-			child := DefineCommand[args, None]("failfast.child."+test.name, 1, WithRetry(Attempts(1)))
-			root := DefineCommand[None, None]("failfast.root."+test.name, 1)
-			var siblingCalls atomic.Int32
-			runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
-				WithPollInterval(5*time.Millisecond))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := runtime.Register(
-				Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
-					Enqueue(work, "a-failure", child, args{Kind: "fail"})
-					Enqueue(work, "z-sibling", child, args{Kind: "sibling"}).Delay(60 * time.Millisecond)
-					return None{}, nil
-				}),
-				Handle(child, func(_ context.Context, work *Work[args]) (None, error) {
-					if work.Args.Kind == "fail" {
-						return None{}, Permanent(errors.New("expected failure"))
-					}
-					siblingCalls.Add(1)
-					return None{}, nil
-				}),
-			); err != nil {
-				t.Fatal(err)
-			}
-			cancelRun, runResult := startRuntime(t, runtime)
-			defer stopRuntime(t, cancelRun, runResult)
-			exec, err := root.Enqueue(ctx, runtime, "failfast/"+test.name, None{}, WithFailFast(test.failFast))
-			if err != nil {
-				t.Fatal(err)
-			}
-			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failed", 5*time.Second)
-			trace, err := Trace(ctx, runtime, exec.RunID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var siblingStatus CommandStatus
-			for _, command := range trace.Commands {
-				if command.Key == "z-sibling" {
-					siblingStatus = command.State
-				}
-			}
-			if siblingStatus != CommandStatus(test.wantSibling) {
-				t.Fatalf("sibling status = %q, want %q", siblingStatus, test.wantSibling)
-			}
-			wantCalls := int32(0)
-			if !test.failFast {
-				wantCalls = 1
-			}
-			if siblingCalls.Load() != wantCalls {
-				t.Fatalf("sibling calls = %d, want %d", siblingCalls.Load(), wantCalls)
-			}
-			assertReplayMatches(t, runtime, exec.RunID)
-		})
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
 	}
+	type args struct{ Kind string }
+	child := DefineCommand[args, None]("failure.child", 1, WithRetry(Attempts(1)))
+	root := DefineCommand[None, None]("failure.root", 1)
+	var siblingCalls atomic.Int32
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(1),
+		WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
+			Enqueue(work, "a-failure", child, args{Kind: "fail"})
+			Enqueue(work, "z-sibling", child, args{Kind: "sibling"}).Delay(60 * time.Millisecond)
+			return None{}, nil
+		}),
+		Handle(child, func(_ context.Context, work *Work[args]) (None, error) {
+			if work.Args.Kind == "fail" {
+				return None{}, Permanent(errors.New("expected failure"))
+			}
+			siblingCalls.Add(1)
+			return None{}, nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancelRun, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancelRun, runResult)
+	run, err := root.Enqueue(ctx, runtime, "failure", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunStatus(t, database.Schema, database.DB.Conn, run.RunID, "failed", 5*time.Second)
+	trace, err := Trace(ctx, runtime, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var siblingStatus CommandStatus
+	for _, command := range trace.Commands {
+		if command.Key == "z-sibling" {
+			siblingStatus = command.State
+		}
+	}
+	if siblingStatus != StatusCancelled || siblingCalls.Load() != 0 {
+		t.Fatalf("sibling status/calls = %q/%d, want cancelled/0", siblingStatus, siblingCalls.Load())
+	}
+	assertReplayMatches(t, runtime, run.RunID)
 }
 
-func TestRunningAttemptSettlementAfterRequiredFailureHandlesNewChildren(t *testing.T) {
+func TestRunningAttemptSettlementAfterCommandFailureCancelsNewChildren(t *testing.T) {
 	t.Parallel()
 	const stagedChildren = 10
-	for _, test := range []struct {
-		name       string
-		failFast   bool
-		childState CommandStatus
-		childCalls int32
-	}{
-		{name: "enabled", failFast: true, childState: StatusCancelled},
-		{name: "disabled", failFast: false, childState: StatusSucceeded, childCalls: stagedChildren},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			database := testpg.Open(t)
-			ctx := context.Background()
-			if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
-				t.Fatal(err)
-			}
-			type args struct{ Kind string }
-			root := DefineCommand[None, None]("settling.root."+test.name, 1)
-			parallel := DefineCommand[args, None]("settling.parallel."+test.name, 1, WithRetry(Attempts(1)))
-			late := DefineCommand[None, None]("settling.late."+test.name, 1)
-			fact := DefineEvent[None]("settling.fact." + test.name)
-			survivorStarted := make(chan struct{})
-			releaseSurvivor := make(chan struct{})
-			var lateCalls atomic.Int32
-			runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
-				WithPollInterval(5*time.Millisecond), WithNotifications(false))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := runtime.Register(
-				Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
-					Enqueue(work, "a-failure", parallel, args{Kind: "failure"})
-					Enqueue(work, "b-survivor", parallel, args{Kind: "survivor"})
-					return None{}, nil
-				}),
-				Handle(parallel, func(_ context.Context, work *Work[args]) (None, error) {
-					if work.Args.Kind == "failure" {
-						select {
-						case <-survivorStarted:
-						case <-time.After(3 * time.Second):
-							return None{}, Permanent(errors.New("survivor did not start"))
-						}
-						return None{}, Permanent(errors.New("required failure"))
-					}
-					close(survivorStarted)
-					<-releaseSurvivor
-					if err := Emit(work, fact, "committed", None{}); err != nil {
-						return None{}, err
-					}
-					for index := range stagedChildren {
-						Enqueue(work, fmt.Sprintf("late-child/%02d", index), late, None{})
-					}
-					return None{}, nil
-				}),
-				Handle(late, func(context.Context, *Work[None]) (None, error) {
-					lateCalls.Add(1)
-					return None{}, nil
-				}),
-			); err != nil {
-				t.Fatal(err)
-			}
-			cancelRun, runResult := startRuntime(t, runtime)
-			defer stopRuntime(t, cancelRun, runResult)
-			exec, err := root.Enqueue(ctx, runtime, "settling/"+test.name, None{}, WithFailFast(test.failFast))
-			if err != nil {
-				t.Fatal(err)
-			}
-			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failing", 5*time.Second)
-			close(releaseSurvivor)
-			waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failed", 5*time.Second)
-			trace, err := Trace(ctx, runtime, exec.RunID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var lateChildren int
-			for _, command := range trace.Commands {
-				if strings.HasPrefix(command.Key, "late-child/") {
-					lateChildren++
-					if command.State != test.childState {
-						t.Fatalf("late child %q state=%s, want %s", command.Key, command.State, test.childState)
-					}
-				}
-			}
-			if lateChildren != stagedChildren || lateCalls.Load() != test.childCalls {
-				t.Fatalf("late children/calls=%d/%d want %d/%d", lateChildren, lateCalls.Load(), stagedChildren, test.childCalls)
-			}
-			var events int
-			if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-				WHERE run_id=$1 AND event_class='application' AND event_name=$2 AND event_key='committed'`,
-				exec.RunID, fact.Name()).Scan(&events); err != nil || events != 1 {
-				t.Fatalf("survivor event count=%d err=%v", events, err)
-			}
-			assertReplayMatches(t, runtime, exec.RunID)
-		})
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
 	}
+	type args struct{ Kind string }
+	root := DefineCommand[None, None]("settling.root", 1)
+	parallel := DefineCommand[args, None]("settling.parallel", 1, WithRetry(Attempts(1)))
+	late := DefineCommand[None, None]("settling.late", 1)
+	fact := DefineEvent[None]("settling.fact")
+	survivorStarted := make(chan struct{})
+	releaseSurvivor := make(chan struct{})
+	var lateCalls atomic.Int32
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithWorkerConcurrency(2),
+		WithPollInterval(5*time.Millisecond), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register(
+		Handle(root, func(_ context.Context, work *Work[None]) (None, error) {
+			Enqueue(work, "a-failure", parallel, args{Kind: "failure"})
+			Enqueue(work, "b-survivor", parallel, args{Kind: "survivor"})
+			return None{}, nil
+		}),
+		Handle(parallel, func(_ context.Context, work *Work[args]) (None, error) {
+			if work.Args.Kind == "failure" {
+				select {
+				case <-survivorStarted:
+				case <-time.After(3 * time.Second):
+					return None{}, Permanent(errors.New("survivor did not start"))
+				}
+				return None{}, Permanent(errors.New("required failure"))
+			}
+			close(survivorStarted)
+			<-releaseSurvivor
+			if err := Emit(work, fact, "committed", None{}); err != nil {
+				return None{}, err
+			}
+			for index := range stagedChildren {
+				Enqueue(work, fmt.Sprintf("late-child/%02d", index), late, None{})
+			}
+			return None{}, nil
+		}),
+		Handle(late, func(context.Context, *Work[None]) (None, error) {
+			lateCalls.Add(1)
+			return None{}, nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancelRun, runResult := startRuntime(t, runtime)
+	defer stopRuntime(t, cancelRun, runResult)
+	exec, err := root.Enqueue(ctx, runtime, "settling", None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failing", 5*time.Second)
+	close(releaseSurvivor)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failed", 5*time.Second)
+	trace, err := Trace(ctx, runtime, exec.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lateChildren int
+	for _, command := range trace.Commands {
+		if strings.HasPrefix(command.Key, "late-child/") {
+			lateChildren++
+			if command.State != StatusCancelled {
+				t.Fatalf("late child %q state=%s, want %s", command.Key, command.State, StatusCancelled)
+			}
+		}
+	}
+	if lateChildren != stagedChildren || lateCalls.Load() != 0 {
+		t.Fatalf("late children/calls=%d/%d want %d/0", lateChildren, lateCalls.Load(), stagedChildren)
+	}
+	var events int
+	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
+				WHERE run_id=$1 AND event_class='application' AND event_name=$2 AND event_key='committed'`,
+		exec.RunID, fact.Name()).Scan(&events); err != nil || events != 1 {
+		t.Fatalf("survivor event count=%d err=%v", events, err)
+	}
+	assertReplayMatches(t, runtime, exec.RunID)
 }
 
 func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {

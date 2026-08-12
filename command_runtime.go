@@ -611,7 +611,6 @@ func prepareWorkerDecision(scope *workScope, claim store.ClaimedCommand) ([]stor
 			return nil, nil, err
 		}
 		child.ParentCommandID = cloneUUIDPointer(claim.CommandID)
-		child.Required = staged.required
 		if staged.startAfter > 0 {
 			child.InitialDelay = staged.startAfter
 		}

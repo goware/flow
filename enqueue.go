@@ -25,7 +25,6 @@ const (
 	maxCommandArgumentBytes  = 256 << 10
 	maxApplicationEventBytes = journalcodec.MaxApplicationEventPayloadBytes
 	maxCommandEventWaits     = 256
-	maxRunMetadataBytes      = 16 << 10
 	maxRunKeyBytes           = 1024
 	maxCommandKeyBytes       = 1024
 	defaultRunDeadline       = 30 * 24 * time.Hour
@@ -39,10 +38,6 @@ type RunOption interface {
 type runOptions struct {
 	deadline      store.DeadlineSpec
 	deadlineSet   bool
-	failFast      bool
-	failFastSet   bool
-	metadata      map[string]string
-	metadataSet   bool
 	keyScope      string
 	keyScopeSet   bool
 	startDelay    time.Duration
@@ -85,28 +80,6 @@ func WithoutRunDeadline() RunOption {
 		}
 		options.deadlineSet = true
 		options.deadline = store.DeadlineSpec{Mode: "none"}
-	})
-}
-
-func WithMetadata(metadata map[string]string) RunOption {
-	return runOptionFunc(func(options *runOptions) {
-		if options.metadataSet {
-			options.errs = append(options.errs, errors.New("metadata configured more than once"))
-			return
-		}
-		options.metadataSet = true
-		options.metadata = cloneStringMap(metadata)
-	})
-}
-
-func WithFailFast(enabled bool) RunOption {
-	return runOptionFunc(func(options *runOptions) {
-		if options.failFastSet {
-			options.errs = append(options.errs, errors.New("fail-fast configured more than once"))
-			return
-		}
-		options.failFastSet = true
-		options.failFast = enabled
 	})
 }
 
@@ -219,7 +192,7 @@ func (cmd Command[A, R]) prepareStartRequest(
 	maxCommands int,
 	opts ...RunOption,
 ) (store.StartRequest, error) {
-	options, metadata, fingerprint, err := prepareStartOptions(cmd.Name(), cmd.Version(), key, input, opts...)
+	options, fingerprint, err := prepareStartOptions(cmd.Name(), cmd.Version(), key, input, opts...)
 	if err != nil {
 		return store.StartRequest{}, err
 	}
@@ -240,8 +213,8 @@ func (cmd Command[A, R]) prepareStartRequest(
 	}
 	return store.StartRequest{
 		ID: uuid.New(), DefinitionName: cmd.Name(), DefinitionVersion: cmd.Version(), Key: key,
-		KeyScope: options.keyScope, StartFingerprint: fingerprint, Input: input, Metadata: metadata,
-		FailFast: options.failFast, Deadline: options.deadline, MaxCommands: maxCommands, Root: &root,
+		KeyScope: options.keyScope, StartFingerprint: fingerprint, Input: input,
+		Deadline: options.deadline, MaxCommands: maxCommands, Root: &root,
 	}, nil
 }
 
@@ -489,16 +462,15 @@ func CancelRun(ctx context.Context, c Client, id RunID, reason string) error {
 	return nil
 }
 
-func prepareStartOptions(name string, version int, key string, input canonical.Value, supplied ...RunOption) (runOptions, canonical.Value, [32]byte, error) {
+func prepareStartOptions(name string, version int, key string, input canonical.Value, supplied ...RunOption) (runOptions, [32]byte, error) {
 	if err := durable.PostgresInteger("definition version", version, 1, durable.PostgresIntegerMax); err != nil {
-		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "version", "", err.Error())
+		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "version", "", err.Error())
 	}
 	if len(key) > maxRunKeyBytes || !utf8.ValidString(key) {
-		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "key", "", "run key is invalid or too long")
+		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "key", "", "run key is invalid or too long")
 	}
 	options := runOptions{
 		deadline: store.DeadlineSpec{Mode: "duration", Duration: defaultRunDeadline},
-		failFast: true, metadata: map[string]string{},
 	}
 	for _, option := range supplied {
 		if option == nil {
@@ -508,37 +480,30 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 		option.applyRun(&options)
 	}
 	if err := errors.Join(options.errs...); err != nil {
-		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "options", "", err.Error())
+		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "options", "", err.Error())
 	}
 	if options.keyScope == store.KeyScopeLive && key == "" {
-		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "key", "", "live key scope requires a non-empty run key")
+		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "key", "", "live key scope requires a non-empty run key")
 	}
 	if options.withinSet && len(options.waits) == 0 {
-		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "within", "", "Within requires WaitFor")
+		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "within", "", "Within requires WaitFor")
 	}
 	if len(options.waits) > maxCommandEventWaits {
-		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "wait", "", "command exceeds the 256 event-wait limit")
-	}
-	if err := validateMetadata(options.metadata); err != nil {
-		return runOptions{}, canonical.Value{}, [32]byte{}, err
-	}
-	metadata, err := canonical.Marshal(options.metadata, maxRunMetadataBytes)
-	if err != nil {
-		return runOptions{}, canonical.Value{}, [32]byte{}, mapCanonicalError("enqueue", "metadata", err)
+		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "wait", "", "command exceeds the 256 event-wait limit")
 	}
 	// key_scope and start_delay_ms are omitted when zero so fingerprints of
 	// starts that predate these options remain rediscoverable.
 	deadlineMilliseconds, err := durable.ExactMilliseconds("run deadline", options.deadline.Duration)
 	if err != nil {
-		return runOptions{}, canonical.Value{}, [32]byte{}, err
+		return runOptions{}, [32]byte{}, err
 	}
 	startDelayMilliseconds, err := durable.ExactMilliseconds("start delay", options.startDelay)
 	if err != nil {
-		return runOptions{}, canonical.Value{}, [32]byte{}, err
+		return runOptions{}, [32]byte{}, err
 	}
 	withinMilliseconds, err := durable.ExactMilliseconds("within", options.within)
 	if err != nil {
-		return runOptions{}, canonical.Value{}, [32]byte{}, err
+		return runOptions{}, [32]byte{}, err
 	}
 	fingerprintRecord := struct {
 		V                 int                      `json:"v"`
@@ -549,24 +514,21 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 		Input             json.RawMessage          `json:"input"`
 		DeadlineMode      string                   `json:"deadline_mode"`
 		DeadlineDuration  int64                    `json:"deadline_duration_ms"`
-		FailFast          bool                     `json:"fail_fast"`
 		StartDelayMS      int64                    `json:"start_delay_ms,omitempty"`
 		Waits             []commandWaitFingerprint `json:"waits,omitempty"`
 		WithinMS          int64                    `json:"within_ms,omitempty"`
-		Metadata          json.RawMessage          `json:"metadata"`
 	}{
 		V: 1, DefinitionName: name, DefinitionVersion: version,
 		RunKey: key, KeyScope: options.keyScope, Input: json.RawMessage(input.BytesCopy()),
 		DeadlineMode: options.deadline.Mode, DeadlineDuration: deadlineMilliseconds,
-		FailFast: options.failFast, StartDelayMS: startDelayMilliseconds,
-		Waits: commandWaitFingerprints(options.waits), WithinMS: withinMilliseconds,
-		Metadata: json.RawMessage(metadata.BytesCopy()),
+		StartDelayMS: startDelayMilliseconds,
+		Waits:        commandWaitFingerprints(options.waits), WithinMS: withinMilliseconds,
 	}
 	fingerprint, err := canonical.Marshal(fingerprintRecord, 0)
 	if err != nil {
-		return runOptions{}, canonical.Value{}, [32]byte{}, newError(ErrInvalid, "enqueue", "identity", "", "cannot canonicalize start identity")
+		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "identity", "", "cannot canonicalize start identity")
 	}
-	return options, metadata, fingerprint.Digest, nil
+	return options, fingerprint.Digest, nil
 }
 
 func prepareCommand(id uuid.UUID, key string, command *definition.Command, defaults commandDefaults, args canonical.Value) (store.CommandCreate, error) {
@@ -584,20 +546,19 @@ func prepareCommand(id uuid.UUID, key string, command *definition.Command, defau
 		return store.CommandCreate{}, newError(ErrInvalid, "create", "command", key, "invalid retry policy")
 	}
 	declaration, err := canonical.Marshal(struct {
-		V        int             `json:"v"`
-		Key      string          `json:"key"`
-		Name     string          `json:"name"`
-		Version  int             `json:"version"`
-		Args     json.RawMessage `json:"args"`
-		Required bool            `json:"required"`
-	}{V: 1, Key: key, Name: command.Name, Version: command.Version, Args: json.RawMessage(args.BytesCopy()), Required: true}, 0)
+		V       int             `json:"v"`
+		Key     string          `json:"key"`
+		Name    string          `json:"name"`
+		Version int             `json:"version"`
+		Args    json.RawMessage `json:"args"`
+	}{V: 1, Key: key, Name: command.Name, Version: command.Version, Args: json.RawMessage(args.BytesCopy())}, 0)
 	if err != nil {
 		return store.CommandCreate{}, newError(ErrInvalid, "create", "command", key, "cannot canonicalize declaration")
 	}
 	return store.CommandCreate{
 		ID: id, Key: key, Name: command.Name, Version: command.Version, Args: args,
-		DeclarationFingerprint: declaration.Digest, Required: true,
-		Queue: defaults.queue, AttemptTimeout: defaults.attemptTimeout, RetryPolicy: policy,
+		DeclarationFingerprint: declaration.Digest,
+		Queue:                  defaults.queue, AttemptTimeout: defaults.attemptTimeout, RetryPolicy: policy,
 	}, nil
 }
 
@@ -672,7 +633,6 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 		Version      int                      `json:"version"`
 		Args         json.RawMessage          `json:"args"`
 		Parent       string                   `json:"parent,omitempty"`
-		Required     bool                     `json:"required"`
 		Queue        string                   `json:"queue"`
 		RetryPolicy  json.RawMessage          `json:"retry_policy"`
 		AttemptMS    int64                    `json:"attempt_timeout_ms,omitempty"`
@@ -682,7 +642,7 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 	}{
 		V: 1, Key: command.Key, Name: command.Name, Version: command.Version,
 		Args: json.RawMessage(command.Args.BytesCopy()), Parent: parent,
-		Required: command.Required, Queue: command.Queue,
+		Queue:       command.Queue,
 		RetryPolicy: json.RawMessage(command.RetryPolicy.BytesCopy()), AttemptMS: attemptTimeoutMilliseconds,
 		StartAfterMS: startAfterMilliseconds,
 		Waits:        waits, WithinMS: withinMilliseconds,
@@ -715,28 +675,11 @@ func validateStableKey(key string, maxBytes int, resource string) error {
 	return nil
 }
 
-func validateMetadata(metadata map[string]string) error {
-	for key, value := range metadata {
-		if key == "" || len(key) > 128 || len(value) > 1024 || !utf8.ValidString(key) || !utf8.ValidString(value) {
-			return newError(ErrInvalid, "enqueue", "metadata", "", "metadata key or value is invalid")
-		}
-	}
-	return nil
-}
-
 func validateCancellationReason(reason string) error {
 	if reason == "" || strings.TrimSpace(reason) != reason || len(reason) > 1024 || !utf8.ValidString(reason) {
 		return newError(ErrInvalid, "cancel", "reason", "", "reason is empty, malformed, or too long")
 	}
 	return nil
-}
-
-func cloneStringMap(input map[string]string) map[string]string {
-	result := make(map[string]string, len(input))
-	for key, value := range input {
-		result[key] = value
-	}
-	return result
 }
 
 func eventName(event *definition.Event) string {

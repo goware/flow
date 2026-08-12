@@ -111,7 +111,7 @@ func testDecision(decision decisionState) []testengine.StagedCommand {
 	for _, command := range decision.orderedCommands() {
 		item := testengine.StagedCommand{Key: command.key, Name: command.definition.Name,
 			Version: command.definition.Version, Args: json.RawMessage(command.args.BytesCopy()),
-			Required: command.required, StartAfter: command.startAfter, Within: command.within}
+			StartAfter: command.startAfter, Within: command.within}
 		for _, wait := range command.waits {
 			item.Waits = append(item.Waits, testengine.EventWait{Name: wait.name, Key: wait.key})
 		}

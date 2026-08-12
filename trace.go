@@ -23,7 +23,6 @@ type Run struct {
 	Key           string
 	RootCommandID CommandID
 	Status        RunStatus
-	FailFast      bool
 	MaxCommands   int
 	CommandCount  int
 	OpenCommands  int
@@ -33,7 +32,6 @@ type Run struct {
 	UpdatedAt     time.Time
 	StatusAt      time.Time
 	FinishedAt    *time.Time
-	Metadata      json.RawMessage
 }
 
 type TraceAttempt struct {
@@ -55,7 +53,6 @@ type TraceCommand struct {
 	Name             string
 	Version          int
 	ParentCommandID  CommandID
-	Required         bool
 	State            CommandStatus
 	Args             json.RawMessage
 	Result           json.RawMessage
@@ -209,8 +206,8 @@ func Trace(ctx context.Context, c Client, id RunID, opts ...TraceOption) (RunTra
 		}
 		item := TraceCommand{
 			ID: CommandID(command.ID.String()), Key: command.Key, Name: command.Name, Version: command.Version,
-			Required: command.Required, State: status,
-			Args: json.RawMessage(append([]byte(nil), command.Args...)), Result: json.RawMessage(append([]byte(nil), command.Result...)),
+			State: status,
+			Args:  json.RawMessage(append([]byte(nil), command.Args...)), Result: json.RawMessage(append([]byte(nil), command.Result...)),
 			Queue: command.Queue, CreatedPosition: JournalPosition(command.CreatedPosition),
 			BudgetStartedAt: cloneTimePointer(command.BudgetStartedAt), NextAttemptAt: cloneTimePointer(command.NextAttemptAt),
 			Failure: cloneFailure(command.Failure),

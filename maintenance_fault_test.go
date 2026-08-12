@@ -249,11 +249,12 @@ func TestWaitExpiryScanErrorIsReported(t *testing.T) {
 		SET wait_deadline_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, runSnapshot.RootCommandID); err != nil {
 		t.Fatal(err)
 	}
-	// The expiry probe does not read required, while ExpireCommandWait scans it
-	// into a bool. This isolated schema corruption forces the transition query's
-	// scan error without adding a production fault hook.
+	// The expiry probe does not read created_position, while ExpireCommandWait
+	// scans it into an integer. This isolated schema corruption forces the
+	// transition query's scan error without adding a production fault hook.
 	if _, err := database.DB.Conn.Exec(ctx, `ALTER TABLE `+schema+`
-		ALTER COLUMN required TYPE text USING required::text`); err != nil {
+		DROP CONSTRAINT flow_commands_created_position_ck,
+		ALTER COLUMN created_position TYPE text USING created_position::text`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -307,7 +308,7 @@ func TestMaintenanceReplicasApplyEachDeadlineOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+
-		pgschema.Table(database.Schema, "flow_journal")+` WHERE event_class='execution_terminal'`).
+		pgschema.Table(database.Schema, "flow_journal")+` WHERE event_class='run_terminal'`).
 		Scan(&terminalEntries); err != nil {
 		t.Fatal(err)
 	}

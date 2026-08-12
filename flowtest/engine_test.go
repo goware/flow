@@ -164,7 +164,7 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 
 	parentRegistration := flow.Handle(parent, func(_ context.Context, work *flow.Work[testArgs]) (testResult, error) {
 		flow.Enqueue(work, "child/next", child, testArgs{Value: work.Args.Value}).
-			Optional().Delay(time.Second).WaitFor(gate, "ready").Within(2 * time.Second)
+			Delay(time.Second).WaitFor(gate, "ready").Within(2 * time.Second)
 		return testResult{Value: "ready/" + work.Args.Value}, nil
 	}, flow.WithCommit(func(ctx context.Context, tx flow.Tx, commit flow.Commit[testArgs, testResult]) error {
 		_, err := tx.Exec(ctx, "record", commit.Args.Value, commit.Result.Value)
@@ -174,7 +174,7 @@ func TestRunWorkerCommitAndDirectUseProductionDecisionRecorder(t *testing.T) {
 	decision, err := flowtest.RunWorker[testArgs, testResult](context.Background(), parentRegistration,
 		testArgs{Value: "parent"})
 	if err != nil || decision.Err != nil || decision.Result.Value != "ready/parent" ||
-		len(decision.Commands) != 1 || decision.Commands[0].Required || decision.Commands[0].StartAfter != time.Second ||
+		len(decision.Commands) != 1 || decision.Commands[0].StartAfter != time.Second ||
 		decision.Commands[0].Within != 2*time.Second || len(decision.Commands[0].Waits) != 1 ||
 		decision.Commands[0].Waits[0].Name != gate.Name() || decision.Commands[0].Waits[0].Key != "ready" {
 		t.Fatalf("RunWorker() = %#v, %v", decision, err)

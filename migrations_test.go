@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/goware/flow/internal/testpg"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -34,7 +33,7 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 		t.Fatalf("CheckSchema() error = %v", err)
 	}
 	if !status.Compatible || status.Schema != database.Schema || status.CurrentVersion != currentSchemaVersion ||
-		status.MinReaderVersion != 2 || status.MinWriterVersion != 2 || status.AppliedAt.IsZero() {
+		status.MinReaderVersion != 1 || status.MinWriterVersion != 1 || status.AppliedAt.IsZero() {
 		t.Fatalf("CheckSchema() = %#v", status)
 	}
 
@@ -74,28 +73,22 @@ func TestMigrateAndCheckSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read rendered initial migration: %v", err)
 	}
-	if bytes.Contains(initial, []byte(migrationToken)) || !bytes.Contains(initial, []byte(quoteIdentifier(database.Schema)+`.flow_executions`)) {
-		t.Fatal("MigrationFS changed the immutable initial migration")
+	if bytes.Contains(initial, []byte(migrationToken)) || !bytes.Contains(initial, []byte(quoteIdentifier(database.Schema)+`.flow_runs`)) ||
+		bytes.Contains(initial, []byte("flow_executions")) || bytes.Contains(initial, []byte("execution_id")) {
+		t.Fatal("MigrationFS did not render the clean Run-named baseline")
 	}
-	runVocabulary, err := fs.ReadFile(migrationFS, "migrations/004_run_vocabulary.sql")
-	if err != nil {
-		t.Fatalf("read rendered run-vocabulary migration: %v", err)
-	}
-	if bytes.Contains(runVocabulary, []byte(migrationToken)) || !bytes.Contains(runVocabulary, []byte(quoteIdentifier(database.Schema)+`.flow_runs`)) {
-		t.Fatal("MigrationFS did not safely render the configured schema")
+	if _, err := fs.ReadFile(migrationFS, "migrations/002_live_keys.sql"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("retired migration remains: %v", err)
 	}
 }
 
-func TestRunVocabularyMigrationRequiresVersionTwoReaderAndWriter(t *testing.T) {
+func TestCleanBaselineRequiresVersionOneReaderAndWriter(t *testing.T) {
 	t.Parallel()
-	if schemaVersionsCompatible(4, 2, 2, 4, 1, 1) {
-		t.Fatal("v0.2 reader/writer unexpectedly accepts the run-vocabulary catalog")
+	if !schemaVersionsCompatible(1, 1, 1, 1, 1, 1) {
+		t.Fatal("version-one reader/writer rejected the clean baseline")
 	}
-	if schemaVersionsCompatible(4, 2, 2, 4, 2, 1) || schemaVersionsCompatible(4, 2, 2, 4, 1, 2) {
-		t.Fatal("partial reader/writer upgrade unexpectedly accepted")
-	}
-	if !schemaVersionsCompatible(4, 2, 2, 4, 2, 2) {
-		t.Fatal("v0.3 reader/writer rejected its catalog")
+	if schemaVersionsCompatible(2, 1, 1, 1, 1, 1) {
+		t.Fatal("different schema version was accepted")
 	}
 }
 
@@ -184,129 +177,6 @@ func TestMigrationReleaseReadPaths(t *testing.T) {
 
 func ptr[T any](value T) *T { return &value }
 
-func TestMigrationVersionThreeRunVocabularyUpgradePreservesData(t *testing.T) {
-	t.Parallel()
-
-	database := testpg.Open(t)
-	ctx := context.Background()
-	option := WithSchema(database.Schema)
-	_, units, err := prepareMigrations(option)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, unit := range units[:3] {
-		if _, err := database.DB.Conn.Exec(ctx, string(externalMigration(database.Schema, unit))); err != nil {
-			t.Fatalf("apply historical migration %d: %v", unit.version, err)
-		}
-	}
-
-	runID, commandID, entryID := uuid.New(), uuid.New(), uuid.New()
-	body := []byte(`{"v":1,"fixture":"preserved"}`)
-	bodyHash := bytes.Repeat([]byte{0x5a}, 32)
-	schema := quoteIdentifier(database.Schema)
-	tx, err := database.DB.Conn.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.flow_executions
-		(execution_id,definition_name,definition_version,execution_key,start_fingerprint,input,
-		 metadata_canonical,max_commands,root_command_id,created_at,updated_at,status_at)
-		VALUES ($1,'migration.fixture',1,'fixture/key',$2,'{}',$3,100,$4,
-		 clock_timestamp(),clock_timestamp(),clock_timestamp())`,
-		runID, bytes.Repeat([]byte{0x11}, 32), []byte(`{}`), commandID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.flow_commands
-		(command_id,execution_id,command_key,name,version,args,declaration_fingerprint,state,
-		 queue,retry_policy,created_position,created_at,updated_at,status_at)
-		VALUES ($1,$2,'root','migration.fixture',1,'{}',$3,'ready','default','{}',1,
-		 clock_timestamp(),clock_timestamp(),clock_timestamp())`,
-		commandID, runID, bytes.Repeat([]byte{0x22}, 32)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.flow_command_queue
-		(command_id,execution_id,queue,name,version,state,next_run_at)
-		VALUES ($1,$2,'default','migration.fixture',1,'ready',clock_timestamp())`, commandID, runID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.flow_journal
-		(execution_id,position,entry_id,entry_kind,recorded_at,body,body_hash)
-		VALUES ($1,1,$2,'execution_started',clock_timestamp(),$3,$4)`, runID, entryID, body, bodyHash); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	before := make(map[int][]byte, 3)
-	rows, err := database.DB.Conn.Query(ctx, `SELECT version,checksum FROM `+quoteIdentifier(database.Schema)+`.flow_schema_migrations ORDER BY version`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var version int
-		var checksum []byte
-		if err := rows.Scan(&version, &checksum); err != nil {
-			rows.Close()
-			t.Fatal(err)
-		}
-		before[version] = bytes.Clone(checksum)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		t.Fatal(err)
-	}
-	rows.Close()
-
-	if err := Migrate(ctx, database.DB, option); err != nil {
-		t.Fatalf("upgrade Migrate() error = %v", err)
-	}
-	for version, checksum := range before {
-		var after []byte
-		if err := database.DB.Conn.QueryRow(ctx, `SELECT checksum FROM `+quoteIdentifier(database.Schema)+`.flow_schema_migrations WHERE version=$1`, version).Scan(&after); err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(after, checksum) {
-			t.Fatalf("historical checksum %d changed", version)
-		}
-	}
-	status, err := CheckSchema(ctx, database.DB, option)
-	if err != nil || status.CurrentVersion != 4 || status.MinReaderVersion != 2 || status.MinWriterVersion != 2 {
-		t.Fatalf("CheckSchema() = %#v, %v", status, err)
-	}
-	var storedBody, storedHash []byte
-	var commandRunID, queueRunID uuid.UUID
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT body,body_hash FROM `+schema+`.flow_journal
-		WHERE run_id=$1 AND position=1`, runID).Scan(&storedBody, &storedHash); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(storedBody, body) || !bytes.Equal(storedHash, bodyHash) {
-		t.Fatalf("journal bytes changed: body=%x hash=%x", storedBody, storedHash)
-	}
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT run_id FROM `+schema+`.flow_commands WHERE command_id=$1`, commandID).Scan(&commandRunID); err != nil {
-		t.Fatal(err)
-	}
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT run_id FROM `+schema+`.flow_command_queue WHERE command_id=$1`, commandID).Scan(&queueRunID); err != nil {
-		t.Fatal(err)
-	}
-	if commandRunID != runID || queueRunID != runID {
-		t.Fatalf("renamed ownership changed: command=%s queue=%s want=%s", commandRunID, queueRunID, runID)
-	}
-	var oldCatalogNames int
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT
-		(SELECT count(*) FROM information_schema.columns WHERE table_schema=$1 AND column_name LIKE 'execution\_%' ESCAPE '\') +
-		(SELECT count(*) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_namespace n ON n.oid=c.connamespace
-		 WHERE n.nspname=$1 AND c.conname LIKE '%execution%') +
-		(SELECT count(*) FROM pg_catalog.pg_indexes WHERE schemaname=$1 AND indexname LIKE '%execution%')`,
-		database.Schema).Scan(&oldCatalogNames); err != nil {
-		t.Fatal(err)
-	}
-	if oldCatalogNames != 0 {
-		t.Fatalf("old execution-named live catalog identifiers = %d", oldCatalogNames)
-	}
-}
-
 func TestMigrationMixedCaseSchemaIsIdempotent(t *testing.T) {
 	t.Parallel()
 
@@ -328,38 +198,6 @@ func TestMigrationMixedCaseSchemaIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestMigrationRejectsLedgerGapBeforeApplyingPending(t *testing.T) {
-	t.Parallel()
-
-	database := testpg.Open(t)
-	ctx := context.Background()
-	option := WithSchema(database.Schema)
-	_, units, err := prepareMigrations(option)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.DB.Conn.Exec(ctx, string(externalMigration(database.Schema, units[0]))); err != nil {
-		t.Fatalf("apply initial migration: %v", err)
-	}
-	unit := units[2]
-	if _, err := database.DB.Conn.Exec(ctx, `INSERT INTO `+quoteIdentifier(database.Schema)+`.flow_schema_migrations
-		(version,name,checksum,library_version,min_reader_version,min_writer_version,applied_at)
-		VALUES ($1,$2,$3,'test',$4,$5,clock_timestamp())`, unit.version, unit.name, unit.checksum[:], unit.minReader, unit.minWriter); err != nil {
-		t.Fatalf("create migration gap: %v", err)
-	}
-	if err := Migrate(ctx, database.DB, option); !errors.Is(err, ErrSchema) {
-		t.Fatalf("Migrate(gap) error = %v, want ErrSchema", err)
-	}
-	var keyScopeColumns int
-	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
-		WHERE table_schema=$1 AND table_name='flow_runs' AND column_name='key_scope'`, database.Schema).Scan(&keyScopeColumns); err != nil {
-		t.Fatal(err)
-	}
-	if keyScopeColumns != 0 {
-		t.Fatal("pending migration 2 was applied despite a non-contiguous ledger")
-	}
-}
-
 func TestVerifyAppliedMigrationsRequiresKnownPrefix(t *testing.T) {
 	_, units, err := prepareMigrations()
 	if err != nil {
@@ -378,10 +216,7 @@ func TestVerifyAppliedMigrationsRequiresKnownPrefix(t *testing.T) {
 	}{
 		{name: "empty", applied: map[int]appliedMigration{}},
 		{name: "first", applied: map[int]appliedMigration{1: row(units[0])}},
-		{name: "complete", applied: map[int]appliedMigration{1: row(units[0]), 2: row(units[1]), 3: row(units[2]), 4: row(units[3])}},
-		{name: "missing first", applied: map[int]appliedMigration{2: row(units[1])}, wantErr: true},
-		{name: "missing middle", applied: map[int]appliedMigration{1: row(units[0]), 3: row(units[2])}, wantErr: true},
-		{name: "unknown future", applied: map[int]appliedMigration{1: row(units[0]), 4: {version: 4}}, wantErr: true},
+		{name: "unknown future", applied: map[int]appliedMigration{1: row(units[0]), 2: {version: 2}}, wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -536,7 +371,7 @@ func TestSchemaCommandKeyQueryPlans(t *testing.T) {
 	}{
 		{
 			name: "run_order",
-			query: `SELECT command_id,command_key,name,version,parent_command_id,required,state,
+			query: `SELECT command_id,command_key,name,version,parent_command_id,state,
 				unsatisfied_waits,terminal_position FROM ` + schema + `.flow_commands
 				WHERE run_id=$1 ORDER BY command_key`,
 			args: []any{run.ID},
@@ -585,7 +420,7 @@ func TestSchemaCommandKeyQueryPlans(t *testing.T) {
 	if _, err := database.DB.Conn.Exec(ctx, `ALTER TABLE `+schema+`.flow_commands
 		DROP CONSTRAINT flow_commands_run_key_uq,
 		ADD CONSTRAINT flow_commands_run_key_uq UNIQUE (run_id,command_key)
-		INCLUDE (command_id,name,version,parent_command_id,required,state,unsatisfied_waits,terminal_position)`); err != nil {
+		INCLUDE (command_id,name,version,parent_command_id,state,unsatisfied_waits,terminal_position)`); err != nil {
 		t.Fatalf("install legacy command-key index shape: %v", err)
 	}
 	if _, err := database.DB.Conn.Exec(ctx, `ANALYZE `+schema+`.flow_commands`); err != nil {
@@ -613,7 +448,9 @@ func TestMigrationPrunesOnlyUnusedProjectionColumns(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
 		FROM information_schema.columns
 		WHERE table_schema=$1 AND (
-			(table_name='flow_runs' AND column_name IN ('input_hash','metadata_hash'))
+			(table_name='flow_runs' AND column_name IN
+				('input','input_hash','metadata','metadata_canonical','metadata_hash','fail_fast'))
+			OR (table_name='flow_commands' AND column_name='required')
 			OR (table_name='flow_commands' AND column_name IN ('args_hash','retry_policy_hash','result_hash'))
 			OR (table_name='flow_command_queue' AND column_name='updated_at')
 		)`, database.Schema).Scan(&pruned); err != nil {
@@ -626,15 +463,13 @@ func TestMigrationPrunesOnlyUnusedProjectionColumns(t *testing.T) {
 	var retained int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
 		FROM information_schema.columns
-		WHERE table_schema=$1 AND (
-			(table_name='flow_runs' AND column_name IN ('input','metadata_canonical'))
-			OR (table_name='flow_commands' AND column_name IN
-				('declaration_fingerprint','result','last_error','terminal_failure'))
-		)`, database.Schema).Scan(&retained); err != nil {
+		WHERE table_schema=$1 AND table_name='flow_commands' AND column_name IN
+				('declaration_fingerprint','result','last_error','terminal_failure')
+		`, database.Schema).Scan(&retained); err != nil {
 		t.Fatalf("inspect retained columns: %v", err)
 	}
-	if retained != 6 {
-		t.Fatalf("retained semantic projection columns = %d, want 6", retained)
+	if retained != 4 {
+		t.Fatalf("retained semantic projection columns = %d, want 4", retained)
 	}
 }
 

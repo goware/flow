@@ -759,7 +759,7 @@ func TestClaimBatchTerminalizesElapsedRetryAlongsideEligibleSibling(t *testing.T
 	wantOrder := []string{
 		"attempt_started:" + result.Commands[0].CommandID.String() + ":",
 		"event_recorded:" + expiredID + ":failed",
-		"execution_failing::",
+		"run_failing::",
 	}
 	if fmt.Sprint(journalOrder) != fmt.Sprint(wantOrder) {
 		t.Fatalf("journal order=%v, want %v", journalOrder, wantOrder)
@@ -767,7 +767,7 @@ func TestClaimBatchTerminalizesElapsedRetryAlongsideEligibleSibling(t *testing.T
 	var failingBody []byte
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT body FROM `+pgschema.Table(database.Schema, "flow_journal")+`
 		WHERE run_id=(SELECT run_id FROM `+pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1)
-		  AND entry_kind='execution_failing' ORDER BY position DESC LIMIT 1`, result.Commands[0].CommandID).
+		  AND entry_kind='run_failing' ORDER BY position DESC LIMIT 1`, result.Commands[0].CommandID).
 		Scan(&failingBody); err != nil {
 		t.Fatal(err)
 	}

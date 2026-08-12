@@ -34,12 +34,12 @@ func TestPublicDurableDurationsRoundUpToMilliseconds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	options, _, firstFingerprint, err := prepareStartOptions("duration.start", 1, "key", input,
+	options, firstFingerprint, err := prepareStartOptions("duration.start", 1, "key", input,
 		WithRunDeadline(time.Nanosecond), WithStartDelay(time.Nanosecond), WaitFor(DefineEvent[None]("duration.gate"), "ready"), Within(time.Nanosecond))
 	if err != nil || options.deadline.Duration != time.Millisecond || options.startDelay != time.Millisecond || options.within != time.Millisecond {
 		t.Fatalf("normalized start options = %#v, %v", options, err)
 	}
-	_, _, secondFingerprint, err := prepareStartOptions("duration.start", 1, "key", input,
+	_, secondFingerprint, err := prepareStartOptions("duration.start", 1, "key", input,
 		WithRunDeadline(time.Millisecond), WithStartDelay(time.Millisecond), WaitFor(DefineEvent[None]("duration.gate"), "ready"), Within(time.Millisecond))
 	if err != nil || firstFingerprint != secondFingerprint {
 		t.Fatalf("equivalent normalized starts differ: %x != %x, %v", firstFingerprint, secondFingerprint, err)
@@ -267,7 +267,7 @@ func TestCommandDeclarationFingerprintIncludesDurableSettings(t *testing.T) {
 	}
 	base := store.CommandCreate{
 		ID: uuid.New(), Key: "child", Name: "fingerprint.command", Version: 1,
-		Args: args, Required: true, Queue: "default", RetryPolicy: policy,
+		Args: args, Queue: "default", RetryPolicy: policy,
 	}
 	want, err := commandDeclarationFingerprint(base)
 	if err != nil {

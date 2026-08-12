@@ -233,7 +233,7 @@ func TestWorkerSettlementReleasesSeveralWaitsAsOneDelta(t *testing.T) {
 	assertReplayMatches(t, runtime, exec.RunID)
 }
 
-func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
+func TestEventAfterWaitDeadlineDoesNotResurrectFailedRun(t *testing.T) {
 	t.Parallel()
 	database := testpg.Open(t)
 	ctx := context.Background()
@@ -241,7 +241,6 @@ func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	late := DefineEvent[None]("gate.delta_late")
-	keeper := DefineEvent[None]("gate.delta_keeper")
 	parent := DefineCommand[None, None]("gate.delta_late_parent", 1)
 	child := DefineCommand[None, None]("gate.delta_late_child", 1)
 	runtime, err := New(database.DB, WithSchema(database.Schema), WithPollInterval(5*time.Millisecond), WithNotifications(false))
@@ -249,8 +248,7 @@ func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := runtime.Register(Handle(parent, func(_ context.Context, work *Work[None]) (None, error) {
-		Enqueue(work, "expiring", child, None{}).Optional().WaitFor(late, "late").Within(40 * time.Millisecond)
-		Enqueue(work, "keeper", child, None{}).WaitFor(keeper, "keeper")
+		Enqueue(work, "expiring", child, None{}).WaitFor(late, "late").Within(40 * time.Millisecond)
 		return None{}, nil
 	})); err != nil {
 		t.Fatal(err)
@@ -268,21 +266,22 @@ func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
 			FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 			JOIN `+pgschema.Table(database.Schema, "flow_runs")+` e USING(run_id)
 			WHERE c.run_id=$1 AND c.command_key='expiring'`, exec.RunID).Scan(&state, &runState)
-		if err == nil && state == "expired" && runState == "running" {
+		if err == nil && state == "expired" && runState == "failed" {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("expiring command/live run state=%q/%q err=%v", state, runState, err)
+			t.Fatalf("expiring command/failed run state=%q/%q err=%v", state, runState, err)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if err := late.Deliver(ctx, runtime, exec.RunID, "late", None{}); err != nil {
-		t.Fatalf("late event into live run: %v", err)
+	if err := late.Deliver(ctx, runtime, exec.RunID, "late", None{}); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("late event into failed run error = %v, want ErrTerminal", err)
 	}
 	var state string
 	var unsatisfied, queued int
 	var satisfyingPosition *int64
-	var waitDeadline, recordedAt time.Time
+	var waitDeadline time.Time
+	var recordedAt *time.Time
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.state,c.unsatisfied_waits,w.satisfied_position,c.wait_deadline_at,
 		(SELECT recorded_at FROM `+pgschema.Table(database.Schema, "flow_journal")+`
 		 WHERE run_id=c.run_id AND event_class='application' AND event_name=$2 AND event_key='late'),
@@ -293,12 +292,9 @@ func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
 		Scan(&state, &unsatisfied, &satisfyingPosition, &waitDeadline, &recordedAt, &queued); err != nil {
 		t.Fatal(err)
 	}
-	if state != "expired" || unsatisfied != 1 || satisfyingPosition != nil || queued != 0 || !recordedAt.After(waitDeadline) {
-		t.Fatalf("late event resurrected/changed command: state=%s waits=%d position=%v queued=%d deadline=%s event=%s",
+	if state != "expired" || unsatisfied != 1 || satisfyingPosition != nil || queued != 0 || recordedAt != nil {
+		t.Fatalf("late event resurrected/changed command: state=%s waits=%d position=%v queued=%d deadline=%s event=%v",
 			state, unsatisfied, satisfyingPosition, queued, waitDeadline, recordedAt)
-	}
-	if err := CancelRun(ctx, runtime, exec.RunID, "late event test complete"); err != nil {
-		t.Fatal(err)
 	}
 	assertReplayMatches(t, runtime, exec.RunID)
 }
@@ -478,7 +474,7 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 	assertReplayMatches(t, runtime, exec.RunID)
 }
 
-func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
+func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	t.Parallel()
 	database := testpg.Open(t)
 	ctx := context.Background()
@@ -495,7 +491,7 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	}
 	if err := runtime.Register(
 		Handle(parent, func(_ context.Context, work *Work[bool]) (None, error) {
-			node := Enqueue(work, "optional", child, None{}).Optional().WaitFor(event, "ready")
+			node := Enqueue(work, "waiting", child, None{}).WaitFor(event, "ready")
 			if work.Args {
 				node.Within(40 * time.Millisecond)
 			}
@@ -521,7 +517,7 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	if run.Status != "running" {
-		t.Fatalf("optional command without Within status=%s, want running", run.Status)
+		t.Fatalf("waiting command without Within status=%s, want running", run.Status)
 	}
 	if err := event.Deliver(ctx, runtime, open.RunID, "ready", None{}); err != nil {
 		t.Fatal(err)
@@ -532,14 +528,14 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, expiring.RunID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, expiring.RunID, "failed", 5*time.Second)
 	trace, err := Trace(ctx, runtime, expiring.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var optionalState CommandStatus
 	for _, command := range trace.Commands {
-		if command.Key == "optional" {
+		if command.Key == "waiting" {
 			optionalState = command.State
 		}
 	}
@@ -556,13 +552,13 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var deadlineOptional TraceCommand
+	var deadlineWaiting TraceCommand
 	for _, command := range deadlineTrace.Commands {
-		if command.Key == "optional" {
-			deadlineOptional = command
+		if command.Key == "waiting" {
+			deadlineWaiting = command
 		}
 	}
-	if deadlineOptional.State != CommandStatusCancelled || deadlineOptional.Failure == nil || deadlineOptional.Failure.Code != "execution_expired" {
+	if deadlineWaiting.State != CommandStatusCancelled || deadlineWaiting.Failure == nil || deadlineWaiting.Failure.Code != "run_expired" {
 		t.Fatalf("optional deadline trace=%+v", deadlineTrace.Commands)
 	}
 	if calls.Load() != 1 {
@@ -767,7 +763,7 @@ func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
 		states[command.Key] = command
 	}
 	if states["producer"].State != CommandStatusFailed || states["join"].State != CommandStatusCancelled ||
-		states["join"].Failure == nil || states["join"].Failure.Code != "fail_fast" || joinCalls.Load() != 0 {
+		states["join"].Failure == nil || states["join"].Failure.Code != "run_failing" || joinCalls.Load() != 0 {
 		t.Fatalf("required failure trace=%+v join calls=%d", trace.Commands, joinCalls.Load())
 	}
 }

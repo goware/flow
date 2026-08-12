@@ -185,8 +185,8 @@ func (tx *SemanticTx) RunID() uuid.UUID {
 type EntryKind string
 
 const (
-	RunStarted       EntryKind = "execution_started"
-	RunFailing       EntryKind = "execution_failing"
+	RunStarted       EntryKind = "run_started"
+	RunFailing       EntryKind = "run_failing"
 	CommandCreated   EntryKind = "command_created"
 	AttemptStarted   EntryKind = "attempt_started"
 	AttemptConcluded EntryKind = "attempt_concluded"

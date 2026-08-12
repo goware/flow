@@ -195,7 +195,6 @@ type stagedCommand struct {
 	defaults   commandDefaults
 	key        string
 	args       canonical.Value
-	required   bool
 	startAfter time.Duration
 	waits      []commandEventWait
 	within     time.Duration
@@ -280,10 +279,7 @@ func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) 
 		state.poison(err)
 		return node
 	}
-	staged := stagedCommand{
-		definition: cmd.def, defaults: cmd.defaults, key: key, args: encoded,
-		required: true,
-	}
+	staged := stagedCommand{definition: cmd.def, defaults: cmd.defaults, key: key, args: encoded}
 	if state.decision.commands == nil {
 		state.decision.commands = make(map[string]stagedCommand)
 	}
@@ -302,7 +298,6 @@ func Enqueue[W, A, R any](work *Work[W], key string, cmd Command[A, R], args A) 
 
 func equivalentStagedCommandIdentity(a, b stagedCommand) bool {
 	left, right := a, b
-	left.required, right.required = true, true
 	left.startAfter, right.startAfter = 0, 0
 	left.waits, right.waits = nil, nil
 	left.within, right.within = 0, 0
@@ -325,7 +320,7 @@ func equivalentStagedCommand(a, b stagedCommand) bool {
 		return false
 	}
 	if a.definition.Name != b.definition.Name || a.definition.Version != b.definition.Version ||
-		a.required != b.required || a.startAfter != b.startAfter || a.within != b.within ||
+		a.startAfter != b.startAfter || a.within != b.within ||
 		!equivalentCommandDefaults(a.defaults, b.defaults) ||
 		!bytes.Equal(a.args.Bytes, b.args.Bytes) || !slices.Equal(a.waits, b.waits) {
 		return false

@@ -1,18 +1,15 @@
 CREATE SCHEMA IF NOT EXISTS {{schema}};
 
-CREATE TABLE {{schema}}.flow_executions (
-    execution_id          uuid PRIMARY KEY,
+CREATE TABLE {{schema}}.flow_runs (
+    run_id                uuid PRIMARY KEY,
     definition_name       text NOT NULL,
     definition_version    integer NOT NULL CHECK (definition_version > 0),
-    execution_key         text NOT NULL DEFAULT '',
+    run_key               text NOT NULL DEFAULT '',
+    key_scope             text NOT NULL DEFAULT 'permanent',
 
     status                text NOT NULL DEFAULT 'running',
-    fail_fast             boolean NOT NULL DEFAULT true,
 
     start_fingerprint     bytea NOT NULL CHECK (octet_length(start_fingerprint) = 32),
-    input                 bytea NOT NULL,
-    metadata              jsonb NOT NULL DEFAULT '{}'::jsonb,
-    metadata_canonical    bytea NOT NULL,
 
     deadline_at           timestamptz,
     max_commands          integer NOT NULL CHECK (max_commands >= 0),
@@ -20,8 +17,8 @@ CREATE TABLE {{schema}}.flow_executions (
     open_commands         integer NOT NULL DEFAULT 0 CHECK (open_commands >= 0),
 
     next_journal_position bigint NOT NULL DEFAULT 1
-        CONSTRAINT flow_executions_next_journal_position_ck CHECK (next_journal_position >= 1),
-    root_command_id       uuid CONSTRAINT flow_executions_root_command_nn NOT NULL,
+        CONSTRAINT flow_runs_next_journal_position_ck CHECK (next_journal_position >= 1),
+    root_command_id       uuid CONSTRAINT flow_runs_root_command_nn NOT NULL,
     failure               jsonb,
 
     created_at            timestamptz NOT NULL,
@@ -29,48 +26,65 @@ CREATE TABLE {{schema}}.flow_executions (
     status_at             timestamptz NOT NULL,
     finished_at           timestamptz,
 
-    CONSTRAINT flow_executions_status_ck CHECK
+    CONSTRAINT flow_runs_status_ck CHECK
         (status IN ('running', 'failing', 'succeeded', 'failed', 'cancelled', 'expired')),
-    CONSTRAINT flow_executions_terminal_shape_ck CHECK (
+    CONSTRAINT flow_runs_terminal_shape_ck CHECK (
         (status IN ('running', 'failing') AND finished_at IS NULL)
         OR
         (status IN ('succeeded', 'failed', 'cancelled', 'expired') AND finished_at IS NOT NULL)
     ),
-    CONSTRAINT flow_executions_command_limit_ck CHECK
-        (max_commands = 0 OR command_count <= max_commands)
+    CONSTRAINT flow_runs_command_limit_ck CHECK
+        (max_commands = 0 OR command_count <= max_commands),
+    CONSTRAINT flow_runs_open_commands_ck CHECK
+        (open_commands <= command_count),
+    CONSTRAINT flow_runs_key_scope_ck CHECK
+        (key_scope IN ('permanent', 'live'))
 );
 
-CREATE UNIQUE INDEX flow_executions_idempotency_uq
-    ON {{schema}}.flow_executions (definition_name, execution_key)
-    WHERE execution_key <> '';
+CREATE UNIQUE INDEX flow_runs_idempotency_uq
+    ON {{schema}}.flow_runs (definition_name, run_key)
+    WHERE run_key <> '' AND key_scope = 'permanent';
 
-CREATE INDEX flow_executions_list_idx
-    ON {{schema}}.flow_executions (definition_name, created_at DESC, execution_id DESC);
+CREATE UNIQUE INDEX flow_runs_live_key_uq
+    ON {{schema}}.flow_runs (definition_name, run_key)
+    WHERE run_key <> '' AND key_scope = 'live'
+      AND status IN ('running', 'failing');
 
-CREATE INDEX flow_executions_key_prefix_idx
-    ON {{schema}}.flow_executions
-       (definition_name, execution_key text_pattern_ops);
+CREATE INDEX flow_runs_list_idx
+    ON {{schema}}.flow_runs (definition_name, created_at DESC, run_id DESC);
 
-CREATE INDEX flow_executions_status_idx
-    ON {{schema}}.flow_executions (status, created_at DESC, execution_id DESC);
+CREATE INDEX flow_runs_key_prefix_idx
+    ON {{schema}}.flow_runs
+       (definition_name, run_key text_pattern_ops);
 
-CREATE INDEX flow_executions_metadata_idx
-    ON {{schema}}.flow_executions USING gin (metadata jsonb_path_ops);
+CREATE INDEX flow_runs_key_lookup_idx
+    ON {{schema}}.flow_runs
+       (run_key COLLATE "C", definition_name, created_at, run_id);
 
-CREATE INDEX flow_executions_deadline_idx
-    ON {{schema}}.flow_executions (deadline_at, execution_id)
+CREATE INDEX flow_runs_created_idx
+    ON {{schema}}.flow_runs (created_at DESC, run_id DESC);
+
+CREATE INDEX flow_runs_status_idx
+    ON {{schema}}.flow_runs (status, created_at DESC, run_id DESC);
+
+CREATE INDEX flow_runs_deadline_idx
+    ON {{schema}}.flow_runs (deadline_at, run_id)
     WHERE status IN ('running', 'failing') AND deadline_at IS NOT NULL;
+
+CREATE INDEX flow_runs_prune_idx
+    ON {{schema}}.flow_runs (finished_at, run_id)
+    WHERE finished_at IS NOT NULL
+      AND (run_key = '' OR key_scope = 'live');
 
 CREATE TABLE {{schema}}.flow_commands (
     command_id              uuid PRIMARY KEY,
-    execution_id            uuid NOT NULL
-        REFERENCES {{schema}}.flow_executions(execution_id) ON DELETE RESTRICT,
+    run_id                  uuid NOT NULL
+        REFERENCES {{schema}}.flow_runs(run_id) ON DELETE RESTRICT,
     command_key             text NOT NULL,
 
     name                    text NOT NULL,
     version                 integer NOT NULL CHECK (version > 0),
     parent_command_id       uuid,
-    required                boolean NOT NULL DEFAULT true,
 
     args                    bytea NOT NULL,
     declaration_fingerprint bytea NOT NULL CHECK (octet_length(declaration_fingerprint) = 32),
@@ -104,11 +118,11 @@ CREATE TABLE {{schema}}.flow_commands (
     status_at               timestamptz NOT NULL,
     finished_at             timestamptz,
 
-    CONSTRAINT flow_commands_execution_key_uq UNIQUE (execution_id, command_key),
-    CONSTRAINT flow_commands_execution_command_uq UNIQUE (execution_id, command_id),
-    CONSTRAINT flow_commands_parent_execution_fk
-        FOREIGN KEY (execution_id, parent_command_id)
-        REFERENCES {{schema}}.flow_commands(execution_id, command_id) ON DELETE RESTRICT,
+    CONSTRAINT flow_commands_run_key_uq UNIQUE (run_id, command_key),
+    CONSTRAINT flow_commands_run_command_uq UNIQUE (run_id, command_id),
+    CONSTRAINT flow_commands_parent_run_fk
+        FOREIGN KEY (run_id, parent_command_id)
+        REFERENCES {{schema}}.flow_commands(run_id, command_id) ON DELETE RESTRICT,
     CONSTRAINT flow_commands_state_ck CHECK
         (state IN ('pending', 'ready', 'running', 'retry_wait',
                    'succeeded', 'failed', 'cancelled', 'expired')),
@@ -144,13 +158,13 @@ CREATE INDEX flow_commands_parent_idx
 
 CREATE INDEX flow_commands_wait_deadline_idx
     ON {{schema}}.flow_commands (wait_deadline_at, command_id)
-    INCLUDE (execution_id)
+    INCLUDE (run_id)
     WHERE state = 'pending' AND wait_deadline_at IS NOT NULL;
 
 CREATE TABLE {{schema}}.flow_command_queue (
     command_id        uuid PRIMARY KEY,
-    execution_id      uuid NOT NULL
-        REFERENCES {{schema}}.flow_executions(execution_id) ON DELETE CASCADE,
+    run_id            uuid NOT NULL
+        REFERENCES {{schema}}.flow_runs(run_id) ON DELETE CASCADE,
 
     queue             text NOT NULL,
     name              text NOT NULL,
@@ -164,9 +178,9 @@ CREATE TABLE {{schema}}.flow_command_queue (
     lease_started_at  timestamptz,
     lease_expires_at  timestamptz,
 
-    CONSTRAINT flow_command_queue_command_execution_fk
-        FOREIGN KEY (execution_id, command_id)
-        REFERENCES {{schema}}.flow_commands(execution_id, command_id) ON DELETE CASCADE,
+    CONSTRAINT flow_command_queue_command_run_fk
+        FOREIGN KEY (run_id, command_id)
+        REFERENCES {{schema}}.flow_commands(run_id, command_id) ON DELETE CASCADE,
     CONSTRAINT flow_command_queue_state_ck CHECK
         (state IN ('ready', 'retry_wait', 'running')),
     CONSTRAINT flow_command_queue_lease_shape_ck CHECK (
@@ -181,47 +195,50 @@ CREATE TABLE {{schema}}.flow_command_queue (
 CREATE INDEX flow_command_queue_claim_idx
     ON {{schema}}.flow_command_queue
        (name, version, next_run_at, queue, command_id)
-    INCLUDE (execution_id)
+    INCLUDE (run_id)
     WHERE state IN ('ready', 'retry_wait');
 
 CREATE INDEX flow_command_queue_lease_idx
     ON {{schema}}.flow_command_queue (lease_expires_at, command_id)
-    INCLUDE (execution_id, active_attempt_id, lease_token)
+    INCLUDE (run_id, active_attempt_id, lease_token)
     WHERE state = 'running';
 
-CREATE INDEX flow_command_queue_execution_idx
-    ON {{schema}}.flow_command_queue (execution_id, command_id);
+CREATE INDEX flow_command_queue_run_idx
+    ON {{schema}}.flow_command_queue (run_id, command_id);
+
+CREATE INDEX flow_command_queue_depth_idx
+    ON {{schema}}.flow_command_queue (queue, state, next_run_at);
 
 CREATE TABLE {{schema}}.flow_command_event_waits (
     command_id         uuid NOT NULL,
-    execution_id       uuid NOT NULL
-        REFERENCES {{schema}}.flow_executions(execution_id) ON DELETE CASCADE,
+    run_id             uuid NOT NULL
+        REFERENCES {{schema}}.flow_runs(run_id) ON DELETE CASCADE,
     event_name         text NOT NULL,
     event_key          text NOT NULL CHECK (event_key <> ''),
     satisfied_position bigint,
 
     PRIMARY KEY (command_id, event_name, event_key),
-    CONSTRAINT flow_command_event_waits_command_execution_fk
-        FOREIGN KEY (execution_id, command_id)
-        REFERENCES {{schema}}.flow_commands(execution_id, command_id) ON DELETE CASCADE,
+    CONSTRAINT flow_command_event_waits_command_run_fk
+        FOREIGN KEY (run_id, command_id)
+        REFERENCES {{schema}}.flow_commands(run_id, command_id) ON DELETE CASCADE,
     CONSTRAINT flow_command_event_waits_position_ck CHECK
         (satisfied_position IS NULL OR satisfied_position >= 1)
 );
 
 CREATE INDEX flow_command_event_waits_reverse_idx
     ON {{schema}}.flow_command_event_waits
-       (execution_id, event_name, event_key, command_id)
+       (run_id, event_name, event_key, command_id)
     WHERE satisfied_position IS NULL;
 
-ALTER TABLE {{schema}}.flow_executions
-    ADD CONSTRAINT flow_executions_root_command_fk
-    FOREIGN KEY (execution_id, root_command_id)
-    REFERENCES {{schema}}.flow_commands(execution_id, command_id)
+ALTER TABLE {{schema}}.flow_runs
+    ADD CONSTRAINT flow_runs_root_command_fk
+    FOREIGN KEY (run_id, root_command_id)
+    REFERENCES {{schema}}.flow_commands(run_id, command_id)
     DEFERRABLE INITIALLY DEFERRED;
 
 CREATE TABLE {{schema}}.flow_journal (
-    execution_id       uuid NOT NULL
-        REFERENCES {{schema}}.flow_executions(execution_id) ON DELETE RESTRICT,
+    run_id             uuid NOT NULL
+        REFERENCES {{schema}}.flow_runs(run_id) ON DELETE RESTRICT,
     position           bigint NOT NULL
         CONSTRAINT flow_journal_position_ck CHECK (position >= 1),
     entry_id           uuid NOT NULL,
@@ -241,15 +258,15 @@ CREATE TABLE {{schema}}.flow_journal (
     body               bytea NOT NULL,
     body_hash          bytea NOT NULL CHECK (octet_length(body_hash) = 32),
 
-    PRIMARY KEY (execution_id, position),
-    CONSTRAINT flow_journal_command_execution_fk
-        FOREIGN KEY (execution_id, command_id)
-        REFERENCES {{schema}}.flow_commands(execution_id, command_id) ON DELETE RESTRICT
+    PRIMARY KEY (run_id, position),
+    CONSTRAINT flow_journal_command_run_fk
+        FOREIGN KEY (run_id, command_id)
+        REFERENCES {{schema}}.flow_commands(run_id, command_id) ON DELETE RESTRICT
         DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT flow_journal_position_causation_ck CHECK
         (causation_position IS NULL OR (causation_position >= 1 AND causation_position < position)),
     CONSTRAINT flow_journal_entry_kind_ck CHECK
-        (entry_kind IN ('execution_started', 'execution_failing', 'command_created',
+        (entry_kind IN ('run_started', 'run_failing', 'command_created',
                         'attempt_started', 'attempt_concluded',
                         'event_recorded')),
     CONSTRAINT flow_journal_event_shape_ck CHECK (
@@ -276,7 +293,7 @@ CREATE TABLE {{schema}}.flow_journal (
         (event_namespace IS NULL OR event_namespace IN ('application', 'runtime')),
     CONSTRAINT flow_journal_event_class_ck CHECK
         (event_class IS NULL OR event_class IN
-            ('application', 'command_terminal', 'execution_terminal')),
+            ('application', 'command_terminal', 'run_terminal')),
     CONSTRAINT flow_journal_application_event_key_ck CHECK (
         event_class IS DISTINCT FROM 'application'
         OR (event_key IS NOT NULL AND event_key <> '')
@@ -285,8 +302,8 @@ CREATE TABLE {{schema}}.flow_journal (
         event_class <> 'command_terminal'
         OR (command_id IS NOT NULL AND terminal_status IS NOT NULL)
     ),
-    CONSTRAINT flow_journal_execution_terminal_shape_ck CHECK (
-        event_class <> 'execution_terminal'
+    CONSTRAINT flow_journal_run_terminal_shape_ck CHECK (
+        event_class <> 'run_terminal'
         OR terminal_status IN ('succeeded', 'failed', 'cancelled', 'expired')
     ),
     CONSTRAINT flow_journal_terminal_status_ck CHECK
@@ -295,7 +312,7 @@ CREATE TABLE {{schema}}.flow_journal (
 );
 
 CREATE UNIQUE INDEX flow_journal_application_event_key_uq
-    ON {{schema}}.flow_journal (execution_id, event_namespace, event_name, event_key)
+    ON {{schema}}.flow_journal (run_id, event_namespace, event_name, event_key)
     WHERE entry_kind = 'event_recorded'
       AND event_class = 'application'
       AND event_key IS NOT NULL;
@@ -308,13 +325,13 @@ CREATE UNIQUE INDEX flow_journal_command_terminal_uq
     ON {{schema}}.flow_journal (command_id)
     WHERE entry_kind = 'event_recorded' AND event_class = 'command_terminal';
 
-CREATE UNIQUE INDEX flow_journal_execution_terminal_uq
-    ON {{schema}}.flow_journal (execution_id)
-    WHERE entry_kind = 'event_recorded' AND event_class = 'execution_terminal';
+CREATE UNIQUE INDEX flow_journal_run_terminal_uq
+    ON {{schema}}.flow_journal (run_id)
+    WHERE entry_kind = 'event_recorded' AND event_class = 'run_terminal';
 
-CREATE UNIQUE INDEX flow_journal_execution_failing_uq
-    ON {{schema}}.flow_journal (execution_id)
-    WHERE entry_kind = 'execution_failing';
+CREATE UNIQUE INDEX flow_journal_run_failing_uq
+    ON {{schema}}.flow_journal (run_id)
+    WHERE entry_kind = 'run_failing';
 
 CREATE UNIQUE INDEX flow_journal_attempt_kind_uq
     ON {{schema}}.flow_journal (attempt_id, entry_kind)

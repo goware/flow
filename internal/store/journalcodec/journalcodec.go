@@ -15,19 +15,16 @@ import (
 // RunStartedBody is the versioned logical start record retained by the
 // journal. Raw JSON fields already contain canonical application values.
 type RunStartedBody struct {
-	V                 int             `json:"v"`
-	RunID             string          `json:"execution_id"`
-	DefinitionName    string          `json:"definition_name"`
-	DefinitionVersion int             `json:"definition_version"`
-	RunKey            string          `json:"execution_key"`
-	KeyScope          string          `json:"key_scope,omitempty"`
-	Input             json.RawMessage `json:"input"`
-	FailFast          bool            `json:"fail_fast"`
-	DeadlineMode      string          `json:"deadline_mode"`
-	DeadlineDuration  int64           `json:"deadline_duration_ms,omitempty"`
-	DeadlineAt        *time.Time      `json:"deadline_at,omitempty"`
-	MaxCommands       int             `json:"max_commands"`
-	Metadata          json.RawMessage `json:"metadata"`
+	V                 int        `json:"v"`
+	RunID             string     `json:"run_id"`
+	DefinitionName    string     `json:"definition_name"`
+	DefinitionVersion int        `json:"definition_version"`
+	RunKey            string     `json:"run_key"`
+	KeyScope          string     `json:"key_scope,omitempty"`
+	DeadlineMode      string     `json:"deadline_mode"`
+	DeadlineDuration  int64      `json:"deadline_duration_ms,omitempty"`
+	DeadlineAt        *time.Time `json:"deadline_at,omitempty"`
+	MaxCommands       int        `json:"max_commands"`
 }
 
 type CommandCreatedBody struct {
@@ -38,7 +35,6 @@ type CommandCreatedBody struct {
 	Version                int             `json:"version"`
 	Args                   json.RawMessage `json:"args"`
 	ParentCommandID        string          `json:"parent_command_id,omitempty"`
-	Required               bool            `json:"required"`
 	InitialState           string          `json:"initial_state"`
 	Queue                  string          `json:"queue"`
 	AttemptTimeoutMS       *int64          `json:"attempt_timeout_ms,omitempty"`

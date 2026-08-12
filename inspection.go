@@ -8,7 +8,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
-	"github.com/goware/flow/internal/canonical"
 	"github.com/goware/flow/internal/definition"
 	"github.com/goware/flow/internal/failure"
 	"github.com/goware/flow/internal/store"
@@ -27,7 +26,6 @@ type RunFilter struct {
 	Statuses      []RunStatus
 	CreatedAfter  *time.Time
 	CreatedBefore *time.Time
-	Metadata      map[string]string
 	PageSize      int
 	Cursor        string
 }
@@ -200,17 +198,6 @@ func ListRuns(ctx context.Context, c Client, filter RunFilter) (RunPage, error) 
 	if filter.CreatedAfter != nil && filter.CreatedBefore != nil && !filter.CreatedAfter.Before(*filter.CreatedBefore) {
 		return RunPage{}, newError(ErrInvalid, "list", "time range", "", "created-after must precede created-before")
 	}
-	if err := validateMetadata(filter.Metadata); err != nil {
-		return RunPage{}, err
-	}
-	var metadataBytes []byte
-	if len(filter.Metadata) != 0 {
-		metadata, err := canonical.Marshal(filter.Metadata, maxRunMetadataBytes)
-		if err != nil {
-			return RunPage{}, mapCanonicalError("list", "metadata", err)
-		}
-		metadataBytes = metadata.BytesCopy()
-	}
 	var cursorTime *time.Time
 	var cursorID *uuid.UUID
 	if filter.Cursor != "" {
@@ -223,7 +210,7 @@ func ListRuns(ctx context.Context, c Client, filter RunFilter) (RunPage, error) 
 	rows, err := client.runtime.store.ListRunsInTx(ctx, client.tx, store.RunListFilter{
 		DefinitionName: filter.Type, KeyPrefix: filter.KeyPrefix, Statuses: statuses,
 		CreatedAfter: cloneTimePointer(filter.CreatedAfter), CreatedBefore: cloneTimePointer(filter.CreatedBefore),
-		Metadata: metadataBytes, CursorCreated: cursorTime, CursorID: cursorID, Limit: pageSize + 1,
+		CursorCreated: cursorTime, CursorID: cursorID, Limit: pageSize + 1,
 	})
 	if err != nil {
 		return RunPage{}, err
@@ -289,12 +276,12 @@ func runFromStore(row store.RunRow) (Run, error) {
 	}
 	run := Run{
 		ID: RunID(row.ID.String()), Type: row.DefinitionName, Version: row.DefinitionVersion,
-		Key: row.Key, Status: status, FailFast: row.FailFast, MaxCommands: row.MaxCommands,
+		Key: row.Key, Status: status, MaxCommands: row.MaxCommands,
 		RootCommandID: CommandID(row.RootCommandID.String()),
 		CommandCount:  row.CommandCount, OpenCommands: row.OpenCommands,
 		DeadlineAt: cloneTimePointer(row.DeadlineAt), Failure: failure.Clone(row.Failure),
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, StatusAt: row.StatusAt,
-		FinishedAt: cloneTimePointer(row.FinishedAt), Metadata: json.RawMessage(append([]byte(nil), row.Metadata...)),
+		FinishedAt: cloneTimePointer(row.FinishedAt),
 	}
 	return run, nil
 }

@@ -2,7 +2,6 @@ package flow
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -149,8 +148,7 @@ func TestRunInspectionAndStablePagination(t *testing.T) {
 
 	var execs []EnqueueResult
 	for index := 0; index < 5; index++ {
-		exec, err := command.Enqueue(ctx, runtime, fmt.Sprintf("batch/%02d", index), inspectionArgs{Value: fmt.Sprint(index)},
-			WithMetadata(map[string]string{"tenant": "acme", "bucket": fmt.Sprint(index % 2)}))
+		exec, err := command.Enqueue(ctx, runtime, fmt.Sprintf("batch/%02d", index), inspectionArgs{Value: fmt.Sprint(index)})
 		if err != nil {
 			t.Fatalf("Enqueue(%d) error = %v", index, err)
 		}
@@ -161,19 +159,15 @@ func TestRunInspectionAndStablePagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRun() error = %v", err)
 	}
-	var metadata map[string]string
-	if err := json.Unmarshal(got.Metadata, &metadata); err != nil {
-		t.Fatalf("decode metadata: %v", err)
-	}
 	if got.ID != execs[2].RunID || got.Type != command.Name() || got.Status != "running" ||
-		got.CommandCount != 1 || got.OpenCommands != 1 || metadata["bucket"] != "0" || metadata["tenant"] != "acme" {
+		got.CommandCount != 1 || got.OpenCommands != 1 {
 		t.Fatalf("GetRun() = %#v", got)
 	}
 	if _, err := GetRun(ctx, runtime, RunID("00000000-0000-0000-0000-000000000001")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetRun(missing) error = %v", err)
 	}
 
-	filter := RunFilter{Type: command.Name(), KeyPrefix: "batch/", Metadata: map[string]string{"tenant": "acme"}, PageSize: 2}
+	filter := RunFilter{Type: command.Name(), KeyPrefix: "batch/", PageSize: 2}
 	var listed []Run
 	for {
 		page, err := ListRuns(ctx, runtime, filter)
@@ -200,9 +194,9 @@ func TestRunInspectionAndStablePagination(t *testing.T) {
 		}
 	}
 	filtered, err := ListRuns(ctx, runtime, RunFilter{
-		Type: command.Name(), Metadata: map[string]string{"bucket": "1"}, Statuses: []RunStatus{RunStatusRunning}, PageSize: 10,
+		Type: command.Name(), Statuses: []RunStatus{RunStatusRunning}, PageSize: 10,
 	})
-	if err != nil || len(filtered.Runs) != 2 {
+	if err != nil || len(filtered.Runs) != 5 {
 		t.Fatalf("filtered list = %#v, %v", filtered, err)
 	}
 	literalWildcard, err := ListRuns(ctx, runtime, RunFilter{Type: command.Name(), KeyPrefix: "batch/%", PageSize: 10})
@@ -288,7 +282,7 @@ func TestTransactionScopedInspectionAndAwait(t *testing.T) {
 		t.Fatalf("Trace() error = %v", err)
 	}
 	if !reflect.DeepEqual(trace.Run, run) || len(trace.Events) != 2 || trace.Events[0].Class != "command_terminal" ||
-		trace.Events[1].Class != "execution_terminal" {
+		trace.Events[1].Class != "run_terminal" {
 		t.Fatalf("Trace() inspection = %#v", trace)
 	}
 	cancelRun()
