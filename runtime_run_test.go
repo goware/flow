@@ -301,9 +301,9 @@ func TestLockedSettlementIsUncertainWhileUnrelatedLeaseRenews(t *testing.T) {
 	}
 	close(releaseCommit)
 	close(releaseUnrelated)
-	waitForRunStatus(t, database.Schema, database.DB.Conn, settlingRun.ID, "succeeded", 3*time.Second)
-	waitForRunStatus(t, database.Schema, database.DB.Conn, unrelatedRun.ID, "succeeded", 3*time.Second)
-	for _, runID := range []RunID{settlingRun.ID, unrelatedRun.ID} {
+	waitForRunStatus(t, database.Schema, database.DB.Conn, settlingRun.RunID, "succeeded", 3*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, unrelatedRun.RunID, "succeeded", 3*time.Second)
+	for _, runID := range []RunID{settlingRun.RunID, unrelatedRun.RunID} {
 		trace, err := Trace(ctx, runtime, runID)
 		if err != nil || len(trace.Commands) != 1 || len(trace.Commands[0].Attempts) != 1 {
 			t.Fatalf("trace %s = %#v, %v", runID, trace, err)
@@ -391,9 +391,9 @@ func TestLeaseWatchdogCancelsAfterPoolStarvationAndAllowsTakeover(t *testing.T) 
 		t.Fatal(err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForRunStatus(t, database.Schema, database.DB.Conn, run.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, run.RunID, "succeeded", 5*time.Second)
 	stopRuntime(t, cancelSecond, secondResult)
-	trace, err := Trace(ctx, mustReader(t, database), run.ID)
+	trace, err := Trace(ctx, mustReader(t, database), run.RunID)
 	if err != nil || len(trace.Commands) != 1 || len(trace.Commands[0].Attempts) != 2 ||
 		trace.Commands[0].Attempts[1].Classification != "succeeded" {
 		t.Fatalf("pool-starvation trace = %#v, %v", trace, err)

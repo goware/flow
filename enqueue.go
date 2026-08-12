@@ -187,28 +187,28 @@ func Within(duration time.Duration) RunOption {
 	})
 }
 
-func (cmd Command[A, R]) Enqueue(ctx context.Context, client Client, key string, args A, opts ...RunOption) (Run, error) {
+func (cmd Command[A, R]) Enqueue(ctx context.Context, client Client, key string, args A, opts ...RunOption) (EnqueueResult, error) {
 	var definitionError error
 	if cmd.def == nil {
 		definitionError = errors.New("zero definition")
 	}
 	if err := errors.Join(cmd.err, definitionError); err != nil {
-		return Run{}, newError(ErrInvalid, "enqueue", "command", cmd.Name(), err.Error())
+		return EnqueueResult{}, newError(ErrInvalid, "enqueue", "command", cmd.Name(), err.Error())
 	}
 	input, err := encodeDefinitionValue(cmd.def.Args, args, maxCommandArgumentBytes, "command arguments")
 	if err != nil {
-		return Run{}, err
+		return EnqueueResult{}, err
 	}
 	resolved, err := resolveClient(client)
 	if err != nil {
-		return Run{}, err
+		return EnqueueResult{}, err
 	}
 	if err := resolved.beforeFlowWrite(); err != nil {
-		return Run{}, err
+		return EnqueueResult{}, err
 	}
 	request, err := cmd.prepareStartRequest(key, input, resolved.runtime.maxCommands, opts...)
 	if err != nil {
-		return Run{}, err
+		return EnqueueResult{}, err
 	}
 	return enqueueStart(ctx, resolved, request)
 }
@@ -305,25 +305,21 @@ func (cmd Command[A, R]) ReplaceCurrentRun(
 	if err != nil {
 		return ReplaceRunResult{}, err
 	}
-	run, err := runFromStore(result.Start.Row)
-	if err != nil {
-		return ReplaceRunResult{}, err
-	}
-	run.Created = result.Start.Created
+	runID := RunID(result.Start.ID.String())
 	if resolved.tx == nil && result.Replaced {
 		resolved.runtime.wakeCommands()
 		resolved.runtime.observe(ctx, Observation{
 			Kind: ObservationRun, Operation: "cancel", Outcome: "cancelled", RunID: expected,
 		})
 		resolved.runtime.observe(ctx, Observation{
-			Kind: ObservationRun, Operation: "start", Outcome: "created", RunID: run.ID,
+			Kind: ObservationRun, Operation: "start", Outcome: "created", RunID: runID,
 			Name: start.DefinitionName, Version: start.DefinitionVersion,
 		})
 	}
-	return ReplaceRunResult{Run: run, Replaced: result.Replaced}, nil
+	return ReplaceRunResult{RunID: runID, Replaced: result.Replaced}, nil
 }
 
-func enqueueStart(ctx context.Context, client resolvedClient, request store.StartRequest) (Run, error) {
+func enqueueStart(ctx context.Context, client resolvedClient, request store.StartRequest) (EnqueueResult, error) {
 	var result store.StartResult
 	err := client.inTransaction(ctx, func(tx pgx.Tx) error {
 		if err := client.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
@@ -334,21 +330,17 @@ func enqueueStart(ctx context.Context, client resolvedClient, request store.Star
 		return err
 	})
 	if err != nil {
-		return Run{}, err
+		return EnqueueResult{}, err
 	}
-	run, err := runFromStore(result.Row)
-	if err != nil {
-		return Run{}, err
-	}
-	run.Created = result.Created
+	runID := RunID(result.ID.String())
 	if client.tx == nil && result.Created {
 		client.runtime.wakeCommands()
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationRun, Operation: "start", Outcome: "created",
-			RunID: run.ID, Name: request.DefinitionName, Version: request.DefinitionVersion,
+			RunID: runID, Name: request.DefinitionName, Version: request.DefinitionVersion,
 		})
 	}
-	return run, nil
+	return EnqueueResult{RunID: runID, Created: result.Created}, nil
 }
 
 // Deliver records an event in a known run, including from inside an

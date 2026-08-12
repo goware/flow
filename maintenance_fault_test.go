@@ -42,7 +42,7 @@ func TestMaintenanceFaultLeavesDeadlineRecoverableByAnotherRuntime(t *testing.T)
 	}
 	time.Sleep(120 * time.Millisecond)
 	waitForObservation(t, observer, "deadline", "error", 1, time.Second)
-	run, err := GetRun(ctx, first, exec.ID)
+	run, err := GetRun(ctx, first, exec.RunID)
 	if err != nil || run.Status != "running" {
 		t.Fatalf("faulted maintenance run = %#v, %v", run, err)
 	}
@@ -53,9 +53,9 @@ func TestMaintenanceFaultLeavesDeadlineRecoverableByAnotherRuntime(t *testing.T)
 		t.Fatal(err)
 	}
 	cancelSecond, secondResult := startRuntime(t, second)
-	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "expired", 3*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "expired", 3*time.Second)
 	stopRuntime(t, cancelSecond, secondResult)
-	trace, err := Trace(ctx, mustReader(t, database), exec.ID)
+	trace, err := Trace(ctx, mustReader(t, database), exec.RunID)
 	if err != nil || trace.Run.Status != "expired" || trace.Run.OpenCommands != 0 {
 		t.Fatalf("recovered maintenance trace = %#v, %v", trace, err)
 	}
@@ -202,17 +202,17 @@ func TestMaintenanceCategoryErrorDoesNotStarveOtherCategories(t *testing.T) {
 	waitForObservation(t, observer, "deadline", "error", 1, time.Second)
 	var deadlineStatus, waitStatus, leaseState string
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT status FROM `+
-		pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, deadlineRun.ID).
+		pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, deadlineRun.RunID).
 		Scan(&deadlineStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT status FROM `+
-		pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, waitRun.ID).
+		pgschema.Table(database.Schema, "flow_runs")+` WHERE run_id=$1`, waitRun.RunID).
 		Scan(&waitStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT state FROM `+
-		pgschema.Table(database.Schema, "flow_commands")+` WHERE run_id=$1`, leaseRun.ID).
+		pgschema.Table(database.Schema, "flow_commands")+` WHERE run_id=$1`, leaseRun.RunID).
 		Scan(&leaseState); err != nil {
 		t.Fatal(err)
 	}
@@ -243,9 +243,10 @@ func TestWaitExpiryScanErrorIsReported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runSnapshot := mustGetRun(t, runtime, run.RunID)
 	schema := pgschema.Table(database.Schema, "flow_commands")
 	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+schema+`
-		SET wait_deadline_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, run.RootCommandID); err != nil {
+		SET wait_deadline_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, runSnapshot.RootCommandID); err != nil {
 		t.Fatal(err)
 	}
 	// The expiry probe does not read required, while ExpireCommandWait scans it

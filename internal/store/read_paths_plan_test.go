@@ -100,7 +100,15 @@ func TestTraceWaitProductionQueryAvoidsUnrelatedSatisfiedWaits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	targetRun, err := flow.GetRun(ctx, runtime, target.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	filler, err := command.Enqueue(ctx, runtime, "trace/filler", flow.None{}, flow.WithoutRunDeadline())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillerRun, err := flow.GetRun(ctx, runtime, filler.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +116,7 @@ func TestTraceWaitProductionQueryAvoidsUnrelatedSatisfiedWaits(t *testing.T) {
 	waits := pgschema.Table(schema, "flow_command_event_waits")
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+waits+`
 		(command_id,run_id,event_name,event_key,satisfied_position)
-		VALUES ($1,$2,'store.trace.target','target',1)`, target.RootCommandID, target.ID); err != nil {
+		VALUES ($1,$2,'store.trace.target','target',1)`, targetRun.RootCommandID, target.RunID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+commands+` (
@@ -117,20 +125,20 @@ func TestTraceWaitProductionQueryAvoidsUnrelatedSatisfiedWaits(t *testing.T) {
 		SELECT md5($1::text||':'||g::text)::uuid,$1::uuid,'trace/sparse/'||g::text,'store.trace.synthetic',1,$2::uuid,true,
 		       convert_to('{}','UTF8'),decode(repeat('00',32),'hex'),'pending',1,'default',convert_to('{}','UTF8'),
 		       1,clock_timestamp(),clock_timestamp(),clock_timestamp()
-		FROM generate_series(1,10000) AS g`, filler.ID, filler.RootCommandID); err != nil {
+		FROM generate_series(1,10000) AS g`, filler.RunID, fillerRun.RootCommandID); err != nil {
 		t.Fatalf("seed unrelated commands: %v", err)
 	}
 	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+waits+`
 		(command_id,run_id,event_name,event_key,satisfied_position)
 		SELECT command_id,run_id,'store.trace.unrelated',command_key,1
-		FROM `+commands+` WHERE run_id=$1 AND parent_command_id IS NOT NULL`, filler.ID); err != nil {
+		FROM `+commands+` WHERE run_id=$1 AND parent_command_id IS NOT NULL`, filler.RunID); err != nil {
 		t.Fatalf("seed unrelated waits: %v", err)
 	}
 	if _, err := db.Conn.Exec(ctx, `ANALYZE `+commands+`, `+waits); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := db.Conn.Query(ctx, `EXPLAIN (ANALYZE,BUFFERS,FORMAT TEXT) `+
-		store.TraceWaitsQueryForTest(repository), target.ID)
+		store.TraceWaitsQueryForTest(repository), target.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -697,6 +697,8 @@ func TestMigrationOwnershipAndPositionConstraints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	firstRun := mustGetRun(t, runtime, first.RunID)
+	secondRun := mustGetRun(t, runtime, second.RunID)
 	schema := quoteIdentifier(database.Schema)
 	assertConstraint := func(name string, operation func(pgx.Tx) error) {
 		t.Helper()
@@ -734,66 +736,66 @@ func TestMigrationOwnershipAndPositionConstraints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET root_command_id=NULL WHERE run_id=$1`, first.ID)
+	_, err = tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET root_command_id=NULL WHERE run_id=$1`, first.RunID)
 	_ = tx.Rollback(ctx)
 	var notNullError *pgconn.PgError
 	if !errors.As(err, &notNullError) || notNullError.ColumnName != "root_command_id" {
 		t.Fatalf("root NOT NULL error = %v", err)
 	}
 	assertConstraint("flow_runs_root_command_fk", func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET root_command_id=$2 WHERE run_id=$1`, first.ID, second.RootCommandID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET root_command_id=$2 WHERE run_id=$1`, first.RunID, secondRun.RootCommandID); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `SET CONSTRAINTS `+schema+`.flow_runs_root_command_fk IMMEDIATE`)
 		return err
 	})
 	assertConstraint("flow_commands_parent_run_fk", func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_commands SET parent_command_id=$2 WHERE command_id=$1`, first.RootCommandID, second.RootCommandID)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_commands SET parent_command_id=$2 WHERE command_id=$1`, firstRun.RootCommandID, secondRun.RootCommandID)
 		return err
 	})
 	assertConstraint("flow_command_queue_command_run_fk", func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_queue SET run_id=$2 WHERE command_id=$1`, first.RootCommandID, second.ID)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_queue SET run_id=$2 WHERE command_id=$1`, firstRun.RootCommandID, second.RunID)
 		return err
 	})
 	if _, err := database.DB.Conn.Exec(ctx, `INSERT INTO `+schema+`.flow_command_event_waits
-		(command_id,run_id,event_name,event_key) VALUES ($1,$2,'constraint.event','key')`, first.RootCommandID, first.ID); err != nil {
+		(command_id,run_id,event_name,event_key) VALUES ($1,$2,'constraint.event','key')`, firstRun.RootCommandID, first.RunID); err != nil {
 		t.Fatal(err)
 	}
 	assertConstraint("flow_command_event_waits_command_run_fk", func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_event_waits SET run_id=$2 WHERE command_id=$1`, first.RootCommandID, second.ID)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_event_waits SET run_id=$2 WHERE command_id=$1`, firstRun.RootCommandID, second.RunID)
 		return err
 	})
 	assertConstraint("flow_journal_command_run_fk", func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET command_id=$3 WHERE run_id=$1 AND position=$2`, first.ID, 1, second.RootCommandID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET command_id=$3 WHERE run_id=$1 AND position=$2`, first.RunID, 1, secondRun.RootCommandID); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `SET CONSTRAINTS `+schema+`.flow_journal_command_run_fk IMMEDIATE`)
 		return err
 	})
 	assertInvalidPosition("flow_runs_next_journal_position_ck", func(tx pgx.Tx, value int64) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET next_journal_position=$2 WHERE run_id=$1`, first.ID, value)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_runs SET next_journal_position=$2 WHERE run_id=$1`, first.RunID, value)
 		return err
 	})
 	assertInvalidPosition("flow_commands_created_position_ck", func(tx pgx.Tx, value int64) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_commands SET created_position=$2 WHERE command_id=$1`, first.RootCommandID, value)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_commands SET created_position=$2 WHERE command_id=$1`, firstRun.RootCommandID, value)
 		return err
 	})
 	assertInvalidPosition("flow_command_event_waits_position_ck", func(tx pgx.Tx, value int64) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_event_waits SET satisfied_position=$2 WHERE command_id=$1`, first.RootCommandID, value)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_command_event_waits SET satisfied_position=$2 WHERE command_id=$1`, firstRun.RootCommandID, value)
 		return err
 	})
 	assertInvalidPosition("flow_journal_position_ck", func(tx pgx.Tx, value int64) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET position=$2 WHERE run_id=$1 AND position=1`, first.ID, value)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET position=$2 WHERE run_id=$1 AND position=1`, first.RunID, value)
 		return err
 	})
 	assertInvalidPosition("flow_commands_terminal_position_ck", func(tx pgx.Tx, value int64) error {
 		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_commands
 			SET state='succeeded',result='{}',terminal_position=$2,finished_at=clock_timestamp()
-			WHERE command_id=$1`, first.RootCommandID, value)
+			WHERE command_id=$1`, firstRun.RootCommandID, value)
 		return err
 	})
 	assertInvalidPosition("flow_journal_position_causation_ck", func(tx pgx.Tx, value int64) error {
-		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET causation_position=$2 WHERE run_id=$1 AND position=2`, first.ID, value)
+		_, err := tx.Exec(ctx, `UPDATE `+schema+`.flow_journal SET causation_position=$2 WHERE run_id=$1 AND position=2`, first.RunID, value)
 		return err
 	})
 }

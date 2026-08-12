@@ -62,11 +62,18 @@ const (
 type Failure = failure.Value
 type CommandFailure = Failure
 
-// ReplaceRunResult reports the current run after an atomic live-key
-// replacement attempt. Replaced is true only for the call that cancelled the
-// expected predecessor and created Run.
+// EnqueueResult reports the run accepted by Enqueue. Created is false when a
+// keyed enqueue idempotently rediscovers an existing run.
+type EnqueueResult struct {
+	RunID   RunID
+	Created bool
+}
+
+// ReplaceRunResult reports the run accepted by an atomic live-key replacement
+// attempt. Replaced is true only for the call that cancelled the expected
+// predecessor and created RunID.
 type ReplaceRunResult struct {
-	Run      Run
+	RunID    RunID
 	Replaced bool
 }
 

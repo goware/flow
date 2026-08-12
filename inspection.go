@@ -70,6 +70,28 @@ func GetResult[A, R any](
 	key string,
 	cmd Command[A, R],
 ) (R, bool, error) {
+	return getResult(ctx, c, id, key, cmd)
+}
+
+// GetResult reads this command definition's typed result projection. It is
+// equivalent to the top-level GetResult form, with the definition supplied by
+// the receiver.
+func (cmd Command[A, R]) GetResult(
+	ctx context.Context,
+	c Client,
+	id RunID,
+	key string,
+) (R, bool, error) {
+	return getResult(ctx, c, id, key, cmd)
+}
+
+func getResult[A, R any](
+	ctx context.Context,
+	c Client,
+	id RunID,
+	key string,
+	cmd Command[A, R],
+) (R, bool, error) {
 	var zero R
 	if cmd.def == nil || cmd.err != nil {
 		return zero, false, newError(ErrInvalid, "get", "command result", key, "invalid command definition")
@@ -118,9 +140,23 @@ func GetResult[A, R any](
 // runs per key over time but at most one live holder; this is the
 // lookup that matches that invariant. found=false means no live holder —
 // settled runs with the key may still exist.
-func GetCurrentRun(ctx context.Context, c Client, typ, key string) (Run, bool, error) {
-	if err := definition.ValidateName(typ); err != nil {
-		return Run{}, false, newError(ErrInvalid, "lookup", "run type", typ, "invalid definition name")
+func GetCurrentRun(ctx context.Context, c Client, rootCommandName, key string) (Run, bool, error) {
+	return getCurrentRun(ctx, c, rootCommandName, key)
+}
+
+// GetCurrentRun finds the live-key run currently held by this root command
+// family. The lookup is name-scoped rather than version-scoped so an older
+// command version that is still running remains discoverable.
+func (cmd Command[A, R]) GetCurrentRun(ctx context.Context, c Client, key string) (Run, bool, error) {
+	if cmd.def == nil || cmd.err != nil {
+		return Run{}, false, newError(ErrInvalid, "lookup", "root command", cmd.Name(), "invalid command definition")
+	}
+	return getCurrentRun(ctx, c, cmd.Name(), key)
+}
+
+func getCurrentRun(ctx context.Context, c Client, rootCommandName, key string) (Run, bool, error) {
+	if err := definition.ValidateName(rootCommandName); err != nil {
+		return Run{}, false, newError(ErrInvalid, "lookup", "root command name", rootCommandName, "invalid definition name")
 	}
 	if key == "" || len(key) > maxRunKeyBytes || !utf8.ValidString(key) {
 		return Run{}, false, newError(ErrInvalid, "lookup", "run key", "", "key is empty, malformed, or too long")
@@ -129,7 +165,7 @@ func GetCurrentRun(ctx context.Context, c Client, typ, key string) (Run, bool, e
 	if err != nil {
 		return Run{}, false, err
 	}
-	row, found, err := client.runtime.store.GetCurrentRun(ctx, client.tx, typ, key)
+	row, found, err := client.runtime.store.GetCurrentRun(ctx, client.tx, rootCommandName, key)
 	if err != nil || !found {
 		return Run{}, false, err
 	}

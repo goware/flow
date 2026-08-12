@@ -68,7 +68,7 @@ func TestReadGettersExposeLiveWorkAndHistory(t *testing.T) {
 		t.Fatalf("first history entry = %#v", history[0])
 	}
 
-	if err := CancelRun(ctx, runtime, started.ID, "test settle"); err != nil {
+	if err := CancelRun(ctx, runtime, started.RunID, "test settle"); err != nil {
 		t.Fatalf("CancelRun() error = %v", err)
 	}
 

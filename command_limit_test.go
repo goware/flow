@@ -37,8 +37,8 @@ func TestCommandCeilingRejectsWorkerBatchAtomically(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
-		trace, err := Trace(ctx, runtime, exec.ID)
+		waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failed", 5*time.Second)
+		trace, err := Trace(ctx, runtime, exec.RunID)
 		if err != nil {
 			t.Fatal(err)
 		}

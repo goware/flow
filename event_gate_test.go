@@ -42,12 +42,13 @@ func TestEventDeltaReadinessUpdatesOnlyAffectedCommands(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	execRun := mustGetRun(t, runtime, exec.RunID)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		var children int
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-			WHERE run_id=$1 AND parent_command_id=$2`, exec.ID, exec.RootCommandID).Scan(&children); err != nil {
+			WHERE run_id=$1 AND parent_command_id=$2`, exec.RunID, execRun.RootCommandID).Scan(&children); err != nil {
 			t.Fatal(err)
 		}
 		if children == 4 {
@@ -66,7 +67,7 @@ func TestEventDeltaReadinessUpdatesOnlyAffectedCommands(t *testing.T) {
 		t.Helper()
 		rows, err := database.DB.Conn.Query(ctx, `SELECT command_key,state,unsatisfied_waits
 			FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-			WHERE run_id=$1 AND parent_command_id=$2 ORDER BY command_key`, exec.ID, exec.RootCommandID)
+			WHERE run_id=$1 AND parent_command_id=$2 ORDER BY command_key`, exec.RunID, execRun.RootCommandID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -97,7 +98,7 @@ func TestEventDeltaReadinessUpdatesOnlyAffectedCommands(t *testing.T) {
 		if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*)
 			FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` q
 			JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c USING(command_id)
-			WHERE c.run_id=$1 AND c.parent_command_id=$2`, exec.ID, exec.RootCommandID).Scan(&queued); err != nil {
+			WHERE c.run_id=$1 AND c.parent_command_id=$2`, exec.RunID, execRun.RootCommandID).Scan(&queued); err != nil {
 			t.Fatal(err)
 		}
 		return queued
@@ -105,7 +106,7 @@ func TestEventDeltaReadinessUpdatesOnlyAffectedCommands(t *testing.T) {
 
 	before := readStates()
 	queuedBefore := readQueuedChildren()
-	if err := unrelated.Deliver(ctx, runtime, exec.ID, "missing", "no match"); err != nil {
+	if err := unrelated.Deliver(ctx, runtime, exec.RunID, "missing", "no match"); err != nil {
 		t.Fatal(err)
 	}
 	afterNoMatch := readStates()
@@ -117,7 +118,7 @@ func TestEventDeltaReadinessUpdatesOnlyAffectedCommands(t *testing.T) {
 	if queuedAfter := readQueuedChildren(); queuedAfter != queuedBefore {
 		t.Fatalf("unrelated event changed child queue rows: before=%d after=%d", queuedBefore, queuedAfter)
 	}
-	if err := shared.Deliver(ctx, runtime, exec.ID, "shared", "accepted"); err != nil {
+	if err := shared.Deliver(ctx, runtime, exec.RunID, "shared", "accepted"); err != nil {
 		t.Fatal(err)
 	}
 	afterShared := readStates()
@@ -127,20 +128,20 @@ func TestEventDeltaReadinessUpdatesOnlyAffectedCommands(t *testing.T) {
 		afterShared["z-unrelated"] != before["z-unrelated"] {
 		t.Fatalf("states after shared event=%+v", afterShared)
 	}
-	if err := shared.Deliver(ctx, runtime, exec.ID, "shared", "accepted"); err != nil {
+	if err := shared.Deliver(ctx, runtime, exec.RunID, "shared", "accepted"); err != nil {
 		t.Fatal(err)
 	}
 	if duplicate := readStates(); duplicate["a-two-waits"] != afterShared["a-two-waits"] ||
 		duplicate["b-shared"] != afterShared["b-shared"] || duplicate["c-shared"] != afterShared["c-shared"] {
 		t.Fatalf("equivalent duplicate changed readiness: before=%+v after=%+v", afterShared, duplicate)
 	}
-	if err := shared.Deliver(ctx, runtime, exec.ID, "shared", "conflict"); !errors.Is(err, ErrConflict) {
+	if err := shared.Deliver(ctx, runtime, exec.RunID, "shared", "conflict"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting duplicate error=%v, want ErrConflict", err)
 	}
 	if conflict := readStates(); conflict["a-two-waits"] != afterShared["a-two-waits"] {
 		t.Fatalf("conflicting duplicate changed readiness: before=%+v after=%+v", afterShared, conflict)
 	}
-	if err := second.Deliver(ctx, runtime, exec.ID, "second", "accepted"); err != nil {
+	if err := second.Deliver(ctx, runtime, exec.RunID, "second", "accepted"); err != nil {
 		t.Fatal(err)
 	}
 	afterSecond := readStates()
@@ -150,16 +151,16 @@ func TestEventDeltaReadinessUpdatesOnlyAffectedCommands(t *testing.T) {
 	}
 	var queued int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE run_id=$1 AND command_id<>$2`, exec.ID, exec.RootCommandID).Scan(&queued); err != nil {
+		WHERE run_id=$1 AND command_id<>$2`, exec.RunID, execRun.RootCommandID).Scan(&queued); err != nil {
 		t.Fatal(err)
 	}
 	if queued != 3 {
 		t.Fatalf("released child queue rows=%d, want 3", queued)
 	}
-	if err := CancelRun(ctx, runtime, exec.ID, "delta readiness test complete"); err != nil {
+	if err := CancelRun(ctx, runtime, exec.RunID, "delta readiness test complete"); err != nil {
 		t.Fatal(err)
 	}
-	assertReplayMatches(t, runtime, exec.ID)
+	assertReplayMatches(t, runtime, exec.RunID)
 }
 
 func TestWorkerSettlementReleasesSeveralWaitsAsOneDelta(t *testing.T) {
@@ -215,7 +216,7 @@ func TestWorkerSettlementReleasesSeveralWaitsAsOneDelta(t *testing.T) {
 			FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 			JOIN `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w USING(command_id)
 			WHERE c.run_id=$1 AND c.command_key='gated'
-			GROUP BY c.command_id,c.state,c.unsatisfied_waits`, exec.ID).
+			GROUP BY c.command_id,c.state,c.unsatisfied_waits`, exec.RunID).
 			Scan(&state, &unsatisfied, &satisfied, &queued)
 		if err == nil && state == "ready" && unsatisfied == 0 && satisfied == 2 && queued == 1 {
 			break
@@ -226,10 +227,10 @@ func TestWorkerSettlementReleasesSeveralWaitsAsOneDelta(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if err := CancelRun(ctx, runtime, exec.ID, "batched event delta test complete"); err != nil {
+	if err := CancelRun(ctx, runtime, exec.RunID, "batched event delta test complete"); err != nil {
 		t.Fatal(err)
 	}
-	assertReplayMatches(t, runtime, exec.ID)
+	assertReplayMatches(t, runtime, exec.RunID)
 }
 
 func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
@@ -266,7 +267,7 @@ func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
 		err := database.DB.Conn.QueryRow(ctx, `SELECT c.state,e.status
 			FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 			JOIN `+pgschema.Table(database.Schema, "flow_runs")+` e USING(run_id)
-			WHERE c.run_id=$1 AND c.command_key='expiring'`, exec.ID).Scan(&state, &runState)
+			WHERE c.run_id=$1 AND c.command_key='expiring'`, exec.RunID).Scan(&state, &runState)
 		if err == nil && state == "expired" && runState == "running" {
 			break
 		}
@@ -275,7 +276,7 @@ func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if err := late.Deliver(ctx, runtime, exec.ID, "late", None{}); err != nil {
+	if err := late.Deliver(ctx, runtime, exec.RunID, "late", None{}); err != nil {
 		t.Fatalf("late event into live run: %v", err)
 	}
 	var state string
@@ -288,7 +289,7 @@ func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` q WHERE q.command_id=c.command_id)
 		FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 		JOIN `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w USING(command_id)
-		WHERE c.run_id=$1 AND c.command_key='expiring'`, exec.ID, late.Name()).
+		WHERE c.run_id=$1 AND c.command_key='expiring'`, exec.RunID, late.Name()).
 		Scan(&state, &unsatisfied, &satisfyingPosition, &waitDeadline, &recordedAt, &queued); err != nil {
 		t.Fatal(err)
 	}
@@ -296,10 +297,10 @@ func TestEventAfterWaitDeadlineDoesNotResurrectCommandInLiveRun(t *testing.T) {
 		t.Fatalf("late event resurrected/changed command: state=%s waits=%d position=%v queued=%d deadline=%s event=%s",
 			state, unsatisfied, satisfyingPosition, queued, waitDeadline, recordedAt)
 	}
-	if err := CancelRun(ctx, runtime, exec.ID, "late event test complete"); err != nil {
+	if err := CancelRun(ctx, runtime, exec.RunID, "late event test complete"); err != nil {
 		t.Fatal(err)
 	}
-	assertReplayMatches(t, runtime, exec.ID)
+	assertReplayMatches(t, runtime, exec.RunID)
 }
 
 func TestWaitExpiryReconciliationAcceptsEventAtExactDeadline(t *testing.T) {
@@ -319,32 +320,33 @@ func TestWaitExpiryReconciliationAcceptsEventAtExactDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	execRun := mustGetRun(t, runtime, exec.RunID)
 	tx, err := database.DB.Conn.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	if err := event.Deliver(ctx, runtime.InTx(tx), exec.ID, "ready", "accepted"); err != nil {
+	if err := event.Deliver(ctx, runtime.InTx(tx), exec.RunID, "ready", "accepted"); err != nil {
 		t.Fatal(err)
 	}
 	var position int64
 	var recordedAt time.Time
 	if err := tx.QueryRow(ctx, `SELECT position,recorded_at FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE run_id=$1 AND event_class='application' AND event_name=$2 AND event_key='ready'`, exec.ID, event.Name()).
+		WHERE run_id=$1 AND event_class='application' AND event_name=$2 AND event_key='ready'`, exec.RunID, event.Name()).
 		Scan(&position, &recordedAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_commands")+`
 		SET state='pending',unsatisfied_waits=1,budget_started_at=NULL,next_attempt_at=NULL,
-		    wait_deadline_at=$2,updated_at=$2,status_at=$2 WHERE command_id=$1`, exec.RootCommandID, recordedAt); err != nil {
+		    wait_deadline_at=$2,updated_at=$2,status_at=$2 WHERE command_id=$1`, execRun.RootCommandID, recordedAt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_command_event_waits")+`
-		SET satisfied_position=NULL WHERE command_id=$1`, exec.RootCommandID); err != nil {
+		SET satisfied_position=NULL WHERE command_id=$1`, execRun.RootCommandID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM `+pgschema.Table(database.Schema, "flow_command_queue")+`
-		WHERE command_id=$1`, exec.RootCommandID); err != nil {
+		WHERE command_id=$1`, execRun.RootCommandID); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -354,7 +356,7 @@ func TestWaitExpiryReconciliationAcceptsEventAtExactDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 1 || candidates[0].CommandID.String() != string(exec.RootCommandID) {
+	if len(candidates) != 1 || candidates[0].CommandID.String() != string(execRun.RootCommandID) {
 		t.Fatalf("expired wait candidates=%+v", candidates)
 	}
 	changed, err := runtime.store.ExpireCommandWait(ctx, candidates[0])
@@ -371,17 +373,17 @@ func TestWaitExpiryReconciliationAcceptsEventAtExactDeadline(t *testing.T) {
 		(SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_command_queue")+` q WHERE q.command_id=c.command_id)
 		FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 		JOIN `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w USING(command_id)
-		WHERE c.command_id=$1`, exec.RootCommandID).Scan(&state, &unsatisfied, &satisfiedPosition, &queued); err != nil {
+		WHERE c.command_id=$1`, execRun.RootCommandID).Scan(&state, &unsatisfied, &satisfiedPosition, &queued); err != nil {
 		t.Fatal(err)
 	}
 	if state != "ready" || unsatisfied != 0 || queued != 1 || satisfiedPosition != position {
 		t.Fatalf("exact-deadline projection state=%s waits=%d queued=%d position=%d want %d",
 			state, unsatisfied, queued, satisfiedPosition, position)
 	}
-	if err := CancelRun(ctx, runtime, exec.ID, "exact deadline test complete"); err != nil {
+	if err := CancelRun(ctx, runtime, exec.RunID, "exact deadline test complete"); err != nil {
 		t.Fatal(err)
 	}
-	assertReplayMatches(t, runtime, exec.ID)
+	assertReplayMatches(t, runtime, exec.RunID)
 }
 
 func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
@@ -419,8 +421,9 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	execRun := mustGetRun(t, runtime, exec.RunID)
 	repeated, err := command.Enqueue(ctx, runtime, "direct", None{}, WaitFor(event, "ready"), Within(2*time.Second))
-	if err != nil || repeated.Created || repeated.ID != exec.ID {
+	if err != nil || repeated.Created || repeated.RunID != exec.RunID {
 		t.Fatalf("equivalent gated start = %+v, %v", repeated, err)
 	}
 	if _, err := command.Enqueue(ctx, runtime, "direct", None{}, WaitFor(event, "other"), Within(2*time.Second)); !errors.Is(err, ErrConflict) {
@@ -430,7 +433,7 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 	var state string
 	var unsatisfied int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT state,unsatisfied_waits FROM `+
-		pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1`, exec.RootCommandID).
+		pgschema.Table(database.Schema, "flow_commands")+` WHERE command_id=$1`, execRun.RootCommandID).
 		Scan(&state, &unsatisfied); err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +442,7 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 	}
 	var queued int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+
-		pgschema.Table(database.Schema, "flow_command_queue")+` WHERE command_id=$1`, exec.RootCommandID).Scan(&queued); err != nil {
+		pgschema.Table(database.Schema, "flow_command_queue")+` WHERE command_id=$1`, execRun.RootCommandID).Scan(&queued); err != nil {
 		t.Fatal(err)
 	}
 	if queued != 0 {
@@ -448,31 +451,31 @@ func TestDirectRootWaitsForExactApplicationEvent(t *testing.T) {
 
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	if err := event.Deliver(ctx, runtime, exec.ID, "not-ready", "ignored"); err != nil {
+	if err := event.Deliver(ctx, runtime, exec.RunID, "not-ready", "ignored"); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if calls.Load() != 0 {
 		t.Fatalf("non-matching event released root, calls=%d", calls.Load())
 	}
-	if err := event.Deliver(ctx, runtime, exec.ID, "ready", "approved"); err != nil {
+	if err := event.Deliver(ctx, runtime, exec.RunID, "ready", "approved"); err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "succeeded", 5*time.Second)
 	if calls.Load() != 1 {
 		t.Fatalf("worker calls=%d", calls.Load())
 	}
 	if value, _ := received.Load().(string); value != "approved" {
 		t.Fatalf("GetEventValue payload=%q", value)
 	}
-	trace, err := Trace(ctx, runtime, exec.ID)
+	trace, err := Trace(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(trace.Commands) != 1 || len(trace.Commands[0].Waits) != 1 || trace.Commands[0].Waits[0].SatisfiedPosition == nil {
 		t.Fatalf("trace wait satisfaction=%+v", trace.Commands)
 	}
-	assertReplayMatches(t, runtime, exec.ID)
+	assertReplayMatches(t, runtime, exec.RunID)
 }
 
 func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
@@ -513,24 +516,24 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(80 * time.Millisecond)
-	run, err := GetRun(ctx, runtime, open.ID)
+	run, err := GetRun(ctx, runtime, open.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if run.Status != "running" {
 		t.Fatalf("optional command without Within status=%s, want running", run.Status)
 	}
-	if err := event.Deliver(ctx, runtime, open.ID, "ready", None{}); err != nil {
+	if err := event.Deliver(ctx, runtime, open.RunID, "ready", None{}); err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, open.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, open.RunID, "succeeded", 5*time.Second)
 
 	expiring, err := parent.Enqueue(ctx, runtime, "optional/expiring", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, expiring.ID, "succeeded", 5*time.Second)
-	trace, err := Trace(ctx, runtime, expiring.ID)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, expiring.RunID, "succeeded", 5*time.Second)
+	trace, err := Trace(ctx, runtime, expiring.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,8 +551,8 @@ func TestOptionalEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, deadline.ID, "expired", 5*time.Second)
-	deadlineTrace, err := Trace(ctx, runtime, deadline.ID)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, deadline.RunID, "expired", 5*time.Second)
+	deadlineTrace, err := Trace(ctx, runtime, deadline.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +606,8 @@ func TestWorkerEventSatisfiesNewChildGateInSameDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	execRun := mustGetRun(t, runtime, exec.RunID)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "succeeded", 5*time.Second)
 	if childCalls.Load() != 1 {
 		t.Fatalf("child calls=%d", childCalls.Load())
 	}
@@ -612,7 +616,7 @@ func TestWorkerEventSatisfiesNewChildGateInSameDecision(t *testing.T) {
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT c.wait_started_at,w.satisfied_position,c.created_position
 		FROM `+pgschema.Table(database.Schema, "flow_commands")+` c
 		JOIN `+pgschema.Table(database.Schema, "flow_command_event_waits")+` w USING (command_id)
-		WHERE c.run_id=$1 AND c.command_key='child'`, exec.ID).
+		WHERE c.run_id=$1 AND c.command_key='child'`, exec.RunID).
 		Scan(&waitStarted, &satisfiedPosition, &childCreatedPosition); err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +625,7 @@ func TestWorkerEventSatisfiesNewChildGateInSameDecision(t *testing.T) {
 		(SELECT position FROM `+pgschema.Table(database.Schema, "flow_journal")+`
 		 WHERE run_id=$1 AND event_class='application' AND event_name=$2 AND event_key='ready'),
 		(SELECT terminal_position FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-		 WHERE command_id=$3)`, exec.ID, event.Name(), exec.RootCommandID).
+			 WHERE command_id=$3)`, exec.RunID, event.Name(), execRun.RootCommandID).
 		Scan(&applicationPosition, &parentTerminalPosition); err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +692,7 @@ func TestWorkerStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 		var state string
 		var unsatisfied int
 		err := database.DB.Conn.QueryRow(ctx, `SELECT state,unsatisfied_waits FROM `+
-			pgschema.Table(database.Schema, "flow_commands")+` WHERE run_id=$1 AND command_key='child'`, exec.ID).
+			pgschema.Table(database.Schema, "flow_commands")+` WHERE run_id=$1 AND command_key='child'`, exec.RunID).
 			Scan(&state, &unsatisfied)
 		if err == nil && state == "pending" && unsatisfied == 1 {
 			break
@@ -698,21 +702,21 @@ func TestWorkerStagesMultipleEventGatesWithANDSemantics(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if err := wrong.Deliver(ctx, runtime, exec.ID, "second", None{}); err != nil {
+	if err := wrong.Deliver(ctx, runtime, exec.RunID, "second", None{}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if childCalls.Load() != 0 {
 		t.Fatalf("wrong event name released child, calls=%d", childCalls.Load())
 	}
-	if err := second.Deliver(ctx, runtime, exec.ID, "second", None{}); err != nil {
+	if err := second.Deliver(ctx, runtime, exec.RunID, "second", None{}); err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "succeeded", 5*time.Second)
 	if childCalls.Load() != 1 {
 		t.Fatalf("child calls=%d", childCalls.Load())
 	}
-	assertReplayMatches(t, runtime, exec.ID)
+	assertReplayMatches(t, runtime, exec.RunID)
 }
 
 func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
@@ -753,8 +757,8 @@ func TestRequiredChildFailureCancelsGatedJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
-	trace, err := Trace(ctx, runtime, exec.ID)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failed", 5*time.Second)
+	trace, err := Trace(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,19 +799,19 @@ func TestWaitCanExpireWhileInitialDelayIsPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "failed", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "failed", 5*time.Second)
 	if calls.Load() != 0 {
 		t.Fatalf("expired delayed command ran %d times", calls.Load())
 	}
-	trace, err := Trace(ctx, runtime, exec.ID)
+	trace, err := Trace(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(trace.Commands) != 1 || trace.Commands[0].State != CommandStatusExpired || trace.Commands[0].Failure == nil || trace.Commands[0].Failure.Code != "wait_expired" {
 		t.Fatalf("expired gate trace=%+v", trace.Commands)
 	}
-	if err := event.Deliver(ctx, runtime, exec.ID, "missing", None{}); !errors.Is(err, ErrTerminal) {
+	if err := event.Deliver(ctx, runtime, exec.RunID, "missing", None{}); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("late event error=%v, want ErrTerminal", err)
 	}
-	assertReplayMatches(t, runtime, exec.ID)
+	assertReplayMatches(t, runtime, exec.RunID)
 }

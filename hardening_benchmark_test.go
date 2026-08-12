@@ -79,7 +79,7 @@ func BenchmarkIndependentCommandLifecycle(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := range b.N {
-				runs := make([]Run, benchmarkLifecycleBatchSize)
+				runs := make([]EnqueueResult, benchmarkLifecycleBatchSize)
 				err := runBenchmarkProducers(producers, benchmarkLifecycleBatchSize, func(index int) error {
 					var executeErr error
 					runs[index], executeErr = command.Enqueue(ctx, runtime,
@@ -91,7 +91,7 @@ func BenchmarkIndependentCommandLifecycle(b *testing.B) {
 				}
 				waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				for _, run := range runs {
-					settled, awaitErr := AwaitRun(waitCtx, runtime, run.ID)
+					settled, awaitErr := AwaitRun(waitCtx, runtime, run.RunID)
 					if awaitErr != nil || settled.Status != RunStatusSucceeded || settled.CommandCount != 1 {
 						cancel()
 						b.Fatalf("AwaitRun() = status %q commands %d, err %v",
@@ -169,7 +169,7 @@ func benchmarkSameRunFanout(b *testing.B, commandCount int) {
 			b.Fatal(executeErr)
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		settled, awaitErr := AwaitRun(waitCtx, runtime, run.ID)
+		settled, awaitErr := AwaitRun(waitCtx, runtime, run.RunID)
 		cancel()
 		if awaitErr != nil || settled.Status != RunStatusSucceeded || settled.CommandCount != commandCount {
 			b.Fatalf("AwaitRun() = status %q commands %d, err %v",
@@ -221,7 +221,7 @@ func BenchmarkSameRunClaimBatch(b *testing.B) {
 			FROM `+pgschema.Table(database.Schema, "flow_runs")+` e
 			JOIN `+pgschema.Table(database.Schema, "flow_commands")+` c
 			  ON c.run_id=e.run_id AND c.command_id=e.root_command_id
-			WHERE e.run_id=$1`, run.ID).Scan(&persistedCommands, &parentState); err != nil {
+			WHERE e.run_id=$1`, run.RunID).Scan(&persistedCommands, &parentState); err != nil {
 			stop()
 			b.Fatal(err)
 		}
@@ -370,7 +370,7 @@ func BenchmarkExternalEventIngress(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			targets[index] = benchmarkEventTarget{runID: run.ID, key: fmt.Sprintf("event/%d", index)}
+			targets[index] = benchmarkEventTarget{runID: run.RunID, key: fmt.Sprintf("event/%d", index)}
 		}
 		benchmarkEventTargets(b, runtime, event, targets)
 	})
@@ -384,7 +384,7 @@ func BenchmarkExternalEventIngress(b *testing.B) {
 		}
 		targets := make([]benchmarkEventTarget, b.N)
 		for index := range b.N {
-			targets[index] = benchmarkEventTarget{runID: run.ID, key: fmt.Sprintf("event/%d", index)}
+			targets[index] = benchmarkEventTarget{runID: run.RunID, key: fmt.Sprintf("event/%d", index)}
 		}
 		benchmarkEventTargets(b, runtime, event, targets)
 	})
@@ -576,11 +576,12 @@ func claimBenchmarkRoot(
 	if err != nil {
 		b.Fatal(err)
 	}
-	commandID, err := uuid.Parse(string(run.RootCommandID))
+	runSnapshot := mustGetRun(b, runtime, run.RunID)
+	commandID, err := uuid.Parse(string(runSnapshot.RootCommandID))
 	if err != nil {
 		b.Fatal(err)
 	}
-	runID, err := uuid.Parse(string(run.ID))
+	runID, err := uuid.Parse(string(run.RunID))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -767,16 +768,17 @@ func benchmarkEventSnapshotMaterialization(b *testing.B, inputCount int, payload
 	if err != nil {
 		b.Fatal(err)
 	}
+	execRun := mustGetRun(b, runtime, exec.RunID)
 	for wait := range inputCount {
-		if err := event.Deliver(ctx, runtime, exec.ID, fmt.Sprintf("input/%03d", wait), payload); err != nil {
+		if err := event.Deliver(ctx, runtime, exec.RunID, fmt.Sprintf("input/%03d", wait), payload); err != nil {
 			b.Fatal(err)
 		}
 	}
-	commandID, err := uuid.Parse(string(exec.RootCommandID))
+	commandID, err := uuid.Parse(string(execRun.RootCommandID))
 	if err != nil {
 		b.Fatal(err)
 	}
-	runID, err := uuid.Parse(string(exec.ID))
+	runID, err := uuid.Parse(string(exec.RunID))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -933,14 +935,14 @@ func startHundredCommandRun(tb benchmarkTB, database testpg.Database, ctx contex
 		tb.Fatal(err)
 	}
 	deadlineCtx, deadlineCancel := context.WithTimeout(ctx, 10*time.Second)
-	settled, err := AwaitRun(deadlineCtx, runtime, exec.ID)
+	settled, err := AwaitRun(deadlineCtx, runtime, exec.RunID)
 	deadlineCancel()
 	if err != nil || settled.Status != "succeeded" || settled.CommandCount != 100 {
 		cancel()
 		<-runResult
 		tb.Fatal("hundred-command run failed", err, settled)
 	}
-	return runtime, exec, func() {
+	return runtime, settled, func() {
 		cancel()
 		<-runResult
 	}

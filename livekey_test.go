@@ -32,11 +32,12 @@ func TestRenamedStoreGetContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runID, err := parseRunID(run.ID)
+	runID, err := parseRunID(run.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	commandID, err := parseCommandID(run.RootCommandID)
+	runSnapshot := mustGetRun(t, runtime, run.RunID)
+	commandID, err := parseCommandID(runSnapshot.RootCommandID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,14 +70,14 @@ func TestRenamedStoreGetContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := event.Deliver(ctx, runtime, run.ID, "ready", "value"); err != nil {
+	if err := event.Deliver(ctx, runtime, run.RunID, "ready", "value"); err != nil {
 		t.Fatal(err)
 	}
 	record, found, err := runtime.store.GetEvent(ctx, nil, runID, event.Name(), "ready")
 	if err != nil || !found || record.ID == uuid.Nil || len(record.Body) == 0 {
 		t.Fatalf("GetEvent(present) = %#v, %v, %v", record, found, err)
 	}
-	if err := CancelRun(ctx, runtime, run.ID, "store get contract complete"); err != nil {
+	if err := CancelRun(ctx, runtime, run.RunID, "store get contract complete"); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := runtime.store.GetCurrentRun(ctx, nil, command.Name(), "entity/gets"); err != nil || found {
@@ -86,6 +87,61 @@ func TestRenamedStoreGetContracts(t *testing.T) {
 
 type liveKeyResult struct {
 	Value string `json:"value"`
+}
+
+func TestCommandGetCurrentRunUsesDefinitionNameAndCallerTransaction(t *testing.T) {
+	t.Parallel()
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := DefineCommand[None, None]("current_run.command", 1, WithQueue("current_run.queue"))
+	v2 := DefineCommand[None, None](v1.Name(), 2, WithQueue("current_run.queue"))
+	started, err := v1.Enqueue(ctx, runtime, "current/visible", None{}, WithLiveKey(), WithStartDelay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromMethod, found, err := v1.GetCurrentRun(ctx, runtime, "current/visible")
+	if err != nil || !found || fromMethod.ID != started.RunID || fromMethod.Version != 1 {
+		t.Fatalf("Command.GetCurrentRun(v1) = %#v, %t, %v", fromMethod, found, err)
+	}
+	fromNewVersion, found, err := v2.GetCurrentRun(ctx, runtime, "current/visible")
+	if err != nil || !found || fromNewVersion.ID != started.RunID || fromNewVersion.Version != 1 {
+		t.Fatalf("Command.GetCurrentRun(v2) = %#v, %t, %v", fromNewVersion, found, err)
+	}
+	fromTopLevel, found, err := GetCurrentRun(ctx, runtime, v1.Name(), "current/visible")
+	if err != nil || !found || fromTopLevel.ID != started.RunID {
+		t.Fatalf("GetCurrentRun() = %#v, %t, %v", fromTopLevel, found, err)
+	}
+	if _, found, err := GetCurrentRun(ctx, runtime, v1.Queue(), "current/visible"); err != nil || found {
+		t.Fatalf("GetCurrentRun(queue) found=%t error=%v", found, err)
+	}
+	if _, _, err := (Command[None, None]{}).GetCurrentRun(ctx, runtime, "current/visible"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("zero Command.GetCurrentRun() error=%v", err)
+	}
+
+	tx, err := database.DB.Conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	txClient := runtime.InTx(tx)
+	uncommitted, err := v1.Enqueue(ctx, txClient, "current/uncommitted", None{}, WithLiveKey(), WithStartDelay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inside, found, err := v1.GetCurrentRun(ctx, txClient, "current/uncommitted")
+	if err != nil || !found || inside.ID != uncommitted.RunID {
+		t.Fatalf("transaction Command.GetCurrentRun() = %#v, %t, %v", inside, found, err)
+	}
+	if _, found, err := v1.GetCurrentRun(ctx, runtime, "current/uncommitted"); err != nil || found {
+		t.Fatalf("outside Command.GetCurrentRun(uncommitted) found=%t error=%v", found, err)
+	}
 }
 
 // A live-scoped key is held while its run is non-terminal — repeated
@@ -133,21 +189,21 @@ func TestLiveKeyReleasesOnSettlement(t *testing.T) {
 	// different arguments both rediscover it silently: live keys are a dedupe
 	// on the entity, not an identity assertion.
 	same, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "a"}, WithLiveKey())
-	if err != nil || same.Created || same.ID != first.ID {
+	if err != nil || same.Created || same.RunID != first.RunID {
 		t.Fatalf("equivalent live start = %#v, %v", same, err)
 	}
 	different, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "different"}, WithLiveKey())
-	if err != nil || different.Created || different.ID != first.ID {
+	if err != nil || different.Created || different.RunID != first.RunID {
 		t.Fatalf("differing live start = %#v, %v", different, err)
 	}
 
 	live, found, err := GetCurrentRun(ctx, runtime, command.Name(), "entity/1")
-	if err != nil || !found || live.ID != first.ID {
+	if err != nil || !found || live.ID != first.RunID {
 		t.Fatalf("GetCurrentRun(live) = %#v, %v, %v", live, found, err)
 	}
 
 	close(release)
-	if _, err := AwaitRun(ctx, runtime, first.ID); err != nil {
+	if _, err := AwaitRun(ctx, runtime, first.RunID); err != nil {
 		t.Fatalf("AwaitRun() error = %v", err)
 	}
 
@@ -157,10 +213,10 @@ func TestLiveKeyReleasesOnSettlement(t *testing.T) {
 
 	// The settled run released the key: the same key starts fresh work.
 	second, err := command.Enqueue(ctx, runtime, "entity/1", liveKeyArgs{Value: "b"}, WithLiveKey())
-	if err != nil || !second.Created || second.ID == first.ID {
+	if err != nil || !second.Created || second.RunID == first.RunID {
 		t.Fatalf("post-settlement live start = %#v, %v", second, err)
 	}
-	if _, err := AwaitRun(ctx, runtime, second.ID); err != nil {
+	if _, err := AwaitRun(ctx, runtime, second.RunID); err != nil {
 		t.Fatalf("AwaitRun(second) error = %v", err)
 	}
 	if got := invocations.Load(); got != 2 {
@@ -238,7 +294,7 @@ func TestStartDelayDefersRootDelivery(t *testing.T) {
 	defer stop()
 	go runtime.Run(runCtx) //nolint:errcheck // returns nil on cancel
 
-	run, err := AwaitRun(ctx, runtime, exec.ID)
+	run, err := AwaitRun(ctx, runtime, exec.RunID)
 	if err != nil {
 		t.Fatalf("AwaitRun() error = %v", err)
 	}

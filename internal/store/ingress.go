@@ -74,11 +74,10 @@ type StartRequest struct {
 	Root              *CommandCreate
 }
 
-// StartResult carries the accepted run row as of durable acceptance.
-// Created is false when an idempotent start rediscovered an existing
-// run.
+// StartResult carries the accepted run identity. Created is false when an
+// idempotent start rediscovered an existing run.
 type StartResult struct {
-	Row     RunRow
+	ID      uuid.UUID
 	Created bool
 }
 
@@ -145,11 +144,7 @@ func (s *Store) ReplaceCurrentRunInTx(
 		if !bytes.Equal(currentFingerprint, request.Start.StartFingerprint[:]) {
 			return ReplaceRunResult{}, fmt.Errorf("%w: current run declaration differs", flowerr.ErrConflict)
 		}
-		row, err := s.GetRunInTx(ctx, tx, currentID)
-		if err != nil {
-			return ReplaceRunResult{}, err
-		}
-		return ReplaceRunResult{Start: StartResult{Row: row}}, nil
+		return ReplaceRunResult{Start: StartResult{ID: currentID}}, nil
 	}
 
 	cancelled, err := s.CancelRunLocked(ctx, semantic, request.Reason)
@@ -163,7 +158,7 @@ func (s *Store) ReplaceCurrentRunInTx(
 	if err != nil {
 		return ReplaceRunResult{}, err
 	}
-	if !started.Created || started.Row.ID == request.Expected {
+	if !started.Created || started.ID == request.Expected {
 		return ReplaceRunResult{}, fmt.Errorf("%w: replacement run was not created", flowerr.ErrInvalidState)
 	}
 	return ReplaceRunResult{Start: started, Replaced: true}, nil
@@ -276,14 +271,7 @@ func (s *Store) startAttempt(ctx context.Context, tx pgx.Tx, request StartReques
 			return StartResult{}, false, err
 		}
 	}
-	// Mirror the row this transaction just inserted instead of re-reading it.
-	return StartResult{Row: RunRow{
-		ID: request.ID, DefinitionName: request.DefinitionName, DefinitionVersion: request.DefinitionVersion,
-		Key: request.Key, RootCommandID: clonePointer(rootID), Status: "running", FailFast: request.FailFast,
-		MaxCommands: request.MaxCommands, CommandCount: commandCount, OpenCommands: commandCount,
-		DeadlineAt: clonePointer(deadlineAt), CreatedAt: dbNow, UpdatedAt: dbNow, StatusAt: dbNow,
-		Metadata: request.Metadata.BytesCopy(),
-	}, Created: true}, false, nil
+	return StartResult{ID: request.ID, Created: true}, false, nil
 }
 
 // loadEquivalentStart resolves an insert that conflicted on the idempotency
@@ -336,11 +324,7 @@ func (s *Store) loadEquivalentStart(
 			status != "running" && status != "failing" {
 			return StartResult{}, true, fmt.Errorf("%w: live key holder changed during start", flowerr.ErrConflict)
 		}
-		row, err := s.GetRunInTx(ctx, tx, id)
-		if err != nil {
-			return StartResult{}, false, err
-		}
-		return StartResult{Row: row, Created: false}, false, nil
+		return StartResult{ID: id, Created: false}, false, nil
 	}
 	var id uuid.UUID
 	err := tx.QueryRow(ctx, `SELECT run_id
@@ -374,11 +358,7 @@ func (s *Store) loadEquivalentStart(
 		!bytes.Equal(input, request.Input.Bytes) || !bytes.Equal(metadata, request.Metadata.Bytes) {
 		return StartResult{}, false, fmt.Errorf("%w: run start identity differs", flowerr.ErrConflict)
 	}
-	row, err := s.GetRunInTx(ctx, tx, id)
-	if err != nil {
-		return StartResult{}, false, err
-	}
-	return StartResult{Row: row, Created: false}, false, nil
+	return StartResult{ID: id, Created: false}, false, nil
 }
 
 func startJournalEntries(request StartRequest, dbNow time.Time, deadlineAt *time.Time) ([]JournalEntry, error) {

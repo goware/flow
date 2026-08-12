@@ -13,11 +13,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Run is a durable run state snapshot. Enqueue returns the
-// snapshot as of durable acceptance; GetRun, AwaitRun, and other
-// inspection reads return the current or final state. Created reports whether
-// the producing Enqueue call created the run; it is false for an
-// idempotent rediscovery and always false on inspection reads.
+// Run is a durable run state snapshot returned by GetRun, AwaitRun, and other
+// inspection reads. Enqueue and ReplaceCurrentRun return compact operation
+// results instead of snapshots.
 type Run struct {
 	ID            RunID
 	Type          string
@@ -36,7 +34,6 @@ type Run struct {
 	StatusAt      time.Time
 	FinishedAt    *time.Time
 	Metadata      json.RawMessage
-	Created       bool
 }
 
 type TraceAttempt struct {

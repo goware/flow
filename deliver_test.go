@@ -69,15 +69,15 @@ func TestDeliverFromActiveWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	producerHandle, err := producer.Enqueue(ctx, runtime, "producer", targetHandle.ID)
+	producerHandle, err := producer.Enqueue(ctx, runtime, "producer", targetHandle.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
 
-	waitForRunStatus(t, database.Schema, database.DB.Conn, targetHandle.ID, "succeeded", 5*time.Second)
-	waitForRunStatus(t, database.Schema, database.DB.Conn, producerHandle.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, targetHandle.RunID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, producerHandle.RunID, "succeeded", 5*time.Second)
 	select {
 	case payload := <-received:
 		if payload.Value != "complete" {
@@ -96,7 +96,7 @@ func TestDeliverFromActiveWorker(t *testing.T) {
 	}
 	var eventCount int
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE run_id=$1 AND event_class='application' AND event_name=$2`, targetHandle.ID, event.Name()).Scan(&eventCount); err != nil {
+		WHERE run_id=$1 AND event_class='application' AND event_name=$2`, targetHandle.RunID, event.Name()).Scan(&eventCount); err != nil {
 		t.Fatal(err)
 	}
 	if eventCount != 1 {
@@ -155,12 +155,13 @@ func TestDeliverInCallerTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	flowTx := runtime.InTx(tx)
-	if err := event.Deliver(ctx, flowTx, committed.ID, "done", deliveredPayload{Value: "committed"}); err != nil {
+	if err := event.Deliver(ctx, flowTx, committed.RunID, "done", deliveredPayload{Value: "committed"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := flowTx.BeginApplicationWrites(); err != nil {
 		t.Fatal(err)
 	}
+	committedRun := mustGetRun(t, flowTx, committed.RunID)
 	if _, err := tx.Exec(ctx, `INSERT INTO `+pgschema.Table(database.Schema, "delivery_records")+` (id) VALUES ('committed')`); err != nil {
 		t.Fatal(err)
 	}
@@ -171,11 +172,11 @@ func TestDeliverInCallerTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := observer.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE run_id=$1 AND event_class='application' AND event_name=$2`, committed.ID, event.Name()).Scan(&committedEvents); err != nil {
+		WHERE run_id=$1 AND event_class='application' AND event_name=$2`, committed.RunID, event.Name()).Scan(&committedEvents); err != nil {
 		t.Fatal(err)
 	}
 	if err := observer.QueryRow(ctx, `SELECT state FROM `+pgschema.Table(database.Schema, "flow_commands")+`
-		WHERE command_id=$1`, committed.RootCommandID).Scan(&commandState); err != nil {
+		WHERE command_id=$1`, committedRun.RootCommandID).Scan(&commandState); err != nil {
 		t.Fatal(err)
 	}
 	if applicationRows != 0 || committedEvents != 0 || commandState != "pending" {
@@ -184,13 +185,13 @@ func TestDeliverInCallerTransaction(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, committed.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, committed.RunID, "succeeded", 5*time.Second)
 	if err := observer.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "delivery_records")+`
 		WHERE id='committed'`).Scan(&applicationRows); err != nil {
 		t.Fatal(err)
 	}
 	if err := observer.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE run_id=$1 AND event_class='application' AND event_name=$2`, committed.ID, event.Name()).Scan(&committedEvents); err != nil {
+		WHERE run_id=$1 AND event_class='application' AND event_name=$2`, committed.RunID, event.Name()).Scan(&committedEvents); err != nil {
 		t.Fatal(err)
 	}
 	if applicationRows != 1 || committedEvents != 1 {
@@ -202,7 +203,7 @@ func TestDeliverInCallerTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	flowTx = runtime.InTx(tx)
-	if err := event.Deliver(ctx, flowTx, rolledBack.ID, "done", deliveredPayload{Value: "rolled-back"}); err != nil {
+	if err := event.Deliver(ctx, flowTx, rolledBack.RunID, "done", deliveredPayload{Value: "rolled-back"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := flowTx.BeginApplicationWrites(); err != nil {
@@ -220,7 +221,7 @@ func TestDeliverInCallerTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := observer.QueryRow(ctx, `SELECT count(*) FROM `+pgschema.Table(database.Schema, "flow_journal")+`
-		WHERE run_id=$1 AND event_class='application' AND event_name=$2`, rolledBack.ID, event.Name()).Scan(&rolledBackEvents); err != nil {
+		WHERE run_id=$1 AND event_class='application' AND event_name=$2`, rolledBack.RunID, event.Name()).Scan(&rolledBackEvents); err != nil {
 		t.Fatal(err)
 	}
 	if applicationRows != 1 || rolledBackEvents != 0 {
@@ -228,7 +229,7 @@ func TestDeliverInCallerTransaction(t *testing.T) {
 	}
 	select {
 	case id := <-runs:
-		if id != committed.ID {
+		if id != committed.RunID {
 			t.Fatalf("rolled-back target %s ran", id)
 		}
 	default:
@@ -278,13 +279,13 @@ func TestDeliverIdentityLifecycleAndGateParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := event.Deliver(ctx, runtime, first.ID, "ready", payload); err != nil {
+	if err := event.Deliver(ctx, runtime, first.RunID, "ready", payload); err != nil {
 		t.Fatal(err)
 	}
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
-	waitForRunStatus(t, database.Schema, database.DB.Conn, first.ID, "succeeded", 5*time.Second)
-	if err := event.Deliver(ctx, runtime, first.ID, "late", payload); !errors.Is(err, ErrTerminal) {
+	waitForRunStatus(t, database.Schema, database.DB.Conn, first.RunID, "succeeded", 5*time.Second)
+	if err := event.Deliver(ctx, runtime, first.RunID, "late", payload); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("Deliver(terminal) error = %v, want ErrTerminal", err)
 	}
 
@@ -292,26 +293,26 @@ func TestDeliverIdentityLifecycleAndGateParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !second.Created || second.ID == first.ID {
+	if !second.Created || second.RunID == first.RunID {
 		t.Fatalf("new stage exec = %#v, first = %#v", second, first)
 	}
-	if err := event.Deliver(ctx, runtime, second.ID, "ready", payload); err != nil {
+	if err := event.Deliver(ctx, runtime, second.RunID, "ready", payload); err != nil {
 		t.Fatal(err)
 	}
-	if err := event.Deliver(ctx, runtime, second.ID, "ready", payload); err != nil {
+	if err := event.Deliver(ctx, runtime, second.RunID, "ready", payload); err != nil {
 		t.Fatalf("idempotent Deliver() error = %v", err)
 	}
-	if err := event.Deliver(ctx, runtime, second.ID, "ready", deliveredPayload{Value: "changed"}); !errors.Is(err, ErrConflict) {
+	if err := event.Deliver(ctx, runtime, second.RunID, "ready", deliveredPayload{Value: "changed"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting Deliver() error = %v, want ErrConflict", err)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, second.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, second.RunID, "succeeded", 5*time.Second)
 
 	seen := make(map[RunID]deliveredPayload, 2)
 	for range 2 {
 		value := <-received
 		seen[value.ID] = value.Payload
 	}
-	if seen[first.ID] != payload || seen[second.ID] != payload {
+	if seen[first.RunID] != payload || seen[second.RunID] != payload {
 		t.Fatalf("Emit/Deliver gate payloads = %#v", seen)
 	}
 }
@@ -361,10 +362,10 @@ func TestDeliverMultiProducerFanIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	producers := make([]Run, 0, len(keys))
+	producers := make([]EnqueueResult, 0, len(keys))
 	for index, key := range keys {
 		exec, err := producer.Enqueue(ctx, runtime, key, deliveredPart{
-			Target: joinHandle.ID, Key: key, Value: string(rune('A' + index)),
+			Target: joinHandle.RunID, Key: key, Value: string(rune('A' + index)),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -374,13 +375,13 @@ func TestDeliverMultiProducerFanIn(t *testing.T) {
 	cancel, runResult := startRuntime(t, runtime)
 	defer stopRuntime(t, cancel, runResult)
 	for _, exec := range producers {
-		waitForRunStatus(t, database.Schema, database.DB.Conn, exec.ID, "succeeded", 5*time.Second)
+		waitForRunStatus(t, database.Schema, database.DB.Conn, exec.RunID, "succeeded", 5*time.Second)
 	}
-	waitForRunStatus(t, database.Schema, database.DB.Conn, joinHandle.ID, "succeeded", 5*time.Second)
+	waitForRunStatus(t, database.Schema, database.DB.Conn, joinHandle.RunID, "succeeded", 5*time.Second)
 	if values := <-joined; len(values) != 3 || values[0] != "A" || values[1] != "B" || values[2] != "C" {
 		t.Fatalf("joined payloads = %#v", values)
 	}
-	trace, err := Trace(ctx, runtime, joinHandle.ID)
+	trace, err := Trace(ctx, runtime, joinHandle.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}

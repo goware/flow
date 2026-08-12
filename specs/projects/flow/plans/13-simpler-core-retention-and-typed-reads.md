@@ -1259,16 +1259,16 @@ exact accepted commit.
 
 ### Definition-bound reads and compact results
 
-- [ ] Add `Command.GetCurrentRun` while retaining top-level `GetCurrentRun`.
-- [ ] Rename the top-level parameter/documentation to `rootCommandName` and add
+- [x] Add `Command.GetCurrentRun` while retaining top-level `GetCurrentRun`.
+- [x] Rename the top-level parameter/documentation to `rootCommandName` and add
   the name-different-from-queue regression test.
-- [ ] Add `Command.GetResult` while retaining top-level `GetResult`.
-- [ ] Route each pair through one private implementation.
-- [ ] Add `EnqueueResult` and remove `Run.Created`.
-- [ ] Compact `ReplaceRunResult` to `RunID` plus `Replaced`.
-- [ ] Narrow store start results and remove unnecessary full Run rediscovery
+- [x] Add `Command.GetResult` while retaining top-level `GetResult`.
+- [x] Route each pair through one private implementation.
+- [x] Add `EnqueueResult` and remove `Run.Created`.
+- [x] Compact `ReplaceRunResult` to `RunID` plus `Replaced`.
+- [x] Narrow store start results and remove unnecessary full Run rediscovery
   reads without changing identity or lock behavior.
-- [ ] Pass enqueue/replacement/current-run/result/transaction/ambiguity focused
+- [x] Pass enqueue/replacement/current-run/result/transaction/ambiguity focused
   PostgreSQL and race gates.
 
 ### One failure rule and metadata removal

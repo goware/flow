@@ -204,7 +204,7 @@ func TestNormalizedDurationsRediscoverEquivalentDurableDeclarations(t *testing.T
 	second, err := secondCommand.Enqueue(ctx, runtime, "same", None{},
 		WithRunDeadline(time.Millisecond), WithStartDelay(time.Millisecond),
 		WaitFor(event, "ready"), Within(time.Millisecond))
-	if err != nil || second.ID != first.ID || second.Created {
+	if err != nil || second.RunID != first.RunID || second.Created {
 		t.Fatalf("equivalent normalized start = %#v, %v; first=%#v", second, err, first)
 	}
 
@@ -309,8 +309,9 @@ func TestLargestPostgresIntegerPersists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Version != math.MaxInt32 || run.MaxCommands != math.MaxInt32 {
-		t.Fatalf("persisted integer boundaries = version %d max %d", run.Version, run.MaxCommands)
+	runSnapshot := mustGetRun(t, runtime, run.RunID)
+	if runSnapshot.Version != math.MaxInt32 || runSnapshot.MaxCommands != math.MaxInt32 {
+		t.Fatalf("persisted integer boundaries = version %d max %d", runSnapshot.Version, runSnapshot.MaxCommands)
 	}
 }
 
@@ -336,7 +337,7 @@ func TestMalformedRetryPolicyBytesFailOnRead(t *testing.T) {
 		t.Fatalf("probe command = %#v, %v", candidates, err)
 	}
 	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+quoteIdentifier(database.Schema)+`.flow_commands
-		SET retry_policy=$2 WHERE run_id=$1`, run.ID, []byte("not canonical JSON")); err != nil {
+		SET retry_policy=$2 WHERE run_id=$1`, run.RunID, []byte("not canonical JSON")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.store.ClaimCommand(ctx, candidates[0], time.Second, "worker", fault.None{}); !errors.Is(err, ErrInvalidState) {
