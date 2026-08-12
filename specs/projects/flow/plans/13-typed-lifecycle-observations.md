@@ -1,4 +1,4 @@
-# Plan 12: Make observations an alertable lifecycle contract
+# Plan 13: Make observations an alertable lifecycle contract
 
 Status: Proposed
 

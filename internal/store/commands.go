@@ -139,6 +139,7 @@ type ClaimedCommand struct {
 	CommandID              uuid.UUID
 	RunID                  uuid.UUID
 	RunKey                 string
+	DefinitionName         string
 	CommandKey             string
 	Name                   string
 	Version                int
@@ -245,11 +246,11 @@ func (s *Store) ClaimCommands(
 	// above), so its status and deadline cannot change until this transaction
 	// commits or rolls back: one read here covers every candidate instead of
 	// one read per candidate.
-	var runStatus, runKey string
+	var runStatus, runKey, runDefinition string
 	var runDeadline *time.Time
-	if err := semantic.PGX().QueryRow(ctx, `SELECT status,deadline_at,run_key FROM `+
+	if err := semantic.PGX().QueryRow(ctx, `SELECT status,deadline_at,run_key,definition_name FROM `+
 		pgschema.Table(s.schema, "flow_runs")+` WHERE run_id=$1`, runID).
-		Scan(&runStatus, &runDeadline, &runKey); err != nil {
+		Scan(&runStatus, &runDeadline, &runKey, &runDefinition); err != nil {
 		return ClaimBatchResult{}, MapError("load claim run", err)
 	}
 	if (runStatus != "running" && runStatus != "failing") ||
@@ -355,7 +356,8 @@ func (s *Store) ClaimCommands(
 			}
 			result.Commands = append(result.Commands, ClaimedCommand{
 				CommandID: command.candidate.CommandID, RunID: command.candidate.RunID, RunKey: runKey,
-				CommandKey: command.key, Name: command.name, Version: command.version, Queue: command.queue,
+				DefinitionName: runDefinition, CommandKey: command.key, Name: command.name,
+				Version: command.version, Queue: command.queue,
 				Args: slices.Clone(command.args), EventInputs: command.eventInputs,
 				RetryMaxElapsed: clonePointer(command.retryPolicy.MaxElapsed), AttemptTimeout: command.attemptTimeout,
 				CreatedAt: command.createdAt, BudgetStartedAt: command.budgetStartedAt,
@@ -948,6 +950,12 @@ type SettleResult struct {
 	Terminal      bool
 	NextAttemptAt *time.Time
 	Status        string
+	// RunTerminalStatus is the terminal run status this settlement
+	// committed, empty when the run stayed open.
+	RunTerminalStatus string
+	// Exhausted marks a terminal failure that concluded because the retry
+	// budget was spent, not because the error was non-retryable.
+	Exhausted bool
 }
 
 type CommitFunctionError struct{ Err error }
@@ -1011,7 +1019,7 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		if err := semantic.Commit(ctx); err != nil {
 			return SettleResult{}, err
 		}
-		return SettleResult{Terminal: true, Status: "expired"}, nil
+		return SettleResult{Terminal: true, Status: "expired", RunTerminalStatus: "expired"}, nil
 	}
 	request.Events, err = s.coalesceApplicationEvents(ctx, semantic, request.Events)
 	if err != nil {
@@ -1260,7 +1268,11 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err := hook.Hit(ctx, fault.SettleCommitAmbiguous); err != nil {
 		return SettleResult{}, err
 	}
-	return SettleResult{Terminal: true, Status: "succeeded"}, nil
+	result := SettleResult{Terminal: true, Status: "succeeded"}
+	if terminalRun {
+		result.RunTerminalStatus = terminalStatus
+	}
+	return result, nil
 }
 
 func (s *Store) cancelStagedCommandBatch(
@@ -1387,7 +1399,7 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		if err := semantic.Commit(ctx); err != nil {
 			return SettleResult{}, err
 		}
-		return SettleResult{Terminal: true, Status: "expired"}, nil
+		return SettleResult{Terminal: true, Status: "expired", RunTerminalStatus: "expired"}, nil
 	}
 	policy, err := retrypolicy.PublicFromCanonical(fence.RetryPolicy)
 	if err != nil {
@@ -1566,8 +1578,16 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 	if err := hook.Hit(ctx, fault.SettleCommitAmbiguous); err != nil {
 		return SettleResult{}, err
 	}
-	return SettleResult{Retry: decision.Retry, Terminal: !decision.Retry, NextAttemptAt: next,
-		Status: map[bool]string{true: "retry_wait", false: "failed"}[decision.Retry]}, nil
+	result := SettleResult{Retry: decision.Retry, Terminal: !decision.Retry, NextAttemptAt: next,
+		Status: map[bool]string{true: "retry_wait", false: "failed"}[decision.Retry]}
+	if terminalRun {
+		result.RunTerminalStatus = map[bool]string{true: "failed", false: "succeeded"}[runFailed]
+	}
+	switch decision.StopReason {
+	case "attempt_limit", "elapsed_limit", "deadline_before_next_attempt":
+		result.Exhausted = !decision.Retry
+	}
+	return result, nil
 }
 
 func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, claim ClaimedCommand) (commandFence, error) {

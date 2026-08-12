@@ -120,8 +120,10 @@ func terminalStatusFromString(value string) (TerminalStatus, error) {
 }
 
 type CommandInfo struct {
-	RunID      RunID
-	RunKey     string
+	RunID  RunID
+	RunKey string
+	// Definition names the run's root definition; Name is this command's own.
+	Definition string
 	CommandID  CommandID
 	CommandKey string
 	Name       string

@@ -361,7 +361,7 @@ func TestWaitExpiryReconciliationAcceptsEventAtExactDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !changed.Progressed {
 		t.Fatal("exact-deadline reconciliation made no change")
 	}
 	var state string

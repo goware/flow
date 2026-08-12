@@ -20,6 +20,7 @@ const (
 type Info struct {
 	RunID            string
 	RunKey           string
+	Definition       string
 	CommandID        string
 	CommandKey       string
 	Name             string

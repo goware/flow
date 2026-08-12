@@ -313,10 +313,12 @@ func (cmd Command[A, R]) ReplaceCurrentRun(
 	if resolved.tx == nil && result.Replaced {
 		resolved.runtime.wakeCommands()
 		resolved.runtime.observe(ctx, Observation{
-			Kind: ObservationRun, Operation: "cancel", Outcome: "cancelled", RunID: expected,
+			Kind: ObservationRun, Operation: ObservationOpCancel, Outcome: ObservationOutcomeCancelled,
+			RunID: expected, RunKey: key,
 		})
 		resolved.runtime.observe(ctx, Observation{
-			Kind: ObservationRun, Operation: "start", Outcome: "created", RunID: run.ID,
+			Kind: ObservationRun, Operation: ObservationOpStart, Outcome: ObservationOutcomeCreated,
+			RunID: run.ID, RunKey: key, Definition: start.DefinitionName,
 			Name: start.DefinitionName, Version: start.DefinitionVersion,
 		})
 	}
@@ -344,8 +346,9 @@ func enqueueStart(ctx context.Context, client resolvedClient, request store.Star
 	if client.tx == nil && result.Created {
 		client.runtime.wakeCommands()
 		client.runtime.observe(ctx, Observation{
-			Kind: ObservationRun, Operation: "start", Outcome: "created",
-			RunID: run.ID, Name: request.DefinitionName, Version: request.DefinitionVersion,
+			Kind: ObservationRun, Operation: ObservationOpStart, Outcome: ObservationOutcomeCreated,
+			RunID: run.ID, RunKey: request.Key, Definition: request.DefinitionName,
+			Name: request.DefinitionName, Version: request.DefinitionVersion,
 		})
 	}
 	return run, nil
@@ -415,7 +418,7 @@ func (event Event[T]) deliverExternal(ctx context.Context, c Client, id RunID, k
 	}
 	if client.tx == nil && created {
 		client.runtime.observe(ctx, Observation{
-			Kind: ObservationEvent, Operation: "deliver", Outcome: "created", RunID: id,
+			Kind: ObservationEvent, Operation: ObservationOpDeliver, Outcome: ObservationOutcomeCreated, RunID: id,
 			Name: event.def.Name,
 		})
 	}
@@ -455,9 +458,10 @@ func CancelCommand(ctx context.Context, c Client, id CommandID, reason string) e
 	}
 	if client.tx == nil && result.Created {
 		client.runtime.observe(ctx, Observation{
-			Kind: ObservationCommand, Operation: "cancel", Outcome: "cancelled",
+			Kind: ObservationCommand, Operation: ObservationOpCancel, Outcome: ObservationOutcomeCancelled,
 			RunID: RunID(runID.String()), CommandID: id,
 		})
+		client.runtime.observeRunTerminal(ctx, result.RunTerminalStatus, RunID(runID.String()), "", "")
 	}
 	return nil
 }
@@ -491,7 +495,7 @@ func CancelRun(ctx context.Context, c Client, id RunID, reason string) error {
 	}
 	if client.tx == nil && result.Created {
 		client.runtime.observe(ctx, Observation{
-			Kind: ObservationRun, Operation: "cancel", Outcome: "cancelled", RunID: id,
+			Kind: ObservationRun, Operation: ObservationOpCancel, Outcome: ObservationOutcomeCancelled, RunID: id,
 		})
 	}
 	return nil
