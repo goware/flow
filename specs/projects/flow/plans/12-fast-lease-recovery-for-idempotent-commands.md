@@ -1,8 +1,11 @@
 # Plan 12: Fast lease recovery for idempotent commands
 
-Status: Planned — reconciled against accepted Plan 13
+Status: Implemented — independent PR review pending
 
 Reconciled at: `c450ff4b060d1a862fde0540c794fb2d9876147b` on 2026-08-12
+
+Implementation base: `d9125dca7bf4894280a5a25f7bca7eb1735c46cd`
+(`v0.4.0`, a descendant of the accepted Plan 13 commit)
 
 - **Priority:** P2 — reduce dead-worker recovery latency for commands whose
   duplicate execution is safe
@@ -772,68 +775,68 @@ Stop implementation and report if:
 
 ### Reconcile and baseline
 
-- [ ] Record the independently accepted Plan 13 commit and confirm a clean
+- [x] Record the independently accepted Plan 13 commit and confirm a clean
   implementation branch.
-- [ ] Re-audit definition, durable creation, claim, renewal, watchdog,
+- [x] Re-audit definition, durable creation, claim, renewal, watchdog,
   maintenance, replay, and schema paths against that commit.
-- [ ] Record contemporaneous default/mixed claim, renewal-cadence, and recovery
+- [x] Record contemporaneous default/mixed claim, renewal-cadence, and recovery
   baselines.
 
 ### Durable declaration
 
-- [ ] Add and validate `WithRecoveryLease` with one-time upward millisecond
+- [x] Add and validate `WithRecoveryLease` with one-time upward millisecond
   normalization and the 30-millisecond technical floor.
-- [ ] Add the override to command defaults, staging equivalence, durable create
+- [x] Add the override to command defaults, staging equivalence, durable create
   validation, and declaration fingerprints.
-- [ ] Add nullable `flow_commands.recovery_lease_ms` to the consolidated
+- [x] Add nullable `flow_commands.recovery_lease_ms` to the consolidated
   baseline and update CopyFrom/catalog tests without adding a migration/index.
-- [ ] Add the optional value to `command_created`, replay, and malformed-state
+- [x] Add the optional value to `command_created`, replay, and malformed-state
   validation.
 
 ### Claim
 
-- [ ] Resolve per-command lease durations from durable rows with runtime
+- [x] Resolve per-command lease durations from durable rows with runtime
   fallback.
-- [ ] Preserve one mixed-duration claim transaction and set-oriented
+- [x] Preserve one mixed-duration claim transaction and set-oriented
   journal/projection writes.
-- [ ] Return internal `LeaseDuration` and anchor conservative local expiry from
+- [x] Return internal `LeaseDuration` and anchor conservative local expiry from
   the exact claimed value.
-- [ ] Prove mixed, rollback, locked-sibling, and ambiguous-commit claim cases.
+- [x] Prove mixed, rollback, locked-sibling, and ambiguous-commit claim cases.
 
 ### Renewal and watchdog
 
-- [ ] Move duration into each `LeaseRenewal` and retain one mixed renewal SQL
+- [x] Move duration into each `LeaseRenewal` and retain one mixed renewal SQL
   statement.
-- [ ] Track lease duration, next due time, local expiry, retry state, and
+- [x] Track lease duration, next due time, local expiry, retry state, and
   in-flight renewal in the bounded active-command registry.
-- [ ] Add the lightweight registry change notification used by both existing
+- [x] Add the lightweight registry change notification used by both existing
   services.
-- [ ] Convert the manager to earliest-due batching with bounded retries inside
+- [x] Convert the manager to earliest-due batching with bounded retries inside
   the remaining local lease window.
-- [ ] Convert the watchdog to earliest-expiry timing and exclude matching
+- [x] Convert the watchdog to earliest-expiry timing and exclude matching
   bounded in-flight renewals.
-- [ ] Preserve shutdown cancellation/drain and observation semantics.
+- [x] Preserve shutdown cancellation/drain and observation semantics.
 
 ### Recovery and fencing
 
-- [ ] Prove healthy short handlers renew across repeated windows.
-- [ ] Prove dead short holders recover sooner while default siblings do not.
-- [ ] Prove competing replicas, takeover, stale settlement rejection, and one
+- [x] Prove healthy short handlers renew across repeated windows.
+- [x] Prove dead short holders recover sooner while default siblings do not.
+- [x] Prove competing replicas, takeover, stale settlement rejection, and one
   durable terminal result.
-- [ ] Prove the committed-renewal/local-watchdog boundary with a deterministic
+- [x] Prove the committed-renewal/local-watchdog boundary with a deterministic
   race test.
 
 ### Documentation, performance, and closure
 
-- [ ] Update `flow.go`, README, API comments, and active functional,
+- [x] Update `flow.go`, README, API comments, and active functional,
   architecture, schema, runtime, and durability specs.
-- [ ] Audit any Trails opt-in candidate rather than applying the option by
+- [x] Audit any Trails opt-in candidate rather than applying the option by
   command/queue name.
-- [ ] Prove one mixed claim transaction, one mixed renewal statement,
+- [x] Prove one mixed claim transaction, one mixed renewal statement,
   default-only cadence isolation, idle efficiency, six tables, and no new
   index.
-- [ ] Run PostgreSQL 17/18 ordinary/race/no-skip gates plus format, build, vet,
+- [x] Run PostgreSQL 17/18 ordinary/race/no-skip gates plus format, build, vet,
   migration, replay, and source scans.
-- [ ] Record implementation/performance evidence and complete all 18 acceptance
+- [x] Record implementation/performance evidence and complete acceptance
   criteria.
 - [ ] Obtain independent final review before marking this plan complete.

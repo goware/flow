@@ -56,7 +56,11 @@
 // renewable leases, settlement fencing, and anonymous takeover across
 // replicas. Renewal calls are internally time-bounded and skip rows held by
 // another Flow transaction so one settlement cannot delay unrelated attempts.
-// A process-local watchdog conservatively cancels attempts whose last known
+// Commands use the conservative 60-second recovery lease unless their
+// immutable definition opts into [WithRecoveryLease]. Short recovery leases
+// are intended only for idempotent or replay-safe work: they permit faster
+// takeover but also make overlapping handler execution more likely. A shared
+// process-local watchdog conservatively cancels attempts whose last known
 // lease window expires; PostgreSQL attempt ID and lease-token fencing remains
 // the durable ownership authority.
 //

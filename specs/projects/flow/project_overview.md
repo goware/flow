@@ -160,11 +160,11 @@ and hash every body. The claim hot path verifies the retained hash and decodes
 the bounded application-event envelope without redundant reconstruction. Full
 replay re-canonicalizes history for stronger conformance diagnostics.
 
-Claims install an attempt ID, lease token, owner, and expiry. Only the currently fenced attempt may settle. A stale worker may finish locally after lease loss, but its result, events, children, and commit callback cannot become durable.
+Claims install an attempt ID, lease token, owner, resolved lease duration, and expiry. Only the currently fenced attempt may settle. A stale worker may finish locally after lease loss, but its result, events, children, and commit callback cannot become durable.
 
 ## Failure and time
 
-Each command definition owns an immutable retry policy, optional attempt timeout, and queue. Retriable errors, requested retry delays, panics, timeouts, shutdown interruption, and lease loss are classified separately. Shutdown interruption and lease loss do not consume the application attempt budget.
+Each command definition owns an immutable retry policy, optional attempt timeout, optional recovery-lease override, and queue. The recovery lease controls dead-worker takeover while the timeout bounds one invocation; unset commands retain the conservative 60-second lease. Retriable errors, requested retry delays, panics, timeouts, shutdown interruption, and lease loss are classified separately. Shutdown interruption and lease loss do not consume the application attempt budget.
 
 Runs have a 30-day deadline by default unless configured otherwise. `Within` is a separate lifetime for commands waiting on exact events and begins when the command is created; `Delay` does not postpone it. An event committed on or before the persisted wait deadline wins, even if expiry maintenance observes it later.
 

@@ -9,7 +9,10 @@ import (
 	"github.com/goware/flow/internal/durable"
 )
 
-const defaultQueue = "default"
+const (
+	defaultQueue         = "default"
+	minimumRecoveryLease = 30 * time.Millisecond
+)
 
 type Command[A, R any] struct {
 	def      *definition.Command
@@ -33,15 +36,17 @@ type CommandOption interface {
 type commandDefaults struct {
 	retryPolicy    RetryPolicy
 	attemptTimeout time.Duration
+	recoveryLease  time.Duration
 	queue          string
 }
 
 type commandOptionState struct {
-	defaults        commandDefaults
-	retryConfigured bool
-	timeoutSet      bool
-	queueSet        bool
-	errs            []error
+	defaults         commandDefaults
+	retryConfigured  bool
+	timeoutSet       bool
+	recoveryLeaseSet bool
+	queueSet         bool
+	errs             []error
 }
 
 type commandOptionFunc func(*commandOptionState)
@@ -148,6 +153,36 @@ func WithTimeout(timeout time.Duration) CommandOption {
 			return
 		}
 		state.defaults.attemptTimeout = normalized
+	})
+}
+
+// WithRecoveryLease controls how soon another worker may retry this command
+// after lease renewal stops. A shorter lease can permit concurrent duplicate
+// handler execution, so use it only when repeating the worker is safe. Attempt
+// fencing still permits only the current owner to durably settle. This setting
+// is durable command identity; change the command version when changing it.
+// It is independent of WithTimeout, which bounds one handler invocation.
+func WithRecoveryLease(lease time.Duration) CommandOption {
+	return commandOptionFunc(func(state *commandOptionState) {
+		if state.recoveryLeaseSet {
+			state.errs = append(state.errs, errors.New("recovery lease configured more than once"))
+			return
+		}
+		state.recoveryLeaseSet = true
+		if lease <= 0 {
+			state.errs = append(state.errs, errors.New("recovery lease must be positive"))
+			return
+		}
+		normalized, _, err := durable.CeilMilliseconds("recovery lease", lease)
+		if err != nil {
+			state.errs = append(state.errs, err)
+			return
+		}
+		if normalized < minimumRecoveryLease {
+			state.errs = append(state.errs, fmt.Errorf("recovery lease must be at least %s", minimumRecoveryLease))
+			return
+		}
+		state.defaults.recoveryLease = normalized
 	})
 }
 

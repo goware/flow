@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/goware/flow/internal/store"
@@ -103,6 +104,60 @@ func TestFoldValidatesApplicationEventBodies(t *testing.T) {
 	application.BodyHash = sha256.Sum256(application.Body)
 	if _, err := Fold([]store.JournalRow{start, application}); err == nil {
 		t.Fatal("Fold() accepted a matching-hash duplicate-key application payload")
+	}
+}
+
+func TestFoldValidatesRecoveryLeaseDeclarationsAndAttempts(t *testing.T) {
+	t.Parallel()
+
+	runID, commandID, attemptID := uuid.New(), uuid.New(), uuid.New()
+	start := row(t, runID, 1, store.RunStarted, nil, journalcodec.RunStartedBody{
+		V: 1, RunID: runID.String(), DefinitionName: "work",
+		DefinitionVersion: 1, RunKey: "key", DeadlineMode: "none", MaxCommands: 1,
+	})
+	lease := int64(120)
+	createdBody := journalcodec.CommandCreatedBody{
+		V: 1, CommandID: commandID.String(), CommandKey: "root", Name: "work", Version: 1,
+		Args: json.RawMessage(`{}`), InitialState: "ready", Queue: "default",
+		RetryPolicy:            json.RawMessage(`{"backoff":[1],"jitter":0,"max_attempts":1}`),
+		RecoveryLeaseMS:        &lease,
+		DeclarationFingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
+	}
+	created := row(t, runID, 2, store.CommandCreated, &commandID, createdBody)
+	started := row(t, runID, 3, store.AttemptStarted, &commandID, journalcodec.AttemptStartedBody{
+		V: 1, AttemptID: attemptID.String(), CommandID: commandID.String(), CommandKey: "root",
+		Attempt: 1, StartedAt: time.Now().UTC(), Worker: "worker", LeaseDurationMS: lease,
+		BudgetStartedAt: time.Now().UTC(),
+	})
+	started.AttemptID = &attemptID
+	if _, err := Fold([]store.JournalRow{start, created, started}); err != nil {
+		t.Fatalf("Fold(valid recovery lease) error = %v", err)
+	}
+
+	tooShort := int64(29)
+	createdBody.RecoveryLeaseMS = &tooShort
+	if _, err := Fold([]store.JournalRow{start, row(t, runID, 2, store.CommandCreated, &commandID, createdBody)}); err == nil {
+		t.Fatal("Fold() accepted a sub-floor recovery lease")
+	}
+	createdBody.RecoveryLeaseMS = &lease
+	zeroStarted := started
+	zeroStarted.Body = row(t, runID, 3, store.AttemptStarted, &commandID, journalcodec.AttemptStartedBody{
+		V: 1, AttemptID: attemptID.String(), CommandID: commandID.String(), CommandKey: "root",
+		Attempt: 1, StartedAt: time.Now().UTC(), Worker: "worker", LeaseDurationMS: 0,
+		BudgetStartedAt: time.Now().UTC(),
+	}).Body
+	zeroStarted.BodyHash = sha256.Sum256(zeroStarted.Body)
+	if _, err := Fold([]store.JournalRow{start, created, zeroStarted}); err == nil {
+		t.Fatal("Fold() accepted a zero attempt lease")
+	}
+	mismatched := row(t, runID, 3, store.AttemptStarted, &commandID, journalcodec.AttemptStartedBody{
+		V: 1, AttemptID: attemptID.String(), CommandID: commandID.String(), CommandKey: "root",
+		Attempt: 1, StartedAt: time.Now().UTC(), Worker: "worker", LeaseDurationMS: 121,
+		BudgetStartedAt: time.Now().UTC(),
+	})
+	mismatched.AttemptID = &attemptID
+	if _, err := Fold([]store.JournalRow{start, created, mismatched}); err == nil {
+		t.Fatal("Fold() accepted an attempt lease that differs from its declaration")
 	}
 }
 

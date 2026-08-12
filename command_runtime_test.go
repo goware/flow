@@ -774,7 +774,8 @@ func TestRuntimeCapacityLeaseRenewalAndTakeover(t *testing.T) {
 	}
 	stopRuntime(t, cancelRun, runResult)
 
-	takeover := DefineCommand[runtimeArgs, runtimeResult]("runtime.takeover", 1, WithRetry(Attempts(2)))
+	takeover := DefineCommand[runtimeArgs, runtimeResult]("runtime.takeover", 1,
+		WithRetry(Attempts(2)), WithRecoveryLease(90*time.Millisecond))
 	takeoverInput := DefineEvent[runtimeArgs]("runtime.takeover_input")
 	firstStarted := make(chan struct{}, 1)
 	releaseFirst := make(chan struct{})

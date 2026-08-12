@@ -270,15 +270,21 @@ func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
 	for index, command := range claimed.Commands {
 		renewals[index] = store.LeaseRenewal{
 			CommandID: command.CommandID, AttemptID: command.AttemptID, Token: command.LeaseToken,
+			Duration: time.Minute,
 		}
 	}
 	incomplete := renewals[0]
 	incomplete.Token = uuid.Nil
-	if _, err := runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{incomplete}, time.Minute); err == nil {
+	if _, err := runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{incomplete}); err == nil {
 		t.Fatal("RenewCommandLeases() accepted an incomplete fence")
 	}
+	invalidDuration := renewals[0]
+	invalidDuration.Duration = 0
+	if _, err := runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{invalidDuration}); err == nil {
+		t.Fatal("RenewCommandLeases() accepted an empty per-command duration")
+	}
 	if _, err := runtime.store.RenewCommandLeases(ctx,
-		[]store.LeaseRenewal{renewals[0], renewals[0]}, time.Minute); err == nil {
+		[]store.LeaseRenewal{renewals[0], renewals[0]}); err == nil {
 		t.Fatal("RenewCommandLeases() accepted a duplicate command ID")
 	}
 
@@ -293,7 +299,7 @@ func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	results, err := runtime.store.RenewCommandLeases(ctx, renewals, time.Minute)
+	results, err := runtime.store.RenewCommandLeases(ctx, renewals)
 	if err != nil {
 		_ = lockTx.Rollback(ctx)
 		t.Fatal(err)
@@ -310,14 +316,14 @@ func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
 	if err := lockTx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	missing := store.LeaseRenewal{CommandID: uuid.New(), AttemptID: uuid.New(), Token: uuid.New()}
-	results, err = runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{missing}, time.Minute)
+	missing := store.LeaseRenewal{CommandID: uuid.New(), AttemptID: uuid.New(), Token: uuid.New(), Duration: time.Minute}
+	results, err = runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{missing})
 	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
 		t.Fatalf("missing renewal results = %#v, %v", results, err)
 	}
 	mismatched := renewals[0]
 	mismatched.Token = uuid.New()
-	results, err = runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{mismatched}, time.Minute)
+	results, err = runtime.store.RenewCommandLeases(ctx, []store.LeaseRenewal{mismatched})
 	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
 		t.Fatalf("mismatched renewal results = %#v, %v", results, err)
 	}
@@ -327,7 +333,7 @@ func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
 		renewals[0].CommandID); err != nil {
 		t.Fatal(err)
 	}
-	results, err = runtime.store.RenewCommandLeases(ctx, renewals[:1], time.Minute)
+	results, err = runtime.store.RenewCommandLeases(ctx, renewals[:1])
 	if err != nil || len(results) != 1 || results[0].Outcome != store.LeaseLost {
 		t.Fatalf("expired renewal results = %#v, %v", results, err)
 	}
@@ -339,7 +345,7 @@ func TestRenewCommandLeasesClassifiesLockedAndLostRows(t *testing.T) {
 	if err := CancelRun(ctx, reader, run.ID, "renewal classification complete"); err != nil {
 		t.Fatal(err)
 	}
-	results, err = runtime.store.RenewCommandLeases(ctx, renewals, time.Minute)
+	results, err = runtime.store.RenewCommandLeases(ctx, renewals)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -869,12 +875,21 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 			t.Fatal(err)
 		}
 		child := DefineCommand[None, None]("claim.batch_rollback_child", 1)
+		shortChild := DefineCommand[None, None]("claim.batch_rollback_short_child", 1,
+			WithRecoveryLease(120*time.Millisecond))
 		runtime, run := stageClaimFixture(t, database, "rollback", 4, func(work *Work[None]) {
 			for index := range 4 {
-				Enqueue(work, fmt.Sprintf("child/%d", index), child, None{})
+				command := child
+				if index%2 != 0 {
+					command = shortChild
+				}
+				Enqueue(work, fmt.Sprintf("child/%d", index), command, None{})
 			}
 		})
-		candidates := probeClaimCandidates(t, runtime, []store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 4)
+		candidates := probeClaimCandidates(t, runtime, []store.CommandKind{
+			{Name: child.Name(), Version: child.Version()},
+			{Name: shortChild.Name(), Version: shortChild.Version()},
+		}, 4)
 		_, err := runtime.store.ClaimCommands(ctx, candidates, time.Minute, "claim-batch-test", fault.Func(
 			func(_ context.Context, point fault.Point) error {
 				if point == fault.ClaimBeforeCommit {
@@ -942,12 +957,21 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 			t.Fatal(err)
 		}
 		child := DefineCommand[None, None]("claim.batch_ambiguous_child", 1)
+		shortChild := DefineCommand[None, None]("claim.batch_ambiguous_short_child", 1,
+			WithRecoveryLease(120*time.Millisecond))
 		runtime, _ := stageClaimFixture(t, database, "ambiguous", 4, func(work *Work[None]) {
 			for index := range 4 {
-				Enqueue(work, fmt.Sprintf("child/%d", index), child, None{})
+				command := child
+				if index%2 != 0 {
+					command = shortChild
+				}
+				Enqueue(work, fmt.Sprintf("child/%d", index), command, None{})
 			}
 		})
-		candidates := probeClaimCandidates(t, runtime, []store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 4)
+		candidates := probeClaimCandidates(t, runtime, []store.CommandKind{
+			{Name: child.Name(), Version: child.Version()},
+			{Name: shortChild.Name(), Version: shortChild.Version()},
+		}, 4)
 		result, err := runtime.store.ClaimCommands(ctx, candidates, time.Minute, "claim-batch-test", fault.Func(
 			func(_ context.Context, point fault.Point) error {
 				if point == fault.ClaimCommitAmbiguous {
@@ -958,12 +982,19 @@ func TestClaimBatchRollbackAndAmbiguousCommitFences(t *testing.T) {
 		if !errors.Is(err, fault.ErrInjected) || len(result.Commands) != 4 {
 			t.Fatalf("ClaimCommands() commands=%d error=%v", len(result.Commands), err)
 		}
+		shortLeases := 0
 		for _, command := range result.Commands {
+			if command.LeaseDuration == 120*time.Millisecond {
+				shortLeases++
+			}
 			ownership, resolveErr := runtime.store.ResolveCommandAttempt(ctx, command.CommandID,
 				command.AttemptID, command.LeaseToken)
 			if resolveErr != nil || ownership != store.AttemptOwnershipStillOwned {
 				t.Fatalf("ResolveCommandAttempt(%s)=%s, %v", command.CommandID, ownership, resolveErr)
 			}
+		}
+		if shortLeases != 2 {
+			t.Fatalf("ambiguous prepared short leases=%d, want 2", shortLeases)
 		}
 	})
 }

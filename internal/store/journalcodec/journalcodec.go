@@ -47,6 +47,7 @@ type CommandCreatedBody struct {
 	InitialState           string          `json:"initial_state"`
 	Queue                  string          `json:"queue"`
 	AttemptTimeoutMS       *int64          `json:"attempt_timeout_ms,omitempty"`
+	RecoveryLeaseMS        *int64          `json:"recovery_lease_ms,omitempty"`
 	RetryPolicy            json.RawMessage `json:"retry_policy"`
 	InitialDelayMS         *int64          `json:"initial_delay_ms,omitempty"`
 	BudgetStartedAt        *time.Time      `json:"budget_started_at,omitempty"`

@@ -85,6 +85,7 @@ partial `flow_runs_prune_idx`; the table count remains exactly six.
 | `flow_commands.result` | successful settlement writes the point-read result projection | non-null only for success and equal to the terminal journal result; removal makes result reads replay-dependent |
 | `flow_commands.last_error` | retry/recovery transitions write it; live trace reads it | latest operational failure and cleared by success; removal requires folding attempt history for live inspection |
 | `flow_commands.terminal_failure` | unsuccessful terminal transitions write it; terminal comparison/inspection reads it | stable unsuccessful terminal reason; removal couples idempotency and inspection to replay |
+| `flow_commands.recovery_lease_ms` | explicit command declaration writes it; claim/replay read it | nullable means the fixed runtime fallback; explicit values are at least 30ms and remain stable across replicas/restarts |
 
 The root command declaration is the only projection/body copy of root arguments;
 the start fingerprint still hashes canonical root input for permanent-key

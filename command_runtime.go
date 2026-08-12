@@ -260,11 +260,16 @@ func (r *Runtime) claimRunGroup(
 	started := time.Now()
 	result, err := r.store.ClaimCommands(ctx, group, r.commandLease, r.replicaName(), r.faults)
 	for index := range result.Commands {
-		window := max(time.Duration(0), result.Commands[index].LeaseExpiresAt.Sub(result.Commands[index].DBNow))
-		result.Commands[index].LocalLeaseExpiresAt = started.Add(window)
+		result.Commands[index].LocalLeaseExpiresAt = started.Add(result.Commands[index].LeaseDuration)
 	}
 	if err != nil && len(result.Commands) > 0 {
-		resolveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), min(5*time.Second, max(100*time.Millisecond, r.commandLease/2)))
+		shortestLease := r.commandLease
+		for _, command := range result.Commands {
+			if command.LeaseDuration > 0 && command.LeaseDuration < shortestLease {
+				shortestLease = command.LeaseDuration
+			}
+		}
+		resolveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), min(5*time.Second, max(100*time.Millisecond, shortestLease/2)))
 		defer cancel()
 		possiblyOwned := result.Commands[:0]
 		for _, command := range result.Commands {
@@ -400,11 +405,11 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	}
 	localLeaseExpiry := claim.LocalLeaseExpiresAt
 	if localLeaseExpiry.IsZero() {
-		localLeaseExpiry = time.Now().Add(max(time.Duration(0), claim.LeaseExpiresAt.Sub(claim.DBNow)))
+		localLeaseExpiry = time.Now().Add(claim.LeaseDuration)
 	}
 	r.active.register(activeCommand{
 		commandID: claim.CommandID, attemptID: claim.AttemptID, token: claim.LeaseToken,
-		localExpiry: localLeaseExpiry, cancel: cancelCause,
+		leaseDuration: claim.LeaseDuration, localExpiry: localLeaseExpiry, cancel: cancelCause,
 	})
 	r.mu.RLock()
 	stopping := r.lifecycle == runtimeStopping || r.lifecycle == runtimeStopped

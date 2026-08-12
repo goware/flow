@@ -193,7 +193,7 @@ func (cmd Command[A, R]) prepareStartRequest(
 	maxCommands int,
 	opts ...RunOption,
 ) (store.StartRequest, error) {
-	options, fingerprint, err := prepareStartOptions(cmd.Name(), cmd.Version(), key, input, opts...)
+	options, fingerprint, err := prepareStartOptions(cmd.Name(), cmd.Version(), key, input, cmd.defaults.recoveryLease, opts...)
 	if err != nil {
 		return store.StartRequest{}, err
 	}
@@ -463,7 +463,14 @@ func CancelRun(ctx context.Context, c Client, id RunID, reason string) error {
 	return nil
 }
 
-func prepareStartOptions(name string, version int, key string, input canonical.Value, supplied ...RunOption) (runOptions, [32]byte, error) {
+func prepareStartOptions(
+	name string,
+	version int,
+	key string,
+	input canonical.Value,
+	recoveryLease time.Duration,
+	supplied ...RunOption,
+) (runOptions, [32]byte, error) {
 	if err := durable.PostgresInteger("definition version", version, 1, durable.PostgresIntegerMax); err != nil {
 		return runOptions{}, [32]byte{}, newError(ErrInvalid, "enqueue", "version", "", err.Error())
 	}
@@ -506,6 +513,10 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 	if err != nil {
 		return runOptions{}, [32]byte{}, err
 	}
+	recoveryLeaseMilliseconds, err := durable.ExactMilliseconds("recovery lease", recoveryLease)
+	if err != nil {
+		return runOptions{}, [32]byte{}, err
+	}
 	fingerprintRecord := struct {
 		V                 int                      `json:"v"`
 		DefinitionName    string                   `json:"definition_name"`
@@ -518,12 +529,14 @@ func prepareStartOptions(name string, version int, key string, input canonical.V
 		StartDelayMS      int64                    `json:"start_delay_ms,omitempty"`
 		Waits             []commandWaitFingerprint `json:"waits,omitempty"`
 		WithinMS          int64                    `json:"within_ms,omitempty"`
+		RecoveryLeaseMS   int64                    `json:"recovery_lease_ms,omitempty"`
 	}{
 		V: 1, DefinitionName: name, DefinitionVersion: version,
 		RunKey: key, KeyScope: options.keyScope, Input: json.RawMessage(input.BytesCopy()),
 		DeadlineMode: options.deadline.Mode, DeadlineDuration: deadlineMilliseconds,
 		StartDelayMS: startDelayMilliseconds,
 		Waits:        commandWaitFingerprints(options.waits), WithinMS: withinMilliseconds,
+		RecoveryLeaseMS: recoveryLeaseMilliseconds,
 	}
 	fingerprint, err := canonical.Marshal(fingerprintRecord, 0)
 	if err != nil {
@@ -559,7 +572,8 @@ func prepareCommand(id uuid.UUID, key string, command *definition.Command, defau
 	return store.CommandCreate{
 		ID: id, Key: key, Name: command.Name, Version: command.Version, Args: args,
 		DeclarationFingerprint: declaration.Digest,
-		Queue:                  defaults.queue, AttemptTimeout: defaults.attemptTimeout, RetryPolicy: policy,
+		Queue:                  defaults.queue, AttemptTimeout: defaults.attemptTimeout,
+		RecoveryLease: defaults.recoveryLease, RetryPolicy: policy,
 	}, nil
 }
 
@@ -623,6 +637,10 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 	if err != nil {
 		return [32]byte{}, err
 	}
+	recoveryLeaseMilliseconds, err := durable.ExactMilliseconds("recovery lease", command.RecoveryLease)
+	if err != nil {
+		return [32]byte{}, err
+	}
 	withinMilliseconds, err := durable.ExactMilliseconds("within", command.Within)
 	if err != nil {
 		return [32]byte{}, err
@@ -637,6 +655,7 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 		Queue        string                   `json:"queue"`
 		RetryPolicy  json.RawMessage          `json:"retry_policy"`
 		AttemptMS    int64                    `json:"attempt_timeout_ms,omitempty"`
+		RecoveryMS   int64                    `json:"recovery_lease_ms,omitempty"`
 		StartAfterMS int64                    `json:"start_after_ms,omitempty"`
 		Waits        []commandWaitFingerprint `json:"waits,omitempty"`
 		WithinMS     int64                    `json:"within_ms,omitempty"`
@@ -645,6 +664,7 @@ func commandDeclarationFingerprint(command store.CommandCreate) ([32]byte, error
 		Args: json.RawMessage(command.Args.BytesCopy()), Parent: parent,
 		Queue:       command.Queue,
 		RetryPolicy: json.RawMessage(command.RetryPolicy.BytesCopy()), AttemptMS: attemptTimeoutMilliseconds,
+		RecoveryMS:   recoveryLeaseMilliseconds,
 		StartAfterMS: startAfterMilliseconds,
 		Waits:        waits, WithinMS: withinMilliseconds,
 	}, 0)

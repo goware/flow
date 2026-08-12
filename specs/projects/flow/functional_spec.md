@@ -35,6 +35,9 @@ This document is the normative caller-visible behavioral contract. The architect
 - The version must be positive and fit PostgreSQL's signed `integer` range while remaining a Go `int` in the public API.
 - `WithRetry` fixes the retry policy stored with every later declaration.
 - `WithTimeout` fixes a positive per-attempt timeout, rounded upward to durable whole-millisecond precision.
+- `WithRecoveryLease` durably opts an idempotent/replay-safe command into a
+  shorter takeover window. It rounds upward to milliseconds, has a 30ms
+  technical floor, and is independent of the attempt timeout.
 - `WithQueue` selects a validated queue name; the default queue is `default`.
 - Duplicate or invalid definition options make the definition invalid. The error is reported when it is registered or used.
 
@@ -307,7 +310,7 @@ Public policy construction supports:
 - `.Attempts(n)`: combine elapsed and attempt bounds; and
 - `.Backoff(delays...)`: replace the positive backoff sequence.
 
-Retry policy, timeout, and queue are copied into the durable command declaration and do not change when another runtime deploys different defaults. Retry policy uses one canonical whole-millisecond representation and is stored as opaque bytes rather than a SQL-queryable JSON document.
+Retry policy, timeout, recovery-lease override, and queue are copied into the durable command declaration and do not change when another runtime deploys different defaults. Retry policy uses one canonical whole-millisecond representation and is stored as opaque bytes rather than a SQL-queryable JSON document.
 
 Worker conclusions are classified as follows:
 
@@ -323,9 +326,9 @@ Worker conclusions are classified as follows:
 
 The run deadline caps attempt run and future retry scheduling. A retry is not scheduled at or beyond the effective elapsed/run deadline.
 
-Claims persist an attempt ID, lease token, owner, start time, and expiry. The runtime renews active leases. If renewal is lost or the lease expires, the local worker context is cancelled and maintenance makes the command eligible for safe takeover. Even if application code ignores cancellation and returns later, the old fence prevents settlement.
+Claims persist an attempt ID, lease token, owner, start time, resolved lease duration, and expiry. An explicit command recovery lease overrides the fixed 60-second fallback; otherwise that fallback remains unchanged. One active-aware manager renews only due attempts in mixed-duration batches, and one active-aware watchdog observes their conservative local expiries. If renewal is lost or the lease expires, the local worker context is cancelled and maintenance makes the command eligible for safe takeover. Even if application code ignores cancellation and returns later, the old fence prevents settlement.
 
-Worker invocation is therefore at-least-once; durable Flow settlement is fence-once. Remote calls, files, messages, and other effects outside the settlement transaction require application idempotency.
+Worker invocation is therefore at-least-once; durable Flow settlement is fence-once. A shorter recovery lease intentionally increases the chance of overlapping handler execution and is suitable only when repetition is safe. Remote calls, files, messages, and other effects outside the settlement transaction require application idempotency.
 
 ## 9. Lifecycle and failure
 
