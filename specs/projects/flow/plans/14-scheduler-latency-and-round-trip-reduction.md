@@ -1,9 +1,9 @@
-# Plan 13: Scheduler latency and round-trip reduction
+# Plan 14: Scheduler latency and round-trip reduction
 
 Status: Proposed
 Priority: P2 · Effort: L (phased, each phase independently shippable) · Risk: LOW–MEDIUM
 
-Branch: `refactor/scheduler-latency` (off `master` at `7abfb8c`)
+Branch: `refactor/scheduler-latency` (master `7abfb8c` merged forward to `d9125dc` / v0.4.0)
 
 ## 0. Relationship to prior plans (why this is not redundant)
 
@@ -19,6 +19,14 @@ Branch: `refactor/scheduler-latency` (off `master` at `7abfb8c`)
   All file:line evidence below was verified against master `7abfb8c`.
 - **Plan 7** (lease/maintenance bug fixes, Complete) was correctness, not
   performance; its invariants are hard boundaries for §4.4.
+- **Plan 13** (simpler core, retention, typed reads — shipped in v0.4.0)
+  reworked the read API surface, retention, and the queue-*stat* N+1. No
+  overlap with the phases here; key anchors re-verified on `d9125dc`:
+  fixed poll (`command_runtime.go:51,187`), `AwaitRun` poll
+  (`inspection.go:246`), pgxpool `Config()` copy (`command_runtime.go:233`),
+  `expireRunLocked` N+1 (`internal/store/commands.go:1695`), and still no
+  `SendBatch` outside tests. §4.7 should build on plan 13's typed-read
+  vocabulary.
 
 ## 1. Purpose
 
@@ -87,12 +95,12 @@ In scope (flow only):
 1. Next-run-aware scheduler timer (§4.1) — `command_runtime.go:51,187`,
    `internal/store/commands.go:97-118`.
 2. `AwaitRun` subscribes to the wake hub, timer as fallback (§4.2) —
-   `inspection.go:223-243`.
+   `inspection.go:246-266`.
 3. Round-trip merges + `SendBatch` for trailing writes (§4.3) —
    `internal/store/store.go:141,148`, `commands.go:250,551,567,
    1184-1250,1583`, `ingress.go:865`.
 4. Maintenance fan-out and expiry N+1 (§4.4) — `runtime_run.go:586-634`,
-   `internal/store/commands.go:1724-1737`.
+   `internal/store/commands.go:1685-1700`.
 5. Probe efficiency (§4.5) — cap `limit` by free slots;
    lane-capacity-aware probe; optional global-order partial index.
 6. Allocation pass (§4.6) — `Config()` deep-copy per round
