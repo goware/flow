@@ -23,6 +23,7 @@ const (
 	commandProbeFactor       = 4
 	maxCommandProbe          = 256
 	maxCommandRoundsPerTurn  = maxCommandProbe + 1
+	minCommandSchedulerSleep = time.Millisecond
 	maxConcurrentClaims      = 8
 	claimMaintenanceHeadroom = 2
 	maxCommandResultBytes    = 256 << 10
@@ -196,13 +197,20 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 			revisitHead = continuationAfter != nil
 		}
 		if !progress {
-			delay := r.pollInterval
-			if !futureWake.IsZero() {
-				delay = min(delay, max(0, time.Until(futureWake)))
-			}
-			r.wake.wait(ctx, seen, delay)
+			r.wake.wait(ctx, seen, commandSchedulerDelay(r.pollInterval, futureWake, time.Now()))
 		}
 	}
+}
+
+func commandSchedulerDelay(pollInterval time.Duration, futureWake, now time.Time) time.Duration {
+	delay := pollInterval
+	if futureWake.IsZero() {
+		return delay
+	}
+	if remaining := futureWake.Sub(now); remaining < delay {
+		delay = max(remaining, min(pollInterval, minCommandSchedulerSleep))
+	}
+	return delay
 }
 
 func commandProbeCursor(candidate store.CommandCandidate) *store.CommandProbeCursor {

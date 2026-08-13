@@ -98,14 +98,18 @@ boundaries.
 - The command probe captures PostgreSQL time once and returns due candidates
   plus a global future duration in one result set. Cursor, run, and lane
   exclusions apply only to due candidates. Scheduler sleep remains capped by
-  `pollInterval` and is interruptible by the existing wake hub. A regression
-  waits for a completed future-work probe, inserts earlier work, and proves the
-  enqueue wake interrupts that calculated sleep.
+  `pollInterval`, retains a 1 ms positive floor at elapsed/near-zero horizons,
+  and is interruptible by the existing wake hub. Out-of-range PostgreSQL
+  durations clamp to Go's maximum positive duration before narrowing. A
+  regression waits for a completed future-work probe, inserts earlier work,
+  and proves the enqueue wake interrupts that calculated sleep.
 - `AwaitRun` snapshots the local generation before every durable read and uses
-  the existing 250 ms-capped timer as its correctness fallback. Remote and
-  notification-disabled completion remains timer-observed. The terminal-run
-  regression observes exactly one query, and the cancellation regression
-  proves all 16 concurrent waiter goroutines exit.
+  the existing 250 ms-capped timer as its correctness fallback. Wake-triggered
+  reads have a 25 ms floor so unrelated process-wide traffic cannot drive them
+  at the global wake rate. Remote and notification-disabled completion remains
+  timer-observed. The terminal-run regression observes exactly one query; the
+  sustained unrelated-wake regression bounds durable reads; and the
+  cancellation regression proves all 16 concurrent waiter goroutines exit.
 - `AttachSemantic` uses a `MATERIALIZED` locking CTE and evaluates
   `clock_timestamp()` only in the outer query. The contended-lock regression
   proves the second transaction's `DBNow` follows lock acquisition; skip-locked

@@ -247,6 +247,7 @@ func AwaitRun(ctx context.Context, c Client, id RunID) (Run, error) {
 	if interval <= 0 {
 		interval = 250 * time.Millisecond
 	}
+	repollFloor := min(interval, 25*time.Millisecond)
 	for {
 		seen := client.runtime.wake.snapshot()
 		run, err := GetRun(ctx, c, id)
@@ -256,9 +257,13 @@ func AwaitRun(ctx context.Context, c Client, id RunID) (Run, error) {
 		if isTerminalRunStatus(run.Status) {
 			return run, nil
 		}
+		readAt := time.Now()
 		client.runtime.wake.wait(ctx, seen, interval)
 		if err := ctx.Err(); err != nil {
 			return Run{}, err
+		}
+		if remaining := repollFloor - time.Since(readAt); remaining > 0 && !waitContext(ctx, remaining) {
+			return Run{}, ctx.Err()
 		}
 	}
 }

@@ -287,11 +287,14 @@ returned duration into a local remaining duration by subtracting monotonic time
 spent probing and processing. When a scheduler turn makes no progress, wait for:
 
 ```text
-min(pollInterval, max(0, remaining database-computed duration))
+min(pollInterval,
+    max(min(pollInterval, 1ms), max(0, remaining database-computed duration)))
 ```
 
 If the probe fails or returns no horizon, wait the ordinary `pollInterval`.
 Notifications and `wake.signal` continue to interrupt the wait.
+Clamp database durations that exceed Go's positive `time.Duration` range
+before narrowing them; they must never overflow into an immediate wake.
 
 Tests in `command_runtime_test.go` and `internal/store/commands_test.go` must
 cover:
@@ -332,6 +335,11 @@ local hub when their worker lifecycle ends (`command_runtime.go:420-425`);
 remote completion, disabled notifications, or a lost notification therefore
 uses the timer fallback.
 
+Because the hub is process-wide, coalesce wake-triggered rechecks behind a
+small positive floor no greater than the fallback interval. This keeps busy
+unrelated work from scaling durable reads with the global wake rate while
+preserving the same-runtime latency improvement.
+
 Tests in `inspection_test.go` must cover:
 
 - already-terminal run: one `GetRun` and immediate return;
@@ -340,6 +348,7 @@ Tests in `inspection_test.go` must cover:
 - remote runtime or notifications disabled: completion is eventually observed
   by the timer;
 - a broad unrelated wake causes only a re-check, not an incorrect return;
+- sustained unrelated wake traffic keeps durable rechecks bounded;
 - cancellation returns `ctx.Err()` and leaves no subscriber/goroutine leak; and
 - transaction clients remain rejected exactly as today.
 

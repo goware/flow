@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -159,8 +160,9 @@ func (s *Store) ProbeCommandsExcluding(
 			return CommandProbeResult{}, MapError("scan command candidate", err)
 		}
 		if delaySeconds != nil && result.FutureDelay == nil {
-			delay := max(0, time.Duration(*delaySeconds*float64(time.Second)))
-			result.FutureDelay = &delay
+			if delay, ok := postgresSecondsDuration(*delaySeconds); ok {
+				result.FutureDelay = &delay
+			}
 		}
 		if commandID != nil {
 			result.Candidates = append(result.Candidates, CommandCandidate{
@@ -173,6 +175,17 @@ func (s *Store) ProbeCommandsExcluding(
 		return CommandProbeResult{}, MapError("read command candidates", err)
 	}
 	return result, nil
+}
+
+func postgresSecondsDuration(seconds float64) (time.Duration, bool) {
+	if seconds <= 0 || math.IsNaN(seconds) {
+		return 0, false
+	}
+	maxSeconds := float64(math.MaxInt64) / float64(time.Second)
+	if math.IsInf(seconds, 1) || seconds >= maxSeconds {
+		return time.Duration(math.MaxInt64), true
+	}
+	return time.Duration(seconds * float64(time.Second)), true
 }
 
 type ClaimedCommand struct {

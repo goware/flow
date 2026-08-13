@@ -2,10 +2,28 @@ package store
 
 import (
 	"errors"
+	"math"
 	"testing"
+	"time"
 
 	"github.com/goware/flow/internal/flowerr"
 )
+
+func TestPostgresSecondsDurationIsBounded(t *testing.T) {
+	for _, seconds := range []float64{-1, 0, math.NaN()} {
+		if duration, ok := postgresSecondsDuration(seconds); ok || duration != 0 {
+			t.Fatalf("postgresSecondsDuration(%v) = %s, %t; want 0, false", seconds, duration, ok)
+		}
+	}
+	if duration, ok := postgresSecondsDuration(1.5); !ok || duration != 1500*time.Millisecond {
+		t.Fatalf("postgresSecondsDuration(1.5) = %s, %t", duration, ok)
+	}
+	for _, seconds := range []float64{math.Inf(1), math.MaxFloat64} {
+		if duration, ok := postgresSecondsDuration(seconds); !ok || duration != time.Duration(math.MaxInt64) {
+			t.Fatalf("postgresSecondsDuration(%v) = %s, %t; want MaxInt64, true", seconds, duration, ok)
+		}
+	}
+}
 
 func TestSuccessfulSettlementJournalLayoutMapsAcceptedPositions(t *testing.T) {
 	layout := newSuccessfulSettlementJournalLayout(2, 2)

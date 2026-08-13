@@ -33,6 +33,61 @@ type plan14ProbeObserver struct {
 	observed chan struct{}
 }
 
+type plan14AwaitRunReadContextKey struct{}
+
+type plan14AwaitRunReadBarrier struct {
+	done chan struct{}
+	once sync.Once
+}
+
+type plan14AwaitRunTracer struct {
+	queryRecorder
+	barrierMu sync.Mutex
+	getRunSQL string
+	barrier   *plan14AwaitRunReadBarrier
+}
+
+func (tracer *plan14AwaitRunTracer) arm(getRunSQL string) <-chan struct{} {
+	tracer.barrierMu.Lock()
+	defer tracer.barrierMu.Unlock()
+	tracer.getRunSQL = getRunSQL
+	tracer.barrier = &plan14AwaitRunReadBarrier{done: make(chan struct{})}
+	return tracer.barrier.done
+}
+
+func (tracer *plan14AwaitRunTracer) TraceQueryStart(
+	ctx context.Context,
+	conn *pgx.Conn,
+	data pgx.TraceQueryStartData,
+) context.Context {
+	ctx = tracer.queryRecorder.TraceQueryStart(ctx, conn, data)
+	tracer.barrierMu.Lock()
+	barrier := tracer.barrier
+	matches := barrier != nil && data.SQL == tracer.getRunSQL
+	tracer.barrierMu.Unlock()
+	if matches {
+		ctx = context.WithValue(ctx, plan14AwaitRunReadContextKey{}, barrier)
+	}
+	return ctx
+}
+
+func (tracer *plan14AwaitRunTracer) TraceQueryEnd(
+	ctx context.Context,
+	conn *pgx.Conn,
+	data pgx.TraceQueryEndData,
+) {
+	tracer.queryRecorder.TraceQueryEnd(ctx, conn, data)
+	if barrier, ok := ctx.Value(plan14AwaitRunReadContextKey{}).(*plan14AwaitRunReadBarrier); data.Err == nil && ok {
+		barrier.once.Do(func() { close(barrier.done) })
+	}
+}
+
+func plan14GetRunSQL(schema string) string {
+	return `SELECT run_id,definition_name,definition_version,run_key,status,
+	max_commands,command_count,open_commands,deadline_at,failure,created_at,updated_at,status_at,
+	finished_at,root_command_id FROM ` + pgschema.Table(schema, "flow_runs") + ` WHERE run_id=$1`
+}
+
 func (observer *plan14ProbeObserver) Observe(_ context.Context, observation Observation) {
 	if observation.Kind == ObservationClaim && observation.Operation == "probe" && observation.Outcome == "ok" {
 		observer.once.Do(func() { close(observer.observed) })
@@ -134,6 +189,59 @@ func TestPlan14CommandProbeReturnsGlobalFutureDelay(t *testing.T) {
 	}
 	if terminal.FutureDelay != nil {
 		t.Fatalf("terminal run set future horizon %s", *terminal.FutureDelay)
+	}
+}
+
+func TestPlan14CommandProbeClampsFarFutureDelay(t *testing.T) {
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := DefineCommand[None, None]("plan14.probe.far_future", 1)
+	run, err := command.Enqueue(ctx, runtime, "far-future", None{}, WithStartDelay(time.Hour), WithoutRunDeadline())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_command_queue")+`
+		SET next_run_at=clock_timestamp()+interval '400 years' WHERE run_id=$1`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+
+	probe, err := runtime.store.ProbeCommandsExcluding(ctx,
+		[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.FutureDelay == nil || *probe.FutureDelay != time.Duration(1<<63-1) {
+		t.Fatalf("far-future delay = %v, want the maximum positive duration", probe.FutureDelay)
+	}
+}
+
+func TestPlan14SchedulerDelayHasPositiveFloor(t *testing.T) {
+	now := time.Now()
+	for _, test := range []struct {
+		name         string
+		pollInterval time.Duration
+		futureWake   time.Time
+		want         time.Duration
+	}{
+		{name: "no horizon", pollInterval: 2 * time.Second, want: 2 * time.Second},
+		{name: "elapsed horizon", pollInterval: 2 * time.Second, futureWake: now.Add(-time.Second), want: time.Millisecond},
+		{name: "near-zero horizon", pollInterval: 2 * time.Second, futureWake: now.Add(time.Nanosecond), want: time.Millisecond},
+		{name: "future horizon", pollInterval: 2 * time.Second, futureWake: now.Add(100 * time.Millisecond), want: 100 * time.Millisecond},
+		{name: "poll cap", pollInterval: 2 * time.Second, futureWake: now.Add(3 * time.Second), want: 2 * time.Second},
+		{name: "sub-millisecond poll", pollInterval: 500 * time.Microsecond, futureWake: now, want: 500 * time.Microsecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := commandSchedulerDelay(test.pollInterval, test.futureWake, now); got != test.want {
+				t.Fatalf("commandSchedulerDelay() = %s, want %s", got, test.want)
+			}
+		})
 	}
 }
 
@@ -410,7 +518,7 @@ func TestPlan14AwaitRunLocalWakeAndTimerFallback(t *testing.T) {
 			}
 			awaited <- awaitErr
 		}()
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 		releasedAt := time.Now()
 		close(release)
 		select {
@@ -418,10 +526,10 @@ func TestPlan14AwaitRunLocalWakeAndTimerFallback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if elapsed := time.Since(releasedAt); elapsed > 500*time.Millisecond {
+			if elapsed := time.Since(releasedAt); elapsed > 150*time.Millisecond {
 				t.Fatalf("local wake took %s", elapsed)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(175 * time.Millisecond):
 			t.Fatal("local wake did not beat fallback timer")
 		}
 	})
@@ -522,6 +630,60 @@ func TestPlan14AwaitRunLocalWakeAndTimerFallback(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatalf("AwaitRun waiter %d did not exit after cancellation", index)
 			}
+		}
+	})
+
+	t.Run("unrelated wake traffic is rate limited", func(t *testing.T) {
+		recorder := &plan14AwaitRunTracer{}
+		database := testpg.OpenWithQueryTracer(t, recorder)
+		ctx := context.Background()
+		if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+			t.Fatal(err)
+		}
+		command := DefineCommand[None, None]("plan14.await.unrelated_traffic", 1)
+		runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false), WithPollInterval(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := command.Enqueue(ctx, runtime, "pending", None{}, WithStartDelay(time.Hour), WithoutRunDeadline())
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorder.reset()
+		getRunSQL := plan14GetRunSQL(database.Schema)
+		initialReadDone := recorder.arm(getRunSQL)
+		waitCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		awaited := make(chan error, 1)
+		go func() {
+			_, awaitErr := AwaitRun(waitCtx, runtime, run.RunID)
+			awaited <- awaitErr
+		}()
+		select {
+		case <-initialReadDone:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("AwaitRun did not perform its initial durable read")
+		}
+		recorder.reset()
+
+		trafficDeadline := time.Now().Add(125 * time.Millisecond)
+		for time.Now().Before(trafficDeadline) {
+			runtime.wake.signal()
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+		if err := <-awaited; !errors.Is(err, context.Canceled) {
+			t.Fatalf("AwaitRun cancellation error = %v", err)
+		}
+		reads := 0
+		for _, query := range recorder.snapshot() {
+			if query == getRunSQL {
+				reads++
+			}
+		}
+		if reads == 0 || reads > 8 {
+			t.Fatalf("AwaitRun performed %d durable reads during unrelated wake traffic, want 1..8", reads)
 		}
 	})
 }
