@@ -52,6 +52,7 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 			continue
 		}
 		progress := false
+		var futureWake time.Time
 		excludedRuns := make(map[uuid.UUID]struct{})
 		excludedQueues := make(map[string]struct{})
 		probeAfter := continuationAfter
@@ -67,15 +68,26 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 			limit := min(maxCommandProbe, max(free, free*commandProbeFactor))
 			atExclusionCap := len(excludedRuns)+len(excludedQueues) >= maxCommandProbe
 			started := time.Now()
-			candidates, err := r.store.ProbeCommandsExcluding(ctx, kinds, limit,
+			probe, err := r.store.ProbeCommandsExcluding(ctx, kinds, limit,
 				runIDs(excludedRuns), queueNames(excludedQueues), probeAfter)
+			candidates := probe.Candidates
+			if err == nil && probe.FutureDelay != nil {
+				futureWake = started.Add(*probe.FutureDelay)
+			} else {
+				futureWake = time.Time{}
+			}
 			if err == nil {
 				err = r.faults.Hit(ctx, fault.ProbeReturn)
 			}
-			r.observe(ctx, Observation{
-				Kind: ObservationClaim, Operation: "probe", Outcome: outcomeForError(err),
-				Count: int64(len(candidates)), Duration: time.Since(started), Worker: r.replicaName(),
-			})
+			if err != nil {
+				futureWake = time.Time{}
+			}
+			if r.observations != nil {
+				r.observe(ctx, Observation{
+					Kind: ObservationClaim, Operation: "probe", Outcome: outcomeForError(err),
+					Count: int64(len(candidates)), Duration: time.Since(started), Worker: r.replicaName(),
+				})
+			}
 			if err != nil || len(candidates) == 0 {
 				if err == nil {
 					reachedEnd = true
@@ -184,7 +196,11 @@ func (r *Runtime) runCommandScheduler(ctx context.Context) {
 			revisitHead = continuationAfter != nil
 		}
 		if !progress {
-			r.wake.wait(ctx, seen, r.pollInterval)
+			delay := r.pollInterval
+			if !futureWake.IsZero() {
+				delay = min(delay, max(0, time.Until(futureWake)))
+			}
+			r.wake.wait(ctx, seen, delay)
 		}
 	}
 }
@@ -228,9 +244,18 @@ func (r *Runtime) claimRunGroups(ctx context.Context, groups [][]store.CommandCa
 	if len(groups) == 0 {
 		return results
 	}
+	if len(groups) == 1 {
+		results[0].candidates = groups[0]
+		if ctx.Err() != nil {
+			results[0].err = ctx.Err()
+			return results
+		}
+		results[0].result, results[0].err = r.claimRunGroup(ctx, groups[0])
+		return results
+	}
 	jobs := make(chan int)
 	var group sync.WaitGroup
-	workers := min(len(groups), claimConcurrencyLimit(r.workerConcurrency, int(r.db.Conn.Config().MaxConns)))
+	workers := min(len(groups), claimConcurrencyLimit(r.workerConcurrency, r.poolCapacity))
 	group.Add(workers)
 	for range workers {
 		go func() {
@@ -286,11 +311,13 @@ func (r *Runtime) claimRunGroup(
 			err = nil
 		}
 	}
-	r.observe(ctx, Observation{
-		Kind: ObservationClaim, Operation: "claim", Outcome: outcomeForError(err),
-		RunID: RunID(group[0].RunID.String()), Count: int64(len(result.Commands)),
-		Duration: time.Since(started), Worker: r.replicaName(),
-	})
+	if r.observations != nil {
+		r.observe(ctx, Observation{
+			Kind: ObservationClaim, Operation: "claim", Outcome: outcomeForError(err),
+			RunID: RunID(group[0].RunID.String()), Count: int64(len(result.Commands)),
+			Duration: time.Since(started), Worker: r.replicaName(),
+		})
+	}
 	return result, err
 }
 
@@ -458,11 +485,13 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 	if hookErr := r.faults.Hit(workerCtx, fault.HandlerReturn); hookErr != nil {
 		workerErr = hookErr
 	}
-	r.observe(context.Background(), Observation{
-		Kind: ObservationAttempt, Operation: "handler", Outcome: outcomeForError(workerErr),
-		RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-		Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Duration: time.Since(started),
-	})
+	if r.observations != nil {
+		r.observe(context.Background(), Observation{
+			Kind: ObservationAttempt, Operation: "handler", Outcome: outcomeForError(workerErr),
+			RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+			Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Duration: time.Since(started),
+		})
+	}
 	if cause := context.Cause(workerCtx); cause != nil {
 		r.concludeClaim(context.Background(), claim, classifyWorkerError(cause, false))
 		return
@@ -515,25 +544,29 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		if settleErr == nil {
 			switch settleResult.Status {
 			case "succeeded":
-				for _, event := range events {
+				if r.observations != nil {
+					for _, event := range events {
+						r.observe(context.Background(), Observation{
+							Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
+							RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+							Name: event.Name, Worker: r.replicaName(),
+						})
+					}
 					r.observe(context.Background(), Observation{
-						Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
+						Kind: ObservationAttempt, Operation: "settle", Outcome: "succeeded",
 						RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-						Name: event.Name, Worker: r.replicaName(),
+						Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
 					})
 				}
-				r.observe(context.Background(), Observation{
-					Kind: ObservationAttempt, Operation: "settle", Outcome: "succeeded",
-					RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-					Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
-				})
 				return
 			case "expired":
-				r.observe(context.Background(), Observation{
-					Kind: ObservationAttempt, Operation: "settle", Outcome: "expired",
-					RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-					Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
-				})
+				if r.observations != nil {
+					r.observe(context.Background(), Observation{
+						Kind: ObservationAttempt, Operation: "settle", Outcome: "expired",
+						RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+						Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
+					})
+				}
 				return
 			default:
 				settleErr = newError(ErrInvalidState, "settle", "status", settleResult.Status, "successful settlement returned an unknown status")
@@ -573,11 +606,13 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 			time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 		}
 	}
-	r.observe(context.Background(), Observation{
-		Kind: ObservationAttempt, Operation: "settle", Outcome: "error",
-		RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-		Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
-	})
+	if r.observations != nil {
+		r.observe(context.Background(), Observation{
+			Kind: ObservationAttempt, Operation: "settle", Outcome: "error",
+			RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+			Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
+		})
+	}
 }
 
 func claimedEventInputSnapshots(inputs []store.ClaimedEventInput) (map[string]eventInputSnapshot, bool) {
@@ -695,11 +730,13 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 			if result.Retry {
 				r.wake.signal()
 			}
-			r.observe(context.Background(), Observation{
-				Kind: ObservationAttempt, Operation: "conclude", Outcome: result.Status,
-				RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
-				CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
-			})
+			if r.observations != nil {
+				r.observe(context.Background(), Observation{
+					Kind: ObservationAttempt, Operation: "conclude", Outcome: result.Status,
+					RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
+					CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
+				})
+			}
 			return
 		}
 		ownership, resolveErr := r.store.ResolveCommandAttempt(context.Background(), claim.CommandID, claim.AttemptID, claim.LeaseToken)
@@ -713,11 +750,13 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 			time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 		}
 	}
-	r.observe(context.Background(), Observation{
-		Kind: ObservationAttempt, Operation: "conclude", Outcome: "error",
-		RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
-		CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
-	})
+	if r.observations != nil {
+		r.observe(context.Background(), Observation{
+			Kind: ObservationAttempt, Operation: "conclude", Outcome: "error",
+			RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
+			CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
+		})
+	}
 }
 
 func commandAttemptRemaining(claim store.ClaimedCommand) (time.Duration, bool) {

@@ -61,6 +61,10 @@ func TestBeginSemanticRunFirst(t *testing.T) {
 		t.Fatalf("blocking lock returned before release: %v", got.err)
 	case <-time.After(75 * time.Millisecond):
 	}
+	var releasedDBNow time.Time
+	if err := first.PGX().QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&releasedDBNow); err != nil {
+		t.Fatalf("capture release database time: %v", err)
+	}
 	if err := first.Rollback(ctx); err != nil {
 		t.Fatalf("Rollback(first) error = %v", err)
 	}
@@ -69,8 +73,8 @@ func TestBeginSemanticRunFirst(t *testing.T) {
 		if got.err != nil {
 			t.Fatalf("BeginSemantic(second) error = %v", got.err)
 		}
-		if !got.tx.DBNow().After(first.DBNow()) {
-			t.Fatalf("second DBNow %s was not captured after first %s", got.tx.DBNow(), first.DBNow())
+		if got.tx.DBNow().Before(releasedDBNow) {
+			t.Fatalf("second DBNow %s was captured before lock release %s", got.tx.DBNow(), releasedDBNow)
 		}
 		if err := got.tx.Rollback(ctx); err != nil {
 			t.Fatalf("Rollback(second) error = %v", err)

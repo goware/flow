@@ -247,14 +247,8 @@ func AwaitRun(ctx context.Context, c Client, id RunID) (Run, error) {
 	if interval <= 0 {
 		interval = 250 * time.Millisecond
 	}
-	timer := time.NewTimer(0)
-	defer timer.Stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return Run{}, ctx.Err()
-		case <-timer.C:
-		}
+		seen := client.runtime.wake.snapshot()
 		run, err := GetRun(ctx, c, id)
 		if err != nil {
 			return Run{}, err
@@ -262,7 +256,10 @@ func AwaitRun(ctx context.Context, c Client, id RunID) (Run, error) {
 		if isTerminalRunStatus(run.Status) {
 			return run, nil
 		}
-		timer.Reset(interval)
+		client.runtime.wake.wait(ctx, seen, interval)
+		if err := ctx.Err(); err != nil {
+			return Run{}, err
+		}
 	}
 }
 

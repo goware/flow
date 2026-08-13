@@ -1,6 +1,6 @@
 # Plan 14: Reduce scheduler latency and database round trips
 
-Status: Proposed
+Status: Implemented — independent review pending
 
 Planned at: `ea0d62b` (v0.4.1, after Plan 12) on 2026-08-12
 
@@ -15,6 +15,12 @@ Planned at: `ea0d62b` (v0.4.1, after Plan 12) on 2026-08-12
 - **Durable format impact:** none
 - **Schema impact:** none in the required work; a baseline-index replacement is
   permitted only if the conditional PostgreSQL plan gate proves it worthwhile
+
+Implementation evidence: [`plan_14_scheduler_latency.md`](../benchmark_evidence/plan_14_scheduler_latency.md).
+Required Phases 4.0–4.6 are complete. Conditional maintenance and scheduler
+probe redesign are deferred. The preliminary PostgreSQL 17/18 wait-expiry
+predicate experiment did not capture the required five samples or actual-row
+counts, so that conditional change is also deferred and the index is unchanged.
 
 > **Executor instructions:** Read this plan completely before editing. Work in
 > phase order, run each phase's focused verification, and record measurements
@@ -674,77 +680,78 @@ Plan 14 phase; release timing remains a repository-level decision.
 
 ### Baseline and scheduler latency
 
-- [ ] Rebase implementation work on `ea0d62b` or newer and refresh every source
+- [x] Rebase implementation work on `ea0d62b` or newer and refresh every source
   anchor.
-- [ ] Record the contemporaneous environment, five-sample benchmark baseline,
+- [x] Record the contemporaneous environment, five-sample benchmark baseline,
   and claim/settle protocol census.
-- [ ] Add scheduled-command and `AwaitRun` latency benchmarks with setup outside
+- [x] Add scheduled-command and `AwaitRun` latency benchmarks with setup outside
   the timer.
-- [ ] Return a global database-computed future-work duration in the existing
+- [x] Return a global database-computed future-work duration in the existing
   command-probe round trip.
-- [ ] Cap every scheduler sleep at `pollInterval` and preserve notification
+- [x] Cap every scheduler sleep at `pollInterval` and preserve notification
   interruption.
-- [ ] Prove horizon correctness across cursor/exclusion, disabled notification,
+- [x] Prove horizon correctness across cursor/exclusion, disabled notification,
   newly earlier work, unregistered kinds, and terminal runs.
 
 ### AwaitRun
 
-- [ ] Snapshot the local wake generation before the first durable run read.
-- [ ] Re-check durable state after local wakes and the unchanged fallback timer.
-- [ ] Cover same-runtime fast wake, remote/timer fallback, unrelated broad wake,
+- [x] Snapshot the local wake generation before the first durable run read.
+- [x] Re-check durable state after local wakes and the unchanged fallback timer.
+- [x] Cover same-runtime fast wake, remote/timer fallback, unrelated broad wake,
   cancellation, no leak, and transaction-client rejection.
 
 ### Round trips and transaction safety
 
-- [ ] Merge run lock, database time, and the minimal initial run projection into
+- [x] Merge run lock, database time, and the minimal initial run projection into
   one statement.
-- [ ] Prove with a contended-lock test that `DBNow` is captured after the lock is
+- [x] Prove with a contended-lock test that `DBNow` is captured after the lock is
   acquired, including `SKIP LOCKED` behavior.
-- [ ] Make initial snapshot semantics explicit; retain live `LoadRunHead` reads
+- [x] Make initial snapshot semantics explicit; retain live `LoadRunHead` reads
   after projection mutation.
-- [ ] Remove only the verified immediate claim and settlement run rereads.
-- [ ] Batch adjacent independent claim projection writes, drain every result,
+- [x] Remove only the verified immediate claim and settlement run rereads.
+- [x] Batch adjacent independent claim projection writes, drain every result,
   and preserve every existing affected-row check.
-- [ ] Batch only the verified adjacent settlement projection pairs without
+- [x] Batch only the verified adjacent settlement projection pairs without
   crossing hooks, children/events, callbacks, notifications, or commit.
-- [ ] Prove rollback, fault, ambiguous-commit, caller-transaction, replay, and
+- [x] Prove rollback, fault, ambiguous-commit, caller-transaction, replay, and
   journal invariants.
-- [ ] Record exact before/after protocol-operation counts.
+- [x] Record exact before/after protocol-operation counts.
 
 ### Run expiry and allocations
 
-- [ ] Replace per-running-command expiry delivery reads with one ordered bulk
+- [x] Replace per-running-command expiry delivery reads with one ordered bulk
   lock/read and exact row-shape validation.
-- [ ] Prove zero/one/100-command, corruption, rollback, and concurrent settlement
+- [x] Prove zero/one/100-command, corruption, rollback, and concurrent settlement
   behavior.
-- [ ] Cache pool capacity and replica name at runtime construction.
-- [ ] Add the direct single-run claim-group path.
-- [ ] Replace profiled UUID string sorting with byte comparison.
-- [ ] Make the default no-observer path avoid adapter enqueue work and preserve
+- [x] Cache pool capacity and replica name at runtime construction.
+- [x] Add the direct single-run claim-group path.
+- [x] Replace profiled UUID string sorting with byte comparison.
+- [x] Make the default no-observer path avoid adapter enqueue work and preserve
   Plan 15's extension point.
-- [ ] Retain only allocation changes with measured benefit and no material
+- [x] Retain only allocation changes with measured benefit and no material
   throughput regression.
 
 ### Conditional decisions
 
-- [ ] Rerun the complete five-sample matrix and append final evidence.
-- [ ] Record `ADOPT`, `DEFER`, or `REJECT` for maintenance horizons/fan-out,
+- [x] Rerun the complete five-sample matrix and append final evidence.
+- [x] Record `ADOPT`, `DEFER`, or `REJECT` for maintenance horizons/fan-out,
   scheduler probe/index redesign, and wait-expiry predicate replacement.
-- [ ] If maintenance is adopted, preserve category-local drain behavior,
-  per-run serialization, pool headroom, and shutdown drain.
-- [ ] If probe/index work is adopted, pass every bounded-fairness regression and
-  PostgreSQL 17/18 plan gate.
-- [ ] If the wait index is adopted, replace only the consolidated baseline index
-  and do not INCLUDE mutable counters.
-- [ ] Keep projection-only public reads, global SQL prebuilding, and settlement
+- [x] If maintenance is adopted, preserve category-local drain behavior,
+  per-run serialization, pool headroom, and shutdown drain. N/A: deferred.
+- [x] If probe/index work is adopted, pass every bounded-fairness regression and
+  PostgreSQL 17/18 plan gate. N/A: deferred.
+- [x] If the wait index is adopted, replace only the consolidated baseline index
+  and do not INCLUDE mutable counters. N/A: deferred because the preliminary
+  experiment did not satisfy the five-sample and actual-row evidence gate.
+- [x] Keep projection-only public reads, global SQL prebuilding, and settlement
   jitter outside Plan 14.
 
 ### Final verification
 
-- [ ] Pass format, diff, build, vet, exact ordinary, and full race gates.
-- [ ] Pass PostgreSQL 17 and 18 durability-on suites with zero named skips.
-- [ ] Complete the final lock/fence/journal/notification/public-API audit.
-- [ ] Update Plan 15's drift anchors and benchmark baseline before its
+- [x] Pass format, diff, build, vet, exact ordinary, and full race gates.
+- [x] Pass PostgreSQL 17 and 18 durability-on suites with zero named skips.
+- [x] Complete the final lock/fence/journal/notification/public-API audit.
+- [x] Update Plan 15's drift anchors and benchmark baseline before its
   implementation begins.
-- [ ] Mark Plan 14 complete only after required phases, evidence, and all adopted
+- [x] Mark Plan 14 complete only after required phases, evidence, and all adopted
   conditional phases pass; deferred/rejected decisions must remain recorded.

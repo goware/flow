@@ -89,15 +89,26 @@ func ParseNotificationHint(payload string) (uuid.UUID, bool) {
 }
 
 type SemanticTx struct {
-	store             *Store
-	tx                pgx.Tx
-	runID             uuid.UUID
-	dbNow             time.Time
-	closed            bool
-	applied           bool
-	notificationSent  bool
-	notificationOwner *SemanticTx
-	failed            bool
+	store                 *Store
+	tx                    pgx.Tx
+	runID                 uuid.UUID
+	dbNow                 time.Time
+	initialLockedSnapshot *InitialLockedSnapshot
+	closed                bool
+	applied               bool
+	notificationSent      bool
+	notificationOwner     *SemanticTx
+	failed                bool
+}
+
+// InitialLockedSnapshot is the run projection captured by AttachSemantic in
+// the same statement that acquires the run lock. It is deliberately distinct
+// from LoadRunHead: callers may use it only before mutating the projection in
+// this semantic transaction.
+type InitialLockedSnapshot struct {
+	Head     RunHead
+	Deadline *time.Time
+	RunKey   string
 }
 
 func (s *Store) BeginSemantic(ctx context.Context, id uuid.UUID, mode LockMode) (*SemanticTx, error) {
@@ -133,22 +144,31 @@ func (s *Store) AttachSemantic(ctx context.Context, tx pgx.Tx, id uuid.UUID, mod
 	if mode != LockBlocking && mode != LockSkipLocked {
 		return nil, fmt.Errorf("%w: unknown lock mode", flowerr.ErrInvalid)
 	}
-	lockSQL := `SELECT run_id FROM ` + pgschema.Table(s.schema, "flow_runs") + ` WHERE run_id=$1 FOR UPDATE`
+	lockSQL := `WITH locked AS MATERIALIZED (
+		SELECT run_id,status,deadline_at,run_key,max_commands,command_count,open_commands
+		FROM ` + pgschema.Table(s.schema, "flow_runs") + ` WHERE run_id=$1 FOR UPDATE`
 	if mode == LockSkipLocked {
 		lockSQL += ` SKIP LOCKED`
 	}
-	var locked uuid.UUID
-	if err := tx.QueryRow(ctx, lockSQL, id).Scan(&locked); err != nil {
+	lockSQL += `
+	) SELECT run_id,status,deadline_at,run_key,max_commands,command_count,open_commands,clock_timestamp()
+	  FROM locked`
+	var snapshot InitialLockedSnapshot
+	var snapshotTime time.Time
+	if err := tx.QueryRow(ctx, lockSQL, id).Scan(
+		&snapshot.Head.ID, &snapshot.Head.Status, &snapshot.Deadline, &snapshot.RunKey,
+		&snapshot.Head.MaxCommands, &snapshot.Head.CommandCount, &snapshot.Head.OpenCommands,
+		&snapshotTime,
+	); err != nil {
 		if mode == LockSkipLocked && errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrLockUnavailable
 		}
 		return nil, MapError("lock run", err)
 	}
-	var dbNow time.Time
-	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
-		return nil, MapError("capture database time", err)
-	}
-	return &SemanticTx{store: s, tx: tx, runID: locked, dbNow: dbNow}, nil
+	return &SemanticTx{
+		store: s, tx: tx, runID: snapshot.Head.ID, dbNow: snapshotTime,
+		initialLockedSnapshot: &snapshot,
+	}, nil
 }
 
 // AdoptSemantic wraps a newly inserted run row that the supplied
@@ -173,6 +193,15 @@ func (tx *SemanticTx) DBNow() time.Time {
 		return time.Time{}
 	}
 	return tx.dbNow
+}
+
+func (tx *SemanticTx) InitialLockedSnapshot() (InitialLockedSnapshot, bool) {
+	if tx == nil || tx.initialLockedSnapshot == nil {
+		return InitialLockedSnapshot{}, false
+	}
+	result := *tx.initialLockedSnapshot
+	result.Deadline = clonePointer(result.Deadline)
+	return result, true
 }
 
 func (tx *SemanticTx) RunID() uuid.UUID {
