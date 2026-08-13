@@ -274,7 +274,7 @@ always replaced, even when its declaration equals the requested successor.
   fences and may settle before the run becomes terminal.
 - Run deadlines, retries, queues, concurrency limits, graceful shutdown, polling, notification hints, observers, history, trace, cancellation, and caller-owned transactions are supported.
 - Publishers may use a `Runtime` without calling `Run` or registering workers. Worker pools may be deployed independently.
-- Observer delivery and shutdown drain are best-effort. Observers must return promptly and should honor context cancellation; observation loss never changes durable correctness.
+- Observer delivery and shutdown drain are best-effort. Observers must return promptly and should honor context cancellation; observation loss never changes durable correctness. Terminal lifecycle facts have a small reserved capacity and separate drop accounting, but durable reads remain the reconciliation backstop. Run-scoped facts carry `RunID`, `RunKey`, and `RootCommandName` when the emission path already holds them.
 - `PruneTerminalRuns` removes one explicit bounded batch of old terminal
   unkeyed/live-key run aggregates. Permanent non-empty keys are never eligible,
   application tables are never touched, and there is no automatic TTL or

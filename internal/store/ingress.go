@@ -851,6 +851,8 @@ type RunHead struct {
 	MaxCommands  int
 	CommandCount int
 	OpenCommands int
+	RunKey       string
+	Definition   string
 }
 
 func (s *Store) LoadRunHead(ctx context.Context, semantic *SemanticTx) (RunHead, error) {
@@ -858,9 +860,10 @@ func (s *Store) LoadRunHead(ctx context.Context, semantic *SemanticTx) (RunHead,
 		return RunHead{}, fmt.Errorf("%w: semantic transaction is nil", flowerr.ErrInvalid)
 	}
 	var result RunHead
-	err := semantic.PGX().QueryRow(ctx, `SELECT run_id,status,max_commands,command_count,open_commands
+	err := semantic.PGX().QueryRow(ctx, `SELECT run_id,status,max_commands,command_count,open_commands,run_key,definition_name
 		FROM `+pgschema.Table(s.schema, "flow_runs")+` WHERE run_id=$1`, semantic.RunID()).
-		Scan(&result.ID, &result.Status, &result.MaxCommands, &result.CommandCount, &result.OpenCommands)
+		Scan(&result.ID, &result.Status, &result.MaxCommands, &result.CommandCount, &result.OpenCommands,
+			&result.RunKey, &result.Definition)
 	if err != nil {
 		return RunHead{}, MapError("load run", err)
 	}
@@ -1023,6 +1026,17 @@ func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event Appl
 
 type CancelResult struct {
 	Created bool
+	// TerminalRun and RunStatus are set by CancelCommandLocked only, when
+	// cancelling the last open command fails the run. CancelRunLocked never
+	// sets them: the run/cancel observation for direct run cancellation is
+	// itself the terminal fact, so a second run/terminal report would
+	// double-count it.
+	TerminalRun bool
+	RunStatus   string
+	RunKey      string
+	Definition  string
+	// CommandKey is the cancelled command's key on command cancellation.
+	CommandKey string
 }
 
 type terminalFailure = failure.Value
@@ -1218,7 +1232,11 @@ func (s *Store) CancelCommandLocked(ctx context.Context, semantic *SemanticTx, c
 			return CancelResult{}, MapError("update run after command cancellation", err)
 		}
 	}
-	return CancelResult{Created: true}, nil
+	result := CancelResult{Created: true, CommandKey: key, RunKey: head.RunKey, Definition: head.Definition}
+	if terminalRun {
+		result.TerminalRun, result.RunStatus = true, "failed"
+	}
+	return result, nil
 }
 
 func (s *Store) CancelRunLocked(ctx context.Context, semantic *SemanticTx, reason string) (CancelResult, error) {
@@ -1355,7 +1373,7 @@ func (s *Store) CancelRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 		WHERE run_id=$1`, head.ID, failure, semantic.DBNow()); err != nil {
 		return CancelResult{}, MapError("cancel run", err)
 	}
-	return CancelResult{Created: true}, nil
+	return CancelResult{Created: true, RunKey: head.RunKey, Definition: head.Definition}, nil
 }
 
 func terminalEvent(commandID uuid.UUID, key, status, reason, name, class string) (JournalEntry, error) {

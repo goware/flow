@@ -269,11 +269,11 @@ func TestImmediateRetryAndLeaseRecoveryNotify(t *testing.T) {
 		SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE command_id=$1`, recoveryClaim.CommandID); err != nil {
 		t.Fatalf("expire lease: %v", err)
 	}
-	changed, err := runtime.store.RecoverExpiredCommandLease(ctx, store.ExpiredLeaseCandidate{
+	recovery, err := runtime.store.RecoverExpiredCommandLease(ctx, store.ExpiredLeaseCandidate{
 		CommandID: recoveryClaim.CommandID, RunID: recoveryClaim.RunID,
 	})
-	if err != nil || !changed {
-		t.Fatalf("RecoverExpiredCommandLease() = %t, %v", changed, err)
+	if err != nil || !recovery.Changed {
+		t.Fatalf("RecoverExpiredCommandLease() = %t, %v", recovery.Changed, err)
 	}
 	waitForNotificationHint(t, listener, RunID(recoveryClaim.RunID.String()), 2*time.Second)
 }

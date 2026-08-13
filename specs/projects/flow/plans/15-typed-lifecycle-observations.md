@@ -1,8 +1,68 @@
 # Plan 15: Make observations an alertable lifecycle contract
 
-Status: Proposed — Plan 14 anchors synchronized 2026-08-12
+Status: Partially implemented — embedder-facing subset shipped (#30);
+Plan 14 anchors synchronized 2026-08-12
 
 Planned at: `d9125dc` (v0.4.0, post-Plan 13) on 2026-08-13
+
+## Implementation status (#30, branch `feat/plan-15-observations`)
+
+The subset consumed by the first production embedder (trails-api plan 012)
+is implemented; the rest of this document is retained as the design record
+for the deferred remainder.
+
+Shipped:
+
+- `Observation.RunKey` and `Observation.RootCommandName` (Section 4.1), populated
+  on run-scoped ingress, claim/attempt/event paths, and the maintenance pages
+  from values already held in memory or columns the probes already read. Plan 14's
+  lock/time/snapshot statement in `AttachSemantic` was widened by
+  `definition_name` (Section 4.2's projection change), which reaches the
+  claim path through `InitialLockedSnapshot` and is carried on
+  `ClaimedCommand.DefinitionName`.
+- Exported constants for the terminal tuple vocabulary only
+  (`ObservationOpTerminal`, `ObservationOpConclude`,
+  `ObservationOpConcludeExhausted`, `ObservationOpExpire`,
+  `ObservationOpRecover`, `ObservationOpLocalCancel`,
+  `ObservationOpObserver`, `ObservationOpCancel`, and the terminal
+  `ObservationOutcome*` values). String values equal the previously emitted
+  literals.
+- The Section 4.4 terminal emissions: run terminal from both settlement
+  paths (surfaced via additive `SettleResult` fields — `TerminalRun`,
+  `RunStatus`, `RunKey`, `Definition`, plus `StopReason` for the retry
+  decision), `CancelCommand`/`CancelRun` (via additive `CancelResult`
+  fields), wait-deadline expiry (`wait`/`expire`/`expired`, resolving the
+  previously unused `ObservationWait` kind), the run-deadline maintenance
+  page (per expired run, page-bounded), and per-command
+  `lease`/`recover`/`recovered` from the recovery page.
+- `conclude_exhausted`: a terminal failed conclusion caused by budget
+  exhaustion (`attempt_limit`, `elapsed_limit`,
+  `deadline_before_next_attempt`) is a distinct operation; a permanent
+  classification remains `conclude`/`failed`.
+- Section 4.5 delivery classes: one goroutine, one observer, 64 of the 1024
+  slots reserved for terminal-class observations, per-class drop accounting,
+  and a drain-time `runtime`/`observer`/`dropped_terminal` report.
+- Minimal README, package, functional-spec, and architecture guidance now
+  documents identity, terminal reserve/drop accounting, and durable-read
+  reconciliation. The larger monitoring example remains deferred.
+
+Deferred (not needed by the first embedder):
+
+- `CommandInfo.Definition` (Section 4.2's second half).
+- The full tuple registry, its exhaustiveness test, and converting
+  duty-cycle emission sites to constants (Section 4.3). Duty-cycle sites
+  still emit string literals; only the terminal vocabulary is pinned.
+- `examples/monitor` and the remaining detailed component documentation
+  (Sections 4.6, Phase 5).
+- Claim benchmark evidence (the Phase 1 gate); Plan 14's claim benchmarks are
+  the live baseline and cover the one-column widening.
+
+This sits on Plan 14 (#27) as Section 0 requires. The additions ride Plan 14's
+merged statements rather than adding their own: `definition_name` is one more
+column on the lock/time/snapshot statement, and the `SettleResult` identity
+fields come from the `commandFence` the settle paths already load. Plan 14's
+§4.5 fast paths are preserved — the default observer is a nil adapter and
+duty-cycle observation construction stays behind that nil check.
 
 - **Branch:** create an implementation branch from `master` after Plans 12
   and 14 have landed; this plan assumes both are complete
@@ -24,9 +84,10 @@ Planned at: `d9125dc` (v0.4.0, post-Plan 13) on 2026-08-13
   `run_terminal`, and added `GetQueueStats`; Plan 12 (fast lease recovery) and
   Plan 14 (scheduler latency and round-trip reduction), both assumed complete
   — Section 0 states what each changes for this plan
-- **Public API impact:** additive only — new `Observation` fields, one new
-  `CommandInfo` field, exported vocabulary constants, and one documented
-  delivery-class distinction; no signature changes and no new goroutine model
+- **Public API impact if the full plan is completed:** additive only — new
+  `Observation` fields, one new `CommandInfo` field, exported vocabulary
+  constants, and one documented delivery-class distinction; no signature
+  changes and no new goroutine model
 - **Durable format impact:** none; one additive widening of the claim-head
   SELECT (no schema change)
 
@@ -295,14 +356,14 @@ Add two fields to `Observation`:
 
 - `RunKey string` — the application-chosen run key, empty when the run was
   started without one;
-- `Definition string` — the run's root definition name.
+- `RootCommandName string` — the run's root command definition name.
 
 Population rules: run-path sites (`start`, `cancel`, the `ReplaceCurrentRun`
 pair) already hold or can cheaply hold both and must set them. Attempt-path
 sites populate them from the claim — `RunKey` is already on `ClaimedCommand`
-today, `Definition` arrives with Section 4.2. Note that `Observation.Name` on
+today, `RootCommandName` arrives with Section 4.2. Note that `Observation.Name` on
 attempt-path facts is the *command* definition name, not the run's; the new
-`Definition` field is the run root and the two are independent. Maintenance
+`RootCommandName` field is the run root and the two are independent. Maintenance
 sites populate them from the probe row when the probe already selects the
 column, and otherwise leave them empty rather than adding a per-candidate
 lookup — maintenance must stay bounded. Runtime, notify-listener, and
@@ -461,7 +522,7 @@ Section 0 baseline.
 
 ### Phase 2 — Observation fields and vocabulary constants
 
-Add `RunKey`/`Definition` to `Observation`, introduce the exported
+Add `RunKey`/`RootCommandName` to `Observation`, introduce the exported
 constants, convert all emission sites, add the registry and its
 exhaustiveness test, and resolve the unused `ObservationWait` kind.
 

@@ -320,11 +320,16 @@ func (r *Runtime) claimRunGroup(
 		}
 	}
 	if r.observations != nil {
-		r.observe(ctx, Observation{
+		observation := Observation{
 			Kind: ObservationClaim, Operation: "claim", Outcome: outcomeForError(err),
 			RunID: RunID(group[0].RunID.String()), Count: int64(len(result.Commands)),
 			Duration: time.Since(started), Worker: r.replicaName(),
-		})
+		}
+		if len(result.Commands) > 0 {
+			observation.RunKey = result.Commands[0].RunKey
+			observation.RootCommandName = result.Commands[0].DefinitionName
+		}
+		r.observe(ctx, observation)
 	}
 	return result, err
 }
@@ -497,6 +502,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		r.observe(context.Background(), Observation{
 			Kind: ObservationAttempt, Operation: "handler", Outcome: outcomeForError(workerErr),
 			RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+			RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 			Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Duration: time.Since(started),
 		})
 	}
@@ -557,23 +563,28 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 						r.observe(context.Background(), Observation{
 							Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
 							RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+							RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 							Name: event.Name, Worker: r.replicaName(),
 						})
 					}
 					r.observe(context.Background(), Observation{
-						Kind: ObservationAttempt, Operation: "settle", Outcome: "succeeded",
+						Kind: ObservationAttempt, Operation: "settle", Outcome: ObservationOutcomeSucceeded,
 						RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+						RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 						Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
 					})
+					r.observeRunTerminal(info.RunID, settleResult)
 				}
 				return
 			case "expired":
 				if r.observations != nil {
 					r.observe(context.Background(), Observation{
-						Kind: ObservationAttempt, Operation: "settle", Outcome: "expired",
+						Kind: ObservationAttempt, Operation: "settle", Outcome: ObservationOutcomeExpired,
 						RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+						RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 						Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
 					})
+					r.observeRunTerminal(info.RunID, settleResult)
 				}
 				return
 			default:
@@ -618,9 +629,21 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		r.observe(context.Background(), Observation{
 			Kind: ObservationAttempt, Operation: "settle", Outcome: "error",
 			RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+			RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 			Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
 		})
 	}
+}
+
+// observeRunTerminal reports the run-terminal edge surfaced by a settlement.
+func (r *Runtime) observeRunTerminal(runID RunID, result store.SettleResult) {
+	if !result.TerminalRun {
+		return
+	}
+	r.observe(context.Background(), Observation{
+		Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: result.RunStatus,
+		RunID: runID, RunKey: result.RunKey, RootCommandName: result.Definition, Worker: r.replicaName(),
+	})
 }
 
 func claimedEventInputSnapshots(inputs []store.ClaimedEventInput) (map[string]eventInputSnapshot, bool) {
@@ -739,11 +762,17 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 				r.wake.signal()
 			}
 			if r.observations != nil {
+				operation := ObservationOpConclude
+				if result.Status == ObservationOutcomeFailed && budgetExhausted(result.StopReason) {
+					operation = ObservationOpConcludeExhausted
+				}
 				r.observe(context.Background(), Observation{
-					Kind: ObservationAttempt, Operation: "conclude", Outcome: result.Status,
+					Kind: ObservationAttempt, Operation: operation, Outcome: result.Status,
 					RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
-					CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
+					CommandKey: claim.CommandKey, RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
+					Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
 				})
+				r.observeRunTerminal(RunID(claim.RunID.String()), result)
 			}
 			return
 		}
@@ -762,9 +791,20 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 		r.observe(context.Background(), Observation{
 			Kind: ObservationAttempt, Operation: "conclude", Outcome: "error",
 			RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
-			CommandKey: claim.CommandKey, Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
+			CommandKey: claim.CommandKey, RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
+			Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
 		})
 	}
+}
+
+// budgetExhausted reports whether a terminal failed conclusion was caused by
+// retry-budget exhaustion rather than a permanent classification.
+func budgetExhausted(stopReason string) bool {
+	switch stopReason {
+	case "attempt_limit", "elapsed_limit", "deadline_before_next_attempt":
+		return true
+	}
+	return false
 }
 
 func commandAttemptRemaining(claim store.ClaimedCommand) (time.Duration, bool) {

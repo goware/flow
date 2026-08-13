@@ -263,8 +263,14 @@ func TestShortRecoveryLeaseBecomesRecoverableBeforeDefault(t *testing.T) {
 	if expired[0].CommandID != shortID {
 		t.Fatalf("expired command=%s, want short %s", expired[0].CommandID, shortID)
 	}
-	if changed, err := runtime.store.RecoverExpiredCommandLease(ctx, expired[0]); err != nil || !changed {
-		t.Fatalf("RecoverExpiredCommandLease()=%t, %v", changed, err)
+	recovery, err := runtime.store.RecoverExpiredCommandLease(ctx, expired[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovery.Changed || !recovery.Recovered || recovery.ExpiredRun ||
+		recovery.CommandKey != "short" || recovery.RunKey != "claim/fixture/recovery_order" ||
+		recovery.Definition != "claim.fixture_parent_recovery_order" {
+		t.Fatalf("RecoverExpiredCommandLease() = %#v", recovery)
 	}
 	var shortState, standardState string
 	if err := database.DB.Conn.QueryRow(ctx, `SELECT
@@ -275,6 +281,50 @@ func TestShortRecoveryLeaseBecomesRecoverableBeforeDefault(t *testing.T) {
 	}
 	if shortState != "retry_wait" || standardState != "running" {
 		t.Fatalf("recovery states short=%s standard=%s", shortState, standardState)
+	}
+}
+
+func TestRunDeadlineExpiredDuringLeaseRecoveryExpiresRun(t *testing.T) {
+	t.Parallel()
+
+	database := testpg.Open(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	child := DefineCommand[None, None]("lease.recovery.expired_run", 1)
+	runtime, run := stageClaimFixture(t, database, "expired_run", 1, func(work *Work[None]) {
+		Enqueue(work, "child", child, None{})
+	})
+	candidates := probeClaimCandidates(t, runtime,
+		[]store.CommandKind{{Name: child.Name(), Version: child.Version()}}, 1)
+	claimed, err := runtime.store.ClaimCommands(ctx, candidates, time.Second, "expired-run-test", fault.None{})
+	if err != nil || len(claimed.Commands) != 1 {
+		t.Fatalf("ClaimCommands() commands=%d, err=%v", len(claimed.Commands), err)
+	}
+	past := time.Now().Add(-time.Minute)
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_runs")+`
+		SET deadline_at=$2 WHERE run_id=$1`, run.ID, past); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Conn.Exec(ctx, `UPDATE `+pgschema.Table(database.Schema, "flow_command_queue")+`
+		SET lease_expires_at=$2 WHERE command_id=$1`, claimed.Commands[0].CommandID, past); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := runtime.store.ProbeExpiredCommandLeases(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expired) != 1 || expired[0].CommandID != claimed.Commands[0].CommandID {
+		t.Fatalf("ProbeExpiredCommandLeases() = %#v", expired)
+	}
+	recovery, err := runtime.store.RecoverExpiredCommandLease(ctx, expired[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovery.Changed || recovery.Recovered || !recovery.ExpiredRun || recovery.CommandKey != "" ||
+		recovery.RunKey != "claim/fixture/expired_run" || recovery.Definition != "claim.fixture_parent_expired_run" {
+		t.Fatalf("RecoverExpiredCommandLease() = %#v", recovery)
 	}
 }
 

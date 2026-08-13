@@ -355,11 +355,11 @@ func TestWaitExpiryReconciliationAcceptsEventAtExactDeadline(t *testing.T) {
 	if len(candidates) != 1 || candidates[0].CommandID.String() != string(execRun.RootCommandID) {
 		t.Fatalf("expired wait candidates=%+v", candidates)
 	}
-	changed, err := runtime.store.ExpireCommandWait(ctx, candidates[0])
+	expiry, err := runtime.store.ExpireCommandWait(ctx, candidates[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !expiry.Changed {
 		t.Fatal("exact-deadline reconciliation made no change")
 	}
 	var state string

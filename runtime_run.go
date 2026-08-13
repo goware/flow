@@ -733,7 +733,7 @@ func (r *Runtime) runMaintenancePass(ctx context.Context) maintenancePassResult 
 	return result
 }
 
-func (r *Runtime) runRunDeadlinePage(ctx context.Context, candidates []uuid.UUID) (int, error) {
+func (r *Runtime) runRunDeadlinePage(ctx context.Context, candidates []store.ExpiredRunCandidate) (int, error) {
 	if len(candidates) > 0 {
 		if err := r.faults.Hit(ctx, fault.MaintenanceAfterProbe); err != nil {
 			return 0, err
@@ -741,13 +741,18 @@ func (r *Runtime) runRunDeadlinePage(ctx context.Context, candidates []uuid.UUID
 	}
 	changed := 0
 	var firstErr error
-	for _, id := range candidates {
-		progressed, err := r.store.ExpireRun(ctx, id, "run deadline reached")
+	for _, candidate := range candidates {
+		progressed, err := r.store.ExpireRun(ctx, candidate.RunID, "run deadline reached")
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 		if progressed {
 			changed++
+			r.observe(ctx, Observation{
+				Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: ObservationOutcomeExpired,
+				RunID: RunID(candidate.RunID.String()), RunKey: candidate.RunKey, RootCommandName: candidate.Definition,
+				Worker: r.replicaName(),
+			})
 		}
 	}
 	return changed, firstErr
@@ -762,12 +767,27 @@ func (r *Runtime) runWaitExpiryPage(ctx context.Context, candidates []store.Expi
 	changed := 0
 	var firstErr error
 	for _, candidate := range candidates {
-		progressed, err := r.store.ExpireCommandWait(ctx, candidate)
+		result, err := r.store.ExpireCommandWait(ctx, candidate)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
-		if progressed {
+		if result.Changed {
 			changed++
+		}
+		if result.Expired {
+			r.observe(ctx, Observation{
+				Kind: ObservationWait, Operation: ObservationOpExpire, Outcome: ObservationOutcomeExpired,
+				RunID: RunID(candidate.RunID.String()), CommandID: CommandID(candidate.CommandID.String()),
+				CommandKey: result.CommandKey, RunKey: result.RunKey, RootCommandName: result.Definition,
+				Worker: r.replicaName(),
+			})
+		}
+		if result.TerminalRun {
+			r.observe(ctx, Observation{
+				Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: ObservationOutcomeFailed,
+				RunID: RunID(candidate.RunID.String()), RunKey: result.RunKey, RootCommandName: result.Definition,
+				Worker: r.replicaName(),
+			})
 		}
 	}
 	return changed, firstErr
@@ -782,12 +802,27 @@ func (r *Runtime) runLeaseRecoveryPage(ctx context.Context, candidates []store.E
 	changed := 0
 	var firstErr error
 	for _, candidate := range candidates {
-		progressed, err := r.store.RecoverExpiredCommandLease(ctx, candidate)
+		result, err := r.store.RecoverExpiredCommandLease(ctx, candidate)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
-		if progressed {
+		if result.Changed {
 			changed++
+		}
+		if result.Recovered {
+			r.observe(ctx, Observation{
+				Kind: ObservationLease, Operation: ObservationOpRecover, Outcome: ObservationOutcomeRecovered,
+				RunID: RunID(candidate.RunID.String()), CommandID: CommandID(candidate.CommandID.String()),
+				CommandKey: result.CommandKey, RunKey: result.RunKey, RootCommandName: result.Definition,
+				Worker: r.replicaName(),
+			})
+		}
+		if result.ExpiredRun {
+			r.observe(ctx, Observation{
+				Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: ObservationOutcomeExpired,
+				RunID: RunID(candidate.RunID.String()), RunKey: result.RunKey, RootCommandName: result.Definition,
+				Worker: r.replicaName(),
+			})
 		}
 	}
 	return changed, firstErr

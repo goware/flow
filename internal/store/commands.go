@@ -201,6 +201,7 @@ type ClaimedCommand struct {
 	CommandID              uuid.UUID
 	RunID                  uuid.UUID
 	RunKey                 string
+	DefinitionName         string
 	CommandKey             string
 	Name                   string
 	Version                int
@@ -416,8 +417,9 @@ func (s *Store) ClaimCommands(
 				return ClaimBatchResult{}, fmt.Errorf("%w: claimed attempt journal mapping differs", flowerr.ErrInvalidState)
 			}
 			result.Commands = append(result.Commands, ClaimedCommand{
-				CommandID: command.candidate.CommandID, RunID: command.candidate.RunID, RunKey: initial.RunKey,
-				CommandKey: command.key, Name: command.name, Version: command.version, Queue: command.queue,
+				CommandID: command.candidate.CommandID, RunID: command.candidate.RunID, RunKey: initial.Head.RunKey,
+				DefinitionName: initial.Head.Definition,
+				CommandKey:     command.key, Name: command.name, Version: command.version, Queue: command.queue,
 				Args: slices.Clone(command.args), EventInputs: command.eventInputs,
 				RetryMaxElapsed: clonePointer(command.retryPolicy.MaxElapsed), AttemptTimeout: command.attemptTimeout,
 				CreatedAt: command.createdAt, BudgetStartedAt: command.budgetStartedAt,
@@ -1038,6 +1040,16 @@ type SettleResult struct {
 	Terminal      bool
 	NextAttemptAt *time.Time
 	Status        string
+	// StopReason carries the retry decision's stop reason on a terminal
+	// failed conclusion ("permanent", "attempt_limit", "elapsed_limit",
+	// "deadline_before_next_attempt").
+	StopReason string
+	// TerminalRun reports that this settlement terminalized the run.
+	// RunStatus, RunKey, and Definition identify the terminal run fact.
+	TerminalRun bool
+	RunStatus   string
+	RunKey      string
+	Definition  string
 }
 
 type CommitFunctionError struct{ Err error }
@@ -1100,7 +1112,8 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		if err := semantic.Commit(ctx); err != nil {
 			return SettleResult{}, err
 		}
-		return SettleResult{Terminal: true, Status: "expired"}, nil
+		return SettleResult{Terminal: true, Status: "expired", TerminalRun: true, RunStatus: "expired",
+			RunKey: fence.Head.RunKey, Definition: fence.Head.Definition}, nil
 	}
 	request.Events, err = s.coalesceApplicationEvents(ctx, semantic, request.Events)
 	if err != nil {
@@ -1353,7 +1366,8 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err := hook.Hit(ctx, fault.SettleCommitAmbiguous); err != nil {
 		return SettleResult{}, err
 	}
-	return SettleResult{Terminal: true, Status: "succeeded"}, nil
+	return SettleResult{Terminal: true, Status: "succeeded", TerminalRun: terminalRun, RunStatus: terminalStatus,
+		RunKey: fence.Head.RunKey, Definition: fence.Head.Definition}, nil
 }
 
 func (s *Store) cancelStagedCommandBatch(
@@ -1480,7 +1494,8 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		if err := semantic.Commit(ctx); err != nil {
 			return SettleResult{}, err
 		}
-		return SettleResult{Terminal: true, Status: "expired"}, nil
+		return SettleResult{Terminal: true, Status: "expired", TerminalRun: true, RunStatus: "expired",
+			RunKey: fence.Head.RunKey, Definition: fence.Head.Definition}, nil
 	}
 	policy, err := retrypolicy.PublicFromCanonical(fence.RetryPolicy)
 	if err != nil {
@@ -1650,7 +1665,10 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		return SettleResult{}, err
 	}
 	return SettleResult{Retry: decision.Retry, Terminal: !decision.Retry, NextAttemptAt: next,
-		Status: map[bool]string{true: "retry_wait", false: "failed"}[decision.Retry]}, nil
+		Status:      map[bool]string{true: "retry_wait", false: "failed"}[decision.Retry],
+		StopReason:  decision.StopReason,
+		TerminalRun: terminalRun, RunStatus: map[bool]string{true: "failed", false: ""}[terminalRun],
+		RunKey: fence.Head.RunKey, Definition: fence.Head.Definition}, nil
 }
 
 func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, claim ClaimedCommand) (commandFence, error) {
@@ -1703,24 +1721,30 @@ func (s *Store) mapFenceMiss(ctx context.Context, tx pgx.Tx, claim ClaimedComman
 	return fmt.Errorf("%w: command attempt no longer owns its lease", flowerr.ErrLeaseLost)
 }
 
-func (s *Store) ProbeExpiredRuns(ctx context.Context, limit int) ([]uuid.UUID, error) {
+type ExpiredRunCandidate struct {
+	RunID      uuid.UUID
+	RunKey     string
+	Definition string
+}
+
+func (s *Store) ProbeExpiredRuns(ctx context.Context, limit int) ([]ExpiredRunCandidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	rows, err := s.db.Conn.Query(ctx, `SELECT run_id FROM `+pgschema.Table(s.schema, "flow_runs")+`
+	rows, err := s.db.Conn.Query(ctx, `SELECT run_id,run_key,definition_name FROM `+pgschema.Table(s.schema, "flow_runs")+`
 		WHERE status IN ('running','failing') AND deadline_at IS NOT NULL AND deadline_at<=clock_timestamp()
 		ORDER BY deadline_at,run_id LIMIT $1`, limit)
 	if err != nil {
 		return nil, MapError("probe expired runs", err)
 	}
 	defer rows.Close()
-	var result []uuid.UUID
+	var result []ExpiredRunCandidate
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var candidate ExpiredRunCandidate
+		if err := rows.Scan(&candidate.RunID, &candidate.RunKey, &candidate.Definition); err != nil {
 			return nil, MapError("scan expired run", err)
 		}
-		result = append(result, id)
+		result = append(result, candidate)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, MapError("read expired runs", err)
@@ -1968,32 +1992,46 @@ func (s *Store) ProbeExpiredCommandLeases(ctx context.Context, limit int) ([]Exp
 	return result, nil
 }
 
-func (s *Store) RecoverExpiredCommandLease(ctx context.Context, candidate ExpiredLeaseCandidate) (bool, error) {
+type LeaseRecoveryResult struct {
+	Changed bool
+	// Recovered reports a per-command lease recovery; RunKey, Definition,
+	// and CommandKey identify it. ExpiredRun reports that the candidate's
+	// run passed its deadline and was expired instead.
+	Recovered  bool
+	ExpiredRun bool
+	RunKey     string
+	Definition string
+	CommandKey string
+}
+
+func (s *Store) RecoverExpiredCommandLease(ctx context.Context, candidate ExpiredLeaseCandidate) (LeaseRecoveryResult, error) {
 	semantic, err := s.BeginSemantic(ctx, candidate.RunID, LockSkipLocked)
 	if errors.Is(err, ErrLockUnavailable) {
-		return false, nil
+		return LeaseRecoveryResult{}, nil
 	}
 	if err != nil {
-		return false, err
+		return LeaseRecoveryResult{}, err
 	}
 	defer semantic.Rollback(context.WithoutCancel(ctx))
-	var status string
+	var status, runKey, runDefinition string
 	var deadline *time.Time
-	if err := semantic.PGX().QueryRow(ctx, `SELECT status,deadline_at FROM `+
-		pgschema.Table(s.schema, "flow_runs")+` WHERE run_id=$1`, candidate.RunID).Scan(&status, &deadline); err != nil {
-		return false, MapError("load lease run", err)
+	if err := semantic.PGX().QueryRow(ctx, `SELECT status,deadline_at,run_key,definition_name FROM `+
+		pgschema.Table(s.schema, "flow_runs")+` WHERE run_id=$1`, candidate.RunID).Scan(&status, &deadline, &runKey, &runDefinition); err != nil {
+		return LeaseRecoveryResult{}, MapError("load lease run", err)
 	}
 	if status != "running" && status != "failing" {
-		return false, nil
+		return LeaseRecoveryResult{}, nil
 	}
+	identity := LeaseRecoveryResult{RunKey: runKey, Definition: runDefinition}
 	if deadline != nil && !semantic.DBNow().Before(*deadline) {
 		if err := s.expireRunLocked(ctx, semantic, "run deadline reached"); err != nil {
-			return false, err
+			return LeaseRecoveryResult{}, err
 		}
 		if err := semantic.Commit(ctx); err != nil {
-			return false, err
+			return LeaseRecoveryResult{}, err
 		}
-		return true, nil
+		identity.Changed, identity.ExpiredRun = true, true
+		return identity, nil
 	}
 	var key, commandState, queueState string
 	var attempt, consumed int
@@ -2010,13 +2048,13 @@ func (s *Store) RecoverExpiredCommandLease(ctx context.Context, candidate Expire
 		candidate.CommandID, candidate.RunID).Scan(&key, &commandState, &attempt, &consumed,
 		&queueState, &attemptID, &leaseExpiresAt, &attemptPosition)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return LeaseRecoveryResult{}, nil
 	}
 	if err != nil {
-		return false, MapError("lock expired command lease", err)
+		return LeaseRecoveryResult{}, MapError("lock expired command lease", err)
 	}
 	if commandState != "running" || queueState != "running" || semantic.DBNow().Before(leaseExpiresAt) {
-		return false, nil
+		return LeaseRecoveryResult{}, nil
 	}
 	next := semantic.DBNow()
 	concluded, err := NewJournalEntry(AttemptConcluded, journalcodec.AttemptConcludedBody{
@@ -2025,31 +2063,32 @@ func (s *Store) RecoverExpiredCommandLease(ctx context.Context, candidate Expire
 		FinishedAt: semantic.DBNow(), NextAttemptAt: &next, ErrorCode: "lease_lost", ErrorMessage: "lease expired before settlement",
 	})
 	if err != nil {
-		return false, err
+		return LeaseRecoveryResult{}, err
 	}
 	concluded.CommandID = clonePointer(&candidate.CommandID)
 	concluded.AttemptID = clonePointer(&attemptID)
 	concluded.CausationPosition = clonePointer(&attemptPosition)
 	if _, err := semantic.Apply(ctx, PersistedChangeSet{Journal: []JournalEntry{concluded}}); err != nil {
-		return false, err
+		return LeaseRecoveryResult{}, err
 	}
 	failure := terminalFailure{Code: "lease_lost", Message: "lease expired before settlement"}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
 		SET state='retry_wait',last_error=$2::jsonb,next_attempt_at=$3,updated_at=$3,status_at=$3 WHERE command_id=$1`,
 		candidate.CommandID, jsonString(failure), semantic.DBNow()); err != nil {
-		return false, MapError("recover expired command", err)
+		return LeaseRecoveryResult{}, MapError("recover expired command", err)
 	}
 	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+`
 		SET state='retry_wait',next_run_at=$2,active_attempt_id=NULL,lease_token=NULL,lease_owner=NULL,
 		    lease_started_at=NULL,lease_expires_at=NULL WHERE command_id=$1`,
 		candidate.CommandID, semantic.DBNow()); err != nil {
-		return false, MapError("recover expired command delivery", err)
+		return LeaseRecoveryResult{}, MapError("recover expired command delivery", err)
 	}
 	if err := semantic.NotifyRunnableCommands(ctx); err != nil {
-		return false, err
+		return LeaseRecoveryResult{}, err
 	}
 	if err := semantic.Commit(ctx); err != nil {
-		return false, err
+		return LeaseRecoveryResult{}, err
 	}
-	return true, nil
+	identity.Changed, identity.Recovered, identity.CommandKey = true, true, key
+	return identity, nil
 }

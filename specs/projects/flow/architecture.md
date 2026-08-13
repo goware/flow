@@ -449,8 +449,8 @@ bodies are stored in PostgreSQL. Retained start/declaration fingerprints and
 journal body hashes support identity comparison and invariant checking;
 redundant copies and write-only projection hashes are not stored. These values
 are not encryption. Applications must avoid putting secrets in keys, errors, or
-observer dimensions and should prefer stable references for sensitive/large
-values.
+observer dimensions such as `RunKey` and `RootCommandName`, and should prefer
+stable references for sensitive/large values.
 
 Parent-produced values should travel directly in child arguments, while exact
 events carry sibling, cross-branch, or external facts. Related events and

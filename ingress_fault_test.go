@@ -60,6 +60,20 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 	if len(observations) != 1 || observations[0].RunID != exec.RunID || observations[0].Operation != "start" {
 		t.Fatalf("observations = %#v", observations)
 	}
+	event := DefineEvent[None]("fault.observed_event")
+	if err := event.Deliver(ctx, runtime, exec.RunID, "fact", None{}); err != nil {
+		t.Fatalf("Deliver(observed) error = %v", err)
+	}
+	observations = waitForObservations(t, observer, 2)
+	if len(observations) < 2 {
+		t.Fatalf("observations = %#v, want start and deliver", observations)
+	}
+	delivered := observations[1]
+	if delivered.Kind != ObservationEvent || delivered.Operation != "deliver" ||
+		delivered.RunID != exec.RunID || delivered.RunKey != "observed" ||
+		delivered.RootCommandName != command.Name() || delivered.OccurredAt.IsZero() {
+		t.Fatalf("deliver observation = %#v", delivered)
+	}
 
 	runtime.faults = fault.Func(func(_ context.Context, got fault.Point) error {
 		if got == fault.IngressCommitAmbiguous {
