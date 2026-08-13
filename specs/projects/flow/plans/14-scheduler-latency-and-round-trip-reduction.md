@@ -1,6 +1,8 @@
 # Plan 14: Reduce scheduler latency and database round trips
 
-Status: Implemented — independent review pending
+Status: Complete — reviewed and merged in PR #27; released in v0.4.2
+
+Completed at: `a98256dff88bf04856bec0387e5afe3debfa581a` on 2026-08-13
 
 Planned at: `ea0d62b` (v0.4.1, after Plan 12) on 2026-08-12
 

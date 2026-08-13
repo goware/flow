@@ -1,6 +1,8 @@
 # Plan 12: Fast lease recovery for idempotent commands
 
-Status: Implemented — independent PR review pending
+Status: Complete — reviewed and merged in PR #29; included in v0.4.1
+
+Completed at: `4b4235658f4ebc9349aabaf0f1d98eadb666483c` on 2026-08-12
 
 Reconciled at: `c450ff4b060d1a862fde0540c794fb2d9876147b` on 2026-08-12
 
@@ -839,4 +841,4 @@ Stop implementation and report if:
   migration, replay, and source scans.
 - [x] Record implementation/performance evidence and complete acceptance
   criteria.
-- [ ] Obtain independent final review before marking this plan complete.
+- [x] Obtain independent final review before marking this plan complete.
