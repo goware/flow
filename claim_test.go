@@ -146,8 +146,9 @@ func TestClaimCommandsLoadsRunKeyInExistingHeadQuery(t *testing.T) {
 			runKeyQueries = append(runKeyQueries, strings.Join(strings.Fields(query), " "))
 		}
 	}
-	if len(runKeyQueries) != 1 || !strings.Contains(runKeyQueries[0], "SELECT status,deadline_at,run_key FROM") {
-		t.Fatalf("claim run-key queries = %q, want one existing run-head projection", runKeyQueries)
+	if len(runKeyQueries) != 1 || !strings.Contains(runKeyQueries[0], "WITH locked AS MATERIALIZED") ||
+		!strings.Contains(runKeyQueries[0], "clock_timestamp() FROM locked") {
+		t.Fatalf("claim run-key queries = %q, want one lock/time/initial-projection statement", runKeyQueries)
 	}
 }
 

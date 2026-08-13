@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -396,7 +397,7 @@ func (s *Store) resolveEventReadinessLocked(
 	for commandID := range newlySatisfied {
 		commandIDs = append(commandIDs, commandID)
 	}
-	sort.Slice(commandIDs, func(i, j int) bool { return commandIDs[i].String() < commandIDs[j].String() })
+	sort.Slice(commandIDs, func(i, j int) bool { return bytes.Compare(commandIDs[i][:], commandIDs[j][:]) < 0 })
 	counts := make([]int32, len(commandIDs))
 	for index, commandID := range commandIDs {
 		counts[index] = int32(newlySatisfied[commandID])

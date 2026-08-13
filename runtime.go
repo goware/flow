@@ -165,6 +165,8 @@ type Runtime struct {
 	shutdownGrace     time.Duration
 	notifications     bool
 	instanceID        uuid.UUID
+	replica           string
+	poolCapacity      int
 	observer          Observer
 	observations      *observerAdapter
 	faults            fault.Hook
@@ -188,7 +190,7 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 		workerConcurrency: max(1, runtime.GOMAXPROCS(0)), commandLease: 60 * time.Second,
 		pollInterval: time.Second, shutdownGrace: 30 * time.Second,
 		notifications: true,
-		observer:      noOpObserver{}, faults: fault.None{},
+		faults:        fault.None{},
 	}
 	for _, option := range opts {
 		if option == nil {
@@ -207,14 +209,20 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	instanceID := uuid.New()
+	var observations *observerAdapter
+	if options.observer != nil {
+		observations = newObserverAdapter(options.observer)
+	}
 	return &Runtime{
 		db: db, store: repository, schema: options.schema, maxCommands: options.maxCommands,
 		workerConcurrency: options.workerConcurrency, commandLease: options.commandLease,
 		queueConcurrency: cloneIntMap(options.queueConcurrency),
 		pollInterval:     options.pollInterval, shutdownGrace: options.shutdownGrace,
 		notifications: options.notifications,
-		instanceID:    uuid.New(),
-		observer:      options.observer, observations: newObserverAdapter(options.observer),
+		instanceID:    instanceID, replica: "runtime-" + instanceID.String(),
+		poolCapacity: int(db.Conn.Config().MaxConns),
+		observer:     options.observer, observations: observations,
 		faults: options.faults, lifecycle: runtimeCreated,
 		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(),
 	}, nil

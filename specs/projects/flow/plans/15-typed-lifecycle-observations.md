@@ -1,6 +1,6 @@
 # Plan 15: Make observations an alertable lifecycle contract
 
-Status: Proposed
+Status: Proposed — Plan 14 anchors synchronized 2026-08-12
 
 Planned at: `d9125dc` (v0.4.0, post-Plan 13) on 2026-08-13
 
@@ -68,16 +68,19 @@ Planned at: `d9125dc` (v0.4.0, post-Plan 13) on 2026-08-13
   page size. If Plan 12 replaced the maintenance-page recovery loop, emit
   from its successor, one fact per recovered command.
 - **Plan 14** (scheduler latency) touches this plan in three places. Its
-  §4.4 reshapes the maintenance loop that Section 4.4 emits from — anchor to
-  the shipped loop, not the line numbers here. Its §4.3 merges settle-path
-  round trips; the additive `SettleResult` field in Section 4.4 must ride the
-  merged statements without adding one back. Its §4.6 short-circuits emission
-  when the observer is `NopObserver` and precomputes the replica name; the
-  constant conversion in Section 4.3 must preserve both optimizations.
-- **Benchmark baseline.** Plan 14 will have re-measured the claim path. Use
-  the newest claim evidence in `specs/projects/flow/benchmark_evidence/` as
-  the comparison baseline for the Phase 1 gate, falling back to the Plan 5
-  conditions only if Plan 14 recorded none.
+  §4.3 now captures an explicit initial locked snapshot through
+  `AttachSemantic`; Section 4.2 must add `definition_name` to that same
+  materialized lock/time/snapshot statement, not restore the removed claim
+  reread. Its settle-path projection pairs use `executeProjectionBatch`; the
+  additive `SettleResult` field in Section 4.4 must ride existing result data
+  without adding a statement or crossing a fault/callback boundary. Its §4.5
+  represents the default observer with a nil adapter, guards profiled
+  observation construction, caches pool capacity, and precomputes the replica
+  name; the constant conversion in Section 4.3 must preserve those fast paths.
+- **Benchmark baseline.** Use Plan 14's evidence at
+  `benchmark_evidence/plan_14_scheduler_latency.md` for the Phase 1 gate. Its
+  five-sample 16-command claim median is 2,080 commands/s, 598,985 B/op, and
+  13,893 allocs/op.
 
 ## 1. Purpose
 
@@ -138,11 +141,11 @@ land before implementation; re-verify per the drift check.
 `Name`, `Version`, `Queue`, and `Worker`, but neither the run key nor the
 definition name.
 
-The v0.3.0 claim path already closed half of the plumbing problem. The
-claim-head read selects `status,deadline_at,run_key` from `flow_runs` under
-the batch's `FOR UPDATE` lock (`internal/store/commands.go:250-252`) and
-stamps `RunKey` onto every `ClaimedCommand` it builds
-(`internal/store/commands.go:356-365`). So the attempt-path emission sites
+The v0.3.0 claim path already closed half of the plumbing problem. Plan 14 now
+selects `status,deadline_at,run_key` and the `RunHead` counters in the
+`MATERIALIZED` locking CTE in `AttachSemantic`, then exposes them as
+`InitialLockedSnapshot`. `ClaimCommands` stamps `RunKey` onto every
+`ClaimedCommand` from that snapshot. So the attempt-path emission sites
 already hold the run key: what remains is the definition name, which
 `flow_runs.definition_name` carries but the claim-head SELECT does not read.
 
@@ -311,17 +314,17 @@ fields explicitly.
 
 ### 4.2 Claim projection carries the root definition name
 
-The claim-head SELECT already reads `run_key` alongside `status` and
-`deadline_at` under the batch's run lock
-(`internal/store/commands.go:250-252`), and `ClaimedCommand.RunKey`
-(`internal/store/commands.go:141`) is already populated from it
-(`internal/store/commands.go:356-365`). The remaining widening is therefore a
-single additional column on that one-per-batch read: add `definition_name`
-to the SELECT and `DefinitionName` to `ClaimedCommand`.
+Plan 14's `AttachSemantic` locking CTE already reads `run_key`, `status`,
+`deadline_at`, and the `RunHead` counters under the batch's run lock, and
+`ClaimCommands` populates `ClaimedCommand.RunKey` from the explicit initial
+snapshot. The remaining widening is therefore one additional column on that
+same lock/time/snapshot statement: add `definition_name` to the locking CTE
+and `InitialLockedSnapshot`, then add `DefinitionName` to `ClaimedCommand`.
+Do not add a claim-head reread or turn `LoadRunHead` into a cache.
 
 This is an additive projection change on a row already locked and already
 read: no new table access, no new statement, no new lock, no schema change.
-Because claim is the hot path — and Plan 14 will have just re-tuned it — the
+Because claim is the hot path — and Plan 14 has just re-tuned it — the
 phase gate re-runs the retained claim benchmark against the newest baseline
 in `specs/projects/flow/benchmark_evidence/` (Section 0) and records the
 comparison there. A measurable regression beyond noise is a STOP condition,

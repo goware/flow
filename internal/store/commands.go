@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -43,8 +44,14 @@ type CommandProbeCursor struct {
 	CommandID uuid.UUID
 }
 
+type CommandProbeResult struct {
+	Candidates  []CommandCandidate
+	FutureDelay *time.Duration
+}
+
 func (s *Store) ProbeCommands(ctx context.Context, kinds []CommandKind, limit int) ([]CommandCandidate, error) {
-	return s.ProbeCommandsExcluding(ctx, kinds, limit, nil, nil, nil)
+	result, err := s.ProbeCommandsExcluding(ctx, kinds, limit, nil, nil, nil)
+	return result.Candidates, err
 }
 
 // ProbeCommandsExcluding returns runnable candidates while omitting runs
@@ -59,18 +66,18 @@ func (s *Store) ProbeCommandsExcluding(
 	excludedRunIDs []uuid.UUID,
 	excludedQueues []string,
 	after *CommandProbeCursor,
-) ([]CommandCandidate, error) {
+) (CommandProbeResult, error) {
 	if len(kinds) == 0 || limit <= 0 {
-		return nil, nil
+		return CommandProbeResult{}, nil
 	}
 	for _, runID := range excludedRunIDs {
 		if runID == uuid.Nil {
-			return nil, fmt.Errorf("%w: invalid excluded run", flowerr.ErrInvalid)
+			return CommandProbeResult{}, fmt.Errorf("%w: invalid excluded run", flowerr.ErrInvalid)
 		}
 	}
 	for _, queue := range excludedQueues {
 		if queue == "" {
-			return nil, fmt.Errorf("%w: invalid excluded queue", flowerr.ErrInvalid)
+			return CommandProbeResult{}, fmt.Errorf("%w: invalid excluded queue", flowerr.ErrInvalid)
 		}
 	}
 	var afterNextRunAt *time.Time
@@ -78,7 +85,7 @@ func (s *Store) ProbeCommandsExcluding(
 	afterCommandID := uuid.Nil
 	if after != nil {
 		if after.NextRunAt.IsZero() || after.Queue == "" || after.CommandID == uuid.Nil {
-			return nil, fmt.Errorf("%w: invalid command probe cursor", flowerr.ErrInvalid)
+			return CommandProbeResult{}, fmt.Errorf("%w: invalid command probe cursor", flowerr.ErrInvalid)
 		}
 		afterNextRunAt, afterQueue, afterCommandID = &after.NextRunAt, after.Queue, after.CommandID
 	}
@@ -86,53 +93,108 @@ func (s *Store) ProbeCommandsExcluding(
 	versions := make([]int32, len(kinds))
 	for index, kind := range kinds {
 		if kind.Name == "" || kind.Version <= 0 {
-			return nil, fmt.Errorf("%w: invalid command probe kind", flowerr.ErrInvalid)
+			return CommandProbeResult{}, fmt.Errorf("%w: invalid command probe kind", flowerr.ErrInvalid)
 		}
 		version, err := durable.PostgresInteger32("command probe version", kind.Version, 1, durable.PostgresIntegerMax)
 		if err != nil {
-			return nil, err
+			return CommandProbeResult{}, err
 		}
 		names[index], versions[index] = kind.Name, version
 	}
-	rows, err := s.db.Conn.Query(ctx, `WITH handled(name,version) AS (
-		SELECT * FROM unnest($1::text[],$2::integer[])
-	)
-	SELECT q.command_id,q.run_id,q.queue,q.name,q.version,q.next_run_at
-	FROM handled h
-	CROSS JOIN LATERAL (
-		SELECT candidate.command_id,candidate.run_id,candidate.queue,candidate.name,candidate.version,candidate.next_run_at
-		FROM `+pgschema.Table(s.schema, "flow_command_queue")+` candidate
-		WHERE candidate.name=h.name AND candidate.version=h.version
-		  AND candidate.state IN ('ready','retry_wait') AND candidate.next_run_at<=clock_timestamp()
-		  AND NOT (candidate.run_id=ANY(COALESCE($4::uuid[],'{}'::uuid[])))
-		  AND NOT (candidate.queue=ANY(COALESCE($5::text[],'{}'::text[])))
-		  AND ($6::timestamptz IS NULL OR
-		       (candidate.next_run_at,candidate.queue,candidate.command_id)>($6::timestamptz,$7::text,$8::uuid))
-		ORDER BY candidate.next_run_at,candidate.queue,candidate.command_id
-		LIMIT $3
-	) q
-	JOIN `+pgschema.Table(s.schema, "flow_runs")+` e ON e.run_id=q.run_id
-	WHERE e.status IN ('running','failing')
-	ORDER BY q.next_run_at,q.queue,q.command_id
-	LIMIT $3`, names, versions, limit, excludedRunIDs, excludedQueues,
+	rows, err := s.db.Conn.Query(ctx, s.probeCommandsSQL(), names, versions, limit, excludedRunIDs, excludedQueues,
 		afterNextRunAt, afterQueue, afterCommandID)
 	if err != nil {
-		return nil, MapError("probe commands", err)
+		return CommandProbeResult{}, MapError("probe commands", err)
 	}
 	defer rows.Close()
-	result := make([]CommandCandidate, 0, limit)
+	result := CommandProbeResult{Candidates: make([]CommandCandidate, 0, limit)}
 	for rows.Next() {
-		var candidate CommandCandidate
-		if err := rows.Scan(&candidate.CommandID, &candidate.RunID, &candidate.Queue,
-			&candidate.Name, &candidate.Version, &candidate.NextRunAt); err != nil {
-			return nil, MapError("scan command candidate", err)
+		var commandID, runID *uuid.UUID
+		var queue, name *string
+		var version *int
+		var nextRunAt *time.Time
+		var delaySeconds *float64
+		if err := rows.Scan(&commandID, &runID, &queue, &name, &version, &nextRunAt, &delaySeconds); err != nil {
+			return CommandProbeResult{}, MapError("scan command candidate", err)
 		}
-		result = append(result, candidate)
+		if delaySeconds != nil && result.FutureDelay == nil {
+			if delay, ok := postgresSecondsDuration(*delaySeconds); ok {
+				result.FutureDelay = &delay
+			}
+		}
+		if commandID != nil {
+			result.Candidates = append(result.Candidates, CommandCandidate{
+				CommandID: *commandID, RunID: *runID, Queue: *queue, Name: *name,
+				Version: *version, NextRunAt: *nextRunAt,
+			})
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, MapError("read command candidates", err)
+		return CommandProbeResult{}, MapError("read command candidates", err)
 	}
 	return result, nil
+}
+
+func (s *Store) probeCommandsSQL() string {
+	return `WITH observed AS MATERIALIZED (
+		SELECT clock_timestamp() AS now
+	), handled(name,version) AS (
+		SELECT * FROM unnest($1::text[],$2::integer[])
+	), future_at AS (
+		SELECT MIN(earliest.next_run_at) AS next_run_at
+		FROM handled h
+		CROSS JOIN observed
+		CROSS JOIN LATERAL (
+			SELECT queued.next_run_at
+			FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` queued
+			JOIN ` + pgschema.Table(s.schema, "flow_runs") + ` e ON e.run_id=queued.run_id
+			WHERE queued.name=h.name AND queued.version=h.version
+			  AND queued.state IN ('ready','retry_wait')
+			  AND queued.next_run_at>observed.now
+			  AND e.status IN ('running','failing')
+			ORDER BY queued.next_run_at,queued.queue,queued.command_id
+			LIMIT 1
+		) earliest
+	), future AS (
+		SELECT CASE WHEN future_at.next_run_at IS NULL THEN NULL
+			ELSE GREATEST(0::double precision,
+				EXTRACT(EPOCH FROM future_at.next_run_at-observed.now)) END AS delay_seconds
+		FROM future_at CROSS JOIN observed
+	), due AS (
+		SELECT q.command_id,q.run_id,q.queue,q.name,q.version,q.next_run_at
+		FROM handled h
+		CROSS JOIN observed
+		CROSS JOIN LATERAL (
+			SELECT candidate.command_id,candidate.run_id,candidate.queue,candidate.name,candidate.version,candidate.next_run_at
+			FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` candidate
+			WHERE candidate.name=h.name AND candidate.version=h.version
+			  AND candidate.state IN ('ready','retry_wait') AND candidate.next_run_at<=observed.now
+			  AND NOT (candidate.run_id=ANY(COALESCE($4::uuid[],'{}'::uuid[])))
+			  AND NOT (candidate.queue=ANY(COALESCE($5::text[],'{}'::text[])))
+			  AND ($6::timestamptz IS NULL OR
+			       (candidate.next_run_at,candidate.queue,candidate.command_id)>($6::timestamptz,$7::text,$8::uuid))
+			ORDER BY candidate.next_run_at,candidate.queue,candidate.command_id
+			LIMIT $3
+		) q
+		JOIN ` + pgschema.Table(s.schema, "flow_runs") + ` e ON e.run_id=q.run_id
+		WHERE e.status IN ('running','failing')
+		ORDER BY q.next_run_at,q.queue,q.command_id
+		LIMIT $3
+	)
+	SELECT due.command_id,due.run_id,due.queue,due.name,due.version,due.next_run_at,future.delay_seconds
+	FROM future LEFT JOIN due ON true
+	ORDER BY due.next_run_at,due.queue,due.command_id`
+}
+
+func postgresSecondsDuration(seconds float64) (time.Duration, bool) {
+	if seconds <= 0 || math.IsNaN(seconds) {
+		return 0, false
+	}
+	maxSeconds := float64(math.MaxInt64) / float64(time.Second)
+	if math.IsInf(seconds, 1) || seconds >= maxSeconds {
+		return time.Duration(math.MaxInt64), true
+	}
+	return time.Duration(seconds * float64(time.Second)), true
 }
 
 type ClaimedCommand struct {
@@ -242,19 +304,12 @@ func (s *Store) ClaimCommands(
 	}
 	defer semantic.Rollback(context.WithoutCancel(ctx))
 
-	// The run row is FOR-UPDATE locked for the whole batch (BeginSemantic
-	// above), so its status and deadline cannot change until this transaction
-	// commits or rolls back: one read here covers every candidate instead of
-	// one read per candidate.
-	var runStatus, runKey string
-	var runDeadline *time.Time
-	if err := semantic.PGX().QueryRow(ctx, `SELECT status,deadline_at,run_key FROM `+
-		pgschema.Table(s.schema, "flow_runs")+` WHERE run_id=$1`, runID).
-		Scan(&runStatus, &runDeadline, &runKey); err != nil {
-		return ClaimBatchResult{}, MapError("load claim run", err)
+	initial, ok := semantic.InitialLockedSnapshot()
+	if !ok {
+		return ClaimBatchResult{}, fmt.Errorf("%w: claim run has no initial locked snapshot", flowerr.ErrInvalidState)
 	}
-	if (runStatus != "running" && runStatus != "failing") ||
-		(runDeadline != nil && !semantic.DBNow().Before(*runDeadline)) {
+	if (initial.Head.Status != "running" && initial.Head.Status != "failing") ||
+		(initial.Deadline != nil && !semantic.DBNow().Before(*initial.Deadline)) {
 		return ClaimBatchResult{}, nil
 	}
 
@@ -361,12 +416,12 @@ func (s *Store) ClaimCommands(
 				return ClaimBatchResult{}, fmt.Errorf("%w: claimed attempt journal mapping differs", flowerr.ErrInvalidState)
 			}
 			result.Commands = append(result.Commands, ClaimedCommand{
-				CommandID: command.candidate.CommandID, RunID: command.candidate.RunID, RunKey: runKey,
+				CommandID: command.candidate.CommandID, RunID: command.candidate.RunID, RunKey: initial.RunKey,
 				CommandKey: command.key, Name: command.name, Version: command.version, Queue: command.queue,
 				Args: slices.Clone(command.args), EventInputs: command.eventInputs,
 				RetryMaxElapsed: clonePointer(command.retryPolicy.MaxElapsed), AttemptTimeout: command.attemptTimeout,
 				CreatedAt: command.createdAt, BudgetStartedAt: command.budgetStartedAt,
-				RunDeadline: clonePointer(runDeadline), Attempt: command.attempt,
+				RunDeadline: clonePointer(initial.Deadline), Attempt: command.attempt,
 				ConsumedAttempts: command.consumed, AttemptID: command.attemptID, LeaseToken: command.leaseToken,
 				DBNow: semantic.DBNow(), LeaseDuration: command.leaseDuration,
 				LeaseExpiresAt: command.leaseExpiresAt, AttemptStartedPosition: row.Position,
@@ -560,38 +615,78 @@ func (s *Store) updateClaimBatch(
 		leaseExpiries[index] = commands[index].leaseExpiresAt
 		attempts[index] = int32(commands[index].attempt)
 	}
-	queueResult, err := semantic.PGX().Exec(ctx, `WITH claimed(command_id,attempt_id,lease_token,lease_expires_at) AS (
+	queueSQL := `WITH claimed(command_id,attempt_id,lease_token,lease_expires_at) AS (
 		SELECT * FROM unnest($1::uuid[],$2::uuid[],$3::uuid[],$4::timestamptz[])
 	)
-	UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+` q
+	UPDATE ` + pgschema.Table(s.schema, "flow_command_queue") + ` q
 	SET state='running',active_attempt_id=claimed.attempt_id,lease_token=claimed.lease_token,lease_owner=$5,
 	    lease_started_at=$6,lease_expires_at=claimed.lease_expires_at
 	FROM claimed
-	WHERE q.command_id=claimed.command_id AND q.run_id=$7 AND q.state IN ('ready','retry_wait')`,
-		commandIDs, attemptIDs, leaseTokens, leaseExpiries, owner, semantic.DBNow(), semantic.RunID())
-	if err != nil {
-		return MapError("claim command queue batch", err)
-	}
-	if queueResult.RowsAffected() != int64(len(commands)) {
-		return fmt.Errorf("%w: claimed %d of %d command queue rows", flowerr.ErrInvalidState,
-			queueResult.RowsAffected(), len(commands))
-	}
-	commandResult, err := semantic.PGX().Exec(ctx, `WITH claimed(command_id,attempt) AS (
+	WHERE q.command_id=claimed.command_id AND q.run_id=$7 AND q.state IN ('ready','retry_wait')`
+	commandSQL := `WITH claimed(command_id,attempt) AS (
 		SELECT * FROM unnest($1::uuid[],$2::integer[])
 	)
-	UPDATE `+pgschema.Table(s.schema, "flow_commands")+` c
+	UPDATE ` + pgschema.Table(s.schema, "flow_commands") + ` c
 	SET state='running',attempt_ordinal=claimed.attempt,updated_at=$3,status_at=$3
 	FROM claimed
-	WHERE c.command_id=claimed.command_id AND c.run_id=$4 AND c.state IN ('ready','retry_wait')`,
-		commandIDs, attempts, semantic.DBNow(), semantic.RunID())
-	if err != nil {
-		return MapError("mark command batch running", err)
+	WHERE c.command_id=claimed.command_id AND c.run_id=$4 AND c.state IN ('ready','retry_wait')`
+	want := int64(len(commands))
+	return executeProjectionBatch(ctx, semantic.PGX(),
+		projectionStatement{
+			operation: "claim command queue batch", query: queueSQL,
+			arguments: []any{commandIDs, attemptIDs, leaseTokens, leaseExpiries, owner, semantic.DBNow(), semantic.RunID()},
+			validateRows: func(got int64) error {
+				if got != want {
+					return fmt.Errorf("%w: claimed %d of %d command queue rows", flowerr.ErrInvalidState, got, want)
+				}
+				return nil
+			},
+		},
+		projectionStatement{
+			operation: "mark command batch running", query: commandSQL,
+			arguments: []any{commandIDs, attempts, semantic.DBNow(), semantic.RunID()},
+			validateRows: func(got int64) error {
+				if got != want {
+					return fmt.Errorf("%w: marked %d of %d commands running", flowerr.ErrInvalidState, got, want)
+				}
+				return nil
+			},
+		},
+	)
+}
+
+type projectionStatement struct {
+	operation    string
+	query        string
+	arguments    []any
+	validateRows func(int64) error
+}
+
+func executeProjectionBatch(ctx context.Context, tx pgx.Tx, statements ...projectionStatement) error {
+	batch := &pgx.Batch{}
+	for _, statement := range statements {
+		batch.Queue(statement.query, statement.arguments...)
 	}
-	if commandResult.RowsAffected() != int64(len(commands)) {
-		return fmt.Errorf("%w: marked %d of %d commands running", flowerr.ErrInvalidState,
-			commandResult.RowsAffected(), len(commands))
+	results := tx.SendBatch(ctx, batch)
+	var resultErr error
+	for _, statement := range statements {
+		tag, err := results.Exec()
+		if err != nil {
+			if resultErr == nil {
+				resultErr = MapError(statement.operation, err)
+			}
+			continue
+		}
+		if statement.validateRows != nil {
+			if err := statement.validateRows(tag.RowsAffected()); err != nil && resultErr == nil {
+				resultErr = err
+			}
+		}
 	}
-	return nil
+	if err := results.Close(); err != nil && resultErr == nil {
+		resultErr = MapError("close projection batch", err)
+	}
+	return resultErr
 }
 
 func (s *Store) claimCandidateStillEligible(ctx context.Context, semantic *SemanticTx, commandID uuid.UUID) (bool, error) {
@@ -1175,15 +1270,19 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 	if err := hook.Hit(ctx, fault.SettleAfterAttempt); err != nil {
 		return SettleResult{}, err
 	}
-	if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
+	if err := executeProjectionBatch(ctx, semantic.PGX(), projectionStatement{
+		operation: "settle successful command", query: `UPDATE ` + pgschema.Table(s.schema, "flow_commands") + `
 		SET state='succeeded',result=$2,last_error=NULL,terminal_failure=NULL,
 		    terminal_position=$3,finished_at=$4,updated_at=$4,status_at=$4
-		WHERE command_id=$1`, request.Claim.CommandID, request.Result.Bytes,
-		layout.parentTerminalPosition(journal), semantic.DBNow()); err != nil {
-		return SettleResult{}, MapError("settle successful command", err)
-	}
-	if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, request.Claim.CommandID); err != nil {
-		return SettleResult{}, MapError("remove successful command queue row", err)
+		WHERE command_id=$1`, arguments: []any{
+			request.Claim.CommandID, request.Result.Bytes, layout.parentTerminalPosition(journal), semantic.DBNow(),
+		},
+	}, projectionStatement{
+		operation: "remove successful command queue row",
+		query:     `DELETE FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` WHERE command_id=$1`,
+		arguments: []any{request.Claim.CommandID},
+	}); err != nil {
+		return SettleResult{}, err
 	}
 	immediatelyRunnable := preparedChildren.immediatelyRunnable && !cancelStagedChildren
 	if len(request.Children) > 0 {
@@ -1485,28 +1584,35 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 		return SettleResult{}, err
 	}
 	if decision.Retry {
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
+		if err := executeProjectionBatch(ctx, semantic.PGX(), projectionStatement{
+			operation: "schedule command retry", query: `UPDATE ` + pgschema.Table(s.schema, "flow_commands") + `
 			SET state='retry_wait',consumed_attempts=$2,last_error=$3::jsonb,next_attempt_at=$4,
-			    updated_at=$5,status_at=$5 WHERE command_id=$1`, request.Claim.CommandID,
-			decision.ConsumedAttempts, jsonString(failure), decision.NextAttemptAt, semantic.DBNow()); err != nil {
-			return SettleResult{}, MapError("schedule command retry", err)
-		}
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_command_queue")+`
+			    updated_at=$5,status_at=$5 WHERE command_id=$1`, arguments: []any{
+				request.Claim.CommandID, decision.ConsumedAttempts, jsonString(failure), decision.NextAttemptAt, semantic.DBNow(),
+			},
+		}, projectionStatement{
+			operation: "release command for retry", query: `UPDATE ` + pgschema.Table(s.schema, "flow_command_queue") + `
 			SET state='retry_wait',next_run_at=$2,active_attempt_id=NULL,lease_token=NULL,lease_owner=NULL,
 			    lease_started_at=NULL,lease_expires_at=NULL WHERE command_id=$1`,
-			request.Claim.CommandID, decision.NextAttemptAt); err != nil {
-			return SettleResult{}, MapError("release command for retry", err)
+			arguments: []any{request.Claim.CommandID, decision.NextAttemptAt},
+		}); err != nil {
+			return SettleResult{}, err
 		}
 	} else {
 		terminalPosition := journal.Journal[1].Position
-		if _, err := semantic.PGX().Exec(ctx, `UPDATE `+pgschema.Table(s.schema, "flow_commands")+`
+		if err := executeProjectionBatch(ctx, semantic.PGX(), projectionStatement{
+			operation: "fail command", query: `UPDATE ` + pgschema.Table(s.schema, "flow_commands") + `
 			SET state='failed',consumed_attempts=$2,last_error=$3::jsonb,terminal_failure=$3::jsonb,
 			    terminal_position=$4,finished_at=$5,updated_at=$5,status_at=$5 WHERE command_id=$1`,
-			request.Claim.CommandID, decision.ConsumedAttempts, jsonString(failure), terminalPosition, semantic.DBNow()); err != nil {
-			return SettleResult{}, MapError("fail command", err)
-		}
-		if _, err := semantic.PGX().Exec(ctx, `DELETE FROM `+pgschema.Table(s.schema, "flow_command_queue")+` WHERE command_id=$1`, request.Claim.CommandID); err != nil {
-			return SettleResult{}, MapError("remove failed command queue row", err)
+			arguments: []any{
+				request.Claim.CommandID, decision.ConsumedAttempts, jsonString(failure), terminalPosition, semantic.DBNow(),
+			},
+		}, projectionStatement{
+			operation: "remove failed command queue row",
+			query:     `DELETE FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` WHERE command_id=$1`,
+			arguments: []any{request.Claim.CommandID},
+		}); err != nil {
+			return SettleResult{}, err
 		}
 		if err := s.applyFailureResolution(ctx, semantic, failureEffects, journal, cancelledOffset,
 			"cancelled after command failure"); err != nil {
@@ -1548,21 +1654,16 @@ func (s *Store) SettleCommandConclusion(ctx context.Context, request CommandConc
 }
 
 func (s *Store) lockCommandFence(ctx context.Context, semantic *SemanticTx, claim ClaimedCommand) (commandFence, error) {
-	head, err := s.LoadRunHead(ctx, semantic)
-	if err != nil {
-		return commandFence{}, err
+	initial, ok := semantic.InitialLockedSnapshot()
+	if !ok {
+		return commandFence{}, fmt.Errorf("%w: command fence has no initial locked snapshot", flowerr.ErrInvalidState)
 	}
-	if head.Status != "running" && head.Status != "failing" {
+	if initial.Head.Status != "running" && initial.Head.Status != "failing" {
 		return commandFence{}, fmt.Errorf("%w: run is terminal", flowerr.ErrTerminal)
 	}
-	var result commandFence
-	result.Head = head
-	if err := semantic.PGX().QueryRow(ctx, `SELECT deadline_at FROM `+pgschema.Table(s.schema, "flow_runs")+`
-		WHERE run_id=$1`, semantic.RunID()).Scan(&result.RunDeadline); err != nil {
-		return commandFence{}, MapError("load run deadline", err)
-	}
+	result := commandFence{Head: initial.Head, RunDeadline: clonePointer(initial.Deadline)}
 	var activeAttempt, token *uuid.UUID
-	err = semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.state,c.attempt_ordinal,
+	err := semantic.PGX().QueryRow(ctx, `SELECT c.command_key,c.name,c.version,c.state,c.attempt_ordinal,
 		c.consumed_attempts,c.budget_started_at,c.retry_policy,
 		q.state,q.active_attempt_id,q.lease_token,q.lease_expires_at,
 		(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
@@ -1698,18 +1799,51 @@ func (s *Store) expireRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 	if len(commands) != head.OpenCommands {
 		return fmt.Errorf("%w: expiring run command counter differs", flowerr.ErrInvalidState)
 	}
+	runningIDs := make([]uuid.UUID, 0, len(commands))
+	runningIndexes := make(map[uuid.UUID]int, len(commands))
 	for index := range commands {
-		if commands[index].State != "running" {
-			continue
+		if commands[index].State == "running" {
+			runningIDs = append(runningIDs, commands[index].ID)
+			runningIndexes[commands[index].ID] = index
 		}
-		var token uuid.UUID
-		err := semantic.PGX().QueryRow(ctx, `SELECT q.active_attempt_id,q.lease_token,
+	}
+	if len(runningIDs) > 0 {
+		rows, err := semantic.PGX().Query(ctx, `SELECT q.command_id,q.active_attempt_id,q.lease_token,
 			(SELECT position FROM `+pgschema.Table(s.schema, "flow_journal")+`
 			 WHERE run_id=$2 AND attempt_id=q.active_attempt_id AND entry_kind='attempt_started')
-			FROM `+pgschema.Table(s.schema, "flow_command_queue")+` q WHERE command_id=$1 FOR UPDATE`,
-			commands[index].ID, semantic.RunID()).Scan(&commands[index].AttemptID, &token, &commands[index].AttemptStartedPosition)
+			FROM `+pgschema.Table(s.schema, "flow_command_queue")+` q
+			WHERE q.command_id=ANY($1::uuid[]) AND q.run_id=$2 AND q.state='running'
+			ORDER BY q.command_id FOR UPDATE`, runningIDs, semantic.RunID())
 		if err != nil {
-			return MapError("lock expiring command delivery", err)
+			return MapError("lock expiring command deliveries", err)
+		}
+		read := 0
+		for rows.Next() {
+			var commandID uuid.UUID
+			var attemptID, token *uuid.UUID
+			var attemptStartedPosition *int64
+			if err := rows.Scan(&commandID, &attemptID, &token, &attemptStartedPosition); err != nil {
+				rows.Close()
+				return MapError("scan expiring command delivery", err)
+			}
+			if read >= len(runningIDs) || commandID != runningIDs[read] ||
+				attemptID == nil || token == nil || attemptStartedPosition == nil {
+				rows.Close()
+				return fmt.Errorf("%w: expiring command delivery projection differs", flowerr.ErrInvalidState)
+			}
+			index := runningIndexes[commandID]
+			commands[index].AttemptID = attemptID
+			commands[index].AttemptStartedPosition = attemptStartedPosition
+			read++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return MapError("read expiring command deliveries", err)
+		}
+		rows.Close()
+		if read != len(runningIDs) {
+			return fmt.Errorf("%w: expiring run has %d of %d delivery projections",
+				flowerr.ErrInvalidState, read, len(runningIDs))
 		}
 	}
 	slices.SortFunc(commands, func(a, b expiringCommand) int {

@@ -825,5 +825,5 @@ func (r *Runtime) observeMaintenanceTransition(
 }
 
 func (r *Runtime) replicaName() string {
-	return "runtime-" + r.instanceID.String()
+	return r.replica
 }
