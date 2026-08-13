@@ -23,7 +23,9 @@ const (
 // Exported vocabulary for the terminal-class observation tuples. String
 // values equal the emitted literals, so consumers can match on constants
 // instead of magic strings. Tuples are only ever added within a major
-// version; consumers must ignore unknown tuples.
+// version; consumers must ignore unknown tuples. For direct run
+// cancellation, the run/cancel tuple is itself the terminal fact; there is
+// no separate run/terminal report for that path.
 const (
 	ObservationOpCancel            = "cancel"
 	ObservationOpTerminal          = "terminal"

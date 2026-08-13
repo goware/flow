@@ -106,6 +106,24 @@ func TestCancellationEmitsTerminalObservations(t *testing.T) {
 	runCancel := waitForTerminalObservation(t, observer, ObservationRun,
 		ObservationOpCancel, ObservationOutcomeCancelled, 5*time.Second)
 	assertRunIdentity(t, runCancel, "observe/cancel-run", command.Name())
+	// Direct run cancellation's run/cancel tuple is the terminal fact; it
+	// must not also emit a run/terminal observation for the same run.
+	cancelRunCancelCount := 0
+	for _, observation := range observer.snapshot() {
+		if observation.RunID != cancelled.RunID {
+			continue
+		}
+		if observation.Kind == ObservationRun && observation.Operation == ObservationOpCancel &&
+			observation.Outcome == ObservationOutcomeCancelled {
+			cancelRunCancelCount++
+		}
+		if observation.Kind == ObservationRun && observation.Operation == ObservationOpTerminal {
+			t.Fatalf("unexpected run/terminal observation for direct run cancellation: %#v", observation)
+		}
+	}
+	if cancelRunCancelCount != 1 {
+		t.Fatalf("run/cancel/cancelled observations for %s = %d, want 1", cancelled.RunID, cancelRunCancelCount)
+	}
 
 	commandRun, err := command.Enqueue(ctx, runtime, "observe/cancel-command", None{}, WithStartDelay(time.Hour))
 	if err != nil {

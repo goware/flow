@@ -1026,8 +1026,11 @@ func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event Appl
 
 type CancelResult struct {
 	Created bool
-	// TerminalRun reports that the cancellation terminalized the run.
-	// RunStatus, RunKey, and Definition identify the terminal run fact.
+	// TerminalRun and RunStatus are set by CancelCommandLocked only, when
+	// cancelling the last open command fails the run. CancelRunLocked never
+	// sets them: the run/cancel observation for direct run cancellation is
+	// itself the terminal fact, so a second run/terminal report would
+	// double-count it.
 	TerminalRun bool
 	RunStatus   string
 	RunKey      string
@@ -1370,8 +1373,7 @@ func (s *Store) CancelRunLocked(ctx context.Context, semantic *SemanticTx, reaso
 		WHERE run_id=$1`, head.ID, failure, semantic.DBNow()); err != nil {
 		return CancelResult{}, MapError("cancel run", err)
 	}
-	return CancelResult{Created: true, TerminalRun: true, RunStatus: "cancelled",
-		RunKey: head.RunKey, Definition: head.Definition}, nil
+	return CancelResult{Created: true, RunKey: head.RunKey, Definition: head.Definition}, nil
 }
 
 func terminalEvent(commandID uuid.UUID, key, status, reason, name, class string) (JournalEntry, error) {
