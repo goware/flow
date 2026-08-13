@@ -18,8 +18,9 @@ Accepted at: `c450ff4b060d1a862fde0540c794fb2d9876147b` on 2026-08-12
   maintenance fixes retained; Plan 8 runtime/release verification guarantees
   retained except its migration-immutability policy, which this development-only
   reset deliberately supersedes
-- **Precedes:** Plan 12. Its amendment is reconciled against accepted Plan 13
-  commit `c450ff4`; Plan 12 remains planned and unimplemented
+- **Precedes:** Plan 12. Its amendment was reconciled against accepted Plan 13
+  commit `c450ff4`; Plan 12 subsequently completed in PR #29 and shipped in
+  v0.4.1
 - **Defers:** Plan 11 durable inline calls. Plan 11 is not implemented; its old
   migration-number proposal is discarded with the old schema history
 - **Primary consumer target:**

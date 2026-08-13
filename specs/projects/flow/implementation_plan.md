@@ -15,9 +15,15 @@ explicit bounded retention. Existing development data is disposable, so the
 schema is one clean Run-named baseline rather than a compatibility chain.
 
 [`plans/11-inline-command-calls.md`](plans/11-inline-command-calls.md) remains
-deferred. [`plans/12-fast-lease-recovery-for-idempotent-commands.md`](plans/12-fast-lease-recovery-for-idempotent-commands.md)
-has been reconciled against accepted Plan 13 commit `c450ff4`; it remains
-planned and unimplemented.
+deliberately deferred: no current consumer justifies another durable delivery
+mode. [`plans/12-fast-lease-recovery-for-idempotent-commands.md`](plans/12-fast-lease-recovery-for-idempotent-commands.md)
+completed in PR #29 at `4b42356` and is included in v0.4.1.
+[`plans/14-scheduler-latency-and-round-trip-reduction.md`](plans/14-scheduler-latency-and-round-trip-reduction.md)
+completed in PR #27 at `a98256d` and was released as v0.4.2.
+[`plans/15-typed-lifecycle-observations.md`](plans/15-typed-lifecycle-observations.md)
+completed its accepted streamlined scope in PR #30 at `b25fbe3` and was
+released as v0.4.3; the larger unused API/registry/example proposal was closed
+rather than retained as required work.
 
 ## Implemented Plans 9–10 outcomes
 

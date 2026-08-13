@@ -1,15 +1,20 @@
 # Plan 15: Make observations an alertable lifecycle contract
 
-Status: Partially implemented — embedder-facing subset shipped (#30);
-Plan 14 anchors synchronized 2026-08-12
+Status: Complete for the accepted streamlined scope — merged in PR #30 and
+released in v0.4.3
+
+Completed at: `b25fbe37a9fd78e12f7eff5a2dbd1d02c600c237` on 2026-08-13
 
 Planned at: `d9125dc` (v0.4.0, post-Plan 13) on 2026-08-13
 
-## Implementation status (#30, branch `feat/plan-15-observations`)
+## Implementation status
 
-The subset consumed by the first production embedder (trails-api plan 012)
-is implemented; the rest of this document is retained as the design record
-for the deferred remainder.
+The scope consumed by the first production embedder (trails-api plan 012) is
+implemented and is the accepted Plan 15 design. Review deliberately rejected
+the broader public API, registry, example, and benchmark work that lacked a
+current consumer. Sections 2–6 retain the original larger proposal as design
+history; the status here and accepted-scope completion list in Section 7 are
+controlling.
 
 Shipped:
 
@@ -44,18 +49,23 @@ Shipped:
   and a drain-time `runtime`/`observer`/`dropped_terminal` report.
 - Minimal README, package, functional-spec, and architecture guidance now
   documents identity, terminal reserve/drop accounting, and durable-read
-  reconciliation. The larger monitoring example remains deferred.
+  reconciliation. The larger monitoring example was closed as unnecessary.
 
-Deferred (not needed by the first embedder):
+Closed without implementation (not required work):
 
-- `CommandInfo.Definition` (Section 4.2's second half).
+- A root-definition field on `CommandInfo` (Section 4.2's second half); handlers
+  have no demonstrated need for it.
 - The full tuple registry, its exhaustiveness test, and converting
   duty-cycle emission sites to constants (Section 4.3). Duty-cycle sites
-  still emit string literals; only the terminal vocabulary is pinned.
+  still emit string literals; only the consumer-relevant terminal vocabulary
+  is pinned. A full registry would add public and maintenance surface without
+  improving durable correctness.
 - `examples/monitor` and the remaining detailed component documentation
-  (Sections 4.6, Phase 5).
-- Claim benchmark evidence (the Phase 1 gate); Plan 14's claim benchmarks are
-  the live baseline and cover the one-column widening.
+  (Sections 4.6, Phase 5); the concise README, package, functional, and
+  architecture documentation is sufficient for the shipped contract.
+- A dedicated claim benchmark (the Phase 1 gate). Plan 14's retained claim
+  evidence covers the one-column projection widening, which adds no statement,
+  lock, transaction, or durable write.
 
 This sits on Plan 14 (#27) as Section 0 requires. The additions ride Plan 14's
 merged statements rather than adding their own: `definition_name` is one more
@@ -64,8 +74,7 @@ fields come from the `commandFence` the settle paths already load. Plan 14's
 §4.5 fast paths are preserved — the default observer is a nil adapter and
 duty-cycle observation construction stays behind that nil check.
 
-- **Branch:** create an implementation branch from `master` after Plans 12
-  and 14 have landed; this plan assumes both are complete
+- **Release:** PR #30 merged to `master` at `b25fbe3` and is tagged v0.4.3
 - **Priority:** P1; embedding applications that must alert on lifecycle
   failures currently reconstruct those signals from log scraping and polling
   because the observer stream cannot carry them, and the first production
@@ -84,10 +93,10 @@ duty-cycle observation construction stays behind that nil check.
   `run_terminal`, and added `GetQueueStats`; Plan 12 (fast lease recovery) and
   Plan 14 (scheduler latency and round-trip reduction), both assumed complete
   — Section 0 states what each changes for this plan
-- **Public API impact if the full plan is completed:** additive only — new
-  `Observation` fields, one new `CommandInfo` field, exported vocabulary
-  constants, and one documented delivery-class distinction; no signature
-  changes and no new goroutine model
+- **Public API impact:** additive only — `Observation.RunKey`,
+  `Observation.RootCommandName`, terminal vocabulary constants, and one
+  documented delivery-class distinction; no signature change and no new
+  goroutine model
 - **Durable format impact:** none; one additive widening of the claim-head
   SELECT (no schema change)
 
@@ -302,7 +311,11 @@ page-worthy. Under sustained load the queue is full of the former when the
 latter arrives. The current design makes the loss invisible even in kind:
 the drop counter does not say *what class* was lost.
 
-## 3. Hard boundaries
+## 3. Original proposed boundaries (historical)
+
+The accepted implementation narrowed this scope as recorded at the top of the
+plan. In particular, `CommandInfo`, the full tuple registry, and the monitor
+example below are not outstanding work.
 
 ### In scope
 
@@ -348,7 +361,7 @@ the drop counter does not say *what class* was lost.
 - Renaming or removing any currently emitted tuple. This plan documents and
   extends the vocabulary; pruning is a separate versioned decision.
 
-## 4. Design
+## 4. Original design and accepted subset
 
 ### 4.1 Observation identity dimensions
 
@@ -392,44 +405,19 @@ comparison there. A measurable regression beyond noise is a STOP condition,
 with the fallback being lazy population on the observation path only for
 terminal facts.
 
-In the same phase, expose the root definition name on the public
-`CommandInfo` struct (`types.go:122-134`) as a new field
-`Definition string`, populated at the single construction site
-(`command_runtime.go:430-435`) from `claim.DefinitionName`. Handlers reading
-`Work.Info()` (`worker.go:48`) and `WithCommit` callbacks then get the run's
-root definition with zero extra reads, which is why this rides along with the
-projection change rather than becoming its own plan. `CommandInfo` grows by
-exactly this one field; anything more is out of scope (Section 3). The
-testing bridge construction (`testing_bridge.go:104`) must carry it too.
+The original proposal also exposed this value on public `CommandInfo`. Review
+rejected that addition because no handler consumer needs it. The value remains
+internal on `ClaimedCommand`, where observation emission uses it without an
+extra read.
 
-### 4.3 Exported vocabulary constants and the normative registry
+### 4.3 Terminal vocabulary constants; full registry rejected
 
-Introduce exported constants for every operation and outcome enumerated in
-Section 2.2 — `ObservationOpProbe`, `ObservationOpClaim`,
-`ObservationOpSettle`, `ObservationOpConclude`, `ObservationOpRenewResult`,
-`ObservationOutcomeOK`, `ObservationOutcomeSucceeded`,
-`ObservationOutcomeExpired`, `ObservationOutcomeRetryWait`, and so on — and
-convert all emission sites to use them. String values must equal the
-currently emitted literals so existing consumers do not break. Outcomes that
-originate in the store (`retry_wait`, `failed`, `succeeded`, `expired`,
-`renewed`, `lost`, `uncertain`) must be mapped through the constants at the
-emission site rather than passed through as raw store strings, so the
-registry test can see them. The conversion must preserve Plan 14's emission
-optimizations (`NopObserver` short-circuit, precomputed replica name).
-
-Add a package-level registry (a var listing every legal
-`(Kind, Operation, Outcome)` tuple) and a test that fails when an emission
-site produces a tuple outside the registry. The registry, not the emission
-sites, becomes the compatibility surface: the documented policy is that
-tuples are only ever added, never renamed or removed within a major version,
-and consumers must ignore unknown tuples. Decide explicitly what to do about
-`ObservationWait` (`observer.go:19`), which no site emits: either register a
-wait tuple that the maintenance wait-expiry path emits, or record that the
-kind is currently unused. Silent omission is not acceptable.
-
-Document the full table in `functional_spec.md` Section 14 (currently
-`functional_spec.md:541-583`) and reference it from
-`components/runtime.md:59`.
+The accepted implementation exports constants for terminal operations and
+outcomes only, preserving the existing literal values. `ObservationWait` is
+now used for wait expiry. Routine duty-cycle tuples remain implementation
+strings. Review rejected a package-level registry, full constant conversion,
+and normative table because they would turn internal telemetry detail into a
+large compatibility surface without serving the current embedder.
 
 ### 4.4 Terminal lifecycle observations
 
@@ -495,40 +483,36 @@ when terminal facts spike).
 
 ### 4.6 Consumer guidance
 
-Extend `examples/monitor` to show the intended embedding shape: a switch on
-registered tuples, counters for duty-cycle facts, and an error-log/page stub
-for terminal-class facts, with a comment stating that durable truth lives in
-the read APIs. The example currently demonstrates only `Trace` polling
-(`examples/monitor/main.go:173-184`) and registers no observer, so this is
-new code beside the existing loop, not a rewrite of it. Add a short
-"alerting from observations" subsection to the README next to the existing
-observer bullets (`README.md:258-260`) that states the loss model and the
-polling backstop requirement.
+README, package, functional-spec, and architecture guidance documents the
+identity fields, best-effort loss model, reserved terminal capacity, separate
+drop accounting, and durable-read backstop. Review rejected expanding
+`examples/monitor`; the production embedder is the useful example and Flow
+does not need another alerting policy surface.
 
-## 5. Phases
+## 5. Implementation phases and scope decisions
 
-### Phase 1 — Claim projection identity and `CommandInfo.Definition`
+The implementation combined the useful parts of the original phases. Rejected
+items are recorded here as decisions rather than incomplete gates.
 
-Add `definition_name` to the claim-head SELECT and `DefinitionName` to
+### Phase 1 — Claim projection identity
+
+Added `definition_name` to the claim-head SELECT and `DefinitionName` to
 `ClaimedCommand`; thread it into the attempt-path observations alongside the
-already-present `RunKey`. In the same phase, add `Definition` to
-`CommandInfo` and populate it at `command_runtime.go:430-435` and
-`testing_bridge.go:104`.
+already-present `RunKey`. The proposed public `CommandInfo` field and dedicated
+claim benchmark were rejected for lack of a consumer; the projection rides the
+existing statement and adds no round trip.
 
-Gate: focused store and command-runtime tests; a test proving `Work.Info()`
-returns both `RunKey` and `Definition` for a claimed command; claim benchmark
-comparison recorded in `specs/projects/flow/benchmark_evidence/` against the
-Section 0 baseline.
+Gate completed: focused store/command-runtime tests prove root and child names
+remain distinct and the existing materialized lock snapshot is reused.
 
-### Phase 2 — Observation fields and vocabulary constants
+### Phase 2 — Observation fields and terminal vocabulary constants
 
-Add `RunKey`/`RootCommandName` to `Observation`, introduce the exported
-constants, convert all emission sites, add the registry and its
-exhaustiveness test, and resolve the unused `ObservationWait` kind.
+Added `RunKey`/`RootCommandName` and central `OccurredAt` population to
+`Observation`, exported the terminal constants, and used `ObservationWait` for
+wait expiry. Full duty-cycle conversion and a registry were rejected.
 
-Gate: `go test -race` on observer, runtime, and command-runtime packages;
-registry test proves every emitted tuple is registered and every registered
-tuple is emitted by at least one test.
+Gate completed: observer, runtime, command-runtime, identity, and timestamp
+tests pass under race.
 
 ### Phase 3 — Terminal lifecycle emissions
 
@@ -550,14 +534,14 @@ Gate: adapter tests covering duty-cycle flood with terminal delivery,
 per-class drop counts, drain-time reporting, panic isolation, and shutdown
 under a blocked observer.
 
-### Phase 5 — Documentation and example
+### Phase 5 — Documentation
 
-Normative vocabulary table and compatibility policy in the functional spec;
-runtime component and architecture updates; README alerting subsection;
-`examples/monitor` consumer; `flow.go` package synopsis touch-up.
+README, package, functional-spec, and architecture guidance document the
+accepted identity and loss contract. A normative table and monitor rewrite
+were rejected with the full registry.
 
-Gate: spec build/lint (`specs/projects/flow/Makefile`), full serial race
-suite, and a manual read of the vocabulary table against the registry var.
+Gate completed: documentation review, full ordinary/race suites, build, vet,
+formatting, vulnerability, and PR review checks passed.
 
 ## 6. STOP conditions
 
@@ -584,36 +568,42 @@ Stop and request review if:
    projection materially different from Sections 2 and 4 — update this plan
    before implementing against it.
 
-## 7. Done criteria
+## 7. Accepted-scope completion
 
-- [ ] `Observation` carries run key and definition name on every emission
-      site that has them, with documented empty-field rules.
-- [ ] `CommandInfo` exposes `Definition`, populated from the claim at its
-      single construction site, with no other new `CommandInfo` fields.
-- [ ] Every emitted `(Kind, Operation, Outcome)` tuple uses exported
-      constants, appears in the registry, and is enumerated in the
-      functional spec with an additive-only compatibility policy; the
-      `ObservationWait` kind is either emitted or documented as unused.
-- [ ] Command terminal, run terminal, retry-budget exhaustion, and
+- [x] `Observation` carries `RunKey` and `RootCommandName` at run-scoped
+      emission sites that already hold them, with documented empty-field rules.
+- [x] Consumer-relevant terminal operations and outcomes use exported
+      constants; `ObservationWait` is emitted for wait expiry.
+- [x] Command terminal, run terminal, retry-budget exhaustion, and
       lease-recovery facts are observable, bounded, and tested for
       exactly-once emission per durable transition in the non-crash case.
-- [ ] Terminal-class observations survive a duty-cycle flood up to the
+- [x] `attempt/settle/expired` is terminal-class rather than duty-cycle.
+- [x] Terminal-class observations survive a duty-cycle flood up to the
       reserved capacity; drop accounting and the drain report are per-class.
-- [ ] No change to durable schema, journal encodings, fencing, settlement,
+- [x] `OccurredAt` is populated centrally for ordinary observations and
+      synthesized drop reports.
+- [x] No change to durable schema, journal encodings, fencing, settlement,
       or the Plan 8 shutdown drain contract; observations still contain no
       payloads, results, SQL, connections, or lease tokens.
-- [ ] Claim benchmark evidence recorded; no regression beyond noise.
-- [ ] `examples/monitor`, README, `flow.go`, and the three spec documents
-      describe the same vocabulary and loss model.
-- [ ] Full `go test -race ./...` passes.
+- [x] README, package, functional-spec, and architecture documentation describe
+      the shipped identity and loss model.
+- [x] PostgreSQL 17/18 ordinary tests, PostgreSQL 18 race tests, build, vet,
+      formatting, vulnerability, and independent review gates pass on PR #30.
+
+Closed scope decisions: no `CommandInfo` root-name field, full duty-cycle
+constant conversion or registry, monitor rewrite, or dedicated claim benchmark
+is required. Plan 14's retained evidence covers the unchanged claim statement
+count and the one-column projection widening adds no query, lock, transaction,
+or durable write.
 
 ## 8. Deferred follow-ups
 
 Recorded so their absence is a decision, not an oversight:
 
-- **Run identity on `Work.Info()`** — closed, not deferred. `RunKey` shipped
-  upstream in v0.3.0 (`types.go:124`), and `Definition` ships in Phase 1 of
-  this plan (Section 4.2). Nothing remains for a separate plan.
+- **Run identity on `Work.Info()`** — `RunKey` shipped upstream in v0.3.0.
+  Adding the root command name was considered and rejected in this plan because
+  no handler consumer needs it; observation paths receive it internally from
+  `ClaimedCommand`.
 - **All-queue depth reads** — closed by Plan 13. `GetQueueStats`
   (`inspection.go:364-367`) reports every requested lane in one call with a
   shared timestamp; no observer work remains.
