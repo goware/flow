@@ -284,7 +284,7 @@ func (cmd Command[A, R]) ReplaceCurrentRun(
 		resolved.runtime.wakeCommands()
 		resolved.runtime.observe(ctx, Observation{
 			Kind: ObservationRun, Operation: ObservationOpCancel, Outcome: ObservationOutcomeCancelled, RunID: expected,
-			Definition: start.DefinitionName,
+			RunKey: key, Definition: start.DefinitionName,
 		})
 		resolved.runtime.observe(ctx, Observation{
 			Kind: ObservationRun, Operation: "start", Outcome: "created", RunID: runID,

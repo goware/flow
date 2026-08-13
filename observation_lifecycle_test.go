@@ -106,6 +106,29 @@ func TestCancellationEmitsTerminalObservations(t *testing.T) {
 	runCancel := waitForTerminalObservation(t, observer, ObservationRun,
 		ObservationOpCancel, ObservationOutcomeCancelled, 5*time.Second)
 	assertRunIdentity(t, runCancel, "observe/cancel-run", command.Name())
+
+	commandRun, err := command.Enqueue(ctx, runtime, "observe/cancel-command", None{}, WithStartDelay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := mustGetRun(t, runtime, commandRun.RunID)
+	if err := CancelCommand(ctx, runtime, target.RootCommandID, "operator cancellation"); err != nil {
+		t.Fatal(err)
+	}
+	commandCancel := waitForTerminalObservation(t, observer, ObservationCommand,
+		ObservationOpCancel, ObservationOutcomeCancelled, 5*time.Second)
+	assertRunIdentity(t, commandCancel, "observe/cancel-command", command.Name())
+	if commandCancel.CommandKey != "root" {
+		t.Fatalf("command cancel CommandKey = %q, want root", commandCancel.CommandKey)
+	}
+	// Cancelling the run's only command terminalizes the run. Deliveries are
+	// FIFO on the adapter queue in this unflooded test, so once this later
+	// observation lands, any earlier run/terminal for cancelled.RunID is
+	// already in the snapshot.
+	terminal := waitForTerminalObservation(t, observer, ObservationRun,
+		ObservationOpTerminal, ObservationOutcomeFailed, 5*time.Second)
+	assertRunIdentity(t, terminal, "observe/cancel-command", command.Name())
+
 	// Direct run cancellation's run/cancel tuple is the terminal fact; it
 	// must not also emit a run/terminal observation for the same run.
 	cancelRunCancelCount := 0
@@ -124,25 +147,6 @@ func TestCancellationEmitsTerminalObservations(t *testing.T) {
 	if cancelRunCancelCount != 1 {
 		t.Fatalf("run/cancel/cancelled observations for %s = %d, want 1", cancelled.RunID, cancelRunCancelCount)
 	}
-
-	commandRun, err := command.Enqueue(ctx, runtime, "observe/cancel-command", None{}, WithStartDelay(time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	target := mustGetRun(t, runtime, commandRun.RunID)
-	if err := CancelCommand(ctx, runtime, target.RootCommandID, "operator cancellation"); err != nil {
-		t.Fatal(err)
-	}
-	commandCancel := waitForTerminalObservation(t, observer, ObservationCommand,
-		ObservationOpCancel, ObservationOutcomeCancelled, 5*time.Second)
-	assertRunIdentity(t, commandCancel, "observe/cancel-command", command.Name())
-	if commandCancel.CommandKey != "root" {
-		t.Fatalf("command cancel CommandKey = %q, want root", commandCancel.CommandKey)
-	}
-	// Cancelling the run's only command terminalizes the run.
-	terminal := waitForTerminalObservation(t, observer, ObservationRun,
-		ObservationOpTerminal, ObservationOutcomeFailed, 5*time.Second)
-	assertRunIdentity(t, terminal, "observe/cancel-command", command.Name())
 }
 
 func TestMaintenanceEmitsTerminalObservations(t *testing.T) {
