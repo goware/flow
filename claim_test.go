@@ -182,6 +182,11 @@ func TestClaimBatchPersistsSixteenSiblingAttemptsTogether(t *testing.T) {
 			t.Fatalf("claim[%d]=%s attempt=%d, candidate=%s", index, command.CommandID, command.Attempt,
 				candidates[index].CommandID)
 		}
+		if command.Name != child.Name() || command.DefinitionName != run.RootCommandName ||
+			command.Name == command.DefinitionName {
+			t.Fatalf("claim[%d] command/root names = %q/%q, want %q/%q",
+				index, command.Name, command.DefinitionName, child.Name(), run.RootCommandName)
+		}
 		if index > 0 && command.AttemptStartedPosition != result.Commands[index-1].AttemptStartedPosition+1 {
 			t.Fatalf("claim positions are not contiguous at %d: %d after %d", index,
 				command.AttemptStartedPosition, result.Commands[index-1].AttemptStartedPosition)

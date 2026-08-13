@@ -65,6 +65,9 @@ func TestIngressFaultRollbackAndPostCommitObservation(t *testing.T) {
 		t.Fatalf("Deliver(observed) error = %v", err)
 	}
 	observations = waitForObservations(t, observer, 2)
+	if len(observations) < 2 {
+		t.Fatalf("observations = %#v, want start and deliver", observations)
+	}
 	delivered := observations[1]
 	if delivered.Kind != ObservationEvent || delivered.Operation != "deliver" ||
 		delivered.RunID != exec.RunID || delivered.RunKey != "observed" ||
