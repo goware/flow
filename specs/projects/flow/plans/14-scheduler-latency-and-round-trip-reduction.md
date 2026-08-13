@@ -279,6 +279,8 @@ The query must:
 - consider only registered `(name, version)` kinds and active runs;
 - calculate the horizon globally, without the continuation cursor or temporary
   run/queue exclusions;
+- seek the first future row through the claim index once per registered kind
+  and reduce those bounded results; never aggregate the complete future queue;
 - clamp the duration to zero in PostgreSQL; and
 - retain the present due-row order, cursor behavior, and candidate limit.
 
@@ -304,6 +306,8 @@ cover:
 - a due row and a later future row are both represented correctly;
 - the horizon ignores cursor, run exclusions, and queue exclusions;
 - terminal runs and unregistered kinds do not set the horizon;
+- a 100,000-row future backlog plus due work keeps each claim-index scan
+  bounded to its first eligible row;
 - inserting earlier work after the probe is still found by the ordinary poll or
   wake signal;
 - notifications disabled/lost does not affect correctness; and

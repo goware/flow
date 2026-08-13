@@ -101,49 +101,7 @@ func (s *Store) ProbeCommandsExcluding(
 		}
 		names[index], versions[index] = kind.Name, version
 	}
-	rows, err := s.db.Conn.Query(ctx, `WITH observed AS MATERIALIZED (
-		SELECT clock_timestamp() AS now
-	), handled(name,version) AS (
-		SELECT * FROM unnest($1::text[],$2::integer[])
-	), future_at AS (
-		SELECT MIN(candidate.next_run_at) AS next_run_at
-		FROM handled h
-		JOIN `+pgschema.Table(s.schema, "flow_command_queue")+` candidate
-		  ON candidate.name=h.name AND candidate.version=h.version
-		JOIN `+pgschema.Table(s.schema, "flow_runs")+` e ON e.run_id=candidate.run_id
-		CROSS JOIN observed
-		WHERE candidate.state IN ('ready','retry_wait')
-		  AND candidate.next_run_at>observed.now
-		  AND e.status IN ('running','failing')
-	), future AS (
-		SELECT CASE WHEN future_at.next_run_at IS NULL THEN NULL
-			ELSE GREATEST(0::double precision,
-				EXTRACT(EPOCH FROM future_at.next_run_at-observed.now)) END AS delay_seconds
-		FROM future_at CROSS JOIN observed
-	), due AS (
-		SELECT q.command_id,q.run_id,q.queue,q.name,q.version,q.next_run_at
-		FROM handled h
-		CROSS JOIN observed
-		CROSS JOIN LATERAL (
-			SELECT candidate.command_id,candidate.run_id,candidate.queue,candidate.name,candidate.version,candidate.next_run_at
-			FROM `+pgschema.Table(s.schema, "flow_command_queue")+` candidate
-			WHERE candidate.name=h.name AND candidate.version=h.version
-			  AND candidate.state IN ('ready','retry_wait') AND candidate.next_run_at<=observed.now
-			  AND NOT (candidate.run_id=ANY(COALESCE($4::uuid[],'{}'::uuid[])))
-			  AND NOT (candidate.queue=ANY(COALESCE($5::text[],'{}'::text[])))
-			  AND ($6::timestamptz IS NULL OR
-			       (candidate.next_run_at,candidate.queue,candidate.command_id)>($6::timestamptz,$7::text,$8::uuid))
-			ORDER BY candidate.next_run_at,candidate.queue,candidate.command_id
-			LIMIT $3
-		) q
-		JOIN `+pgschema.Table(s.schema, "flow_runs")+` e ON e.run_id=q.run_id
-		WHERE e.status IN ('running','failing')
-		ORDER BY q.next_run_at,q.queue,q.command_id
-		LIMIT $3
-	)
-	SELECT due.command_id,due.run_id,due.queue,due.name,due.version,due.next_run_at,future.delay_seconds
-	FROM future LEFT JOIN due ON true
-	ORDER BY due.next_run_at,due.queue,due.command_id`, names, versions, limit, excludedRunIDs, excludedQueues,
+	rows, err := s.db.Conn.Query(ctx, s.probeCommandsSQL(), names, versions, limit, excludedRunIDs, excludedQueues,
 		afterNextRunAt, afterQueue, afterCommandID)
 	if err != nil {
 		return CommandProbeResult{}, MapError("probe commands", err)
@@ -175,6 +133,57 @@ func (s *Store) ProbeCommandsExcluding(
 		return CommandProbeResult{}, MapError("read command candidates", err)
 	}
 	return result, nil
+}
+
+func (s *Store) probeCommandsSQL() string {
+	return `WITH observed AS MATERIALIZED (
+		SELECT clock_timestamp() AS now
+	), handled(name,version) AS (
+		SELECT * FROM unnest($1::text[],$2::integer[])
+	), future_at AS (
+		SELECT MIN(earliest.next_run_at) AS next_run_at
+		FROM handled h
+		CROSS JOIN observed
+		CROSS JOIN LATERAL (
+			SELECT queued.next_run_at
+			FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` queued
+			JOIN ` + pgschema.Table(s.schema, "flow_runs") + ` e ON e.run_id=queued.run_id
+			WHERE queued.name=h.name AND queued.version=h.version
+			  AND queued.state IN ('ready','retry_wait')
+			  AND queued.next_run_at>observed.now
+			  AND e.status IN ('running','failing')
+			ORDER BY queued.next_run_at,queued.queue,queued.command_id
+			LIMIT 1
+		) earliest
+	), future AS (
+		SELECT CASE WHEN future_at.next_run_at IS NULL THEN NULL
+			ELSE GREATEST(0::double precision,
+				EXTRACT(EPOCH FROM future_at.next_run_at-observed.now)) END AS delay_seconds
+		FROM future_at CROSS JOIN observed
+	), due AS (
+		SELECT q.command_id,q.run_id,q.queue,q.name,q.version,q.next_run_at
+		FROM handled h
+		CROSS JOIN observed
+		CROSS JOIN LATERAL (
+			SELECT candidate.command_id,candidate.run_id,candidate.queue,candidate.name,candidate.version,candidate.next_run_at
+			FROM ` + pgschema.Table(s.schema, "flow_command_queue") + ` candidate
+			WHERE candidate.name=h.name AND candidate.version=h.version
+			  AND candidate.state IN ('ready','retry_wait') AND candidate.next_run_at<=observed.now
+			  AND NOT (candidate.run_id=ANY(COALESCE($4::uuid[],'{}'::uuid[])))
+			  AND NOT (candidate.queue=ANY(COALESCE($5::text[],'{}'::text[])))
+			  AND ($6::timestamptz IS NULL OR
+			       (candidate.next_run_at,candidate.queue,candidate.command_id)>($6::timestamptz,$7::text,$8::uuid))
+			ORDER BY candidate.next_run_at,candidate.queue,candidate.command_id
+			LIMIT $3
+		) q
+		JOIN ` + pgschema.Table(s.schema, "flow_runs") + ` e ON e.run_id=q.run_id
+		WHERE e.status IN ('running','failing')
+		ORDER BY q.next_run_at,q.queue,q.command_id
+		LIMIT $3
+	)
+	SELECT due.command_id,due.run_id,due.queue,due.name,due.version,due.next_run_at,future.delay_seconds
+	FROM future LEFT JOIN due ON true
+	ORDER BY due.next_run_at,due.queue,due.command_id`
 }
 
 func postgresSecondsDuration(seconds float64) (time.Duration, bool) {

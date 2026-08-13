@@ -8,11 +8,80 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/goware/flow"
 	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store"
 	"github.com/jackc/pgx/v5"
 )
+
+func TestCommandProbeProductionQueryBoundsFutureBacklogScan(t *testing.T) {
+	db, schema, repository := setupStore(t)
+	ctx := context.Background()
+	runID := seedRun(t, db, schema, "probe-backlog")
+	runs := pgschema.Table(schema, "flow_runs")
+	commands := pgschema.Table(schema, "flow_commands")
+	queue := pgschema.Table(schema, "flow_command_queue")
+	var rootCommandID uuid.UUID
+	if err := db.Conn.QueryRow(ctx, `SELECT root_command_id FROM `+runs+` WHERE run_id=$1`, runID).
+		Scan(&rootCommandID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Conn.Exec(ctx, `INSERT INTO `+queue+`
+		(command_id,run_id,queue,name,version,state,next_run_at)
+		VALUES ($1,$2,'default','work',1,'ready',clock_timestamp()-interval '1 second')`,
+		rootCommandID, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Conn.Exec(ctx, `WITH inserted AS (
+		INSERT INTO `+commands+` (
+			command_id,run_id,command_key,name,version,parent_command_id,args,declaration_fingerprint,
+			state,queue,retry_policy,created_position,created_at,updated_at,status_at
+		)
+		SELECT md5($1::text||':future:'||g::text)::uuid,$1::uuid,'future/'||g::text,
+		       'work',1,$2::uuid,convert_to('{}','UTF8'),decode(repeat('00',32),'hex'),
+		       'ready','default',convert_to('{}','UTF8'),1,
+		       clock_timestamp(),clock_timestamp(),clock_timestamp()
+		FROM generate_series(1,100000) AS g
+		RETURNING command_id,run_id,queue,name,version
+	)
+	INSERT INTO `+queue+` (command_id,run_id,queue,name,version,state,next_run_at)
+	SELECT command_id,run_id,queue,name,version,'ready',clock_timestamp()+interval '1 hour'
+	FROM inserted`, runID, rootCommandID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Conn.Exec(ctx, `ANALYZE `+runs+`, `+queue); err != nil {
+		t.Fatal(err)
+	}
+
+	probe, err := repository.ProbeCommandsExcluding(ctx,
+		[]store.CommandKind{{Name: "work", Version: 1}}, 1, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(probe.Candidates) != 1 || probe.FutureDelay == nil || *probe.FutureDelay < 30*time.Minute {
+		t.Fatalf("large-backlog probe = %#v", probe)
+	}
+
+	rows, err := db.Conn.Query(ctx, `EXPLAIN (ANALYZE,BUFFERS,FORMAT TEXT) `+
+		store.ProbeCommandsQueryForTest(repository),
+		[]string{"work"}, []int32{1}, 1, []uuid.UUID(nil), []string(nil), nil, "", uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := strings.Join(lines, "\n")
+	boundedClaimScans := regexp.MustCompile(
+		`(?m)Index Only Scan using flow_command_queue_claim_idx .*actual .*rows=1(?:\.00)? loops=1`,
+	).FindAllString(plan, -1)
+	if len(boundedClaimScans) < 2 {
+		t.Fatalf("probe plan did not bound both due and future claim-index scans:\n%s", plan)
+	}
+	t.Logf("bounded 100,000-row future-backlog plan:\n%s", plan)
+}
 
 func TestReleaseReadPathProductionQueriesUsePlannedIndexes(t *testing.T) {
 	t.Parallel()

@@ -77,6 +77,26 @@ to 147,953 bytes / 2,835 allocs. Same-runtime Await moved from 164,526 bytes /
 bytes / 6,623 allocs at its median sample; this shape intentionally includes
 the independently running remote worker.
 
+## Future-backlog probe bound
+
+A review follow-up measured the global future-horizon query with one due
+command and 100,000 future commands of the same registered kind. The fixture
+and timed `ProbeCommandsExcluding` call are preserved in
+`BenchmarkPlan14CommandProbeFutureBacklog`; fixture creation and `ANALYZE` are
+outside the timer. Five 20-iteration samples ran against the same PostgreSQL
+18.1 durability-on server.
+
+| Query shape | Range; median | Bytes / alloc median |
+|---|---:|---:|
+| `c819b81` joined `MIN()` | 12.14–12.28; 12.18 ms/op | 5,449 / 80 |
+| Index-directed per-kind first row | 0.494–1.002; 0.633 ms/op | 5,470 / 80 |
+
+The bounded query reduced median probe latency by 94.8% (19.3x) without an
+allocation increase. `EXPLAIN (ANALYZE, BUFFERS)` on the retained production
+query showed both the due and future claim-index scans stopping after one row;
+the complete probe took 0.056 ms and touched 10 shared buffers. The prior
+horizon aggregate independently scanned all 100,000 future index entries.
+
 ## Protocol-operation census
 
 `plan14ProtocolTracer` implements pgx query, batch, and CopyFrom tracing. The
@@ -97,7 +117,10 @@ boundaries.
 
 - The command probe captures PostgreSQL time once and returns due candidates
   plus a global future duration in one result set. Cursor, run, and lane
-  exclusions apply only to due candidates. Scheduler sleep remains capped by
+  exclusions apply only to due candidates. The global horizon performs one
+  ordered claim-index seek per registered kind and reduces only those bounded
+  first-row results; it does not aggregate the complete delayed backlog.
+  Scheduler sleep remains capped by
   `pollInterval`, retains a 1 ms positive floor at elapsed/near-zero horizons,
   and is interruptible by the existing wake hub. Out-of-range PostgreSQL
   durations clamp to Go's maximum positive duration before narrowing. A
@@ -141,10 +164,12 @@ headroom at risk without measured benefit, so no maintenance code changed.
 ### Scheduler probe/query/index redesign — DEFER
 
 The required duration horizon reduced the target delayed-command median by
-92.4%, and the existing bounded fairness/cursor suite remains green. A
-capacity-aware/global rewrite or overlapping claim index would increase
-fairness and write-amplification risk without a demonstrated remaining target
-bottleneck, so the existing lateral due-candidate query and claim index remain.
+92.4%, and the existing bounded fairness/cursor suite remains green. The
+review-discovered backlog-proportional horizon aggregate was replaced by the
+targeted index-directed bound measured above. A broader capacity-aware/global
+rewrite or overlapping claim index would increase fairness and
+write-amplification risk without a demonstrated remaining target bottleneck,
+so the existing candidate query and claim index otherwise remain.
 
 ### Wait-expiry baseline predicate — DEFER
 

@@ -22,4 +22,6 @@ func QueueStatsQueryForTest(s *Store) string { return s.queueStatsQuery() }
 
 func PruneCandidatesQueryForTest(s *Store) string { return s.pruneCandidatesQuery() }
 
+func ProbeCommandsQueryForTest(s *Store) string { return s.probeCommandsSQL() }
+
 func TraceWaitsQueryForTest(s *Store) string { return s.traceWaitsQuery() }

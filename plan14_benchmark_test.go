@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/goware/flow/internal/pgschema"
 	"github.com/goware/flow/internal/store"
 	"github.com/goware/flow/internal/testpg"
 )
@@ -122,6 +123,79 @@ func BenchmarkPlan14AwaitRunLatency(b *testing.B) {
 				b.ReportMetric(float64(total)/float64(time.Millisecond)/float64(b.N), "latency_ms/op")
 			}
 		})
+	}
+}
+
+func BenchmarkPlan14CommandProbeFutureBacklog(b *testing.B) {
+	b.StopTimer()
+	database := testpg.Open(b)
+	ctx := context.Background()
+	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
+		b.Fatal(err)
+	}
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false))
+	if err != nil {
+		b.Fatal(err)
+	}
+	command := DefineCommand[None, None]("plan14.benchmark.probe_backlog", 1)
+	run, err := command.Enqueue(ctx, runtime, "due", None{}, WithoutRunDeadline())
+	if err != nil {
+		b.Fatal(err)
+	}
+	snapshot, err := GetRun(ctx, runtime, run.RunID)
+	if err != nil {
+		b.Fatal(err)
+	}
+	seedPlan14FutureBacklog(b, database, run.RunID, snapshot.RootCommandID, command.Name(), 100_000)
+	if _, err := database.DB.Conn.Exec(ctx, `ANALYZE `+
+		pgschema.Table(database.Schema, "flow_runs")+`, `+
+		pgschema.Table(database.Schema, "flow_command_queue")); err != nil {
+		b.Fatal(err)
+	}
+	kinds := []store.CommandKind{{Name: command.Name(), Version: command.Version()}}
+
+	b.ReportAllocs()
+	b.ReportMetric(100_000, "future_rows")
+	b.ResetTimer()
+	b.StartTimer()
+	for range b.N {
+		probe, err := runtime.store.ProbeCommandsExcluding(ctx, kinds, 1, nil, nil, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(probe.Candidates) != 1 || probe.FutureDelay == nil {
+			b.Fatalf("large-backlog probe = %#v", probe)
+		}
+	}
+}
+
+func seedPlan14FutureBacklog(
+	t testing.TB,
+	database testpg.Database,
+	runID RunID,
+	rootCommandID CommandID,
+	commandName string,
+	count int,
+) {
+	t.Helper()
+	commands := pgschema.Table(database.Schema, "flow_commands")
+	queue := pgschema.Table(database.Schema, "flow_command_queue")
+	if _, err := database.DB.Conn.Exec(context.Background(), `WITH inserted AS (
+		INSERT INTO `+commands+` (
+			command_id,run_id,command_key,name,version,parent_command_id,args,declaration_fingerprint,
+			state,queue,retry_policy,created_position,created_at,updated_at,status_at
+		)
+		SELECT md5($1::text||':plan14-future:'||g::text)::uuid,$1::uuid,
+		       'plan14/future/'||g::text,$3,1,$2::uuid,convert_to('{}','UTF8'),
+		       decode(repeat('00',32),'hex'),'ready','default',convert_to('{}','UTF8'),1,
+		       clock_timestamp(),clock_timestamp(),clock_timestamp()
+		FROM generate_series(1,$4::integer) AS g
+		RETURNING command_id,run_id,queue,name,version
+	)
+	INSERT INTO `+queue+` (command_id,run_id,queue,name,version,state,next_run_at)
+	SELECT command_id,run_id,queue,name,version,'ready',clock_timestamp()+interval '1 hour'
+	FROM inserted`, runID, rootCommandID, commandName, count); err != nil {
+		t.Fatalf("seed %d future commands: %v", count, err)
 	}
 }
 
