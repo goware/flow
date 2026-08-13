@@ -167,7 +167,6 @@ type Runtime struct {
 	instanceID        uuid.UUID
 	replica           string
 	poolCapacity      int
-	observer          Observer
 	observations      *observerAdapter
 	faults            fault.Hook
 
@@ -222,8 +221,8 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 		notifications: options.notifications,
 		instanceID:    instanceID, replica: "runtime-" + instanceID.String(),
 		poolCapacity: int(db.Conn.Config().MaxConns),
-		observer:     options.observer, observations: observations,
-		faults: options.faults, lifecycle: runtimeCreated,
+		observations: observations,
+		faults:       options.faults, lifecycle: runtimeCreated,
 		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(),
 	}, nil
 }

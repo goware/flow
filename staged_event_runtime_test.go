@@ -343,7 +343,8 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 		case ObservationEvent:
 			eventObservations++
 			if observation.Outcome != "accepted" || observation.CommandID != successRun.RootCommandID ||
-				observation.CommandKey != "root" || observation.Name != event.Name() {
+				observation.CommandKey != "root" || observation.Name != event.Name() ||
+				observation.RunKey != "success" || observation.RootCommandName != success.Name() {
 				t.Fatalf("worker event observation=%+v", observation)
 			}
 		case ObservationAttempt:
@@ -355,6 +356,19 @@ func TestWorkerStagedEventsSettleAtomicallyWithChildrenAndCommit(t *testing.T) {
 	}
 	if eventObservations != 2 || attemptObservations != 1 {
 		t.Fatalf("worker settle observations=%+v", settled)
+	}
+	claimObserved := false
+	for _, observation := range observer.snapshot() {
+		if observation.Kind == ObservationClaim && observation.Operation == "claim" &&
+			observation.RunID == successHandle.RunID {
+			claimObserved = true
+			if observation.RunKey != "success" || observation.RootCommandName != success.Name() {
+				t.Fatalf("claim observation identity=%+v", observation)
+			}
+		}
+	}
+	if !claimObserved {
+		t.Fatal("successful run claim observation was not delivered")
 	}
 	rolledBack := map[RunID]bool{
 		failureHandle.RunID: true, commitFailureHandle.RunID: true,

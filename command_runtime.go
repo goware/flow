@@ -320,11 +320,16 @@ func (r *Runtime) claimRunGroup(
 		}
 	}
 	if r.observations != nil {
-		r.observe(ctx, Observation{
+		observation := Observation{
 			Kind: ObservationClaim, Operation: "claim", Outcome: outcomeForError(err),
 			RunID: RunID(group[0].RunID.String()), Count: int64(len(result.Commands)),
 			Duration: time.Since(started), Worker: r.replicaName(),
-		})
+		}
+		if len(result.Commands) > 0 {
+			observation.RunKey = result.Commands[0].RunKey
+			observation.RootCommandName = result.Commands[0].DefinitionName
+		}
+		r.observe(ctx, observation)
 	}
 	return result, err
 }
@@ -497,7 +502,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		r.observe(context.Background(), Observation{
 			Kind: ObservationAttempt, Operation: "handler", Outcome: outcomeForError(workerErr),
 			RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-			RunKey: claim.RunKey, Definition: claim.DefinitionName,
+			RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 			Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Duration: time.Since(started),
 		})
 	}
@@ -558,13 +563,14 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 						r.observe(context.Background(), Observation{
 							Kind: ObservationEvent, Operation: "settle", Outcome: "accepted",
 							RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
+							RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 							Name: event.Name, Worker: r.replicaName(),
 						})
 					}
 					r.observe(context.Background(), Observation{
 						Kind: ObservationAttempt, Operation: "settle", Outcome: ObservationOutcomeSucceeded,
 						RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-						RunKey: claim.RunKey, Definition: claim.DefinitionName,
+						RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 						Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(), Count: int64(len(events)),
 					})
 					r.observeRunTerminal(info.RunID, settleResult)
@@ -575,7 +581,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 					r.observe(context.Background(), Observation{
 						Kind: ObservationAttempt, Operation: "settle", Outcome: ObservationOutcomeExpired,
 						RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-						RunKey: claim.RunKey, Definition: claim.DefinitionName,
+						RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 						Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
 					})
 					r.observeRunTerminal(info.RunID, settleResult)
@@ -623,7 +629,7 @@ func (r *Runtime) executeClaim(worker erasedWorker, claim store.ClaimedCommand, 
 		r.observe(context.Background(), Observation{
 			Kind: ObservationAttempt, Operation: "settle", Outcome: "error",
 			RunID: info.RunID, CommandID: info.CommandID, CommandKey: info.CommandKey,
-			RunKey: claim.RunKey, Definition: claim.DefinitionName,
+			RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 			Name: info.Name, Version: info.Version, Queue: claim.Queue, Worker: r.replicaName(),
 		})
 	}
@@ -636,7 +642,7 @@ func (r *Runtime) observeRunTerminal(runID RunID, result store.SettleResult) {
 	}
 	r.observe(context.Background(), Observation{
 		Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: result.RunStatus,
-		RunID: runID, RunKey: result.RunKey, Definition: result.Definition, Worker: r.replicaName(),
+		RunID: runID, RunKey: result.RunKey, RootCommandName: result.Definition, Worker: r.replicaName(),
 	})
 }
 
@@ -763,7 +769,7 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 				r.observe(context.Background(), Observation{
 					Kind: ObservationAttempt, Operation: operation, Outcome: result.Status,
 					RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
-					CommandKey: claim.CommandKey, RunKey: claim.RunKey, Definition: claim.DefinitionName,
+					CommandKey: claim.CommandKey, RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 					Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
 				})
 				r.observeRunTerminal(RunID(claim.RunID.String()), result)
@@ -785,7 +791,7 @@ func (r *Runtime) concludeClaim(ctx context.Context, claim store.ClaimedCommand,
 		r.observe(context.Background(), Observation{
 			Kind: ObservationAttempt, Operation: "conclude", Outcome: "error",
 			RunID: RunID(claim.RunID.String()), CommandID: CommandID(claim.CommandID.String()),
-			CommandKey: claim.CommandKey, RunKey: claim.RunKey, Definition: claim.DefinitionName,
+			CommandKey: claim.CommandKey, RunKey: claim.RunKey, RootCommandName: claim.DefinitionName,
 			Name: claim.Name, Version: claim.Version, Queue: claim.Queue, Worker: r.replicaName(),
 		})
 	}

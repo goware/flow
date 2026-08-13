@@ -17,6 +17,7 @@ func TestObservationTerminalClass(t *testing.T) {
 		{Kind: ObservationWait, Operation: ObservationOpExpire, Outcome: ObservationOutcomeExpired},
 		{Kind: ObservationLease, Operation: ObservationOpRecover, Outcome: ObservationOutcomeRecovered},
 		{Kind: ObservationLease, Operation: ObservationOpLocalCancel, Outcome: "lost"},
+		{Kind: ObservationAttempt, Operation: "settle", Outcome: ObservationOutcomeExpired},
 		{Kind: ObservationAttempt, Operation: ObservationOpConcludeExhausted, Outcome: ObservationOutcomeFailed},
 		{Kind: ObservationAttempt, Operation: ObservationOpConclude, Outcome: ObservationOutcomeFailed},
 		{Kind: ObservationRuntime, Operation: ObservationOpObserver, Outcome: ObservationOutcomeDropped},
@@ -69,6 +70,9 @@ func TestObserverTerminalReserveSurvivesDutyCycleFlood(t *testing.T) {
 	delivered := 0
 	var droppedReport, droppedTerminalReport int64
 	for _, observation := range observer.snapshot() {
+		if observation.OccurredAt.IsZero() {
+			t.Fatalf("observation has zero OccurredAt: %#v", observation)
+		}
 		if observation.Kind == ObservationRun && observation.Operation == ObservationOpTerminal {
 			delivered++
 		}

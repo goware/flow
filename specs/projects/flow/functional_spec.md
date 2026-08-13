@@ -583,7 +583,7 @@ waits and satisfying positions, events, and raw ordered history. The current
 implementation rejects an initial trace at 100,000 or more retained history
 entries rather than returning an unbounded snapshot.
 
-While `Run` is active, observers receive bounded operational metadata asynchronously. Delivery and shutdown drain are best-effort: a full observer queue drops observations and later reports a drop count, and observer panics do not affect run. Observers must return promptly and should honor callback-context cancellation. A blocked observer may strand its one delivery goroutine, but cannot block runtime shutdown or durable work. Observations contain no arguments, results, event payloads, SQL, connection objects, or lease tokens.
+While `Run` is active, observers receive bounded operational metadata asynchronously. Delivery and shutdown drain are best-effort: a full observer queue drops observations and later reports a drop count, and observer panics do not affect run. Terminal lifecycle facts have a small reserved capacity and separate drop accounting; a nonzero terminal drop count means durable reads must reconcile missed edges. Run-scoped observations carry `RunID`, `RunKey`, and `RootCommandName` when the emission path already holds them, and `OccurredAt` records when Flow produced the fact. Observers must return promptly and should honor callback-context cancellation. A blocked observer may strand its one delivery goroutine, but cannot block runtime shutdown or durable work. Observations contain no arguments, results, event payloads, SQL, connection objects, or lease tokens.
 
 ## 15. Errors and data handling
 

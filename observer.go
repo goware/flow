@@ -58,16 +58,16 @@ type Observation struct {
 	// RunKey is the application-chosen run key, empty when the run was
 	// started without one or the emission site does not hold it.
 	RunKey string
-	// Definition is the run's root definition name, independent of Name,
-	// which on attempt-path facts is the command definition name.
-	Definition string
-	Name       string
-	Version    int
-	Queue      string
-	Worker     string
-	Count      int64
-	Duration   time.Duration
-	OccurredAt time.Time
+	// RootCommandName is the run's root command definition name, independent
+	// of Name, which on attempt-path facts is the current command definition.
+	RootCommandName string
+	Name            string
+	Version         int
+	Queue           string
+	Worker          string
+	Count           int64
+	Duration        time.Duration
+	OccurredAt      time.Time
 }
 
 // terminalClass reports whether the observation is a terminal lifecycle
@@ -84,7 +84,8 @@ func (o Observation) terminalClass() bool {
 	case ObservationLease:
 		return o.Operation == ObservationOpRecover || o.Operation == ObservationOpLocalCancel
 	case ObservationAttempt:
-		return o.Operation == ObservationOpConcludeExhausted ||
+		return (o.Operation == "settle" && o.Outcome == ObservationOutcomeExpired) ||
+			o.Operation == ObservationOpConcludeExhausted ||
 			(o.Operation == ObservationOpConclude && o.Outcome == ObservationOutcomeFailed)
 	case ObservationRuntime:
 		return o.Operation == ObservationOpObserver
@@ -178,6 +179,9 @@ func (adapter *observerAdapter) emit(observation Observation) {
 	if adapter == nil {
 		return
 	}
+	if observation.OccurredAt.IsZero() {
+		observation.OccurredAt = time.Now().UTC()
+	}
 	terminal := observation.terminalClass()
 	adapter.mu.RLock()
 	defer adapter.mu.RUnlock()
@@ -225,5 +229,10 @@ func (adapter *observerAdapter) close() {
 
 func (adapter *observerAdapter) deliver(observation Observation) {
 	defer func() { _ = recover() }()
+	if observation.OccurredAt.IsZero() {
+		// Drop reports are synthesized during drain rather than enqueued through
+		// emit, so give those reports a timestamp at their point of creation.
+		observation.OccurredAt = time.Now().UTC()
+	}
 	adapter.observer.Observe(adapter.ctx, observation)
 }

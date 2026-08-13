@@ -279,7 +279,6 @@ func BenchmarkPlan14RetainedAllocationChanges(b *testing.B) {
 	withAdapter := &Runtime{
 		instanceID:   runtime.instanceID,
 		replica:      runtime.replica,
-		observer:     noOpObserver{},
 		observations: newObserverAdapter(noOpObserver{}),
 	}
 	defer withAdapter.observations.close()

@@ -136,9 +136,13 @@
 // cancels non-running siblings while already running attempts remain fenced and
 // settleable.
 //
-// Observer delivery is bounded and best-effort. Observers must return promptly
-// and should honor context cancellation; a blocked or failed observer never
-// changes durable run correctness or prevents runtime shutdown.
+// Observer delivery is bounded and best-effort. Terminal lifecycle facts have
+// a small reserved capacity and separate drop accounting, but durable reads
+// remain the reconciliation backstop. Run-scoped facts carry the run ID and,
+// when already held by the emission path, its application key and root command
+// name. Observers must return promptly and should honor context cancellation;
+// a blocked or failed observer never changes durable run correctness or
+// prevents runtime shutdown.
 //
 // The current development line supports Go 1.26 and PostgreSQL 17 and 18. Its
 // single-migration schema is a clean baseline. Older development schemas are

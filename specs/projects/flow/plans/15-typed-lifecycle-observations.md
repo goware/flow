@@ -13,9 +13,9 @@ for the deferred remainder.
 
 Shipped:
 
-- `Observation.RunKey` and `Observation.Definition` (Section 4.1), populated
-  on the attempt path from the claim, on run/cancel ingress paths, and on
-  the maintenance pages from columns the probes already read. Plan 14's
+- `Observation.RunKey` and `Observation.RootCommandName` (Section 4.1), populated
+  on run-scoped ingress, claim/attempt/event paths, and the maintenance pages
+  from values already held in memory or columns the probes already read. Plan 14's
   lock/time/snapshot statement in `AttachSemantic` was widened by
   `definition_name` (Section 4.2's projection change), which reaches the
   claim path through `InitialLockedSnapshot` and is carried on
@@ -42,6 +42,9 @@ Shipped:
 - Section 4.5 delivery classes: one goroutine, one observer, 64 of the 1024
   slots reserved for terminal-class observations, per-class drop accounting,
   and a drain-time `runtime`/`observer`/`dropped_terminal` report.
+- Minimal README, package, functional-spec, and architecture guidance now
+  documents identity, terminal reserve/drop accounting, and durable-read
+  reconciliation. The larger monitoring example remains deferred.
 
 Deferred (not needed by the first embedder):
 
@@ -49,7 +52,7 @@ Deferred (not needed by the first embedder):
 - The full tuple registry, its exhaustiveness test, and converting
   duty-cycle emission sites to constants (Section 4.3). Duty-cycle sites
   still emit string literals; only the terminal vocabulary is pinned.
-- `examples/monitor`, README, `flow.go`, and spec documentation phases
+- `examples/monitor` and the remaining detailed component documentation
   (Sections 4.6, Phase 5).
 - Claim benchmark evidence (the Phase 1 gate); Plan 14's claim benchmarks are
   the live baseline and cover the one-column widening.
@@ -81,9 +84,10 @@ duty-cycle observation construction stays behind that nil check.
   `run_terminal`, and added `GetQueueStats`; Plan 12 (fast lease recovery) and
   Plan 14 (scheduler latency and round-trip reduction), both assumed complete
   — Section 0 states what each changes for this plan
-- **Public API impact:** additive only — new `Observation` fields, one new
-  `CommandInfo` field, exported vocabulary constants, and one documented
-  delivery-class distinction; no signature changes and no new goroutine model
+- **Public API impact if the full plan is completed:** additive only — new
+  `Observation` fields, one new `CommandInfo` field, exported vocabulary
+  constants, and one documented delivery-class distinction; no signature
+  changes and no new goroutine model
 - **Durable format impact:** none; one additive widening of the claim-head
   SELECT (no schema change)
 
@@ -352,14 +356,14 @@ Add two fields to `Observation`:
 
 - `RunKey string` — the application-chosen run key, empty when the run was
   started without one;
-- `Definition string` — the run's root definition name.
+- `RootCommandName string` — the run's root command definition name.
 
 Population rules: run-path sites (`start`, `cancel`, the `ReplaceCurrentRun`
 pair) already hold or can cheaply hold both and must set them. Attempt-path
 sites populate them from the claim — `RunKey` is already on `ClaimedCommand`
-today, `Definition` arrives with Section 4.2. Note that `Observation.Name` on
+today, `RootCommandName` arrives with Section 4.2. Note that `Observation.Name` on
 attempt-path facts is the *command* definition name, not the run's; the new
-`Definition` field is the run root and the two are independent. Maintenance
+`RootCommandName` field is the run root and the two are independent. Maintenance
 sites populate them from the probe row when the probe already selects the
 column, and otherwise leave them empty rather than adding a per-candidate
 lookup — maintenance must stay bounded. Runtime, notify-listener, and
@@ -518,7 +522,7 @@ Section 0 baseline.
 
 ### Phase 2 — Observation fields and vocabulary constants
 
-Add `RunKey`/`Definition` to `Observation`, introduce the exported
+Add `RunKey`/`RootCommandName` to `Observation`, introduce the exported
 constants, convert all emission sites, add the registry and its
 exhaustiveness test, and resolve the unused `ObservationWait` kind.
 

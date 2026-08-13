@@ -750,7 +750,7 @@ func (r *Runtime) runRunDeadlinePage(ctx context.Context, candidates []store.Exp
 			changed++
 			r.observe(ctx, Observation{
 				Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: ObservationOutcomeExpired,
-				RunID: RunID(candidate.RunID.String()), RunKey: candidate.RunKey, Definition: candidate.Definition,
+				RunID: RunID(candidate.RunID.String()), RunKey: candidate.RunKey, RootCommandName: candidate.Definition,
 				Worker: r.replicaName(),
 			})
 		}
@@ -778,14 +778,14 @@ func (r *Runtime) runWaitExpiryPage(ctx context.Context, candidates []store.Expi
 			r.observe(ctx, Observation{
 				Kind: ObservationWait, Operation: ObservationOpExpire, Outcome: ObservationOutcomeExpired,
 				RunID: RunID(candidate.RunID.String()), CommandID: CommandID(candidate.CommandID.String()),
-				CommandKey: result.CommandKey, RunKey: result.RunKey, Definition: result.Definition,
+				CommandKey: result.CommandKey, RunKey: result.RunKey, RootCommandName: result.Definition,
 				Worker: r.replicaName(),
 			})
 		}
 		if result.TerminalRun {
 			r.observe(ctx, Observation{
 				Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: ObservationOutcomeFailed,
-				RunID: RunID(candidate.RunID.String()), RunKey: result.RunKey, Definition: result.Definition,
+				RunID: RunID(candidate.RunID.String()), RunKey: result.RunKey, RootCommandName: result.Definition,
 				Worker: r.replicaName(),
 			})
 		}
@@ -813,14 +813,14 @@ func (r *Runtime) runLeaseRecoveryPage(ctx context.Context, candidates []store.E
 			r.observe(ctx, Observation{
 				Kind: ObservationLease, Operation: ObservationOpRecover, Outcome: ObservationOutcomeRecovered,
 				RunID: RunID(candidate.RunID.String()), CommandID: CommandID(candidate.CommandID.String()),
-				CommandKey: result.CommandKey, RunKey: result.RunKey, Definition: result.Definition,
+				CommandKey: result.CommandKey, RunKey: result.RunKey, RootCommandName: result.Definition,
 				Worker: r.replicaName(),
 			})
 		}
 		if result.ExpiredRun {
 			r.observe(ctx, Observation{
 				Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: ObservationOutcomeExpired,
-				RunID: RunID(candidate.RunID.String()), RunKey: result.RunKey, Definition: result.Definition,
+				RunID: RunID(candidate.RunID.String()), RunKey: result.RunKey, RootCommandName: result.Definition,
 				Worker: r.replicaName(),
 			})
 		}

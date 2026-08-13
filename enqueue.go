@@ -284,11 +284,11 @@ func (cmd Command[A, R]) ReplaceCurrentRun(
 		resolved.runtime.wakeCommands()
 		resolved.runtime.observe(ctx, Observation{
 			Kind: ObservationRun, Operation: ObservationOpCancel, Outcome: ObservationOutcomeCancelled, RunID: expected,
-			RunKey: key, Definition: start.DefinitionName,
+			RunKey: key, RootCommandName: start.DefinitionName,
 		})
 		resolved.runtime.observe(ctx, Observation{
 			Kind: ObservationRun, Operation: "start", Outcome: "created", RunID: runID,
-			RunKey: key, Definition: start.DefinitionName,
+			RunKey: key, RootCommandName: start.DefinitionName,
 			Name: start.DefinitionName, Version: start.DefinitionVersion,
 		})
 	}
@@ -313,7 +313,7 @@ func enqueueStart(ctx context.Context, client resolvedClient, request store.Star
 		client.runtime.wakeCommands()
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationRun, Operation: "start", Outcome: "created",
-			RunID: runID, RunKey: request.Key, Definition: request.DefinitionName,
+			RunID: runID, RunKey: request.Key, RootCommandName: request.DefinitionName,
 			Name: request.DefinitionName, Version: request.DefinitionVersion,
 		})
 	}
@@ -369,7 +369,12 @@ func (event Event[T]) deliverExternal(ctx context.Context, c Client, id RunID, k
 		return newError(ErrConflict, "deliver", "event", key, "event identity differs")
 	}
 	created := false
+	var runKey, rootCommandName string
 	err = client.semantic(ctx, runID, func(semantic *store.SemanticTx) error {
+		if snapshot, ok := semantic.InitialLockedSnapshot(); ok {
+			runKey = snapshot.Head.RunKey
+			rootCommandName = snapshot.Head.Definition
+		}
 		if err := client.runtime.faults.Hit(ctx, fault.IngressBeforeJournal); err != nil {
 			return err
 		}
@@ -385,7 +390,7 @@ func (event Event[T]) deliverExternal(ctx context.Context, c Client, id RunID, k
 	if client.tx == nil && created {
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationEvent, Operation: "deliver", Outcome: "created", RunID: id,
-			Name: event.def.Name,
+			RunKey: runKey, RootCommandName: rootCommandName, Name: event.def.Name,
 		})
 	}
 	return nil
@@ -426,12 +431,12 @@ func CancelCommand(ctx context.Context, c Client, id CommandID, reason string) e
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationCommand, Operation: ObservationOpCancel, Outcome: ObservationOutcomeCancelled,
 			RunID: RunID(runID.String()), CommandID: id, CommandKey: result.CommandKey,
-			RunKey: result.RunKey, Definition: result.Definition,
+			RunKey: result.RunKey, RootCommandName: result.Definition,
 		})
 		if result.TerminalRun {
 			client.runtime.observe(ctx, Observation{
 				Kind: ObservationRun, Operation: ObservationOpTerminal, Outcome: result.RunStatus,
-				RunID: RunID(runID.String()), RunKey: result.RunKey, Definition: result.Definition,
+				RunID: RunID(runID.String()), RunKey: result.RunKey, RootCommandName: result.Definition,
 			})
 		}
 	}
@@ -468,7 +473,7 @@ func CancelRun(ctx context.Context, c Client, id RunID, reason string) error {
 	if client.tx == nil && result.Created {
 		client.runtime.observe(ctx, Observation{
 			Kind: ObservationRun, Operation: ObservationOpCancel, Outcome: ObservationOutcomeCancelled, RunID: id,
-			RunKey: result.RunKey, Definition: result.Definition,
+			RunKey: result.RunKey, RootCommandName: result.Definition,
 		})
 	}
 	return nil

@@ -34,9 +34,12 @@ func waitForTerminalObservation(
 
 func assertRunIdentity(t *testing.T, observation Observation, runKey, definition string) {
 	t.Helper()
-	if observation.RunKey != runKey || observation.Definition != definition {
-		t.Fatalf("observation identity RunKey=%q Definition=%q, want %q/%q",
-			observation.RunKey, observation.Definition, runKey, definition)
+	if observation.RunKey != runKey || observation.RootCommandName != definition {
+		t.Fatalf("observation identity RunKey=%q RootCommandName=%q, want %q/%q",
+			observation.RunKey, observation.RootCommandName, runKey, definition)
+	}
+	if observation.OccurredAt.IsZero() {
+		t.Fatal("observation OccurredAt is zero")
 	}
 }
 
