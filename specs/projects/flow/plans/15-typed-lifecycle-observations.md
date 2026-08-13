@@ -1,8 +1,65 @@
 # Plan 15: Make observations an alertable lifecycle contract
 
-Status: Proposed — Plan 14 anchors synchronized 2026-08-12
+Status: Partially implemented — embedder-facing subset shipped (#30);
+Plan 14 anchors synchronized 2026-08-12
 
 Planned at: `d9125dc` (v0.4.0, post-Plan 13) on 2026-08-13
+
+## Implementation status (#30, branch `feat/plan-15-observations`)
+
+The subset consumed by the first production embedder (trails-api plan 012)
+is implemented; the rest of this document is retained as the design record
+for the deferred remainder.
+
+Shipped:
+
+- `Observation.RunKey` and `Observation.Definition` (Section 4.1), populated
+  on the attempt path from the claim, on run/cancel ingress paths, and on
+  the maintenance pages from columns the probes already read. Plan 14's
+  lock/time/snapshot statement in `AttachSemantic` was widened by
+  `definition_name` (Section 4.2's projection change), which reaches the
+  claim path through `InitialLockedSnapshot` and is carried on
+  `ClaimedCommand.DefinitionName`.
+- Exported constants for the terminal tuple vocabulary only
+  (`ObservationOpTerminal`, `ObservationOpConclude`,
+  `ObservationOpConcludeExhausted`, `ObservationOpExpire`,
+  `ObservationOpRecover`, `ObservationOpLocalCancel`,
+  `ObservationOpObserver`, `ObservationOpCancel`, and the terminal
+  `ObservationOutcome*` values). String values equal the previously emitted
+  literals.
+- The Section 4.4 terminal emissions: run terminal from both settlement
+  paths (surfaced via additive `SettleResult` fields — `TerminalRun`,
+  `RunStatus`, `RunKey`, `Definition`, plus `StopReason` for the retry
+  decision), `CancelCommand`/`CancelRun` (via additive `CancelResult`
+  fields), wait-deadline expiry (`wait`/`expire`/`expired`, resolving the
+  previously unused `ObservationWait` kind), the run-deadline maintenance
+  page (per expired run, page-bounded), and per-command
+  `lease`/`recover`/`recovered` from the recovery page.
+- `conclude_exhausted`: a terminal failed conclusion caused by budget
+  exhaustion (`attempt_limit`, `elapsed_limit`,
+  `deadline_before_next_attempt`) is a distinct operation; a permanent
+  classification remains `conclude`/`failed`.
+- Section 4.5 delivery classes: one goroutine, one observer, 64 of the 1024
+  slots reserved for terminal-class observations, per-class drop accounting,
+  and a drain-time `runtime`/`observer`/`dropped_terminal` report.
+
+Deferred (not needed by the first embedder):
+
+- `CommandInfo.Definition` (Section 4.2's second half).
+- The full tuple registry, its exhaustiveness test, and converting
+  duty-cycle emission sites to constants (Section 4.3). Duty-cycle sites
+  still emit string literals; only the terminal vocabulary is pinned.
+- `examples/monitor`, README, `flow.go`, and spec documentation phases
+  (Sections 4.6, Phase 5).
+- Claim benchmark evidence (the Phase 1 gate); Plan 14's claim benchmarks are
+  the live baseline and cover the one-column widening.
+
+This sits on Plan 14 (#27) as Section 0 requires. The additions ride Plan 14's
+merged statements rather than adding their own: `definition_name` is one more
+column on the lock/time/snapshot statement, and the `SettleResult` identity
+fields come from the `commandFence` the settle paths already load. Plan 14's
+§4.5 fast paths are preserved — the default observer is a nil adapter and
+duty-cycle observation construction stays behind that nil check.
 
 - **Branch:** create an implementation branch from `master` after Plans 12
   and 14 have landed; this plan assumes both are complete
