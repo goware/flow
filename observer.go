@@ -96,6 +96,9 @@ type Observer interface {
 	// Observe receives best-effort operational metadata. Implementations must
 	// return promptly and should stop work when ctx is cancelled. Flow never
 	// waits indefinitely for an observer during runtime shutdown.
+	// Delivery order across the duty-cycle and terminal classes is not
+	// guaranteed under load; consumers needing exact ordering must read the
+	// journal.
 	Observe(context.Context, Observation)
 }
 
