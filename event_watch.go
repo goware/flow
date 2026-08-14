@@ -32,6 +32,8 @@ type EventWatch[T any] struct {
 // Watch starts after the run's current journal head. It requires notifications
 // on every runtime that may write the watched run. Establish the watch before
 // reading the application's projection to close the application read race.
+// A watch may be created before runtime.Run starts; until the listener starts
+// and performs its catch-up wake, callers must bound Next with a context.
 func (event Event[T]) Watch(ctx context.Context, runtime *Runtime, id RunID) (*EventWatch[T], error) {
 	if event.err != nil || event.def == nil || event.def.Namespace != "application" {
 		return nil, newError(ErrInvalid, "watch", "event", eventName(event.def), "invalid event definition")

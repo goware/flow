@@ -43,6 +43,10 @@ for one run by separate semantic operations in one caller transaction are
 folded into one delivered notification by PostgreSQL. Median latency remains
 well inside the plan's 10% investigation gate.
 
+The shared external-event fixture now uses the runtime default of notifications
+enabled for all of its shapes. Plan 16 repeats and reports only
+`hot_live/no_match`, the controlling event-only ingress shape named by the plan.
+
 ## Sparse post-cursor read
 
 `TestEventWatchSparsePostCursorPlan` runs the exact production query with the

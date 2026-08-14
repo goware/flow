@@ -103,7 +103,7 @@ func TestReplaceCurrentRunNotifiesOnlyForCommittedRunnableSuccessor(t *testing.T
 	if err != nil || !replaced.Replaced {
 		t.Fatalf("replacement = %#v, %v", replaced, err)
 	}
-	waitForNotificationHint(t, listener, replaced.RunID, 2*time.Second)
+	waitForNotificationHintKind(t, listener, replaced.RunID, store.NotificationRun, 2*time.Second)
 
 	rolledBackOriginal, err := command.Enqueue(ctx, runtime, "notify/replace-rollback", None{}, WithLiveKey(), WithStartDelay(time.Hour))
 	if err != nil {
@@ -210,7 +210,7 @@ func TestClaimDoesNotNotifyAndTerminalSettlementWakesWatchers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enqueue() error = %v", err)
 	}
-	waitForNotificationHint(t, listener, exec.RunID, 2*time.Second)
+	waitForNotificationHintKind(t, listener, exec.RunID, store.NotificationRun, 2*time.Second)
 
 	candidates, err := runtime.store.ProbeCommands(ctx, []store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 1)
 	if err != nil || len(candidates) != 1 {
@@ -252,7 +252,7 @@ func TestImmediateRetryAndLeaseRecoveryNotify(t *testing.T) {
 	}, fault.None{}); err != nil {
 		t.Fatalf("SettleCommandConclusion(interrupted) error = %v", err)
 	}
-	waitForNotificationHint(t, listener, RunID(claim.RunID.String()), 2*time.Second)
+	waitForNotificationHintKind(t, listener, RunID(claim.RunID.String()), store.NotificationRun, 2*time.Second)
 	candidates, err := runtime.store.ProbeCommands(ctx,
 		[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 10)
 	if err != nil {
@@ -292,7 +292,7 @@ func TestImmediateRetryAndLeaseRecoveryNotify(t *testing.T) {
 	if err != nil || !recovery.Changed {
 		t.Fatalf("RecoverExpiredCommandLease() = %t, %v", recovery.Changed, err)
 	}
-	waitForNotificationHint(t, listener, RunID(recoveryClaim.RunID.String()), 2*time.Second)
+	waitForNotificationHintKind(t, listener, RunID(recoveryClaim.RunID.String()), store.NotificationRun, 2*time.Second)
 }
 
 func openNotificationListener(t *testing.T, database testpg.Database, runtime *Runtime) *pgx.Conn {
@@ -310,11 +310,6 @@ func openNotificationListener(t *testing.T, database testpg.Database, runtime *R
 	return listener
 }
 
-func waitForNotificationHint(t *testing.T, listener *pgx.Conn, runID RunID, timeout time.Duration) {
-	t.Helper()
-	waitForNotificationHintKind(t, listener, runID, "", timeout)
-}
-
 func waitForNotificationHintKind(t *testing.T, listener *pgx.Conn, runID RunID, kind string, timeout time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -325,7 +320,7 @@ func waitForNotificationHintKind(t *testing.T, listener *pgx.Conn, runID RunID, 
 			t.Fatalf("WaitForNotification() error = %v", err)
 		}
 		hint, valid := store.ParseNotificationHint(notification.Payload)
-		if valid && hint.RunID.String() == string(runID) && (kind == "" || hint.Kind == kind) {
+		if valid && hint.RunID.String() == string(runID) && hint.Kind == kind {
 			return
 		}
 	}
@@ -354,7 +349,7 @@ func startAndClaimForNotification(
 	if err != nil {
 		t.Fatalf("Enqueue(%s) error = %v", key, err)
 	}
-	waitForNotificationHint(t, listener, exec.RunID, 2*time.Second)
+	waitForNotificationHintKind(t, listener, exec.RunID, store.NotificationRun, 2*time.Second)
 	candidates, err := runtime.store.ProbeCommands(ctx,
 		[]store.CommandKind{{Name: command.Name(), Version: command.Version()}}, 10)
 	if err != nil {

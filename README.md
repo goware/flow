@@ -240,11 +240,13 @@ for {
 creates no command, lease, acknowledgement, callback, or connection per
 waiter. `Next` reads the journal and then waits without polling. PostgreSQL
 notifications carry only the run ID and wake that durable read; listener
-startup/reconnect performs catch-up. Use a bounded context. Every runtime that
-writes a watched run must keep notifications enabled, and application tables
-remain the response authority. `History` reads retained facts, `AwaitRun`
-waits for terminal run state, and `GetResult` reads one successful command
-result; none of them consumes an event.
+startup/reconnect performs catch-up. A watch may be created before
+`Runtime.Run` to close a startup race, but `Next` cannot receive a future-event
+wake until the listener starts, so always use a bounded context. Every runtime
+that writes a watched run must keep notifications enabled, and application
+tables remain the response authority. `History` reads retained facts,
+`AwaitRun` waits for terminal run state, and `GetResult` reads one successful
+command result; none of them consumes an event.
 
 Positive durable durations may be fractional: Flow rounds them upward once to
 the next whole millisecond before fingerprinting or persistence. Zero and
