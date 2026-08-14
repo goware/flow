@@ -1356,6 +1356,10 @@ func (s *Store) SettleCommandSuccess(ctx context.Context, request CommandSuccess
 		if err := semantic.NotifyRunnableCommands(ctx); err != nil {
 			return SettleResult{}, err
 		}
+	} else if len(request.Events) > 0 {
+		if err := semantic.NotifyEventWatchers(ctx); err != nil {
+			return SettleResult{}, err
+		}
 	}
 	if err := hook.Hit(ctx, fault.SettleBeforeCommit); err != nil {
 		return SettleResult{}, err

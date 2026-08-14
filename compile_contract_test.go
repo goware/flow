@@ -1,6 +1,7 @@
 package flow
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -11,6 +12,17 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestEventWatchCompileContract(t *testing.T) {
+	event := DefineEvent[string]("compile.watch")
+	var watchFn func(context.Context, *Runtime, RunID) (*EventWatch[string], error) = event.Watch
+	var watch *EventWatch[string]
+	var nextFn func(context.Context) (string, string, error) = watch.Next
+	var closeFn func() = watch.Close
+	_ = watchFn
+	_ = nextFn
+	_ = closeFn
+}
 
 func TestRemovedPublicAPINamesStayRemoved(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)

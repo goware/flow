@@ -50,7 +50,7 @@ Flow does not replay the full journal on every claim. It also does not treat mut
 
 ### 2.4 PostgreSQL is the coordination authority
 
-There is no sidecar broker, distributed lock service, or in-memory leader. PostgreSQL uniqueness, row locks, transactions, `SKIP LOCKED`, durable timestamps, and constraints define accepted state. Process-local channels and `LISTEN/NOTIFY` only reduce latency.
+There is no sidecar broker, distributed lock service, or in-memory leader. PostgreSQL uniqueness, row locks, transactions, `SKIP LOCKED`, durable timestamps, and constraints define accepted state. Process-local channels and `LISTEN/NOTIFY` reduce command latency and provide EventWatch liveness; notification payloads never define durable truth.
 
 ### 2.5 Durable representation boundaries are explicit
 
@@ -191,8 +191,9 @@ Standalone Flow writes use `READ COMMITTED`. A semantic mutation follows this pr
 7. append the immutable batch;
 8. update projections, counters, readiness, and queue state;
 9. execute an optional fenced application commit callback;
-10. issue an optional transactional notification hint only if the transition
-    created immediately runnable work; and
+10. issue bounded transactional run-identity hints when the transition creates
+    immediately runnable work, records an application event, or terminalizes
+    the run; and
 11. commit or roll back the whole unit.
 
 Database time is captured after lock acquisition so transitions serialized on one run also have a consistent decision time. Journal reservation and append occur in the same transaction, so rollback creates no visible gaps.
@@ -335,6 +336,14 @@ commands reaching zero are transitioned and queued. The operation reports
 whether any released command is runnable at database time so notification is
 limited to useful immediate wakes.
 
+The same journal supports typed future-event inspection without another
+durable consumer model. `Event.Watch` registers one run in a process-local
+channel hub before capturing `next_journal_position - 1`. Each `Next` snapshots
+the run channel before querying the earliest matching post-cursor application
+event, which closes the query-to-wait race. Notification startup/reconnect
+signals all registered runs; normal valid hints signal only their run. Watches
+create no durable rows, timers, worker callbacks, or checked-out connections.
+
 ## 11. Retry and failure transitions
 
 Retry policies are canonicalized into every command declaration as opaque bytes with whole-millisecond elapsed/backoff fields. Decisions use PostgreSQL time, persisted budget start, consumed attempts, immutable policy, attempt identity, error classification, and run deadline. Jitter is deterministic and rounded to a durable whole millisecond, so failover replicas calculate the same next time.
@@ -378,12 +387,14 @@ There is no global worker-count table. PostgreSQL row locks, queue state, and fe
 
 Lease renewals run as one bounded set-oriented statement for the locally active attempts whose individual renewal times are due. Each request carries its own durable duration; a short command never forces unrelated default commands onto its cadence. Exact running fences are selected `FOR UPDATE SKIP LOCKED`, so one row held by settlement cannot block unrelated renewals. Each request is classified as renewed, definitely lost, or uncertain. Definitely lost fences cancel the matching local context immediately; an error or uncertain locked row retains its prior conservative deadline and receives a bounded retry inside that window. A separate earliest-expiry watchdog skips known in-flight renewals, closing the committed-result/local-application race without weakening the durable fence. Both services use shared active-registry timers rather than per-attempt goroutines. Maintenance later recovers expired durable queue rows through the existing path.
 
-Notifications use one separately established session-capable PostgreSQL connection because pool/transaction connections cannot reliably own `LISTEN`. The listener reconnects with bounded backoff and performs a broad wake after every connection to close commit-before-LISTEN gaps. Every scheduler continues polling regardless.
+Notifications use one separately established session-capable PostgreSQL connection because pool/transaction connections cannot reliably own `LISTEN`. The listener reconnects with bounded backoff and performs a broad wake after every connection to close commit-before-LISTEN gaps. Every scheduler continues polling regardless; event watches do not poll and therefore require notifications on every writer of their watched runs.
 
-The store emits at most one transactional wake for an operation that creates
-immediately runnable work. Claims, journal-only transitions, unmatched events,
-terminal settlement without follow-up work, and future-scheduled work do not
-notify.
+`run` hints wake both the scheduler and run-scoped event watchers. `event`
+hints wake only watchers. An application-event operation emits `run` when it
+releases immediately runnable work and otherwise emits `event`; run-terminal
+journal appends emit `event`. Per-semantic state caps each kind, PostgreSQL
+folds identical payloads in a caller transaction, and payloads never contain
+event names, keys, or bodies. Claims and future-scheduled work do not notify.
 
 ## 14. Runtime lifecycle and deployment
 
@@ -406,7 +417,7 @@ Supported deployment shapes include one all-worker binary, independently scaled 
 
 ## 15. Inspection, history, and replay
 
-Point/list/queue queries read indexed projections. History reads journal positions directly. Await polls the run projection without reserving a connection between polls.
+Point/list/queue queries read indexed projections. History reads journal positions directly. Await polls the run projection without reserving a connection between polls. Event watches read post-baseline journal positions and block on the shared listener without polling or retaining a connection.
 
 Trace uses a repeatable-read transaction when it owns the read. It loads bounded history, folds it through the pure replay reducer, loads the live run projection and operational command/wait data in the same snapshot, and overlays those operational fields onto reconstructed semantic commands. A caller-owned Trace inherits the supplied transaction's isolation; callers that require the same coherent cross-statement view must use Repeatable Read or Serializable.
 

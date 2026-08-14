@@ -444,7 +444,7 @@ func setupExternalEventBenchmark(b *testing.B) (*Runtime, Command[None, None], E
 	if err := Migrate(ctx, database.DB, WithSchema(database.Schema)); err != nil {
 		b.Fatal(err)
 	}
-	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(false),
+	runtime, err := New(database.DB, WithSchema(database.Schema), WithNotifications(true),
 		WithMaxCommandsPerRun(0))
 	if err != nil {
 		b.Fatal(err)

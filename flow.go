@@ -123,6 +123,13 @@
 // selected run settles before delivery. Event definitions should name stable
 // fact kinds; deterministic keys should carry entity and generation identity.
 //
+// [Event.Watch] observes future matching application events without creating
+// durable work. Construct the watch before reading the application's own
+// projection, then call [EventWatch.Next] sequentially under a bounded context.
+// Notification payloads carry only run identity; Next returns data decoded
+// from the durable journal. Watches hold no connection and do not poll, so
+// every runtime writing a watched run must keep notifications enabled.
+//
 // [Command.ReplaceCurrentRun] atomically cancels an exact expected live-key
 // generation and creates a distinct successor. Retries can rediscover a
 // declaration-equivalent successor only after the current run ID differs from

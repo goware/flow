@@ -359,6 +359,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 		r.lifecycle = runtimeStopping
 	}
 	r.mu.Unlock()
+	r.eventWakes.close()
 	graceCtx, cancelGrace := context.WithTimeout(context.Background(), r.shutdownGrace)
 	graceful := waitGroupContext(graceCtx, &r.workerGroup)
 	cancelGrace()
@@ -384,8 +385,9 @@ func (r *Runtime) Run(ctx context.Context) error {
 }
 
 // runNotificationListener owns exactly one session-capable connection outside
-// the application pool. Hints only reduce latency: every connect performs a
-// broad catch-up wake, and every scheduler retains its correctness poll.
+// the application pool. Command hints only reduce scheduler latency; event
+// watches use targeted hints plus a broad catch-up after every connection and
+// always re-read durable journal truth.
 func (r *Runtime) runNotificationListener(ctx context.Context) {
 	const (
 		initialBackoff = 50 * time.Millisecond
@@ -428,6 +430,7 @@ func (r *Runtime) runNotificationListener(ctx context.Context) {
 		// LISTEN begins only after its statement commits. Wake immediately to
 		// close the commit-before-LISTEN and reconnect windows.
 		r.wake.signal()
+		r.eventWakes.signalAll()
 		r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_listener", Outcome: "listening"})
 		for ctx.Err() == nil {
 			if err := r.faults.Hit(ctx, fault.NotifyBeforeWait); err != nil {
@@ -437,12 +440,18 @@ func (r *Runtime) runNotificationListener(ctx context.Context) {
 			if waitErr != nil {
 				break
 			}
-			r.wake.signal()
-			if _, valid := store.ParseNotificationHint(notification.Payload); valid {
+			hint, valid := store.ParseNotificationHint(notification.Payload)
+			if valid {
+				if hint.Kind == store.NotificationRun {
+					r.wake.signal()
+				}
+				r.eventWakes.signal(hint.RunID)
 				r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_hint", Outcome: "received"})
 			} else {
 				// Unknown versions and malformed hints are never interpreted as
 				// work. A bounded broad wake is forward-compatible and safe.
+				r.wake.signal()
+				r.eventWakes.signalAll()
 				r.observe(ctx, Observation{Kind: ObservationRuntime, Operation: "notify_hint", Outcome: "broad_wake"})
 			}
 		}
@@ -489,6 +498,9 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	}
 	done := r.runDone
 	r.mu.Unlock()
+	if r.eventWakes != nil {
+		r.eventWakes.close()
+	}
 	if done == nil {
 		return nil
 	}

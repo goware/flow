@@ -543,7 +543,10 @@ func TestEventGatedCommandsRemainLiveUntilTerminal(t *testing.T) {
 		t.Fatalf("wait expiry trace=%+v", trace.Commands)
 	}
 
-	deadline, err := parent.Enqueue(ctx, runtime, "lifecycle/deadline", false, WithRunDeadline(250*time.Millisecond))
+	// Leave enough headroom for the race-instrumented parent settlement to
+	// durably create the gated child before this case exercises run-deadline
+	// cancellation of that child.
+	deadline, err := parent.Enqueue(ctx, runtime, "lifecycle/deadline", false, WithRunDeadline(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}

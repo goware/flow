@@ -40,6 +40,13 @@ later application writes under caller commit ownership. A new event appends
 history, resolves exact wait rows, and updates command readiness in one
 transaction. Worker-staged events use the same transition during settlement.
 
+`Event.Watch` is a typed read-side view over future application-event journal
+rows. It registers one run in a shared local channel hub, captures the journal
+head, and performs a durable read before blocking the caller's `Next`
+goroutine. Valid hints target one run; listener startup/reconnect and malformed
+hints conservatively signal all current registrations. Watches allocate no
+goroutine, timer, connection, command, lease, or acknowledgement of their own.
+
 `ReplaceCurrentRun` locks the exact expected live-key predecessor, cancels it,
 and inserts a distinct successor in one transaction. An unexpected equivalent
 current ID is only rediscovered for retry/ambiguous-commit recovery; a different
@@ -52,7 +59,10 @@ The maintenance scheduler expires unresolved wait budgets independently of initi
 
 Active attempts retain IDs, tokens, their resolved lease duration, conservative local expiry, next renewal, in-flight/retry state, and cancellation function. One earliest-due service renews all due attempts in one mixed-duration, time-bounded statement. Exact fences use `FOR UPDATE SKIP LOCKED` and classify every request as renewed, lost, or uncertain. Errors and uncertain rows receive bounded retries inside their remaining local window; a retry may use more than the ordinary five-second cap but never an unbounded database call. Lost cancels only the matching attempt. The independent earliest-expiry watchdog ignores a matching renewal while its result is in flight, then cancels locally expired contexts. Both services share one lightweight registry-change signal, not a goroutine or timer per attempt. Maintenance recovers expired durable leases unchanged so another replica can retry safely.
 
-Notification hints reduce wake latency. Polling remains sufficient through transaction-pooling proxies, lost messages, reconnects, or disabled notifications.
+Notification hints reduce command wake latency, whose scheduler retains
+polling. Event watches intentionally have no polling repair path: they require
+notifications enabled on every writer and use listener startup/reconnect
+catch-up plus caller-bounded contexts.
 
 Cancellation stops claims/listening/maintenance, waits through shutdown grace, then cancels remaining worker contexts. The caller-owned database pool is never closed.
 

@@ -13,6 +13,10 @@ The engine owns typed contracts and deterministic worker decisions. It transform
 
 Commands retain name/version, argument/result codecs, retry policy, attempt timeout, and queue. Events retain a name and payload codec. `Event.Deliver` is deliberately detached targeted ingress to a known run, including from application code inside a worker attempt. Definitions are immutable; invalid names/versions/options and nil workers fail validation.
 
+`Event.Watch` reuses that same typed definition for read-side inspection of
+future events in one known run. It does not add an event handler, subscription,
+callback, acknowledgement, or executable engine concept.
+
 `Work[A]` is the attempt-local scope for one claimed command, not the whole
 run or the immutable command definition. A fresh value is created for every
 worker invocation. It exposes typed `Args` and immutable `CommandInfo`,

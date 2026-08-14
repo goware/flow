@@ -40,7 +40,7 @@ type Store struct {
 }
 
 // New constructs the PostgreSQL store. Notifications controls transactional
-// wake hints; correctness never depends on it.
+// wake hints. Command scheduling retains polling; EventWatch requires hints.
 func New(db *pgkit.DB, schema string, notifications bool) (*Store, error) {
 	if db == nil || db.Conn == nil {
 		return nil, fmt.Errorf("%w: database is nil", flowerr.ErrInvalid)
@@ -72,20 +72,33 @@ func (s *Store) NotificationChannel() string {
 	return s.notificationChannel
 }
 
+const (
+	NotificationRun   = "run"
+	NotificationEvent = "event"
+)
+
+type NotificationHint struct {
+	RunID uuid.UUID
+	Kind  string
+}
+
 // ParseNotificationHint validates the deliberately tiny, versioned payload.
-// A hint is never durable work and is safe to discard; polling remains the
-// correctness mechanism for malformed or future versions.
-func ParseNotificationHint(payload string) (uuid.UUID, bool) {
+// A hint carries identity only; callers must read durable state after it.
+func ParseNotificationHint(payload string) (NotificationHint, bool) {
 	var hint struct {
 		V    int    `json:"v"`
 		Kind string `json:"kind"`
 		Key  string `json:"key"`
 	}
-	if err := json.Unmarshal([]byte(payload), &hint); err != nil || hint.V != 1 || hint.Kind != "run" {
-		return uuid.Nil, false
+	if err := json.Unmarshal([]byte(payload), &hint); err != nil || hint.V != 1 ||
+		(hint.Kind != NotificationRun && hint.Kind != NotificationEvent) {
+		return NotificationHint{}, false
 	}
 	id, err := uuid.Parse(hint.Key)
-	return id, err == nil
+	if err != nil {
+		return NotificationHint{}, false
+	}
+	return NotificationHint{RunID: id, Kind: hint.Kind}, true
 }
 
 type SemanticTx struct {
@@ -96,7 +109,8 @@ type SemanticTx struct {
 	initialLockedSnapshot *InitialLockedSnapshot
 	closed                bool
 	applied               bool
-	notificationSent      bool
+	eventHintSent         bool
+	runHintSent           bool
 	notificationOwner     *SemanticTx
 	failed                bool
 }
@@ -296,6 +310,16 @@ func (tx *SemanticTx) Apply(ctx context.Context, changes PersistedChangeSet) (Ap
 		return ApplyResult{}, fmt.Errorf("%w: journal batch inserted %d of %d rows", flowerr.ErrInvalidState, count, len(copyRows))
 	}
 	tx.applied = true
+	// Run terminal entries always wake event watches. Application-event
+	// operations choose event versus run only after readiness is projected.
+	for _, entry := range changes.Journal {
+		if entry.Kind == EventRecorded && entry.EventClass != nil && *entry.EventClass == "run_terminal" {
+			if err := tx.NotifyEventWatchers(ctx); err != nil {
+				return ApplyResult{}, err
+			}
+			break
+		}
+	}
 	return ApplyResult{Journal: cloneJournalRows(rows)}, nil
 }
 
@@ -314,15 +338,41 @@ func (tx *SemanticTx) NotifyRunnableCommands(ctx context.Context) error {
 	if tx.notificationOwner != nil {
 		notificationState = tx.notificationOwner
 	}
-	if notificationState.notificationSent {
+	if notificationState.runHintSent {
 		return nil
 	}
-	payload := `{"v":1,"kind":"run","key":"` + tx.runID.String() + `"}`
+	payload := `{"v":1,"kind":"` + NotificationRun + `","key":"` + tx.runID.String() + `"}`
 	if _, err := tx.tx.Exec(ctx, `SELECT pg_notify($1, $2)`, tx.store.notificationChannel, payload); err != nil {
 		tx.failed = true
 		return MapError("notify runnable commands", err)
 	}
-	notificationState.notificationSent = true
+	notificationState.runHintSent = true
+	return nil
+}
+
+// NotifyEventWatchers emits one transactional run-identity hint for durable
+// application events and run terminal transitions. A run hint is stronger and
+// already wakes event watchers, so it suppresses a later event hint.
+func (tx *SemanticTx) NotifyEventWatchers(ctx context.Context) error {
+	if err := tx.ensureOpen("notify event watchers"); err != nil {
+		return err
+	}
+	if !tx.store.notifications {
+		return nil
+	}
+	notificationState := tx
+	if tx.notificationOwner != nil {
+		notificationState = tx.notificationOwner
+	}
+	if notificationState.eventHintSent || notificationState.runHintSent {
+		return nil
+	}
+	payload := `{"v":1,"kind":"` + NotificationEvent + `","key":"` + tx.runID.String() + `"}`
+	if _, err := tx.tx.Exec(ctx, `SELECT pg_notify($1, $2)`, tx.store.notificationChannel, payload); err != nil {
+		tx.failed = true
+		return MapError("notify event watchers", err)
+	}
+	notificationState.eventHintSent = true
 	return nil
 }
 
