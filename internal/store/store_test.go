@@ -326,8 +326,12 @@ func TestNotificationChannelAndPayload(t *testing.T) {
 	}
 	id := uuid.New()
 	parsed, ok := store.ParseNotificationHint(`{"v":1,"kind":"run","key":"` + id.String() + `"}`)
-	if !ok || parsed != id {
-		t.Fatalf("parsed notification=%s/%t want %s", parsed, ok, id)
+	if !ok || parsed.RunID != id || parsed.Kind != store.NotificationRun {
+		t.Fatalf("parsed notification=%#v/%t want %s", parsed, ok, id)
+	}
+	parsed, ok = store.ParseNotificationHint(`{"v":1,"kind":"event","key":"` + id.String() + `"}`)
+	if !ok || parsed.RunID != id || parsed.Kind != store.NotificationEvent {
+		t.Fatalf("parsed event notification=%#v/%t want %s", parsed, ok, id)
 	}
 	for _, invalid := range []string{"", `{}`, `{"v":2,"kind":"run","key":"` + id.String() + `"}`,
 		`{"v":1,"kind":"work","key":"` + id.String() + `"}`} {

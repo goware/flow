@@ -24,4 +24,6 @@ func PruneCandidatesQueryForTest(s *Store) string { return s.pruneCandidatesQuer
 
 func ProbeCommandsQueryForTest(s *Store) string { return s.probeCommandsSQL() }
 
+func EventWatchReadQueryForTest(s *Store) string { return s.readEventWatchSQL() }
+
 func TraceWaitsQueryForTest(s *Store) string { return s.traceWaitsQuery() }

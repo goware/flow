@@ -142,8 +142,9 @@ Every semantic mutation is scoped to one run and locks its run row first. Within
 2. allocates consecutive journal positions;
 3. appends immutable semantic entries;
 4. updates current-state, readiness, and delivery projections;
-5. emits an optional transactional notification hint only when the mutation
-   creates immediately runnable work; and
+5. emits a transactional run-identity hint when the mutation creates
+   immediately runnable work, records an application event, or terminalizes
+   the run and notifications are enabled; and
 6. commits all changes together.
 
 The journal is gap-free and commit-ordered within each run. It records run start/failing, command creation, attempt start/conclusion, application events, and command/run terminal events. Current projections make claims and inspection efficient; replay verifies that retained semantic history reconstructs the same outcome.
@@ -222,7 +223,9 @@ multi-migration development schema is not upgraded; operators drop and
 recreate the Flow schema first. `New` verifies schema compatibility and starts
 nothing. `Run` owns a bounded scheduler, lease renewal,
 wait/deadline/recovery maintenance, optional notification listening, observers,
-and graceful shutdown. Polling is always sufficient for correctness.
+and graceful shutdown. Polling remains sufficient for command processing;
+EventWatch is a notification-backed inspection API with listener
+startup/reconnect catch-up and no periodic polling.
 
 `PruneTerminalRuns` deletes one bounded batch of old terminal unkeyed or
 live-key aggregates in a Flow-owned transaction. Permanent non-empty keys and

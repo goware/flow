@@ -104,9 +104,12 @@ failure transition.
 
 External event ingress through `Event.Deliver` enforces exact target-local identity, appends the event, records satisfying positions, and applies delta readiness. Equivalent repeats are idempotent; conflicting repeats fail; terminal runs cannot be reopened. Delivery adds no source identity or storage shape and uses a caller transaction unchanged when supplied.
 
-The generic journal append emits no scheduler notification. A semantic
-operation may emit at most one transactional hint after it creates work that is
-immediately runnable at database time; polling remains the correctness path.
+The generic journal append emits no scheduler wake for journal-only work. An
+application-event operation emits one transactional `run` hint when it creates
+immediately runnable work and otherwise emits an `event` hint; run-terminal
+entries emit `event`. Both contain run identity only. Command scheduling
+retains polling; event watches rely on the shared listener and startup/
+reconnect catch-up.
 
 Bounded indexed maintenance recovers command leases, expires unresolved waits, and enforces run deadlines. Inspection uses indexed lookup/keyset pagination. Trace folds the journal under repeatable read and overlays bounded operational command data.
 

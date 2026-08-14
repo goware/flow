@@ -273,6 +273,33 @@ part of ordinary event readiness resolution.
 
 Retries and lease takeovers receive the same immutable payloads selected by the recorded satisfying positions.
 
+### 6.3 Future-event inspection
+
+`event.Watch(ctx, runtime, runID)` captures the current journal head and
+returns an `EventWatch[T]` for later matching application events. A watch is a
+broadcast read: it does not consume or acknowledge an event, create a command,
+hold a connection, invoke a callback, or count against worker concurrency.
+`Next(ctx)` returns `(eventKey, typedPayload, error)` in journal order and must
+be called sequentially. `Close` is idempotent and releases the local
+registration.
+
+Applications establish the watch before reading their own projection. An
+event committed around that boundary is then either included in the watch
+baseline and visible to the application read, or appears after the baseline
+and is returned by `Next`. Application tables remain the response authority.
+If the run becomes terminal, matching post-baseline events are drained first;
+otherwise `Next` returns `ErrTerminal` so a live-key caller can re-read and
+resolve a replacement generation. A retained run pruned after construction is
+also terminal to the watch.
+
+`Next` performs one immediate durable journal read and then waits only for a
+run-scoped PostgreSQL hint, listener startup/reconnect catch-up, caller
+cancellation, `Close`, or runtime shutdown. It has no periodic poll or
+internal deadline. Callers must use a context matching their latency contract.
+Every runtime that writes a watched run through `Deliver`, `Emit`, settlement,
+cancellation, expiry, or replacement must have notifications enabled;
+notification-disabled runtimes cannot create watches.
+
 ## 7. Successful settlement and `WithCommit`
 
 After a worker returns successfully, Flow validates the attempt context, canonicalizes the result, normalizes the decision, and reacquires the run under the attempt fence.
@@ -479,12 +506,17 @@ Public options are:
 - one reconnecting PostgreSQL notification listener when enabled; and
 - asynchronous observer delivery.
 
-Polling is the correctness path. Notifications are transactional latency hints; malformed/lost hints, listener disconnects, transaction-pooling proxies, and disabled notifications do not lose work.
+Polling remains the command-scheduler and maintenance correctness path.
+`EventWatch` deliberately does not poll: it requires notifications, performs a
+durable read after targeted hints, and catches disconnected commits when the
+listener successfully starts or reconnects. A prolonged listener outage is
+bounded by the caller's `Next` context.
 
-Flow emits a wake hint only when a committed transition creates work that is
-immediately runnable. Journal-only transitions, claims, terminal settlements
-without follow-up work, unmatched events, and work scheduled for the future do
-not require a hint.
+Flow emits a `run` hint when a committed transition creates immediately
+runnable work. It also emits an `event` hint for durable application events and
+run terminal transitions when no stronger hint has already covered the
+semantic operation. Both payloads contain only version, kind, and run ID;
+claims and future-scheduled work do not notify.
 
 The scheduler may claim selected groups from independent runs
 concurrently using an internal bound derived from worker capacity and the
@@ -565,6 +597,10 @@ not promise a cross-page snapshot; transaction-scoped clients observe the
 caller transaction and its uncommitted writes.
 
 `AwaitRun` polls without holding a worker, lease, or database connection between reads until the run is terminal or the context ends.
+
+`EventWatch` instead observes future events for one known run. It uses the
+runtime's shared listener, performs no periodic read while idle, and requires
+notifications enabled on all writers of that run.
 
 `GetQueueStats(ctx, client, queues...)` accepts at most 200 queue-name inputs before
 deduplication and returns an entry for every requested distinct lane, including

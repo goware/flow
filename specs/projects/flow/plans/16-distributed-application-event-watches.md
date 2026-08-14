@@ -1,6 +1,6 @@
 # Plan 16: Await durable application events across runtime instances
 
-Status: Draft
+Status: Implemented; release pending
 
 > **Executor instructions:** Read this plan completely before editing. Follow
 > the phases in order and run every phase's verification before continuing.
@@ -719,34 +719,34 @@ that consumer upgrades.
 
 ## 8. Done criteria
 
-- [ ] `Event[T].Watch`, `EventWatch[T].Next`, and `Close` implement the exact
+- [x] `Event[T].Watch`, `EventWatch[T].Next`, and `Close` implement the exact
       signatures and contract in Section 4.1; `EventWatch[T]` is the only new
       exported type.
-- [ ] Future matching events come from durable journal reads, not notification
+- [x] Future matching events come from durable journal reads, not notification
       payloads or process memory.
-- [ ] One Flow runtime uses one existing dedicated listener connection for any
+- [x] One Flow runtime uses one existing dedicated listener connection for any
       number of watches.
-- [ ] Cross-runtime tests prove a commit on A wakes a watch on B; no sticky
+- [x] Cross-runtime tests prove a commit on A wakes a watch on B; no sticky
       session assumption exists.
-- [ ] Application-event and terminal-only transactions emit a committed
+- [x] Application-event and terminal-only transactions emit a committed
       run-scoped hint; runnable semantics are unchanged.
-- [ ] Listener startup/reconnect signals all registered watches and closes
+- [x] Listener startup/reconnect signals all registered watches and closes
       commit-before-listen/disconnected windows through durable rereads.
-- [ ] Event watches reject notification-disabled runtimes; a pre-`Run` watch
+- [x] Event watches reject notification-disabled runtimes; a pre-`Run` watch
       becomes active through listener startup catch-up, with no event-watch
       polling interval, fallback timer, or public fallback option.
-- [ ] Public documentation states that every writer of watched runs must have
+- [x] Public documentation states that every writer of watched runs must have
       notifications enabled; the disabled-writer characterization test proves
       Flow does not silently promise a wake it cannot send.
-- [ ] An idle `Next` performs no database query after its initial read until an
+- [x] An idle `Next` performs no database query after its initial read until an
       explicit hint/startup/reconnect signal arrives.
-- [ ] Run replacement releases the old watch so callers can re-resolve a live
+- [x] Run replacement releases the old watch so callers can re-resolve a live
       key.
-- [ ] No new command, wait row, lease, table, trigger, broker, or schema
+- [x] No new command, wait row, lease, table, trigger, broker, or schema
       migration is introduced.
-- [ ] `make test-with-reset`, `make build`, `go vet ./...`, formatting, module
+- [x] `make test-with-reset`, `make build`, `go vet ./...`, formatting, module
       consistency, and `git diff --check` all pass.
-- [ ] README and normative specs explain the read-side-only model and the
+- [x] README and normative specs explain the read-side-only model and the
       watch-before-read race closure.
 - [ ] The reviewed release commit is tagged and available for Trails plan 012.
 
@@ -783,20 +783,20 @@ Stop and report; do not improvise if:
 
 ## 10. Punchlist
 
-- [ ] Characterize event-only, runnable-event, broadcast, and rollback hints.
-- [ ] Add typed cursor/next-event store reads and payload decoding.
-- [ ] Add only `EventWatch`, `Event.Watch`, `EventWatch.Next`, and `Close`; keep
+- [x] Characterize event-only, runnable-event, broadcast, and rollback hints.
+- [x] Add typed cursor/next-event store reads and payload decoding.
+- [x] Add only `EventWatch`, `Event.Watch`, `EventWatch.Next`, and `Close`; keep
       cursor and journal metadata private.
-- [ ] Add the run-targeted local wake hub and listener routing.
-- [ ] Add the `event` notification kind with bounded per-semantic suppression;
+- [x] Add the run-targeted local wake hub and listener routing.
+- [x] Add the `event` notification kind with bounded per-semantic suppression;
       rely on PostgreSQL for identical-payload folding.
-- [ ] Wake watches on every run terminal path and live-key replacement.
-- [ ] Prove cross-runtime, reconnect catch-up, cancellation, and shutdown
+- [x] Wake watches on every run terminal path and live-key replacement.
+- [x] Prove cross-runtime, reconnect catch-up, cancellation, and shutdown
       behavior under `-race`.
-- [ ] Document the API distinctions and watch-before-read recipe.
-- [ ] Measure sparse post-cursor reads, 1,000 idle watches, and event-ingress
+- [x] Document the API distinctions and watch-before-read recipe.
+- [x] Measure sparse post-cursor reads, 1,000 idle watches, and event-ingress
       overhead without adding speculative indexes or caches.
-- [ ] Run ordinary, race, build, vet, format, module, and diff gates.
+- [x] Run ordinary, race, build, vet, format, module, and diff gates.
 - [ ] Tag the reviewed public feature release and record its commit for Trails.
 
 ## 11. Maintenance notes

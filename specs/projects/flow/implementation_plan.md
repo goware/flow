@@ -24,6 +24,10 @@ completed in PR #27 at `a98256d` and was released as v0.4.2.
 completed its accepted streamlined scope in PR #30 at `b25fbe3` and was
 released as v0.4.3; the larger unused API/registry/example proposal was closed
 rather than retained as required work.
+[`plans/16-distributed-application-event-watches.md`](plans/16-distributed-application-event-watches.md)
+is implemented and awaiting its reviewed release commit. It adds typed,
+run-scoped future-event inspection through the existing PostgreSQL listener,
+without polling or adding a durable subscription model.
 
 ## Implemented Plans 9–10 outcomes
 

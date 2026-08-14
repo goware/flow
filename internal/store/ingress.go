@@ -1020,6 +1020,8 @@ func (s *Store) EmitLocked(ctx context.Context, semantic *SemanticTx, event Appl
 		if err := semantic.NotifyRunnableCommands(ctx); err != nil {
 			return false, err
 		}
+	} else if err := semantic.NotifyEventWatchers(ctx); err != nil {
+		return false, err
 	}
 	return true, nil
 }

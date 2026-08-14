@@ -202,6 +202,50 @@ in one deterministic event-key helper used by `WaitFor`, `Deliver`, and
 `GetCurrentRun`, then `Deliver` to the returned ID. The run can settle between
 those operations, so `ErrTerminal` is an expected race to handle explicitly.
 
+Application code may also wait for the next durable event without creating a
+command. Establish the watch before reading the application projection; an
+event is then either included in the baseline and visible to that read, or is
+returned by `Next`:
+
+```go
+watch, err := receiptChanged.Watch(ctx, runtime, runID)
+if errors.Is(err, flow.ErrTerminal) || errors.Is(err, flow.ErrNotFound) {
+	return readReceipt(ctx)
+}
+if err != nil {
+	return err
+}
+defer watch.Close()
+
+receipt, err := readReceipt(ctx)
+if err != nil || receipt.Ready {
+	return err
+}
+for {
+	_, _, err := watch.Next(ctx)
+	if errors.Is(err, flow.ErrTerminal) {
+		return readReceipt(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	receipt, err = readReceipt(ctx)
+	if err != nil || receipt.Ready {
+		return err
+	}
+}
+```
+
+`Event.Watch` is a broadcast inspection API, not a subscription worker: it
+creates no command, lease, acknowledgement, callback, or connection per
+waiter. `Next` reads the journal and then waits without polling. PostgreSQL
+notifications carry only the run ID and wake that durable read; listener
+startup/reconnect performs catch-up. Use a bounded context. Every runtime that
+writes a watched run must keep notifications enabled, and application tables
+remain the response authority. `History` reads retained facts, `AwaitRun`
+waits for terminal run state, and `GetResult` reads one successful command
+result; none of them consumes an event.
+
 Positive durable durations may be fractional: Flow rounds them upward once to
 the next whole millisecond before fingerprinting or persistence. Zero and
 negative values retain each option's validation rules.

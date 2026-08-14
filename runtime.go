@@ -132,9 +132,8 @@ func WithPollInterval(interval time.Duration) Option {
 }
 
 // WithNotifications enables or disables transactional PostgreSQL wake hints.
-// It defaults to enabled. Polling always remains active and is the correctness
-// path, so disabling notifications is suitable for transaction-pooling
-// proxies and deliberately poll-only deployments.
+// It defaults to enabled. Command scheduling retains polling when disabled,
+// but Event.Watch rejects notification-disabled runtimes.
 func WithNotifications(enabled bool) Option {
 	return runtimeOptionFunc(func(options *runtimeOptions) { options.notifications = enabled })
 }
@@ -177,6 +176,7 @@ type Runtime struct {
 	runCancel   context.CancelFunc
 	runDone     chan struct{}
 	wake        *wakeHub
+	eventWakes  *eventWakeHub
 	active      *activeCommands
 	workerGroup sync.WaitGroup
 }
@@ -223,7 +223,7 @@ func New(db *pgkit.DB, opts ...Option) (*Runtime, error) {
 		poolCapacity: int(db.Conn.Config().MaxConns),
 		observations: observations,
 		faults:       options.faults, lifecycle: runtimeCreated,
-		registry: newRuntimeRegistry(), wake: newWakeHub(), active: newActiveCommands(),
+		registry: newRuntimeRegistry(), wake: newWakeHub(), eventWakes: newEventWakeHub(), active: newActiveCommands(),
 	}, nil
 }
 
