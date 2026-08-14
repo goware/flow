@@ -7,9 +7,10 @@ Status: Draft
 > This is a read-side observation feature, not a second workflow engine:
 > watches must never create commands, leases, journal acknowledgements, or
 > callback workers. PostgreSQL remains the durable authority and
-> `LISTEN/NOTIFY` remains a disposable latency hint. Stop and report any design
-> that requires a connection, additional background goroutine, or durable row
-> per waiting caller. `Next` may block the caller's existing goroutine.
+> `LISTEN/NOTIFY` is an identity-only wake signal, never the returned truth.
+> Stop and report any design that requires a connection, periodic timer/query,
+> additional background goroutine, or durable row per waiting caller. `Next`
+> may block the caller's existing goroutine under its supplied context.
 >
 > **Drift check (run first):**
 >
@@ -64,10 +65,13 @@ application transaction
   -> application re-reads its own projection and returns if it changed
 ```
 
-The event payload is not the application's source of truth, and notification
-delivery is not a correctness promise. The durable journal closes races and a
-low-frequency Flow-owned poll repairs a lost hint. No sticky sessions or
-application-specific database triggers are required.
+The event payload in PostgreSQL's notification is not the application's source
+of truth: the durable journal is. `LISTEN/NOTIFY` wakes the read, and a
+successful listener start/reconnect signals every registered watch so events
+committed during a connection gap are discovered. There is no periodic watch
+poll. Callers bound `Next` with their own context and re-read application truth
+when that context ends. No sticky sessions or application-specific database
+triggers are required.
 
 ## 3. Current state and verified evidence
 
@@ -88,8 +92,9 @@ The implementation starts from these facts at the planned commit:
   history projection. Using general `History` would force every caller to
   decode/filter pages and invent its own wait protocol.
 - `inspection.go:238-269` implements `AwaitRun` with a durable row check, a
-  process-local broad wake, and timer fallback. It waits only for terminal run
-  state; it cannot report intermediate application events.
+  process-local broad wake, and its existing timer fallback. That separate API
+  waits only for terminal run state; `Event.Watch` neither reuses its timer nor
+  reports command/run completion as an application event.
 - `runtime_run.go:389-458` owns one session-capable PostgreSQL connection per
   runtime, outside the application pool. PostgreSQL sends each committed
   notification to every listening session, which is the distribution model
@@ -102,9 +107,10 @@ The implementation starts from these facts at the planned commit:
 - The notification payload is deliberately small and versioned:
   `{"v":1,"kind":"run","key":"<run UUID>"}`. Unknown payloads cause a safe
   broad wake.
-- Plans 13 and 14 require polling to remain the correctness path. This plan
-  preserves that rule; it moves polling behind one generic Flow contract
-  rather than claiming PostgreSQL notifications cannot be lost.
+- Plans 13 and 14 retain polling for command scheduling and maintenance. This
+  plan does not change that engine contract and does not reuse its poll for
+  read-side event watches. A watch progresses through committed notification
+  hints, listener start/reconnect catch-up, or caller cancellation only.
 
 The functional specification currently says Flow omits event handlers and
 command-outcome subscriptions. Preserve that boundary. A caller awaiting an
@@ -118,28 +124,27 @@ the event, run a callback, or durably react to it.
 Add a typed future-event watch to `Event[T]`:
 
 ```go
-type EventRecord[T any] struct {
-	RunID      RunID
-	Position   JournalPosition
-	EventID    EventID
-	Key        string
-	Payload    T
-	RecordedAt time.Time
-}
-
 func (event Event[T]) Watch(
 	ctx context.Context,
-	client Client,
+	runtime *Runtime,
 	runID RunID,
 ) (*EventWatch[T], error)
 
-func (watch *EventWatch[T]) Next(ctx context.Context) (EventRecord[T], error)
+func (watch *EventWatch[T]) Next(ctx context.Context) (
+	key string,
+	payload T,
+	err error,
+)
 func (watch *EventWatch[T]) Close()
 ```
 
-The names above are the target API. Do not replace them with a Trails-specific
-helper or expose internal store/journal types. `EventWatch` has unexported
-state and is deliberately small.
+The names and signatures above are the complete target API. `EventWatch` is the
+only new exported type and has unexported state. `Next` returns the immutable
+application event key and typed payload; the caller already knows the run and
+event definition. Keep the journal cursor, position, event ID, recorded time,
+and listener state private. Do not add an exported event-record/cursor type,
+watch options, a Trails-specific helper, or access to internal store/journal
+types.
 
 Contract:
 
@@ -150,10 +155,13 @@ Contract:
 2. Register-before-cursor-read is required. If an event commits during watch
    construction, the cursor includes it and the application read that follows
    sees the transaction that produced it.
-3. `Next` first queries durable journal state for the earliest matching
-   application event with `position > cursor`, then waits for a targeted hint,
-   fallback timer, context cancellation, runtime shutdown, or run terminality.
-   It repeats the durable query after every wake.
+3. `Next` snapshots the current targeted-hub generation/channel *before* it
+   queries durable journal state for the earliest matching application event
+   with `position > cursor`. If the query finds neither an event nor a terminal
+   run, it waits on that channel, context cancellation, caller `Close`, or
+   runtime shutdown. It repeats the durable query after every hint/startup/
+   reconnect wake. Taking the wait channel before the query closes the local
+   query-to-wait race without a timer.
 4. A returned event advances the cursor to its position. Sequential `Next`
    calls drain matching events in journal order. Concurrent `Next` calls on one
    watch are invalid; document and reject them rather than introducing
@@ -172,18 +180,21 @@ Contract:
    resolve the new current run. If the previously verified run disappears
    because an explicit retention pass pruned it after terminal settlement,
    `Next` also returns `ErrTerminal`; a watch never pins retained history.
-8. A transaction client is rejected as `ErrInvalid`: an open caller
-   transaction cannot observe commits made after its snapshot and must not
-   block while holding locks.
+8. `Watch` accepts `*Runtime`, not `Client`. The concrete type encodes that a
+   watch needs the runtime's process-local listener/hub and makes a transaction
+   client impossible to pass. A nil runtime is `ErrInvalid`.
 9. The watch holds no PostgreSQL connection between reads, creates no durable
    row, command, wait, lease, or acknowledgement, and does not count against
    worker or queue concurrency.
 10. Watchers are broadcast readers. Any number of runtimes and callers may see
     the same event; nothing is consumed globally.
-11. An open runtime may use a watch before `Runtime.Run`; the durable fallback
-    remains correct without background services. An active `Runtime.Run`
-    supplies notification latency and runtime-shutdown signaling. Once the
-    runtime stops and closes, active watches return `ErrClosed`.
+11. `Watch` requires notifications to be enabled. A runtime configured with
+    `WithNotifications(false)` is rejected as `ErrInvalid`. A created runtime
+    may register a watch before `Runtime.Run`; it receives no future-event wake
+    until `Run` successfully establishes `LISTEN`, whose startup catch-up signal
+    then forces a durable read. The caller context bounds a runtime that never
+    starts. A stopping/stopped runtime is `ErrClosed`, and stopping an accepted
+    runtime closes all active watches.
 
 The documented race-free application pattern is:
 
@@ -205,7 +216,7 @@ if err != nil || projectionIsReady(projection) {
 }
 
 for {
-	if _, err := watch.Next(ctx); errors.Is(err, flow.ErrTerminal) {
+	if _, _, err := watch.Next(ctx); errors.Is(err, flow.ErrTerminal) {
 		return readApplicationProjection(ctx)
 	} else if err != nil {
 		return err
@@ -223,6 +234,20 @@ application read, or it is after the baseline and returned by `Next`. A
 terminal error from either watch construction or `Next` is a reason to re-read
 application truth, not a reason to return stale projection data.
 
+`Next` deliberately has no internal deadline. A listener outage that has not
+yet reconnected can therefore hold it until the caller's context ends. Public
+documentation and examples must always use a context appropriate to the
+consumer's latency contract. This is preferable to multiplying periodic
+database reads by the number of waiters.
+
+The notification requirement applies to producers as well as consumers. Every
+runtime that may `Deliver`, `Emit`, terminalize, or replace a run observed by
+`Event.Watch` must have notifications enabled. A notification-disabled writer
+can still record durable state for Flow's existing poll-only command mode, but
+it cannot wake a watch and there is deliberately no timer repair. Flow cannot
+enforce another process's configuration through local API validation, so this
+is a documented deployment invariant for applications adopting watches.
+
 ### 4.2 Durable query contract
 
 Add narrow store reads rather than implementing watches through public
@@ -238,11 +263,10 @@ The event query is conceptually one statement with one lateral event lookup:
 
 ```sql
 SELECT r.status,
-       next_event.position, next_event.event_id, next_event.event_key,
-       next_event.recorded_at, next_event.body
+       next_event.position, next_event.event_key, next_event.body
 FROM flow_runs AS r
 LEFT JOIN LATERAL (
-    SELECT position, event_id, event_key, recorded_at, body
+    SELECT position, event_key, body
     FROM flow_journal
     WHERE run_id = r.run_id
       AND position > $2
@@ -263,7 +287,9 @@ run.
 
 Decode through the event definition's existing codec and canonical
 application-event envelope. A malformed retained body is `ErrInvalidState`.
-Never return raw journal bodies from this typed API.
+Advance the private cursor with `position`, but return only `event_key` and the
+typed payload. Never return raw journal bodies or export journal metadata from
+this API.
 
 The primary key `(run_id, position)` starts the scan at the watch cursor, so
 old history before watch creation is not revisited. A running run has no strict
@@ -283,7 +309,8 @@ generation/channel pattern like the existing `wakeHub`, with these additions:
 - multiple watchers for one run each wake on one signal;
 - a signal is coalesced, not queued per event;
 - registration/unregistration is bounded and leak-free;
-- reconnect performs a catch-up signal for all current watches;
+- successful initial `LISTEN` and every reconnect perform a catch-up signal for
+  all current watches;
 - runtime shutdown closes all watches; and
 - an unrelated run hint does not wake or re-query this run's watches.
 
@@ -291,6 +318,11 @@ Use one shared generation/channel entry per watched run plus one close channel
 per `EventWatch`; do not allocate one hub goroutine or one notification queue
 per watcher. Remove the run entry when its final watch closes. Watch
 construction must unregister on every validation/cursor-read failure.
+
+Each `Next` loop obtains the hub's current generation/channel before issuing
+its durable read. A signal between that read and the blocking select therefore
+leaves the captured channel closed and forces another durable read. Do not use
+a timer to cover an incorrectly ordered query/wait sequence.
 
 Keying only by run ID is intentional. PostgreSQL hints do not carry payloads or
 event names; durable queries perform the exact event-name filter. This keeps
@@ -336,8 +368,9 @@ or map of touched runs. The simple rules are:
 
 The ordinary maximum is therefore one `event` plus one `run` payload for one
 run in one transaction, not an elaborate application-side exactly-one
-protocol. PostgreSQL notifications are disposable hints, and distinct runs
-have distinct payloads. A hint for run A must never suppress a hint for run B.
+protocol. Notifications are identity-only wake signals and distinct runs have
+distinct payloads. The durable journal, not notification delivery or payload,
+is the event authority. A hint for run A must never suppress a hint for run B.
 Do not send event payloads, names, keys, tenant identifiers, or secrets through
 `pg_notify`.
 
@@ -366,36 +399,37 @@ must deliver them only if that transaction commits. A rolled-back application
 event or terminal transition must produce neither durable data nor an
 actionable wake. Do not add a general after-commit hook. A same-runtime caller
 receives its own committed PostgreSQL notification when notifications are
-enabled; when they are disabled, the documented fallback is the correctness
-path. A local post-commit signal is allowed only at an existing code boundary
-that already knows a runtime-owned commit succeeded, and is not required for
-this plan.
+enabled. Event watches reject notification-disabled runtimes; command
+scheduling may continue to support its existing poll-only deployment mode. A
+local post-commit signal is allowed only at an existing code boundary that
+already knows a runtime-owned commit succeeded, and is not required for this
+plan.
 
-### 4.5 Poll fallback and efficiency
+### 4.5 Notification-only waiting and efficiency
 
-Notifications are the hot path; durable polling remains correctness. Use one
-private five-second event-watch fallback:
+There is no event-watch poll interval, fallback mode, or timer-driven query.
+One `Watch` construction reads its baseline. One `Next` call reads immediately,
+then reads again only after a targeted notification, listener startup/reconnect
+catch-up, or another explicit hub signal. Context expiry returns `ctx.Err()`
+without another Flow query; the application decides whether its response
+contract requires one final projection read.
 
-```text
-eventWatchFallback = 5s
-```
+The listener's successful `LISTEN` is the recovery boundary. It signals every
+registered watch before waiting for notifications, closing both the initial
+commit-before-listen window and every disconnected interval. If the listener
+cannot reconnect, bounded callers time out normally; Flow must expose the
+existing `listening`, `connect_error`, and `reconnecting` observations so
+operators can diagnose the outage. Emit state changes, not a log/metric per
+watch. Tests must prove a connect failure and successful recovery produce the
+expected low-cardinality lifecycle observations. Do not claim an unbounded
+liveness guarantee when PostgreSQL is unavailable.
 
-Do not derive it from `runtime.pollInterval`: command scheduling and read-side
-HTTP observation have different load/latency tradeoffs. Five seconds bounds
-recovery when notifications are disabled, a listener reconnects, or a hint is
-lost, while limiting 1,000 continuously waiting callers to at most about 200
-fallback reads per second before query-duration effects. Tests may use one
-private duration seam rather than sleeping five seconds; do not add a public
-runtime option. Every reconnect signals current watches immediately before
-waiting for new notifications.
-
-Do not create a goroutine or timer per registered watch while it is idle.
-`Next` may block the caller's existing goroutine on a timer/channel select.
+Do not create a Flow-owned goroutine or timer per registered watch while it is
+idle. `Next` blocks only the caller's existing goroutine on channels/context.
 There is one dedicated PostgreSQL listener connection per runtime, not per
-watch. Multiple waiters may each perform the one durable read needed to decode
-their result after a hint; do not add a cache of typed payloads in this phase.
-If measured production demand later makes shared fallback reads worthwhile,
-that is a separate optimization with its own cache/lifetime contract.
+watch, and no application-pool connection remains checked out. Multiple
+waiters may each perform the durable read needed to decode their result after a
+hint; do not add a cache of typed payloads in this phase.
 
 ## 5. Scope
 
@@ -430,10 +464,14 @@ that is a separate optimization with its own cache/lifetime contract.
 - Changing application-event identity, `WaitFor` gate semantics, journal
   retention, run lock order, attempt fencing, queue scheduling, or delivery
   guarantees.
-- Guaranteeing zero fallback reads. PostgreSQL notifications are hints, not a
-  durable message broker.
-- A public watch-poll option, shared typed-payload cache, transaction-wide
-  notification registry, or general after-commit callback mechanism.
+- A watch that works with notifications disabled; that configuration has no
+  event-wake owner without polling.
+- Cross-process configuration discovery or enforcement for notification-
+  disabled writers; watch-using deployments must keep notifications enabled on
+  every writer of the watched runs.
+- Any event-watch poll/fallback option, shared typed-payload cache,
+  transaction-wide notification registry, or general after-commit callback
+  mechanism.
 
 ## 6. Implementation phases
 
@@ -470,28 +508,41 @@ three query plans are recorded as baseline evidence.
 ### Phase 1 — add typed durable event reads
 
 Implement the store cursor/next-event query and payload decoding. Add the
-public `EventRecord[T]` and watch construction/`Next`/`Close` API with timer-only
-wake behavior first. Reject invalid events, invalid/missing/terminal runs,
-transaction clients, concurrent `Next`, and use after close with existing Flow
-sentinel categories. Map disappearance of a run that was verified during
-watch construction to `ErrTerminal`; do not pin or recreate pruned history.
+public `EventWatch[T]` handle and the exact `Watch`/`Next`/`Close` API from
+Section 4.1 with direct durable reads plus context/close behavior first. Reject
+invalid events, nil runtimes, invalid/missing/terminal runs,
+notification-disabled runtimes, concurrent `Next`, and use after close with
+existing Flow sentinel categories. Map disappearance of a run that was
+verified during watch construction to `ErrTerminal`; do not pin or recreate
+pruned history. Use a directly signaled internal hub in tests until Phase 2
+routes database hints; do not add a timer.
 
 Tests must cover:
 
+- `compile_contract_test.go` pins `Event[T].Watch` to
+  `func(context.Context, *Runtime, RunID) (*EventWatch[T], error)` and `Next`
+  to `func(context.Context) (string, T, error)` so later work cannot widen the
+  surface back to `Client` or an exported record without an explicit API
+  decision;
 - events before the watch baseline are not returned;
 - several events after the cursor return in position order;
 - other event names and runtime events are ignored;
-- event keys and typed payloads round-trip;
+- event keys and typed payloads round-trip without exposing run ID, journal
+  position, event ID, or recorded time through a new public record type;
 - malformed stored payload returns `ErrInvalidState`;
 - a matching event committed between the pre-wait query and the channel wait
   is found on the next durable read;
 - terminal-with-event returns the event before `ErrTerminal`;
 - missing and terminal-at-start construction races;
 - terminal pruning after construction returns `ErrTerminal`;
-- transaction-client, close, and concurrent-`Next` behavior;
+- nil-runtime, close, and concurrent-`Next` behavior;
 - a cancelled `Next` returns `ctx.Err()`, remains reusable, and is removed only
-  when the caller invokes `Close`; and
-- notifications disabled still observes an event through fallback polling.
+  when the caller invokes `Close`;
+- `WithNotifications(false)` returns `ErrInvalid`, a created runtime permits a
+  bounded watch that gains wakeups when `Run` starts, and a stopped runtime
+  returns `ErrClosed`; and
+- after its immediate read, an unchanged `Next` performs no second query before
+  an explicit hub signal or context cancellation.
 
 **Verify:**
 
@@ -513,16 +564,26 @@ event/terminal writes to the new hint.
 Tests must start two runtimes against one database and prove:
 
 - a committed test `pg_notify` carrying `kind:"event"` for a watched run wakes
-  Runtime B before a deliberately long fallback;
+  Runtime B within a bounded test deadline;
 - two runtimes and multiple watchers on each all observe the same fact;
 - an unrelated run hint does not wake/query the watched run;
 - a malformed/future hint performs a conservative catch-up;
 - forced listener disconnect/reconnect cannot strand a committed event;
-- `WithNotifications(false)` uses the bounded timer path;
+- an event committed while the listener is disconnected is returned after the
+  reconnect catch-up signal, even when no later event commits;
+- a prolonged injected listener outage lets `Next` reach its caller deadline
+  without periodic queries, and the same watch remains reusable after reconnect;
 - caller `Close` and `Runtime.Run` shutdown remove every registration;
-- a watch created before `Runtime.Run` observes through fallback, then gains
-  hints after `Run` starts; and
+- notification-disabled runtimes reject `Watch`; a pre-`Run` watch whose event
+  is already durable wakes from the listener's initial catch-up when `Run`
+  starts; and
+- a notification-disabled producer does not wake a watch on another runtime,
+  documenting why watch-using deployments require every writer to enable
+  notifications; and
 - no application-pool connection remains checked out while `Next` waits.
+
+Also assert the shared observer receives `connect_error`/`reconnecting` and
+the later `listening` recovery outcome without any per-watch observation storm.
 
 **Verify:**
 
@@ -552,7 +613,7 @@ Tests must prove:
 - event-only commits now wake remote watches without waking the new runtime's
   scheduler path;
 - Runtime A commits `Event.Deliver`; a watch created through Runtime B wakes
-  before a deliberately long fallback and returns the durable typed event;
+  within a bounded deadline and returns the durable typed event;
 - application event plus released command emits no more than one `event` and
   one `run` hint for that run and both scheduler and watcher progress;
 - identical payloads from repeated semantic operations in one caller-owned
@@ -580,16 +641,19 @@ Update public and project documentation with:
 - the distinction among `WaitFor`, `Event.Deliver`, `Event.Watch`, `History`,
   `GetResult`, and `AwaitRun`;
 - cross-runtime broadcast behavior and lack of sticky-session requirements;
-- notification-as-hint and fallback-poll semantics;
+- notification wake, reconnect catch-up, caller-context, and no-poll semantics;
+- listener lifecycle observations operators should alert on;
 - terminal/replacement behavior; and
 - the rule that application tables remain source of truth.
 
 Add a benchmark or bounded query-count test for 1,000 idle watches on one
 runtime. It need not assert wall-clock speed. It must prove one listener
 connection, no worker/queue/lease growth, no goroutine created merely by
-registration, no application connection held while waiting, and fallback
-reads bounded by the documented five-second interval. Use a private test seam
-for the interval rather than adding a public option.
+registration, no application connection held while waiting, and no query-count
+growth during an idle observation interval after each caller's initial `Next`
+read. Test goroutines that invoke `Next` represent caller goroutines and must
+all exit through context cancellation; Flow must not create another goroutine
+for them.
 
 Repeat the existing no-wait external-event ingress benchmark for five samples
 with notifications enabled. Record median/range and PostgreSQL protocol/query
@@ -637,15 +701,18 @@ that consumer upgrades.
 | Case | Durable result | Wake path | Expected watch result |
 |---|---|---|---|
 | Event existed before `Watch` | event retained | none required | excluded by baseline |
-| Event commits after `Watch` on same runtime | event retained | PostgreSQL hint or fallback | next typed record |
+| Event commits after `Watch` on same runtime | event retained | PostgreSQL hint | next typed record |
 | Event commits on another runtime/pod | event retained | PostgreSQL broadcast | next typed record |
-| Hint is dropped | event retained | fallback timer | next typed record |
-| Notifications disabled | event retained | fallback timer | next typed record |
+| Event commits while listener is disconnected | event retained | successful reconnect catch-up | next typed record |
+| Listener outage exceeds caller bound | event retained | caller context | `ctx.Err()`; watch remains reusable and later reconnect finds the event |
+| Notifications disabled | no watch created | validation | `ErrInvalid` |
+| Separate writer has notifications disabled | event retained, no hint | caller context | no wake; unsupported deployment is characterized explicitly |
+| Runtime not yet running | event may become durable | caller context, then listener startup catch-up | bounded `Next` may time out and remain reusable; after `Run`, next typed record |
 | Event transaction rolls back | no event | no committed hint | continues waiting |
 | Equivalent event redelivery | one event | no duplicate semantic hint | one record only |
 | Different event name/run | other event retained | targeted/filtered | continues waiting |
-| Run terminates | terminal projection/journal retained | terminal hint/fallback | `ErrTerminal` after matching-event drain |
-| Terminal run is pruned after watch creation | run/history removed | hint/fallback | `ErrTerminal` |
+| Run terminates | terminal projection/journal retained | terminal hint | `ErrTerminal` after matching-event drain |
+| Terminal run is pruned after watch creation | run/history removed | terminal or reconnect hint | `ErrTerminal` |
 | Live run is replaced | old terminal, new live holder | predecessor terminal hint | `ErrTerminal`; caller re-resolves |
 | One `Next` context ends | no state change | context | `ctx.Err()`; watch remains until `Close` |
 | Runtime stops | durable state unchanged | hub close | `ErrClosed` and cleanup |
@@ -653,7 +720,8 @@ that consumer upgrades.
 ## 8. Done criteria
 
 - [ ] `Event[T].Watch`, `EventWatch[T].Next`, and `Close` implement the exact
-      contract in Section 4.1.
+      signatures and contract in Section 4.1; `EventWatch[T]` is the only new
+      exported type.
 - [ ] Future matching events come from durable journal reads, not notification
       payloads or process memory.
 - [ ] One Flow runtime uses one existing dedicated listener connection for any
@@ -662,9 +730,16 @@ that consumer upgrades.
       session assumption exists.
 - [ ] Application-event and terminal-only transactions emit a committed
       run-scoped hint; runnable semantics are unchanged.
-- [ ] Lost/disabled notifications remain correct through the bounded fallback.
-- [ ] The fallback is a private fixed five seconds and does not inherit command
-      scheduler polling cadence.
+- [ ] Listener startup/reconnect signals all registered watches and closes
+      commit-before-listen/disconnected windows through durable rereads.
+- [ ] Event watches reject notification-disabled runtimes; a pre-`Run` watch
+      becomes active through listener startup catch-up, with no event-watch
+      polling interval, fallback timer, or public fallback option.
+- [ ] Public documentation states that every writer of watched runs must have
+      notifications enabled; the disabled-writer characterization test proves
+      Flow does not silently promise a wake it cannot send.
+- [ ] An idle `Next` performs no database query after its initial read until an
+      explicit hint/startup/reconnect signal arrives.
 - [ ] Run replacement releases the old watch so callers can re-resolve a live
       key.
 - [ ] No new command, wait row, lease, table, trigger, broker, or schema
@@ -679,8 +754,13 @@ that consumer upgrades.
 
 Stop and report; do not improvise if:
 
-- correct observation appears to require trusting `NOTIFY`, holding a database
-  connection while waiting, or creating durable state per watcher;
+- correct decoding appears to require trusting a notification payload instead
+  of the durable journal, holding a database connection while waiting, or
+  creating durable state per watcher;
+- any normal application-event or terminal commit can omit its transactional
+  notification wake when its writer has notifications enabled;
+- the runtime cannot reject notifications-disabled/stopped watches while
+  retaining a bounded pre-`Run` watch for startup-race safety;
 - application events can commit without an identifiable run ID;
 - the journal query needs a schema/index change to stay bounded at the tested
   10,000-entry post-cursor shape;
@@ -690,12 +770,14 @@ Stop and report; do not improvise if:
 - terminal replacement cannot wake the predecessor without changing live-key
   or cancellation semantics;
 - watcher cleanup requires one background goroutine per registered watch;
-- the 10,000-entry sparse query or 1,000-watcher fallback test shows work that
-  is not bounded by the stated cursor/interval contract;
+- the 10,000-entry sparse query is materially unbounded, or the 1,000-watcher
+  idle test shows timer-driven/query growth without an explicit signal;
 - no-wait external event ingress regresses by more than 10% median in a
   same-environment five-sample comparison and the regression cannot be
   explained or corrected without expanding scope;
-- a transaction client would have to wait for external commits; or
+- a correct watch would require accepting a general `Client`, exposing its
+  private cursor/journal metadata, or adding another public option/type beyond
+  Section 4.1; or
 - any test exposes a journal, fencing, lock-order, queue, or scheduler behavior
   change outside this plan.
 
@@ -703,12 +785,13 @@ Stop and report; do not improvise if:
 
 - [ ] Characterize event-only, runnable-event, broadcast, and rollback hints.
 - [ ] Add typed cursor/next-event store reads and payload decoding.
-- [ ] Add `EventRecord`, `Event.Watch`, `EventWatch.Next`, and `Close`.
+- [ ] Add only `EventWatch`, `Event.Watch`, `EventWatch.Next`, and `Close`; keep
+      cursor and journal metadata private.
 - [ ] Add the run-targeted local wake hub and listener routing.
 - [ ] Add the `event` notification kind with bounded per-semantic suppression;
       rely on PostgreSQL for identical-payload folding.
 - [ ] Wake watches on every run terminal path and live-key replacement.
-- [ ] Prove cross-runtime, reconnect, fallback, cancellation, and shutdown
+- [ ] Prove cross-runtime, reconnect catch-up, cancellation, and shutdown
       behavior under `-race`.
 - [ ] Document the API distinctions and watch-before-read recipe.
 - [ ] Measure sparse post-cursor reads, 1,000 idle watches, and event-ingress
@@ -727,13 +810,18 @@ Stop and report; do not improvise if:
 - Keep notification payloads identity-only. Applications may place sensitive
   data in event bodies; it must remain in the durable database path and out of
   `pg_notify`, logs, and observations.
-- Polling stays as repair, but consumer code should not add another correctness
-  ticker around `EventWatch`. The consumer re-reads its projection after an
-  event and once when its own request deadline expires.
+- A deployment using watches keeps notifications enabled on every runtime that
+  writes the watched runs. Adding a poll-only writer later silently removes the
+  wake signal even though the event remains durable; review runtime options as
+  part of every deployment/configuration change.
+- Event watches have no polling repair path. Consumers use bounded `Next`
+  contexts, re-read their projection after an event, and may read once when
+  their own response deadline expires. Listener startup/reconnect catch-up is
+  the only recovery wake for a commit made outside an active LISTEN session.
 - Application event keys must identify one immutable fact. An empty payload
   such as `None` cannot expose accidental key reuse, so an application whose
   status can recur must include a stable causal identity or durable generation
   in the key rather than relying only on the status text.
-- A future optimization may coalesce fallback reads among many watchers for
-  one run, but only after production evidence justifies the additional cache
-  and lifecycle state. It is deliberately absent here.
+- Do not add a timer “just for safety.” If production evidence shows listener
+  health is insufficient, improve connection detection/observability or write
+  a new explicit plan; do not silently turn every waiter into a poller.
