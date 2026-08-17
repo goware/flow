@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           # base SHA on pull_request events; default branch on comment events
           ref: ${{ github.event.pull_request.base.sha || '' }}
