@@ -45,13 +45,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           # base SHA on pull_request events; default branch on comment events
           ref: ${{ github.event.pull_request.base.sha || '' }}
           fetch-depth: 0
 
-      - uses: 0xPolygon/codegenie@v0.5.5
+      - uses: 0xPolygon/codegenie@v0.5.6
         with:
           model: "anthropic/claude-opus-5:high"
           llm-api-key: ${{ secrets.ANTHROPIC_API_KEY_GITHUB_ACTIONS }}
